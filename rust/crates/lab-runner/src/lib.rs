@@ -1019,7 +1019,7 @@ impl TrialPaths {
         copy_dir_filtered(
             &self.exp_dir,
             &self.workspace,
-            &[".lab", ".venv", "target", "rust/agentlab/target"],
+            &[".lab", ".venv", "target", "rust/target"],
         )?;
         fs::copy(
             &self.dataset_src,

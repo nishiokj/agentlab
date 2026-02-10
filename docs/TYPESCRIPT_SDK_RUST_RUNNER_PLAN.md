@@ -14,8 +14,8 @@ Build a user-facing TypeScript SDK that uses the Rust runner as the execution en
 
 ## Why This Fits the Current Codebase
 
-1. Rust already exposes reusable library functions in `rust/agentlab/crates/lab-runner/src/lib.rs`.
-2. Current Rust CLI output is human-oriented text in `rust/agentlab/crates/lab-cli/src/main.rs`; TypeScript needs a stable machine-readable mode.
+1. Rust already exposes reusable library functions in `rust/crates/lab-runner/src/lib.rs`.
+2. Current Rust CLI output is human-oriented text in `rust/crates/lab-cli/src/main.rs`; TypeScript needs a stable machine-readable mode.
 
 ## Phased Implementation
 
@@ -45,7 +45,7 @@ Acceptance:
 Acceptance:
 - Every operation has a documented JSON request/response shape.
 
-## 3) TypeScript SDK Core (`packages/sdk`)
+## 3) TypeScript SDK Core (`sdk`)
 
 - Implement `LabClient`:
   - `describe()`
@@ -139,7 +139,7 @@ Implemented in this repository:
      - `{ "ok": false, "error": { "code": "command_failed", "message": "...", "details": {} } }`
 
 2. TypeScript SDK package:
-   - Added `packages/sdk` (`@agentlab/sdk`) with:
+   - Added `sdk/` (`@agentlab/sdk`) with:
      - `LabClient`
      - `ExperimentBuilder`
      - typed responses and `LabRunnerError`

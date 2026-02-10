@@ -39,14 +39,14 @@ The Rust CLI (`lab-cli`) is the primary execution engine.
 
 ```bash
 git clone <agentlab-repo>
-cd <agentlab-repo>/rust/agentlab
+cd <agentlab-repo>/rust
 cargo build -p lab-cli --release
 ```
 
 Use from a harness repo:
 
 ```bash
-ln -sf /path/to/agentlab/rust/agentlab/target/release/lab-cli ./lab
+ln -sf /path/to/agentlab/rust/target/release/lab-cli ./lab
 ./lab --help
 ```
 
@@ -196,10 +196,10 @@ duckdb agentlab.duckdb < tables/load_duckdb.sql
 
 ## TypeScript SDK (`@agentlab/sdk`)
 
-Local package path: `packages/sdk`
+Local package path: `sdk`
 
 ```bash
-cd packages/sdk
+cd sdk
 npm install
 npm run build
 npm test
@@ -299,5 +299,5 @@ GUI flow:
 
 If GUI cannot find binary, set `Lab Binary` in sidebar:
 - `./lab` (symlink in harness repo)
-- `rust/agentlab/target/debug/lab-cli`
+- `rust/target/debug/lab-cli`
 

@@ -5,7 +5,7 @@ use serde_json::Value;
 use std::fs;
 use std::path::Path;
 
-static SCHEMAS_DIR: Dir = include_dir!("$CARGO_MANIFEST_DIR/../../../../schemas");
+static SCHEMAS_DIR: Dir = include_dir!("$CARGO_MANIFEST_DIR/../../../schemas");
 
 pub fn schema_names() -> Vec<String> {
     SCHEMAS_DIR

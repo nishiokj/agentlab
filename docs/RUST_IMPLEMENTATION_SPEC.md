@@ -16,7 +16,7 @@ The goal is to reuse the *contract* (schemas + file layout + invariants) while i
 - Universal cross-platform allowlist enforcement (Linux-first for allowlist).
 
 ## Repository Layout Proposal
-- `rust/agentlab/` (Cargo workspace)
+- `rust/` (Cargo workspace)
   - `crates/lab-cli/` (binary)
   - `crates/lab-core/` (canonical JSON, hashing, artifact store, ids)
   - `crates/lab-schemas/` (embed JSON schemas as resources)

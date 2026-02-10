@@ -11,7 +11,7 @@ npm install @agentlab/sdk
 For local development in this repository:
 
 ```bash
-cd packages/sdk
+cd sdk
 npm install
 npm run build
 ```
