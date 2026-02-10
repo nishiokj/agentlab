@@ -1,0 +1,21 @@
+{
+  "schema_version": "harness_manifest_v1",
+  "created_at": "2026-02-04T20:29:17.642749+00:00",
+  "integration_level": "cli_basic",
+  "harness": {
+    "name": "Experiments",
+    "version": "0.1.0",
+    "entry_command": [
+      "node",
+      "./agentlab_demo_harness.js",
+      "run"
+    ]
+  },
+  "step": {
+    "semantics": "none"
+  },
+  "control_plane": {
+    "mode": "file",
+    "path": "/state/lab_control.json"
+  }
+}

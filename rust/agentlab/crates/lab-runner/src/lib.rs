@@ -1,0 +1,1734 @@
+use anyhow::{anyhow, Result};
+use chrono::Utc;
+use lab_analysis::{summarize_trial, write_analysis};
+use lab_core::{canonical_json_digest, ensure_dir, sha256_bytes, sha256_file, ArtifactStore};
+use lab_hooks::{load_manifest, validate_hooks};
+use lab_provenance::{default_attestation, write_attestation};
+use lab_schemas::compile_schema;
+use serde::Deserialize;
+use serde_json::json;
+use serde_json::Value;
+use std::collections::BTreeMap;
+use std::fs;
+use std::io::Write;
+#[cfg(unix)]
+use std::os::unix::fs::symlink;
+use std::path::{Component, Path, PathBuf};
+use std::process::{Command, Stdio};
+
+pub struct RunResult {
+    pub run_dir: PathBuf,
+    pub run_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct ExperimentOverrides {
+    schema_version: String,
+    #[serde(default)]
+    manifest_path: Option<String>,
+    #[serde(default)]
+    values: BTreeMap<String, Value>,
+}
+
+#[derive(Debug, Deserialize)]
+struct KnobManifest {
+    schema_version: String,
+    knobs: Vec<KnobDef>,
+}
+
+#[derive(Debug, Deserialize)]
+struct KnobDef {
+    id: String,
+    json_pointer: String,
+    #[serde(rename = "type")]
+    value_type: String,
+    #[serde(default)]
+    options: Option<Vec<Value>>,
+    #[serde(default)]
+    minimum: Option<f64>,
+    #[serde(default)]
+    maximum: Option<f64>,
+}
+
+pub fn validate_knob_overrides(manifest_path: &Path, overrides_path: &Path) -> Result<()> {
+    let manifest = load_knob_manifest(manifest_path)?;
+    let overrides = load_experiment_overrides(overrides_path)?;
+    let mut by_id: BTreeMap<String, KnobDef> = BTreeMap::new();
+    for knob in manifest.knobs {
+        by_id.insert(knob.id.clone(), knob);
+    }
+    for (id, value) in overrides.values.iter() {
+        let knob = by_id
+            .get(id)
+            .ok_or_else(|| anyhow!("override references unknown knob id: {}", id))?;
+        validate_knob_value(knob, value)?;
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct RunBehavior {
+    pub setup_command: Option<String>,
+    pub network_mode_override: Option<String>,
+    pub require_network_none: bool,
+}
+
+pub fn find_project_root(experiment_dir: &Path) -> PathBuf {
+    let mut cur = Some(experiment_dir);
+    while let Some(p) = cur {
+        if p.file_name().and_then(|s| s.to_str()) == Some(".lab") {
+            return p.parent().unwrap_or(experiment_dir).to_path_buf();
+        }
+        cur = p.parent();
+    }
+    experiment_dir.to_path_buf()
+}
+
+#[derive(Debug, Clone)]
+pub struct ExperimentSummary {
+    pub exp_id: String,
+    pub workload_type: String,
+    pub dataset_path: PathBuf,
+    pub task_count: usize,
+    pub replications: usize,
+    pub variant_count: usize,
+    pub total_trials: usize,
+    pub harness_command: Vec<String>,
+    pub integration_level: String,
+    pub container_mode: bool,
+    pub image: Option<String>,
+    pub network_mode: String,
+    pub events_path: Option<String>,
+    pub tracing_mode: Option<String>,
+    pub control_path: String,
+    pub harness_script_resolved: Option<PathBuf>,
+    pub harness_script_exists: bool,
+}
+
+pub fn run_experiment(path: &Path, use_container: bool) -> Result<RunResult> {
+    run_experiment_with_behavior(path, use_container, RunBehavior::default(), None)
+}
+
+pub fn run_experiment_dev(path: &Path, setup_command: Option<String>) -> Result<RunResult> {
+    run_experiment_dev_with_overrides(path, setup_command, None)
+}
+
+pub fn run_experiment_with_overrides(
+    path: &Path,
+    use_container: bool,
+    overrides_path: Option<&Path>,
+) -> Result<RunResult> {
+    run_experiment_with_behavior(path, use_container, RunBehavior::default(), overrides_path)
+}
+
+pub fn run_experiment_dev_with_overrides(
+    path: &Path,
+    setup_command: Option<String>,
+    overrides_path: Option<&Path>,
+) -> Result<RunResult> {
+    let behavior = RunBehavior {
+        setup_command,
+        network_mode_override: Some("full".to_string()),
+        require_network_none: false,
+    };
+    run_experiment_with_behavior(path, true, behavior, overrides_path)
+}
+
+pub fn run_experiment_strict(path: &Path) -> Result<RunResult> {
+    run_experiment_strict_with_overrides(path, None)
+}
+
+pub fn run_experiment_strict_with_overrides(
+    path: &Path,
+    overrides_path: Option<&Path>,
+) -> Result<RunResult> {
+    let behavior = RunBehavior {
+        setup_command: None,
+        network_mode_override: None,
+        require_network_none: true,
+    };
+    run_experiment_with_behavior(path, true, behavior, overrides_path)
+}
+
+fn run_experiment_with_behavior(
+    path: &Path,
+    use_container: bool,
+    behavior: RunBehavior,
+    overrides_path: Option<&Path>,
+) -> Result<RunResult> {
+    let exp_dir = path
+        .parent()
+        .unwrap_or(Path::new("."))
+        .canonicalize()
+        .unwrap_or_else(|_| PathBuf::from("."));
+    let project_root = find_project_root(&exp_dir)
+        .canonicalize()
+        .unwrap_or_else(|_| find_project_root(&exp_dir));
+    let raw_yaml = fs::read_to_string(path)?;
+    let yaml_value: serde_yaml::Value = serde_yaml::from_str(&raw_yaml)?;
+    let mut json_value: Value = serde_json::to_value(yaml_value)?;
+    if let Some(overrides_path) = overrides_path {
+        json_value = apply_experiment_overrides(json_value, overrides_path, &project_root)?;
+    }
+    let workload_type = json_value
+        .pointer("/experiment/workload_type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("agent_harness")
+        .to_string();
+    let configured_network_mode = json_value
+        .pointer("/runtime/network/mode")
+        .and_then(|v| v.as_str())
+        .unwrap_or("none");
+    let effective_network_mode = behavior
+        .network_mode_override
+        .as_deref()
+        .unwrap_or(configured_network_mode)
+        .to_string();
+    if behavior.require_network_none && effective_network_mode != "none" {
+        return Err(anyhow!(
+            "run-experiment requires network mode 'none' (current effective mode: {})",
+            effective_network_mode
+        ));
+    }
+
+    let run_id = format!("run_{}", Utc::now().format("%Y%m%d_%H%M%S"));
+    let run_dir = project_root.join(".lab").join("runs").join(&run_id);
+    ensure_dir(&run_dir)?;
+
+    let resolved_path = run_dir.join("resolved_experiment.json");
+    fs::write(&resolved_path, serde_json::to_vec_pretty(&json_value)?)?;
+    let resolved_digest = canonical_json_digest(&json_value);
+    fs::write(
+        run_dir.join("resolved_experiment.digest"),
+        resolved_digest.as_bytes(),
+    )?;
+
+    let manifest = json!({
+        "schema_version": "manifest_v1",
+        "run_id": run_id,
+        "runner_version": "rust-0.3.0",
+        "created_at": Utc::now().to_rfc3339(),
+    });
+    fs::write(
+        run_dir.join("manifest.json"),
+        serde_json::to_vec_pretty(&manifest)?,
+    )?;
+
+    let dataset_path = resolve_dataset_path(&json_value, &exp_dir)?;
+    let tasks = load_tasks(&dataset_path, &json_value)?;
+
+    let (variants, baseline_id) = resolve_variant_plan(&json_value)?;
+    let replications = json_value
+        .pointer("/design/replications")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(1) as usize;
+
+    let trials_dir = run_dir.join("trials");
+    ensure_dir(&trials_dir)?;
+
+    let analysis_dir = run_dir.join("analysis");
+    ensure_dir(&analysis_dir)?;
+
+    let _artifact_store = ArtifactStore::new(run_dir.join("trials").join("artifacts"));
+
+    let harness = resolve_harness(&json_value, &project_root)?;
+    validate_harness_command(&harness.command_raw, &project_root)?;
+    let container_mode = use_container || harness.force_container;
+
+    let mut trial_summaries = Vec::new();
+    let mut event_counts: BTreeMap<String, BTreeMap<String, usize>> = BTreeMap::new();
+    let mut trial_event_counts: BTreeMap<String, BTreeMap<String, usize>> = BTreeMap::new();
+
+    let mut trial_index: usize = 0;
+    for variant in variants {
+        for (task_idx, task) in tasks.iter().enumerate() {
+            for repl in 0..replications {
+                trial_index += 1;
+                let trial_id = format!("trial_{}", trial_index);
+                let trial_dir = trials_dir.join(&trial_id);
+                ensure_dir(&trial_dir)?;
+
+                let trial_paths = TrialPaths::new(&trial_dir, &project_root, &dataset_path)?;
+                trial_paths.prepare()?;
+
+                let input = build_trial_input(
+                    &json_value,
+                    &workload_type,
+                    &trial_id,
+                    &variant,
+                    task_idx,
+                    repl,
+                    task,
+                    &trial_paths,
+                    container_mode,
+                );
+                let input_bytes = serde_json::to_vec_pretty(&input)?;
+                let canonical_input_path = trial_dir.join("trial_input.json");
+                fs::write(&canonical_input_path, &input_bytes)?;
+
+                let (input_path, output_path) =
+                    prepare_io_paths(&trial_paths, container_mode, &input_bytes)?;
+
+                let (control_path_harness, control_path_host) =
+                    resolve_control_paths(&harness.control_path, &trial_paths, container_mode);
+                write_control_file(&control_path_host)?;
+
+                let mut otel_receiver = None;
+                let mut otel_manifest = None;
+                if harness.tracing_mode == Some("otlp".to_string()) {
+                    if container_mode
+                        && json_value
+                            .pointer("/runtime/network/mode")
+                            .and_then(|v| v.as_str())
+                            == Some("none")
+                    {
+                        otel_manifest = Some(json!({
+                            "schema_version": "trace_manifest_v1",
+                            "mode": "none",
+                            "reason": "network_none",
+                        }));
+                    } else {
+                        let receiver = lab_otel::OtlpReceiver::start(
+                            4318,
+                            ArtifactStore::new(trial_dir.join("artifacts")),
+                        )?;
+                        let endpoint = receiver.endpoint.clone();
+                        otel_receiver = Some(receiver);
+                        otel_manifest = Some(json!({
+                            "schema_version": "trace_manifest_v1",
+                            "mode": "otlp",
+                            "endpoint": endpoint,
+                        }));
+                    }
+                }
+
+                let status = if container_mode {
+                    let command = resolve_command_container(&harness.command_raw, &project_root);
+                    run_harness_container(
+                        &json_value,
+                        &harness,
+                        &trial_paths,
+                        &input_path,
+                        &output_path,
+                        &control_path_harness,
+                        &command,
+                        &effective_network_mode,
+                        behavior.setup_command.as_deref(),
+                    )?
+                } else {
+                    if behavior.setup_command.is_some() {
+                        return Err(anyhow!(
+                            "setup command is only supported for container runs"
+                        ));
+                    }
+                    let command = resolve_command_local(&harness.command_raw, &project_root);
+                    run_harness_local(
+                        &harness,
+                        &trial_paths,
+                        &input_path,
+                        &output_path,
+                        &control_path_harness,
+                        &command,
+                    )?
+                };
+
+                if let Some(receiver) = otel_receiver {
+                    let records = receiver.records();
+                    receiver.stop();
+                    if let Some(mut manifest) = otel_manifest {
+                        if let Some(obj) = manifest.as_object_mut() {
+                            obj.insert("records".to_string(), serde_json::to_value(records)?);
+                        }
+                        let path = trial_dir.join("trace_manifest.json");
+                        fs::write(path, serde_json::to_vec_pretty(&manifest)?)?;
+                    }
+                }
+
+                if container_mode {
+                    let canonical_output = trial_dir.join("trial_output.json");
+                    if output_path.exists() {
+                        fs::copy(&output_path, &canonical_output)?;
+                    }
+                }
+
+                let canonical_output = trial_dir.join("trial_output.json");
+                let trial_output: Value = if canonical_output.exists() {
+                    serde_json::from_slice(&fs::read(&canonical_output)?)?
+                } else {
+                    json!({"schema_version": "trial_output_v1", "outcome": "error"})
+                };
+
+                let task_id = task
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string())
+                    .unwrap_or_else(|| format!("task_{}", task_idx));
+                let summary = summarize_trial(
+                    &run_id,
+                    &trial_output,
+                    &trial_id,
+                    &workload_type,
+                    &variant.id,
+                    task_idx,
+                    &task_id,
+                    repl,
+                    status,
+                    container_mode,
+                    &harness.integration_level,
+                    configured_network_mode,
+                    &effective_network_mode,
+                );
+                trial_summaries.push(summary);
+
+                write_state_inventory(
+                    &trial_dir,
+                    &json_value,
+                    &harness,
+                    container_mode,
+                    &trial_paths,
+                    &resolve_exec_digest(&harness.command_raw, &project_root)?,
+                    &effective_network_mode,
+                )?;
+
+                if let Some(events_path) = harness.events_path.as_ref() {
+                    let manifest_path = resolve_harness_manifest_path(&trial_paths, container_mode);
+                    if manifest_path.exists() {
+                        let manifest = load_manifest(&manifest_path)?;
+                        let schema = compile_schema("hook_events_v1.jsonschema")?;
+                        let ev_path = resolve_event_path(events_path, &trial_paths, container_mode);
+                        if ev_path.exists() {
+                            let _ = validate_hooks(&manifest, &ev_path, &schema);
+                            let counts = count_event_types(&ev_path)?;
+                            let trial_map = trial_event_counts.entry(trial_id.clone()).or_default();
+                            for (k, v) in counts.into_iter() {
+                                *trial_map.entry(k.clone()).or_default() += v;
+                                *event_counts
+                                    .entry(variant.id.clone())
+                                    .or_default()
+                                    .entry(k)
+                                    .or_default() += v;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    write_analysis(
+        &analysis_dir,
+        &trial_summaries,
+        &baseline_id,
+        &event_counts,
+        &trial_event_counts,
+    )?;
+
+    let grades = json!({
+        "schema_version": "grades_v1",
+        "integration_level": json_value.pointer("/runtime/harness/integration_level").and_then(|v| v.as_str()).unwrap_or("cli_basic"),
+        "replay_grade": "best_effort",
+        "isolation_grade": if use_container {"bounded"} else {"leaky"},
+        "comparability_grade": "unknown",
+        "provenance_grade": "recorded",
+        "privacy_grade": "unknown"
+    });
+
+    let att = default_attestation(
+        &resolved_digest,
+        None,
+        grades.clone(),
+        vec![],
+        json!({"name": "unknown"}),
+        "hooks",
+    );
+    write_attestation(&run_dir, att)?;
+
+    Ok(RunResult { run_dir, run_id })
+}
+
+pub fn describe_experiment(path: &Path) -> Result<ExperimentSummary> {
+    describe_experiment_with_overrides(path, None)
+}
+
+pub fn describe_experiment_with_overrides(
+    path: &Path,
+    overrides_path: Option<&Path>,
+) -> Result<ExperimentSummary> {
+    let exp_dir = path
+        .parent()
+        .unwrap_or(Path::new("."))
+        .canonicalize()
+        .unwrap_or_else(|_| PathBuf::from("."));
+    let project_root = find_project_root(&exp_dir)
+        .canonicalize()
+        .unwrap_or_else(|_| find_project_root(&exp_dir));
+    let raw_yaml = fs::read_to_string(path)?;
+    let yaml_value: serde_yaml::Value = serde_yaml::from_str(&raw_yaml)?;
+    let mut json_value: Value = serde_json::to_value(yaml_value)?;
+    if let Some(overrides_path) = overrides_path {
+        json_value = apply_experiment_overrides(json_value, overrides_path, &project_root)?;
+    }
+
+    let dataset_path = resolve_dataset_path(&json_value, &exp_dir)?;
+    let task_count = count_tasks(&dataset_path, &json_value)?;
+    let (variants, _) = resolve_variant_plan(&json_value)?;
+    let replications = json_value
+        .pointer("/design/replications")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(1) as usize;
+    let variant_count = variants.len();
+    let total_trials = task_count * replications * variant_count;
+
+    let harness = resolve_harness(&json_value, &project_root)?;
+    let container_mode = json_value
+        .pointer("/runtime/sandbox/mode")
+        .and_then(|v| v.as_str())
+        == Some("container");
+    let image = json_value
+        .pointer("/runtime/sandbox/image")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let network_mode = json_value
+        .pointer("/runtime/network/mode")
+        .and_then(|v| v.as_str())
+        .unwrap_or("none")
+        .to_string();
+
+    let exp_id = json_value
+        .pointer("/experiment/id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("exp")
+        .to_string();
+    let workload_type = json_value
+        .pointer("/experiment/workload_type")
+        .and_then(|v| v.as_str())
+        .unwrap_or("agent_harness")
+        .to_string();
+
+    let harness_script_resolved = resolve_command_script_path(&harness.command_raw, &project_root);
+    let harness_script_exists = harness_script_resolved
+        .as_ref()
+        .map(|p| p.exists())
+        .unwrap_or(true);
+    Ok(ExperimentSummary {
+        exp_id,
+        workload_type,
+        dataset_path,
+        task_count,
+        replications,
+        variant_count,
+        total_trials,
+        harness_command: harness.command_raw,
+        integration_level: harness.integration_level,
+        container_mode,
+        image,
+        network_mode,
+        events_path: harness.events_path,
+        tracing_mode: harness.tracing_mode,
+        control_path: harness.control_path,
+        harness_script_resolved,
+        harness_script_exists,
+    })
+}
+
+pub fn resolve_docker_build(path: &Path) -> Result<(PathBuf, PathBuf)> {
+    resolve_docker_build_with_overrides(path, None)
+}
+
+pub fn resolve_docker_build_with_overrides(
+    path: &Path,
+    overrides_path: Option<&Path>,
+) -> Result<(PathBuf, PathBuf)> {
+    let exp_dir = path
+        .parent()
+        .unwrap_or(Path::new("."))
+        .canonicalize()
+        .unwrap_or_else(|_| PathBuf::from("."));
+    let project_root = find_project_root(&exp_dir)
+        .canonicalize()
+        .unwrap_or_else(|_| find_project_root(&exp_dir));
+    let raw_yaml = fs::read_to_string(path)?;
+    let yaml_value: serde_yaml::Value = serde_yaml::from_str(&raw_yaml)?;
+    let mut json_value: Value = serde_json::to_value(yaml_value)?;
+    if let Some(overrides_path) = overrides_path {
+        json_value = apply_experiment_overrides(json_value, overrides_path, &project_root)?;
+    }
+
+    let dockerfile = json_value
+        .pointer("/runtime/sandbox/dockerfile")
+        .and_then(|v| v.as_str())
+        .unwrap_or("Dockerfile");
+    let context = json_value
+        .pointer("/runtime/sandbox/context")
+        .and_then(|v| v.as_str())
+        .unwrap_or(".");
+
+    let dockerfile_path = project_root.join(dockerfile);
+    let context_path = project_root.join(context);
+    Ok((dockerfile_path, context_path))
+}
+
+pub fn run_docker_build(tag: &str, dockerfile: &Path, context: &Path) -> Result<String> {
+    let status = Command::new("docker")
+        .arg("build")
+        .arg("-t")
+        .arg(tag)
+        .arg("-f")
+        .arg(dockerfile)
+        .arg(context)
+        .status()?;
+    Ok(format!("{:?}", status.code()))
+}
+
+#[derive(Clone)]
+struct Variant {
+    id: String,
+    bindings: Value,
+}
+
+fn resolve_variant_plan(json_value: &Value) -> Result<(Vec<Variant>, String)> {
+    let baseline = json_value
+        .pointer("/baseline/variant_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("base")
+        .to_string();
+    let baseline_bindings = json_value
+        .pointer("/baseline/bindings")
+        .cloned()
+        .unwrap_or(json!({}));
+
+    let mut variants = Vec::new();
+    variants.push(Variant {
+        id: baseline.clone(),
+        bindings: baseline_bindings,
+    });
+
+    let variant_list = json_value
+        .pointer("/variant_plan")
+        .and_then(|v| v.as_array())
+        .or_else(|| json_value.pointer("/variants").and_then(|v| v.as_array()));
+    if let Some(list) = variant_list {
+        for item in list {
+            let id = item
+                .get("variant_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("variant")
+                .to_string();
+            let bindings = item.get("bindings").cloned().unwrap_or(json!({}));
+            variants.push(Variant { id, bindings });
+        }
+    }
+    Ok((variants, baseline))
+}
+
+fn apply_experiment_overrides(
+    mut experiment: Value,
+    overrides_path: &Path,
+    project_root: &Path,
+) -> Result<Value> {
+    let overrides = load_experiment_overrides(overrides_path)?;
+    if overrides.values.is_empty() {
+        return Ok(experiment);
+    }
+
+    let manifest_rel = overrides
+        .manifest_path
+        .clone()
+        .unwrap_or_else(|| ".lab/knobs/manifest.json".to_string());
+    let manifest_path = if Path::new(&manifest_rel).is_absolute() {
+        PathBuf::from(&manifest_rel)
+    } else {
+        project_root.join(&manifest_rel)
+    };
+    let manifest = load_knob_manifest(&manifest_path)?;
+
+    let mut by_id: BTreeMap<String, KnobDef> = BTreeMap::new();
+    for knob in manifest.knobs {
+        by_id.insert(knob.id.clone(), knob);
+    }
+
+    for (id, value) in overrides.values.iter() {
+        let knob = by_id
+            .get(id)
+            .ok_or_else(|| anyhow!("override references unknown knob id: {}", id))?;
+        validate_knob_value(knob, value)?;
+        set_json_pointer_value(&mut experiment, &knob.json_pointer, value.clone())?;
+    }
+
+    Ok(experiment)
+}
+
+fn load_experiment_overrides(overrides_path: &Path) -> Result<ExperimentOverrides> {
+    let overrides_schema = compile_schema("experiment_overrides_v1.jsonschema")?;
+    let overrides_data = fs::read_to_string(overrides_path)?;
+    let overrides_json: Value = serde_json::from_str(&overrides_data)?;
+    if let Err(errors) = overrides_schema.validate(&overrides_json) {
+        let mut msgs = Vec::new();
+        for e in errors {
+            msgs.push(e.to_string());
+        }
+        return Err(anyhow!(
+            "overrides schema validation failed ({}): {}",
+            overrides_path.display(),
+            msgs.join("; ")
+        ));
+    }
+    let overrides: ExperimentOverrides = serde_json::from_value(overrides_json)?;
+    if overrides.schema_version != "experiment_overrides_v1" {
+        return Err(anyhow!(
+            "unsupported overrides schema_version: {}",
+            overrides.schema_version
+        ));
+    }
+    Ok(overrides)
+}
+
+fn load_knob_manifest(manifest_path: &Path) -> Result<KnobManifest> {
+    let manifest_schema = compile_schema("knob_manifest_v1.jsonschema")?;
+    let manifest_data = fs::read_to_string(manifest_path)?;
+    let manifest_json: Value = serde_json::from_str(&manifest_data)?;
+    if let Err(errors) = manifest_schema.validate(&manifest_json) {
+        let mut msgs = Vec::new();
+        for e in errors {
+            msgs.push(e.to_string());
+        }
+        return Err(anyhow!(
+            "knob manifest schema validation failed ({}): {}",
+            manifest_path.display(),
+            msgs.join("; ")
+        ));
+    }
+    let manifest: KnobManifest = serde_json::from_value(manifest_json)?;
+    if manifest.schema_version != "knob_manifest_v1" {
+        return Err(anyhow!(
+            "unsupported knob manifest schema_version: {}",
+            manifest.schema_version
+        ));
+    }
+    Ok(manifest)
+}
+
+fn validate_knob_value(knob: &KnobDef, value: &Value) -> Result<()> {
+    if !value_matches_type(value, &knob.value_type) {
+        return Err(anyhow!(
+            "override value type mismatch for knob {}: expected {}, got {}",
+            knob.id,
+            knob.value_type,
+            value_type_name(value)
+        ));
+    }
+
+    if let Some(options) = knob.options.as_ref() {
+        if !options.iter().any(|opt| opt == value) {
+            return Err(anyhow!(
+                "override value for knob {} is not in allowed options",
+                knob.id
+            ));
+        }
+    }
+
+    if let Some(min) = knob.minimum {
+        if let Some(v) = value.as_f64() {
+            if v < min {
+                return Err(anyhow!(
+                    "override value for knob {} is below minimum {}",
+                    knob.id,
+                    min
+                ));
+            }
+        }
+    }
+    if let Some(max) = knob.maximum {
+        if let Some(v) = value.as_f64() {
+            if v > max {
+                return Err(anyhow!(
+                    "override value for knob {} is above maximum {}",
+                    knob.id,
+                    max
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn value_matches_type(value: &Value, t: &str) -> bool {
+    match t {
+        "string" => value.is_string(),
+        "integer" => value.as_i64().is_some() || value.as_u64().is_some(),
+        "number" => value.is_number(),
+        "boolean" => value.is_boolean(),
+        "array" => value.is_array(),
+        "object" => value.is_object(),
+        _ => false,
+    }
+}
+
+fn value_type_name(value: &Value) -> &'static str {
+    if value.is_string() {
+        "string"
+    } else if value.is_boolean() {
+        "boolean"
+    } else if value.is_number() {
+        "number"
+    } else if value.is_array() {
+        "array"
+    } else if value.is_object() {
+        "object"
+    } else {
+        "null"
+    }
+}
+
+fn decode_pointer_token(token: &str) -> String {
+    token.replace("~1", "/").replace("~0", "~")
+}
+
+fn set_json_pointer_value(root: &mut Value, pointer: &str, new_value: Value) -> Result<()> {
+    if pointer.is_empty() || pointer == "/" {
+        *root = new_value;
+        return Ok(());
+    }
+    if !pointer.starts_with('/') {
+        return Err(anyhow!("json_pointer must start with '/': {}", pointer));
+    }
+
+    let tokens: Vec<String> = pointer
+        .split('/')
+        .skip(1)
+        .map(decode_pointer_token)
+        .collect();
+    if tokens.is_empty() {
+        *root = new_value;
+        return Ok(());
+    }
+
+    let mut cur = root;
+    for token in tokens.iter().take(tokens.len() - 1) {
+        match cur {
+            Value::Object(map) => {
+                let entry = map.entry(token.clone()).or_insert_with(|| json!({}));
+                cur = entry;
+            }
+            Value::Array(arr) => {
+                let idx: usize = token.parse().map_err(|_| {
+                    anyhow!(
+                        "json_pointer token '{}' is not a valid array index in {}",
+                        token,
+                        pointer
+                    )
+                })?;
+                if idx >= arr.len() {
+                    return Err(anyhow!(
+                        "json_pointer array index {} out of bounds in {}",
+                        idx,
+                        pointer
+                    ));
+                }
+                cur = &mut arr[idx];
+            }
+            _ => {
+                return Err(anyhow!(
+                    "json_pointer traversal hit non-container at token '{}' in {}",
+                    token,
+                    pointer
+                ));
+            }
+        }
+    }
+
+    let last = tokens.last().unwrap();
+    match cur {
+        Value::Object(map) => {
+            map.insert(last.clone(), new_value);
+            Ok(())
+        }
+        Value::Array(arr) => {
+            let idx: usize = last.parse().map_err(|_| {
+                anyhow!(
+                    "json_pointer token '{}' is not a valid array index in {}",
+                    last,
+                    pointer
+                )
+            })?;
+            if idx >= arr.len() {
+                return Err(anyhow!(
+                    "json_pointer array index {} out of bounds in {}",
+                    idx,
+                    pointer
+                ));
+            }
+            arr[idx] = new_value;
+            Ok(())
+        }
+        _ => Err(anyhow!(
+            "json_pointer target is not an object/array for {}",
+            pointer
+        )),
+    }
+}
+
+fn resolve_dataset_path(json_value: &Value, exp_dir: &Path) -> Result<PathBuf> {
+    let rel = json_value
+        .pointer("/dataset/path")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow!("dataset.path missing"))?;
+    let path = exp_dir.join(rel);
+    Ok(path)
+}
+
+fn load_tasks(path: &Path, json_value: &Value) -> Result<Vec<Value>> {
+    let data = fs::read_to_string(path)?;
+    let mut tasks = Vec::new();
+    for line in data.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let task: Value = serde_json::from_str(line)?;
+        tasks.push(task);
+    }
+    if let Some(limit) = json_value
+        .pointer("/dataset/limit")
+        .and_then(|v| v.as_u64())
+    {
+        tasks.truncate(limit as usize);
+    }
+    Ok(tasks)
+}
+
+fn count_tasks(path: &Path, json_value: &Value) -> Result<usize> {
+    let data = fs::read_to_string(path)?;
+    let mut count = 0usize;
+    for line in data.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        count += 1;
+        if let Some(limit) = json_value
+            .pointer("/dataset/limit")
+            .and_then(|v| v.as_u64())
+        {
+            if count >= limit as usize {
+                break;
+            }
+        }
+    }
+    Ok(count)
+}
+#[derive(Clone)]
+struct HarnessConfig {
+    command_raw: Vec<String>,
+    integration_level: String,
+    input_path: String,
+    output_path: String,
+    events_path: Option<String>,
+    control_path: String,
+    tracing_mode: Option<String>,
+    force_container: bool,
+}
+
+fn resolve_harness(json_value: &Value, _exp_dir: &Path) -> Result<HarnessConfig> {
+    let harness = json_value
+        .pointer("/runtime/harness")
+        .ok_or_else(|| anyhow!("runtime.harness missing"))?;
+    let command = harness
+        .pointer("/command")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| anyhow!("runtime.harness.command missing"))?
+        .iter()
+        .map(|v| v.as_str().unwrap_or("").to_string())
+        .collect::<Vec<_>>();
+
+    let integration_level = harness
+        .pointer("/integration_level")
+        .and_then(|v| v.as_str())
+        .unwrap_or("cli_basic")
+        .to_string();
+    let input_path = harness
+        .pointer("/input_path")
+        .and_then(|v| v.as_str())
+        .unwrap_or("/out/trial_input.json")
+        .to_string();
+    let output_path = harness
+        .pointer("/output_path")
+        .and_then(|v| v.as_str())
+        .unwrap_or("/out/trial_output.json")
+        .to_string();
+    let events_path = harness
+        .pointer("/events/path")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let control_path = harness
+        .pointer("/control_plane/path")
+        .and_then(|v| v.as_str())
+        .unwrap_or("/state/lab_control.json")
+        .to_string();
+    let tracing_mode = harness
+        .pointer("/tracing/mode")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
+    let force_container = json_value
+        .pointer("/runtime/sandbox/mode")
+        .and_then(|v| v.as_str())
+        == Some("container");
+
+    Ok(HarnessConfig {
+        command_raw: command,
+        integration_level,
+        input_path,
+        output_path,
+        events_path,
+        control_path,
+        tracing_mode,
+        force_container,
+    })
+}
+
+struct TrialPaths {
+    trial_dir: PathBuf,
+    workspace: PathBuf,
+    state: PathBuf,
+    dataset: PathBuf,
+    out: PathBuf,
+    tmp: PathBuf,
+    dataset_src: PathBuf,
+    exp_dir: PathBuf,
+}
+
+impl TrialPaths {
+    fn new(trial_dir: &Path, exp_dir: &Path, dataset_src: &Path) -> Result<Self> {
+        Ok(Self {
+            trial_dir: trial_dir.to_path_buf(),
+            workspace: trial_dir.join("workspace"),
+            state: trial_dir.join("state"),
+            dataset: trial_dir.join("dataset"),
+            out: trial_dir.join("out"),
+            tmp: trial_dir.join("tmp"),
+            dataset_src: dataset_src.to_path_buf(),
+            exp_dir: exp_dir.to_path_buf(),
+        })
+    }
+
+    fn prepare(&self) -> Result<()> {
+        ensure_dir(&self.workspace)?;
+        ensure_dir(&self.state)?;
+        ensure_dir(&self.dataset)?;
+        ensure_dir(&self.out)?;
+        ensure_dir(&self.tmp)?;
+        copy_dir_filtered(
+            &self.exp_dir,
+            &self.workspace,
+            &[".lab", ".venv", "target", "rust/agentlab/target"],
+        )?;
+        fs::copy(
+            &self.dataset_src,
+            self.dataset.join(self.dataset_src.file_name().unwrap()),
+        )?;
+        Ok(())
+    }
+}
+
+fn build_trial_input(
+    json_value: &Value,
+    workload_type: &str,
+    trial_id: &str,
+    variant: &Variant,
+    task_idx: usize,
+    repl: usize,
+    task: &Value,
+    paths: &TrialPaths,
+    container_mode: bool,
+) -> Value {
+    let runtime_paths = if container_mode {
+        json!({
+            "workspace": "/workspace",
+            "state": "/state",
+            "dataset": "/dataset",
+            "out": "/out",
+            "tmp": "/tmp",
+        })
+    } else {
+        json!({
+            "workspace": paths.workspace.to_string_lossy(),
+            "state": paths.state.to_string_lossy(),
+            "dataset": paths.dataset.to_string_lossy(),
+            "out": paths.out.to_string_lossy(),
+            "tmp": paths.tmp.to_string_lossy(),
+        })
+    };
+    let control_path = if container_mode {
+        json_value
+            .pointer("/runtime/harness/control_plane/path")
+            .and_then(|v| v.as_str())
+            .unwrap_or("/state/lab_control.json")
+            .to_string()
+    } else {
+        paths
+            .state
+            .join("lab_control.json")
+            .to_string_lossy()
+            .to_string()
+    };
+    json!({
+        "schema_version": "trial_input_v1",
+        "ids": {
+            "run_id": json_value.pointer("/experiment/id").and_then(|v| v.as_str()).unwrap_or("run"),
+            "trial_id": trial_id,
+            "variant_id": variant.id,
+            "task_id": task.get("id").and_then(|v| v.as_str()).unwrap_or(&format!("task_{}", task_idx)),
+            "repl_idx": repl
+        },
+        "task": task,
+        "workload": {
+            "type": workload_type
+        },
+        "bindings": variant.bindings.clone(),
+        "design": {
+            "sanitization_profile": json_value.pointer("/design/sanitization_profile").and_then(|v| v.as_str()).unwrap_or("hermetic_functional_v2"),
+            "integration_level": json_value.pointer("/runtime/harness/integration_level").and_then(|v| v.as_str()).unwrap_or("cli_basic"),
+        },
+        "runtime": {
+            "paths": runtime_paths,
+            "network": {
+                "mode_requested": json_value.pointer("/runtime/network/mode").and_then(|v| v.as_str()).unwrap_or("none"),
+                "allowed_hosts": json_value.pointer("/runtime/network/allowed_hosts").cloned().unwrap_or(json!([])),
+            },
+            "control_plane": {
+                "mode": json_value.pointer("/runtime/harness/control_plane/mode").and_then(|v| v.as_str()).unwrap_or("file"),
+                "path": control_path,
+            }
+        }
+    })
+}
+
+fn run_harness_local(
+    harness: &HarnessConfig,
+    paths: &TrialPaths,
+    input_path: &Path,
+    output_path: &Path,
+    control_path: &str,
+    command: &[String],
+) -> Result<String> {
+    let mut cmd = Command::new(&command[0]);
+    cmd.args(&command[1..]);
+    cmd.current_dir(&paths.workspace);
+    cmd.env("AGENTLAB_TRIAL_INPUT", &input_path);
+    cmd.env("AGENTLAB_TRIAL_OUTPUT", &output_path);
+    cmd.env("AGENTLAB_CONTROL_PATH", control_path);
+    if harness.tracing_mode.as_deref() == Some("otlp") {
+        cmd.env("OTEL_EXPORTER_OTLP_ENDPOINT", "http://127.0.0.1:4318");
+    }
+    run_process_with_trial_io(cmd, input_path, output_path)
+}
+
+fn run_harness_container(
+    json_value: &Value,
+    harness: &HarnessConfig,
+    paths: &TrialPaths,
+    input_path: &Path,
+    output_path: &Path,
+    control_path: &str,
+    command: &[String],
+    network_mode: &str,
+    setup_command: Option<&str>,
+) -> Result<String> {
+    let image = json_value
+        .pointer("/runtime/sandbox/image")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow!("runtime.sandbox.image required for container mode"))?;
+
+    if network_mode == "allowlist_enforced" {
+        return Err(anyhow!("allowlist_enforced not implemented in Rust runner"));
+    }
+
+    let mut cmd = Command::new("docker");
+    cmd.arg("run").arg("--rm");
+
+    if json_value
+        .pointer("/runtime/sandbox/root_read_only")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true)
+    {
+        cmd.arg("--read-only");
+    }
+
+    let run_as_user = json_value
+        .pointer("/runtime/sandbox/run_as_user")
+        .and_then(|v| v.as_str());
+    if let Some(user) = run_as_user {
+        cmd.args(["-u", user]);
+    }
+
+    if network_mode == "none" {
+        cmd.arg("--network=none");
+    }
+
+    if json_value
+        .pointer("/runtime/sandbox/hardening/no_new_privileges")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true)
+    {
+        cmd.args(["--security-opt", "no-new-privileges"]);
+    }
+    if json_value
+        .pointer("/runtime/sandbox/hardening/drop_all_caps")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true)
+    {
+        cmd.args(["--cap-drop", "ALL"]);
+    }
+
+    if let Some(cpu) = json_value
+        .pointer("/runtime/sandbox/resources/cpu_count")
+        .and_then(|v| v.as_u64())
+    {
+        cmd.arg("--cpus").arg(cpu.to_string());
+    }
+    if let Some(mem) = json_value
+        .pointer("/runtime/sandbox/resources/memory_mb")
+        .and_then(|v| v.as_u64())
+    {
+        cmd.arg("--memory").arg(format!("{}m", mem));
+    }
+
+    cmd.args(["-v", &format!("{}:/workspace", paths.workspace.display())]);
+    cmd.args(["-v", &format!("{}:/state", paths.state.display())]);
+    cmd.args(["-v", &format!("{}:/dataset:ro", paths.dataset.display())]);
+    cmd.args(["-v", &format!("{}:/out", paths.out.display())]);
+    cmd.args(["--tmpfs", "/tmp:rw"]);
+    cmd.args(["-w", "/workspace"]);
+
+    cmd.arg("-e")
+        .arg(format!("AGENTLAB_TRIAL_INPUT={}", harness.input_path));
+    cmd.arg("-e")
+        .arg(format!("AGENTLAB_TRIAL_OUTPUT={}", harness.output_path));
+    cmd.arg("-e")
+        .arg(format!("AGENTLAB_CONTROL_PATH={}", control_path));
+
+    if harness.tracing_mode.as_deref() == Some("otlp") {
+        cmd.arg("-e")
+            .arg("OTEL_EXPORTER_OTLP_ENDPOINT=http://host.docker.internal:4318");
+        #[cfg(target_os = "linux")]
+        {
+            cmd.arg("--add-host")
+                .arg("host.docker.internal:host-gateway");
+        }
+    }
+
+    cmd.arg(image);
+    if let Some(setup) = setup_command {
+        let mut script_parts = Vec::new();
+        script_parts.push(setup.to_string());
+        script_parts.push(shell_join(command));
+        let script = script_parts.join(" && ");
+        cmd.arg("sh").arg("-lc").arg(script);
+    } else {
+        cmd.args(command);
+    }
+    run_process_with_trial_io(cmd, input_path, output_path)
+}
+
+fn resolve_command_local(command: &[String], exp_dir: &Path) -> Vec<String> {
+    let mut resolved = Vec::new();
+    for part in command {
+        let p = Path::new(part);
+        if p.is_relative() && command_part_looks_like_path(part) {
+            resolved.push(
+                normalize_path(&exp_dir.join(p))
+                    .to_string_lossy()
+                    .to_string(),
+            );
+        } else {
+            resolved.push(part.clone());
+        }
+    }
+    resolved
+}
+
+fn resolve_command_container(command: &[String], exp_dir: &Path) -> Vec<String> {
+    let mut resolved = Vec::new();
+    for part in command {
+        let p = Path::new(part);
+        if p.is_relative() && command_part_looks_like_path(part) {
+            let rel = p.to_string_lossy().trim_start_matches("./").to_string();
+            resolved.push(format!("/workspace/{}", rel));
+        } else if p.is_absolute() && p.starts_with(exp_dir) {
+            if let Ok(rel) = p.strip_prefix(exp_dir) {
+                let rel = rel.to_string_lossy().trim_start_matches('/').to_string();
+                resolved.push(format!("/workspace/{}", rel));
+            } else {
+                resolved.push(part.clone());
+            }
+        } else {
+            resolved.push(part.clone());
+        }
+    }
+    resolved
+}
+
+fn resolve_command_script_path(command: &[String], project_root: &Path) -> Option<PathBuf> {
+    if command.is_empty() {
+        return None;
+    }
+    let candidate_idx = if command_part_looks_like_path(&command[0]) {
+        0
+    } else if command.len() >= 2 && command_part_looks_like_path(&command[1]) {
+        1
+    } else {
+        return None;
+    };
+    let candidate = Path::new(&command[candidate_idx]);
+    if candidate.is_absolute() {
+        return Some(normalize_path(candidate));
+    }
+    if candidate.as_os_str().is_empty() {
+        return None;
+    }
+    Some(normalize_path(&project_root.join(candidate)))
+}
+
+fn normalize_path(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for c in path.components() {
+        match c {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                let _ = out.pop();
+            }
+            other => out.push(other.as_os_str()),
+        }
+    }
+    out
+}
+
+fn validate_harness_command(command: &[String], project_root: &Path) -> Result<()> {
+    if command.is_empty() {
+        return Ok(());
+    }
+    let path = resolve_command_script_path(command, project_root);
+    if let Some(p) = path {
+        if !p.exists() {
+            let mut candidates: Vec<String> = Vec::new();
+            for c in [
+                "harness.js",
+                "agentlab_demo_harness.js",
+                "agentlab/harness.js",
+                "harness.py",
+                "main.py",
+            ] {
+                let cp = project_root.join(c);
+                if cp.exists() {
+                    candidates.push(cp.display().to_string());
+                }
+            }
+            let hint = if candidates.is_empty() {
+                "no common harness entrypoints found".to_string()
+            } else {
+                format!("candidates: {}", candidates.join(", "))
+            };
+            return Err(anyhow!(
+                "harness command file not found: {} (update runtime.harness.command). {}",
+                p.display(),
+                hint
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn run_process_with_trial_io(
+    mut cmd: Command,
+    input_path: &Path,
+    output_path: &Path,
+) -> Result<String> {
+    let input_bytes = fs::read(input_path).unwrap_or_default();
+    cmd.stdin(Stdio::piped());
+    cmd.stdout(Stdio::piped());
+    cmd.stderr(Stdio::inherit());
+
+    let mut child = cmd.spawn()?;
+    if let Some(mut stdin) = child.stdin.take() {
+        let _ = stdin.write_all(&input_bytes);
+    }
+    let output = child.wait_with_output()?;
+
+    if !output_path.exists() {
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let maybe_json = stdout
+            .lines()
+            .rev()
+            .find(|l| !l.trim().is_empty())
+            .map(|s| s.trim().to_string());
+        if let Some(line) = maybe_json {
+            if serde_json::from_str::<Value>(&line).is_ok() {
+                if let Some(parent) = output_path.parent() {
+                    ensure_dir(parent)?;
+                }
+                fs::write(output_path, line.as_bytes())?;
+            }
+        }
+    }
+
+    if !output_path.exists() {
+        let ids = serde_json::from_slice::<Value>(&input_bytes)
+            .ok()
+            .and_then(|v| v.get("ids").cloned())
+            .unwrap_or(json!({}));
+        let stderr_tail = String::from_utf8_lossy(&output.stderr)
+            .lines()
+            .rev()
+            .find(|l| !l.trim().is_empty())
+            .unwrap_or("harness exited without writing trial_output")
+            .to_string();
+        let fallback = json!({
+            "schema_version": "trial_output_v1",
+            "ids": ids,
+            "outcome": "error",
+            "error": {
+                "error_type": "harness_process_error",
+                "message": stderr_tail
+            }
+        });
+        if let Some(parent) = output_path.parent() {
+            ensure_dir(parent)?;
+        }
+        fs::write(output_path, serde_json::to_vec_pretty(&fallback)?)?;
+    }
+
+    Ok(output
+        .status
+        .code()
+        .map(|c| c.to_string())
+        .unwrap_or_else(|| "signal".to_string()))
+}
+
+fn shell_join(parts: &[String]) -> String {
+    parts
+        .iter()
+        .map(|p| shell_quote(p))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn shell_quote(s: &str) -> String {
+    if s.is_empty() {
+        "''".to_string()
+    } else if s
+        .chars()
+        .all(|c| c.is_ascii_alphanumeric() || "-_./:".contains(c))
+    {
+        s.to_string()
+    } else {
+        format!("'{}'", s.replace('\'', "'\"'\"'"))
+    }
+}
+
+fn prepare_io_paths(
+    paths: &TrialPaths,
+    container_mode: bool,
+    input_bytes: &[u8],
+) -> Result<(PathBuf, PathBuf)> {
+    let input_host = if container_mode {
+        let path = paths.out.join("trial_input.json");
+        fs::write(&path, input_bytes)?;
+        path
+    } else {
+        paths.trial_dir.join("trial_input.json")
+    };
+    let output_host = if container_mode {
+        paths.out.join("trial_output.json")
+    } else {
+        paths.trial_dir.join("trial_output.json")
+    };
+    Ok((input_host, output_host))
+}
+
+fn resolve_control_paths(
+    control_path: &str,
+    paths: &TrialPaths,
+    container_mode: bool,
+) -> (String, PathBuf) {
+    if container_mode {
+        let host_path = map_container_path_to_host(control_path, paths);
+        (control_path.to_string(), host_path)
+    } else {
+        let host = paths.state.join("lab_control.json");
+        (host.to_string_lossy().to_string(), host)
+    }
+}
+
+fn write_control_file(path: &Path) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        ensure_dir(parent)?;
+    }
+    let payload = json!({ "action": "continue" });
+    fs::write(path, serde_json::to_vec_pretty(&payload)?)?;
+    Ok(())
+}
+
+fn resolve_event_path(events_path: &str, paths: &TrialPaths, _container_mode: bool) -> PathBuf {
+    if events_path.starts_with("/out")
+        || events_path.starts_with("/state")
+        || events_path.starts_with("/workspace")
+        || events_path.starts_with("/dataset")
+        || events_path.starts_with("/tmp")
+    {
+        map_container_path_to_host(events_path, paths)
+    } else {
+        let p = Path::new(events_path);
+        if p.is_absolute() {
+            p.to_path_buf()
+        } else {
+            paths.workspace.join(p)
+        }
+    }
+}
+
+fn resolve_harness_manifest_path(paths: &TrialPaths, container_mode: bool) -> PathBuf {
+    if container_mode {
+        map_container_path_to_host("/out/harness_manifest.json", paths)
+    } else {
+        let direct = paths.trial_dir.join("harness_manifest.json");
+        if direct.exists() {
+            direct
+        } else if paths.workspace.join("harness_manifest.json").exists() {
+            paths.workspace.join("harness_manifest.json")
+        } else {
+            paths.out.join("harness_manifest.json")
+        }
+    }
+}
+
+fn resolve_exec_digest(command: &[String], exp_dir: &Path) -> Result<String> {
+    if let Some(candidate_part) = resolve_command_digest_target(command) {
+        let candidate = Path::new(candidate_part);
+        let host_path = if candidate.is_relative() {
+            exp_dir.join(candidate)
+        } else {
+            candidate.to_path_buf()
+        };
+        if host_path.exists() && host_path.is_file() {
+            return sha256_file(&host_path);
+        }
+    }
+    Ok(sha256_bytes(command.join(" ").as_bytes()))
+}
+
+fn write_state_inventory(
+    trial_dir: &Path,
+    json_value: &Value,
+    harness: &HarnessConfig,
+    container_mode: bool,
+    paths: &TrialPaths,
+    exec_digest: &str,
+    effective_network_mode: &str,
+) -> Result<()> {
+    let sanitization_profile = json_value
+        .pointer("/design/sanitization_profile")
+        .and_then(|v| v.as_str())
+        .unwrap_or("hermetic_functional_v2");
+    let integration_level = harness.integration_level.as_str();
+    let mode_requested = json_value
+        .pointer("/runtime/network/mode")
+        .and_then(|v| v.as_str())
+        .unwrap_or("none");
+    let mode_effective = if container_mode {
+        effective_network_mode
+    } else {
+        "full"
+    };
+    let enforcement_effective = if container_mode && mode_requested == "none" {
+        "docker_none"
+    } else {
+        "unknown"
+    };
+
+    let mounts = if container_mode {
+        vec![
+            json!({"name": "workspace", "path": "/workspace", "writable": true}),
+            json!({"name": "state", "path": "/state", "writable": true}),
+            json!({"name": "dataset", "path": "/dataset", "writable": false}),
+            json!({"name": "out", "path": "/out", "writable": true}),
+            json!({"name": "tmp", "path": "/tmp", "writable": true}),
+        ]
+    } else {
+        vec![
+            json!({"name": "workspace", "path": paths.workspace.to_string_lossy(), "writable": true}),
+            json!({"name": "state", "path": paths.state.to_string_lossy(), "writable": true}),
+            json!({"name": "dataset", "path": paths.dataset.to_string_lossy(), "writable": false}),
+            json!({"name": "out", "path": paths.out.to_string_lossy(), "writable": true}),
+            json!({"name": "tmp", "path": paths.tmp.to_string_lossy(), "writable": true}),
+        ]
+    };
+
+    let state = json!({
+        "schema_version": "state_inventory_v1",
+        "sanitization_profile": sanitization_profile,
+        "integration_level": integration_level,
+        "mounts": mounts,
+        "network": {
+            "mode_requested": mode_requested,
+            "mode_effective": mode_effective,
+            "allowed_hosts": json_value.pointer("/runtime/network/allowed_hosts").cloned().unwrap_or(json!([])),
+            "enforcement_effective": enforcement_effective,
+            "egress_self_test": {
+                "performed": false,
+                "cases": []
+            }
+        },
+        "harness_identity": {
+            "name": harness.command_raw.get(0).cloned().unwrap_or("unknown".to_string()),
+            "exec_digest": exec_digest,
+            "entry_command": harness.command_raw.clone()
+        },
+        "violations": {
+            "state_leak": false,
+            "profile_invariant_violation": false,
+            "notes": []
+        }
+    });
+    fs::write(
+        trial_dir.join("state_inventory.json"),
+        serde_json::to_vec_pretty(&state)?,
+    )?;
+    Ok(())
+}
+
+fn map_container_path_to_host(path: &str, paths: &TrialPaths) -> PathBuf {
+    if let Some(rest) = path.strip_prefix("/state") {
+        paths.state.join(rest.trim_start_matches('/'))
+    } else if let Some(rest) = path.strip_prefix("/out") {
+        paths.out.join(rest.trim_start_matches('/'))
+    } else if let Some(rest) = path.strip_prefix("/workspace") {
+        paths.workspace.join(rest.trim_start_matches('/'))
+    } else if let Some(rest) = path.strip_prefix("/dataset") {
+        paths.dataset.join(rest.trim_start_matches('/'))
+    } else if let Some(rest) = path.strip_prefix("/tmp") {
+        paths.tmp.join(rest.trim_start_matches('/'))
+    } else {
+        paths.trial_dir.join(path.trim_start_matches('/'))
+    }
+}
+
+fn count_event_types(events_path: &Path) -> Result<BTreeMap<String, usize>> {
+    let data = fs::read_to_string(events_path)?;
+    let mut counts: BTreeMap<String, usize> = BTreeMap::new();
+    for line in data.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let v: Value = serde_json::from_str(line)?;
+        if let Some(et) = v.get("event_type").and_then(|v| v.as_str()) {
+            *counts.entry(et.to_string()).or_default() += 1;
+        }
+    }
+    Ok(counts)
+}
+
+fn copy_dir_filtered(src: &Path, dst: &Path, exclude: &[&str]) -> Result<()> {
+    for entry in walkdir::WalkDir::new(src) {
+        let entry = entry?;
+        let path = entry.path();
+        let rel = path.strip_prefix(src).unwrap();
+        if rel.as_os_str().is_empty() {
+            continue;
+        }
+        if exclude.iter().any(|ex| rel.starts_with(ex)) {
+            continue;
+        }
+        let target = dst.join(rel);
+        if entry.file_type().is_dir() {
+            ensure_dir(&target)?;
+        } else if entry.file_type().is_symlink() {
+            if let Some(parent) = target.parent() {
+                ensure_dir(parent)?;
+            }
+            match fs::canonicalize(path) {
+                Ok(real) if real.is_dir() => {
+                    copy_dir_filtered(&real, &target, &[])?;
+                }
+                Ok(real) if real.is_file() => {
+                    fs::copy(real, &target)?;
+                }
+                Ok(_) => {}
+                Err(_) => {
+                    // Preserve broken links instead of aborting trial setup.
+                    let link_target = fs::read_link(path)?;
+                    if target.exists() {
+                        let _ = fs::remove_file(&target);
+                    }
+                    #[cfg(unix)]
+                    {
+                        symlink(&link_target, &target)?;
+                    }
+                }
+            }
+        } else if entry.file_type().is_file() {
+            if let Some(parent) = target.parent() {
+                ensure_dir(parent)?;
+            }
+            fs::copy(path, target)?;
+        }
+    }
+    Ok(())
+}
+
+fn command_part_looks_like_path(part: &str) -> bool {
+    part.starts_with('.')
+        || part.starts_with('/')
+        || part.contains('/')
+        || part.ends_with(".js")
+        || part.ends_with(".mjs")
+        || part.ends_with(".cjs")
+        || part.ends_with(".ts")
+        || part.ends_with(".py")
+        || part.ends_with(".sh")
+}
+
+fn resolve_command_digest_target(command: &[String]) -> Option<&str> {
+    if command.is_empty() {
+        return None;
+    }
+    if command_part_looks_like_path(&command[0]) {
+        return Some(command[0].as_str());
+    }
+    if command.len() >= 2 && command_part_looks_like_path(&command[1]) {
+        return Some(command[1].as_str());
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolve_script_path_supports_binary_first_commands() {
+        let root = PathBuf::from("/tmp/agentlab_proj");
+        let cmd = vec!["./harness".to_string(), "run".to_string()];
+        let resolved = resolve_command_script_path(&cmd, &root).expect("expected path");
+        assert_eq!(resolved, normalize_path(&root.join("harness")));
+    }
+
+    #[test]
+    fn resolve_script_path_supports_interpreter_plus_script() {
+        let root = PathBuf::from("/tmp/agentlab_proj");
+        let cmd = vec![
+            "node".to_string(),
+            "./harness.js".to_string(),
+            "run".to_string(),
+        ];
+        let resolved = resolve_command_script_path(&cmd, &root).expect("expected path");
+        assert_eq!(resolved, normalize_path(&root.join("harness.js")));
+    }
+
+    #[test]
+    fn resolve_command_local_resolves_first_token_when_path_like() {
+        let root = PathBuf::from("/tmp/agentlab_proj");
+        let cmd = vec!["./harness".to_string(), "run".to_string()];
+        let resolved = resolve_command_local(&cmd, &root);
+        assert_eq!(resolved[0], root.join("harness").to_string_lossy());
+        assert_eq!(resolved[1], "run");
+    }
+}

@@ -34,6 +34,19 @@ def _event(event_type: str, seq: int, step_index=None):
     }
 
 
+def _model_call_end(seq: int, step_index: int):
+    e = _event("model_call_end", seq, step_index)
+    e.update(
+        {
+            "call_id": "call_1",
+            "outcome": {"status": "ok"},
+            "usage": {"tokens_in": 0, "tokens_out": 0},
+            "timing": {"duration_ms": 1},
+        }
+    )
+    return e
+
+
 def test_seq_monotonic_enforced():
     with tempfile.TemporaryDirectory() as tmp:
         registry = SchemaRegistry(os.path.join(os.getcwd(), "schemas"))
@@ -69,8 +82,9 @@ def test_control_ack_required():
         events_path = os.path.join(tmp, "harness_events.jsonl")
         events = [
             _event("agent_step_start", 1, 0),
-            _event("agent_step_end", 2, 0),
-            _event("agent_step_start", 3, 1),
+            _model_call_end(2, 0),
+            _event("agent_step_end", 3, 0),
+            _event("agent_step_start", 4, 1),
         ]
         with open(events_path, "w", encoding="utf-8") as f:
             for e in events:

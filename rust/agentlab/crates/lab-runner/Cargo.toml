@@ -1,0 +1,19 @@
+[package]
+name = "lab-runner"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml.workspace = true
+chrono.workspace = true
+walkdir.workspace = true
+lab-core = { path = "../lab-core" }
+lab-schemas = { path = "../lab-schemas" }
+lab-hooks = { path = "../lab-hooks" }
+lab-provenance = { path = "../lab-provenance" }
+lab-otel = { path = "../lab-otel" }
+lab-analysis = { path = "../lab-analysis" }

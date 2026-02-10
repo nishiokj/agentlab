@@ -3,6 +3,7 @@ import os
 from typing import Any, Dict
 
 from jsonschema import Draft202012Validator
+import importlib.resources as resources
 
 
 class SchemaRegistry:
@@ -13,8 +14,15 @@ class SchemaRegistry:
     def load(self, filename: str) -> dict:
         if filename not in self._cache:
             path = os.path.join(self.schema_dir, filename)
-            with open(path, "r", encoding="utf-8") as f:
-                self._cache[filename] = json.load(f)
+            if os.path.exists(path):
+                with open(path, "r", encoding="utf-8") as f:
+                    self._cache[filename] = json.load(f)
+            else:
+                # Installed mode: load from package resources.
+                data = resources.files("agentlab_schemas").joinpath(filename).read_text(
+                    encoding="utf-8"
+                )
+                self._cache[filename] = json.loads(data)
         return self._cache[filename]
 
     def validate(self, filename: str, data: Any) -> None:

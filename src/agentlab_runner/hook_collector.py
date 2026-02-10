@@ -12,6 +12,25 @@ class HookValidationResult:
     turn_count: int
 
 
+class HookValidationError(ValueError):
+    def __init__(
+        self,
+        message: str,
+        *,
+        line_num: Optional[int] = None,
+        seq: Optional[int] = None,
+        event_type: Optional[str] = None,
+        raw_line: Optional[str] = None,
+        details: Optional[str] = None,
+    ) -> None:
+        super().__init__(message)
+        self.line_num = line_num
+        self.seq = seq
+        self.event_type = event_type
+        self.raw_line = raw_line
+        self.details = details
+
+
 class HookCollector:
     def __init__(self, schema_registry: SchemaRegistry) -> None:
         self.registry = schema_registry
@@ -38,21 +57,57 @@ class HookCollector:
 
         with open(path, "r", encoding="utf-8") as f:
             for line_num, line in enumerate(f, start=1):
-                line = line.strip()
+                raw_line = line.rstrip("\n")
+                line = raw_line.strip()
                 if not line:
                     continue
-                obj = json.loads(line)
+                try:
+                    obj = json.loads(line)
+                except Exception as e:
+                    raise HookValidationError(
+                        "Invalid JSON in hook stream",
+                        line_num=line_num,
+                        raw_line=raw_line,
+                        details=str(e),
+                    ) from e
 
                 if obj.get("event_type") == "hooks.header":
-                    self._validate_header(obj, manifest)
+                    try:
+                        self._validate_header(obj, manifest)
+                    except Exception as e:
+                        raise HookValidationError(
+                            "Header does not match harness_manifest.json",
+                            line_num=line_num,
+                            seq=obj.get("seq"),
+                            event_type="hooks.header",
+                            raw_line=raw_line,
+                            details=str(e),
+                        ) from e
                     continue
 
                 # Validate schema per event
-                self.registry.validate("hook_events_v1.jsonschema", obj)
+                try:
+                    self.registry.validate("hook_events_v1.jsonschema", obj)
+                except Exception as e:
+                    raise HookValidationError(
+                        "Schema validation failed for hook event",
+                        line_num=line_num,
+                        seq=obj.get("seq"),
+                        event_type=obj.get("event_type"),
+                        raw_line=raw_line,
+                        details=str(e),
+                    ) from e
 
                 seq = obj.get("seq")
                 if last_seq is not None and seq <= last_seq:
-                    raise ValueError("Hook seq must be monotonically increasing")
+                    raise HookValidationError(
+                        "Hook seq must be monotonically increasing",
+                        line_num=line_num,
+                        seq=seq,
+                        event_type=obj.get("event_type"),
+                        raw_line=raw_line,
+                        details=f"previous_seq={last_seq}, current_seq={seq}",
+                    )
                 last_seq = seq
 
                 event_type = obj.get("event_type")
@@ -61,25 +116,59 @@ class HookCollector:
                 if event_type == "agent_step_start":
                     seen_step = True
                     if pending_control_ack is not None:
-                        raise ValueError("Missing control_ack before next step start")
+                        raise HookValidationError(
+                            "Missing control_ack before next step start",
+                            line_num=line_num,
+                            seq=seq,
+                            event_type=event_type,
+                            raw_line=raw_line,
+                            details=f"pending_control_ack_for_step={pending_control_ack}",
+                        )
                     if current_step is None:
                         current_step = step_index
                     else:
                         if step_index != current_step + 1:
-                            raise ValueError("step_index must increment by 1")
+                            raise HookValidationError(
+                                "step_index must increment by 1",
+                                line_num=line_num,
+                                seq=seq,
+                                event_type=event_type,
+                                raw_line=raw_line,
+                                details=f"expected={current_step + 1}, got={step_index}",
+                            )
                         current_step = step_index
                     if stop_observed:
-                        raise ValueError("Stop observed but step continued")
+                        raise HookValidationError(
+                            "Stop observed but step continued",
+                            line_num=line_num,
+                            seq=seq,
+                            event_type=event_type,
+                            raw_line=raw_line,
+                        )
 
                 if event_type == "agent_step_end":
                     seen_step = True
                     if current_step is None or step_index != current_step:
-                        raise ValueError("agent_step_end must match current step_index")
+                        raise HookValidationError(
+                            "agent_step_end must match current step_index",
+                            line_num=line_num,
+                            seq=seq,
+                            event_type=event_type,
+                            raw_line=raw_line,
+                            details=f"current_step={current_step}, got={step_index}",
+                        )
                     pending_control_ack = step_index
 
                 if event_type == "control_ack":
                     if pending_control_ack is None or step_index != pending_control_ack:
-                        raise ValueError("control_ack must match latest agent_step_end")
+                        raise HookValidationError(
+                            "control_ack must match latest agent_step_end",
+                            line_num=line_num,
+                            seq=seq,
+                            event_type=event_type,
+                            raw_line=raw_line,
+                            details=f"expected_step={pending_control_ack}, got={step_index}",
+                        )
                     pending_control_ack = None
                     if obj.get("action_observed") == "stop":
                         stop_observed = True
@@ -89,11 +178,20 @@ class HookCollector:
 
                 if seen_step and event_type in ("model_call_end", "tool_call_end", "error"):
                     if step_index is None:
-                        raise ValueError("Causal events must include step_index when steps are used")
+                        raise HookValidationError(
+                            "Causal events must include step_index when steps are used",
+                            line_num=line_num,
+                            seq=seq,
+                            event_type=event_type,
+                            raw_line=raw_line,
+                        )
 
                 events.append(obj)
 
         if pending_control_ack is not None:
-            raise ValueError("Missing control_ack after agent_step_end")
+            raise HookValidationError(
+                "Missing control_ack after agent_step_end",
+                details=f"pending_control_ack_for_step={pending_control_ack}",
+            )
 
         return HookValidationResult(events=events, turn_count=turn_count)

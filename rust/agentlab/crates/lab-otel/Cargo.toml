@@ -1,0 +1,13 @@
+[package]
+name = "lab-otel"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+tiny_http.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+chrono.workspace = true
+lab-core = { path = "../lab-core" }

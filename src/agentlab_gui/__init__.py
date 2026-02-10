@@ -1,0 +1,2 @@
+"""AgentLab GUI package."""
+

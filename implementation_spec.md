@@ -8,6 +8,7 @@
 - Container engine: Docker (primary) with overlayfs available.
 - Analysis implemented in Python (pandas/pyarrow) unless constrained otherwise.
 - Harness integration is externalized: CLI I/O + optional hook events/traces; no requirement to own in‑process ModelClient boundaries.
+- For `allowlist_enforced`, reference implementation uses a proxy-based egress path with network-level bypass blocking (where host/runtime supports it).
 
 ## Harness Integration Levels (v0.3)
 **Purpose:** Define what the framework can guarantee based on observable harness evidence.
@@ -109,14 +110,20 @@ Derived guarantees (grades) must be computed from the integration level actually
 - **Spec Resolution**
   - Default filling, path resolution, dataset hashing, registration + digest.
 - **Variant Expansion + Scheduling**
-  - Baseline + variants -> resolved variants stored in `variants/`.
+  - Baseline + `variant_plan` -> resolved variants stored in `variants/` (artifact path kept stable).
   - Task shuffling, variant order randomization, block by task.
 - **Container Runner + Profiles**
   - Read‑only root FS, surface mounts, per‑trial workspace isolation.
   - Network policy enforcement: `none | full | allowlist_enforced`.
   - `allowlist_enforced` requires netns+iptables or sidecar proxy with bypass blocked.
+  - Runner SHOULD support proxy-first enforcement:
+    - start per-trial egress proxy
+    - force outbound path through proxy
+    - block direct egress at network layer
+  - Proxy headers/env (`HTTP_PROXY`, `HTTPS_PROXY`) are convenience only; claims rely on blocking bypass.
   - Record `network.mode_effective`, `network.enforcement_effective`, `allowed_hosts`, `bypass_risk` in `state_inventory.json`.
   - Require a preflight egress self‑test artifact for `allowlist_enforced` (expected allow/deny).
+  - Emit optional `network_events.jsonl` with allow/block decisions and transport metadata for coarse observability.
   - Profile invariant checks; fail or grade as bounded/leaky.
 
 ### Interfaces
@@ -129,6 +136,9 @@ Derived guarantees (grades) must be computed from the integration level actually
 - `TrialPlanner.plan(resolved_experiment) -> trial list`
 - `ContainerRunner.run(trial_spec) -> exit_status`
 - `ProfileEnforcer.check(runtime_state) -> invariants_ok|violations`
+- `NetworkProxy.start(policy) -> proxy_handle`
+- `NetworkEnforcer.apply(mode, policy, proxy_handle) -> enforcement_state`
+- `EgressSelfTest.run(policy, enforcement_state) -> artifact_ref + pass/fail`
 
 ### Acceptance Criteria
 - A CLI harness can run end‑to‑end with only trial_input/output.
@@ -137,6 +147,7 @@ Derived guarantees (grades) must be computed from the integration level actually
 - If `allowlist_enforced` is requested without enforcement, the run fails or isolation_grade = leaky (per `fail_on_profile_invariant_violation`).
 - Missing `control_ack` at a step end downgrades replay/interpretability grades or fails in strict profiles.
 - `allowlist_enforced` requires a recorded egress self‑test artifact; ambiguous results fail or downgrade per policy.
+- Reports must label evidence sources explicitly (`hooks`, `traces`, `network_proxy`, `framework_events`) and avoid causal over-claims when only proxy evidence exists.
 - Missing `harness_manifest.json` for `cli_events` / `otel` / `sdk_*` is a hard fail by default.
 - Optional runner flag `--allow-missing-harness-manifest` can downgrade effective integration to `cli_basic` and label grades.
 
@@ -313,13 +324,23 @@ Derived guarantees (grades) must be computed from the integration level actually
 ### Open Questions
 - Preferred SBOM tool and invocation.
 
+### Precision Substeps (Phase 5 Implementation)
+1. Read `resolved_experiment.digest` and include it in `attestation.json`.
+2. Collect hashchain heads from `trials/*/events.head`.
+3. Compute a best‑effort artifact store root digest.
+4. Include grades summary and harness identity in attestation when present.
+5. Record hooks schema version and trace ingestion mode.
+6. If `sbom/image.spdx.json` exists, store it via artifact store and reference it.
+7. Emit `attestation.json` at run root.
+8. Build a minimal debug bundle zip with key artifacts.
+
 ---
 
 ## Cross‑Cutting Test Plan (initial)
 - Unit tests for hashing, redaction, event envelope validation.
 - Integration tests for hook schema validation, control‑plane actions, trace ingestion.
 - Integration tests for record/replay, checkpoint restore, strict replay failure paths.
-- End‑to‑end test: small paired experiment with two variants; verify grades + analysis outputs.
+- End‑to‑end test: small paired experiment with two variant-plan entries; verify grades + analysis outputs.
 - Negative tests: allowlist_enforced requested without enforcement -> fail or leaky grade.
 - Negative tests: hooks header mismatch with manifest -> fail; missing control_ack -> fail or downgrade.
 
@@ -354,13 +375,22 @@ Derived guarantees (grades) must be computed from the integration level actually
   - CLI entrypoint with subcommands: `src/agentlab_cli/cli.py` and `src/agentlab_cli/__main__.py`.
   - Schema validation (`schema-validate`) and hooks validation (`hooks-validate`).
   - `analyze` and `compare` commands wired to analysis + report builder.
+  - `run`, `validate`, `replay`, `fork` implemented with a local CLI harness runner (best effort).
+  - Minimal experiment resolver and dataset loader powering CLI `run` / `validate`:
+    - `src/agentlab_runner/experiment_resolver.py`
+    - `src/agentlab_runner/dataset_loader.py`
+  - Local run engine: `src/agentlab_runner/run_engine.py`.
   - Minimal HTML report builder: `src/agentlab_report/report_builder.py`.
   - Tests: `tests/test_report.py`.
+- Phase 5 implemented (best effort):
+  - Attestation writer: `src/agentlab_runner/provenance.py`.
+  - SBOM capture stub (stores existing `sbom/image.spdx.json` if present).
+  - Debug bundle builder: `src/agentlab_runner/debug_bundle.py`.
 - Not yet implemented:
   - OTLP receiver / tracing ingest path (only manifest ingestion stub exists).
   - Container runner, network enforcement, preflight egress self‑test, and profile enforcement.
-  - Trial planner / scheduler / experiment resolver.
-  - Fully‑functional `run`, `validate`, `replay`, `fork` (currently stubs in CLI).
+  - Full trial planner / scheduler / profile‑aware spec resolver (only minimal YAML resolver exists).
+  - Full containerized `run` / `replay` / `fork` semantics (current implementation is local best‑effort).
 
 ## Appendix A — JSON Schemas (Draft 2020‑12)
 
