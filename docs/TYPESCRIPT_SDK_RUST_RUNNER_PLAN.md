@@ -26,7 +26,6 @@ Build a user-facing TypeScript SDK that uses the Rust runner as the execution en
   - `run`
   - `run-dev`
   - `run-experiment`
-  - `image-build`
   - `publish`
   - `knobs-validate`
 - JSON mode emits one stable JSON object and no human text.
@@ -133,7 +132,7 @@ const run = await client.run(exp);
 Implemented in this repository:
 
 1. Rust JSON command mode:
-   - Added `--json` for `describe`, `run`, `run-dev`, `run-experiment`, `image-build`, `publish`, `knobs-validate`, `schema-validate`, `hooks-validate`.
+   - Added `--json` for `describe`, `run`, `run-dev`, `run-experiment`, `publish`, `knobs-validate`, `schema-validate`, `hooks-validate`.
    - JSON success envelopes include `ok: true`, `command`, and command-specific payload.
    - JSON error envelope is standardized as:
      - `{ "ok": false, "error": { "code": "command_failed", "message": "...", "details": {} } }`

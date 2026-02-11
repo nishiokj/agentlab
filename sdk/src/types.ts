@@ -51,7 +51,6 @@ export interface RunResponse {
   dev_setup?: string | null;
   dev_network_mode?: string;
   experiment_network_requirement?: string;
-  docker_build_status?: string | null;
 }
 
 export interface PublishResponse {
@@ -61,6 +60,65 @@ export interface PublishResponse {
   run_dir: string;
 }
 
+export interface ReplayResult {
+  replay_id: string;
+  replay_dir: string;
+  parent_trial_id: string;
+  strict: boolean;
+  replay_grade: string;
+  harness_status: string;
+}
+
+export interface ReplayResponse {
+  ok: true;
+  command: 'replay';
+  replay: ReplayResult;
+}
+
+export interface ForkResult {
+  fork_id: string;
+  fork_dir: string;
+  parent_trial_id: string;
+  selector: string;
+  strict: boolean;
+  source_checkpoint: string | null;
+  fallback_mode: string;
+  replay_grade: string;
+  harness_status: string;
+}
+
+export interface ForkResponse {
+  ok: true;
+  command: 'fork';
+  fork: ForkResult;
+}
+
+export interface PauseResult {
+  run_id: string;
+  trial_id: string;
+  label: string;
+  checkpoint_acked: boolean;
+  stop_acked: boolean;
+}
+
+export interface PauseResponse {
+  ok: true;
+  command: 'pause';
+  pause: PauseResult;
+}
+
+export interface ResumeResult {
+  trial_id: string;
+  selector: string;
+  fork: ForkResult;
+}
+
+export interface ResumeResponse {
+  ok: true;
+  command: 'resume';
+  resume: ResumeResult;
+}
+
 export interface ValidateResponse {
   ok: true;
   command: 'knobs-validate' | 'schema-validate' | 'hooks-validate';
@@ -68,21 +126,15 @@ export interface ValidateResponse {
   [key: string]: unknown;
 }
 
-export interface ImageBuildResponse {
-  ok: true;
-  command: 'image-build';
-  image: string;
-  dockerfile: string;
-  context: string;
-  docker_build: string;
-}
-
 export type JsonCommandResponse =
   | DescribeResponse
   | RunResponse
+  | ReplayResponse
+  | ForkResponse
+  | PauseResponse
+  | ResumeResponse
   | PublishResponse
-  | ValidateResponse
-  | ImageBuildResponse;
+  | ValidateResponse;
 
 export interface CommandOptions {
   cwd?: string;
@@ -108,15 +160,35 @@ export interface RunDevArgs extends DescribeArgs {
   setup?: string;
 }
 
-export interface RunExperimentArgs extends DescribeArgs {
-  buildImage?: boolean;
-  tag?: string;
+export interface RunExperimentArgs extends DescribeArgs {}
+
+export interface ReplayArgs extends CommandOptions {
+  runDir: string;
+  trialId: string;
+  strict?: boolean;
 }
 
-export interface ImageBuildArgs extends DescribeArgs {
-  tag?: string;
-  dockerfile?: string;
-  context?: string;
+export interface ForkArgs extends CommandOptions {
+  runDir: string;
+  fromTrial: string;
+  at: string;
+  set?: JsonMap;
+  strict?: boolean;
+}
+
+export interface PauseArgs extends CommandOptions {
+  runDir: string;
+  trialId?: string;
+  label?: string;
+  timeoutSeconds?: number;
+}
+
+export interface ResumeArgs extends CommandOptions {
+  runDir: string;
+  trialId?: string;
+  label?: string;
+  set?: JsonMap;
+  strict?: boolean;
 }
 
 export interface PublishArgs extends CommandOptions {

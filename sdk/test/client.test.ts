@@ -2,60 +2,648 @@ import assert from 'node:assert/strict';
 import { mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import test from 'node:test';
+import test, { describe, afterEach, beforeEach } from 'node:test';
 
 import { LabClient, LabRunnerError } from '../src/client.js';
 
-function makeFakeRunner(dir: string): string {
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Creates a fake runner script that echoes the received args as JSON,
+ * and dispatches on the first arg (command name) for different behaviors.
+ */
+function makeFakeRunner(dir: string, script: string): string {
   const binPath = join(dir, 'fake-lab.js');
-  const script = `#!/usr/bin/env node
-const args = process.argv.slice(2);
-const cmd = args[0] || '';
-if (cmd === 'describe') {
-  console.log(JSON.stringify({ ok: true, command: 'describe', summary: { experiment: 'exp1', workload_type: 'agent_harness', dataset: 'tasks.jsonl', tasks: 2, replications: 1, variant_plan_entries: 1, total_trials: 2, harness: ['node','./harness.js','run'], integration_level: 'cli_basic', container_mode: false, network: 'none', control_path: '/state/lab_control.json', harness_script_exists: true } }));
-  process.exit(0);
-}
-if (cmd === 'run') {
-  console.log(JSON.stringify({ ok: false, error: { code: 'bad_config', message: 'invalid config', details: { path: 'x' } } }));
-  process.exit(1);
-}
-console.log(JSON.stringify({ ok: true, command: cmd, valid: true }));
-`;
-  writeFileSync(binPath, script, { encoding: 'utf8', mode: 0o755 });
+  writeFileSync(binPath, `#!/usr/bin/env node\n${script}`, {
+    encoding: 'utf8',
+    mode: 0o755,
+  });
   return binPath;
 }
 
-test('LabClient describe parses JSON success payload', async () => {
-  const dir = mkdtempSync(join(tmpdir(), 'agentlab-sdk-test-'));
-  try {
-    const fakeRunner = makeFakeRunner(dir);
-    const client = new LabClient({ runnerBin: fakeRunner, cwd: dir });
-    const res = await client.describe({ experiment: 'experiment.yaml' });
+/** Standard runner that returns success payloads for every command. */
+function makeSuccessRunner(dir: string): string {
+  return makeFakeRunner(
+    dir,
+    `
+const args = process.argv.slice(2);
+const cmd = args[0] || '';
+const json = args.includes('--json');
 
-    assert.equal(res.ok, true);
-    assert.equal(res.command, 'describe');
-    assert.equal(res.summary.experiment, 'exp1');
-  } finally {
-    rmSync(dir, { recursive: true, force: true });
-  }
+const summary = {
+  experiment: 'exp1', workload_type: 'agent_harness', dataset: 'tasks.jsonl',
+  tasks: 2, replications: 1, variant_plan_entries: 1, total_trials: 2,
+  harness: ['node','./harness.js','run'], integration_level: 'cli_basic',
+  container_mode: false, network: 'none', control_path: '/state/lab_control.json',
+  harness_script_exists: true,
+};
+
+const payloads = {
+  'describe':        { ok: true, command: 'describe', summary },
+  'run':             { ok: true, command: 'run', summary, run: { run_id: 'run_20260210_120000', run_dir: '.lab/runs/run_20260210_120000' } },
+  'run-dev':         { ok: true, command: 'run-dev', summary, run: { run_id: 'run_dev_001', run_dir: '.lab/runs/run_dev_001' } },
+  'run-experiment':  { ok: true, command: 'run-experiment', summary, run: { run_id: 'run_exp_001', run_dir: '.lab/runs/run_exp_001' } },
+  'publish':         { ok: true, command: 'publish', bundle: '/tmp/bundle.zip', run_dir: '.lab/runs/run1' },
+  'knobs-validate':  { ok: true, command: 'knobs-validate', valid: true },
+  'hooks-validate':  { ok: true, command: 'hooks-validate', valid: true },
+  'schema-validate': { ok: true, command: 'schema-validate', valid: true },
+};
+
+const payload = payloads[cmd] || { ok: true, command: cmd, valid: true };
+console.log(JSON.stringify(payload));
+process.exit(0);
+`,
+  );
+}
+
+/** Runner that writes received args to a sidecar file for assertion. */
+function makeArgCapturingRunner(dir: string): { binPath: string; argsFile: string } {
+  const argsFile = join(dir, 'captured-args.json');
+  const binPath = makeFakeRunner(
+    dir,
+    `
+const fs = require('fs');
+const args = process.argv.slice(2);
+fs.writeFileSync('${argsFile.replace(/\\/g, '\\\\')}', JSON.stringify(args));
+console.log(JSON.stringify({ ok: true, command: args[0], valid: true, summary: {} }));
+process.exit(0);
+`,
+  );
+  return { binPath, argsFile };
+}
+
+/** Runner that emits an error envelope on stdout (non-zero exit but has JSON). */
+function makeErrorEnvelopeRunner(dir: string): string {
+  return makeFakeRunner(
+    dir,
+    `
+console.log(JSON.stringify({ ok: false, error: { code: 'bad_config', message: 'invalid config', details: { path: 'x' } } }));
+process.exit(1);
+`,
+  );
+}
+
+// ---------------------------------------------------------------------------
+// LabRunnerError
+// ---------------------------------------------------------------------------
+describe('LabRunnerError', () => {
+  test('has correct name', () => {
+    const err = new LabRunnerError({
+      message: 'boom',
+      code: 'test_error',
+      command: ['lab', 'run'],
+      stderr: 'err output',
+    });
+    assert.equal(err.name, 'LabRunnerError');
+  });
+
+  test('stores all properties', () => {
+    const err = new LabRunnerError({
+      message: 'fail',
+      code: 'cfg_error',
+      command: ['lab', 'describe', '--json'],
+      stderr: 'stderr text',
+      details: { field: 'missing' },
+      exitCode: 2,
+    });
+    assert.equal(err.message, 'fail');
+    assert.equal(err.code, 'cfg_error');
+    assert.deepEqual(err.command, ['lab', 'describe', '--json']);
+    assert.equal(err.stderr, 'stderr text');
+    assert.deepEqual(err.details, { field: 'missing' });
+    assert.equal(err.exitCode, 2);
+  });
+
+  test('is an instance of Error', () => {
+    const err = new LabRunnerError({
+      message: 'x',
+      code: 'x',
+      command: [],
+      stderr: '',
+    });
+    assert.ok(err instanceof Error);
+  });
+
+  test('optional properties default to undefined', () => {
+    const err = new LabRunnerError({
+      message: 'x',
+      code: 'x',
+      command: [],
+      stderr: '',
+    });
+    assert.equal(err.details, undefined);
+    assert.equal(err.exitCode, undefined);
+  });
 });
 
-test('LabClient throws typed LabRunnerError for error envelope', async () => {
-  const dir = mkdtempSync(join(tmpdir(), 'agentlab-sdk-test-'));
-  try {
-    const fakeRunner = makeFakeRunner(dir);
-    const client = new LabClient({ runnerBin: fakeRunner, cwd: dir });
-
-    await assert.rejects(
-      () => client.run({ experiment: 'experiment.yaml' }),
-      (error: unknown) => {
-        assert.ok(error instanceof LabRunnerError);
-        assert.equal(error.code, 'bad_config');
-        assert.equal(error.message, 'invalid config');
+// ---------------------------------------------------------------------------
+// LabClient – constructor / runner resolution
+// ---------------------------------------------------------------------------
+describe('LabClient constructor', () => {
+  test('defaults runnerBin to "lab" when no option or env', () => {
+    // We can't easily test the default without spawning, but we can test that
+    // a bogus binary throws spawn_failed
+    const client = new LabClient({ runnerBin: '__nonexistent_binary__' });
+    assert.rejects(
+      () => client.describe({ experiment: 'e.yaml' }),
+      (err: unknown) => {
+        assert.ok(err instanceof LabRunnerError);
+        assert.equal(err.code, 'spawn_failed');
         return true;
       },
     );
-  } finally {
+  });
+
+  test('accepts custom env', async () => {
+    const dir = mkdtempSync(join(tmpdir(), 'sdk-test-'));
+    try {
+      const binPath = makeFakeRunner(
+        dir,
+        `
+const val = process.env.MY_CUSTOM_VAR || 'not set';
+console.log(JSON.stringify({ ok: true, command: 'describe', summary: { custom_var: val, experiment: 'e', workload_type:'', dataset:'', tasks:0, replications:0, variant_plan_entries:0, total_trials:0, harness:[], integration_level:'', container_mode:false, network:'', control_path:'', harness_script_exists:false } }));
+`,
+      );
+      const client = new LabClient({
+        runnerBin: binPath,
+        cwd: dir,
+        env: { ...process.env, MY_CUSTOM_VAR: 'hello' },
+      });
+      const res = await client.describe({ experiment: 'e.yaml' });
+      assert.equal((res.summary as unknown as Record<string, unknown>).custom_var, 'hello');
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// LabClient – describe()
+// ---------------------------------------------------------------------------
+describe('LabClient.describe()', () => {
+  let dir: string;
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'sdk-test-'));
+  });
+  afterEach(() => {
     rmSync(dir, { recursive: true, force: true });
-  }
+  });
+
+  test('parses success payload', async () => {
+    const bin = makeSuccessRunner(dir);
+    const client = new LabClient({ runnerBin: bin, cwd: dir });
+    const res = await client.describe({ experiment: 'experiment.yaml' });
+    assert.equal(res.ok, true);
+    assert.equal(res.command, 'describe');
+    assert.equal(res.summary.experiment, 'exp1');
+    assert.equal(res.summary.total_trials, 2);
+  });
+
+  test('passes --overrides when provided', async () => {
+    const { binPath, argsFile } = makeArgCapturingRunner(dir);
+    const client = new LabClient({ runnerBin: binPath, cwd: dir });
+    await client.describe({ experiment: 'exp.yaml', overrides: 'knobs.json' });
+
+    const { readFileSync } = await import('node:fs');
+    const args: string[] = JSON.parse(readFileSync(argsFile, 'utf8'));
+    assert.ok(args.includes('--overrides'));
+    assert.ok(args.includes('knobs.json'));
+    assert.ok(args.includes('--json'));
+    assert.ok(args.includes('describe'));
+  });
+
+  test('does not pass --overrides when omitted', async () => {
+    const { binPath, argsFile } = makeArgCapturingRunner(dir);
+    const client = new LabClient({ runnerBin: binPath, cwd: dir });
+    await client.describe({ experiment: 'exp.yaml' });
+
+    const { readFileSync } = await import('node:fs');
+    const args: string[] = JSON.parse(readFileSync(argsFile, 'utf8'));
+    assert.ok(!args.includes('--overrides'));
+  });
+});
+
+// ---------------------------------------------------------------------------
+// LabClient – run()
+// ---------------------------------------------------------------------------
+describe('LabClient.run()', () => {
+  let dir: string;
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'sdk-test-'));
+  });
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  test('parses run success payload', async () => {
+    const bin = makeSuccessRunner(dir);
+    const client = new LabClient({ runnerBin: bin, cwd: dir });
+    const res = await client.run({ experiment: 'exp.yaml' });
+    assert.equal(res.ok, true);
+    assert.equal(res.command, 'run');
+    assert.ok(res.run.run_id);
+  });
+
+  test('passes --container flag when container=true', async () => {
+    const { binPath, argsFile } = makeArgCapturingRunner(dir);
+    const client = new LabClient({ runnerBin: binPath, cwd: dir });
+    await client.run({ experiment: 'exp.yaml', container: true });
+
+    const { readFileSync } = await import('node:fs');
+    const args: string[] = JSON.parse(readFileSync(argsFile, 'utf8'));
+    assert.ok(args.includes('--container'));
+  });
+
+  test('does not pass --container flag when container is falsy', async () => {
+    const { binPath, argsFile } = makeArgCapturingRunner(dir);
+    const client = new LabClient({ runnerBin: binPath, cwd: dir });
+    await client.run({ experiment: 'exp.yaml' });
+
+    const { readFileSync } = await import('node:fs');
+    const args: string[] = JSON.parse(readFileSync(argsFile, 'utf8'));
+    assert.ok(!args.includes('--container'));
+  });
+
+  test('throws LabRunnerError on error envelope', async () => {
+    const bin = makeErrorEnvelopeRunner(dir);
+    const client = new LabClient({ runnerBin: bin, cwd: dir });
+    await assert.rejects(
+      () => client.run({ experiment: 'exp.yaml' }),
+      (err: unknown) => {
+        assert.ok(err instanceof LabRunnerError);
+        assert.equal(err.code, 'bad_config');
+        assert.equal(err.message, 'invalid config');
+        assert.deepEqual(err.details, { path: 'x' });
+        assert.ok(err.command.length > 0);
+        return true;
+      },
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// LabClient – runDev()
+// ---------------------------------------------------------------------------
+describe('LabClient.runDev()', () => {
+  let dir: string;
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'sdk-test-'));
+  });
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  test('passes --setup when provided', async () => {
+    const { binPath, argsFile } = makeArgCapturingRunner(dir);
+    const client = new LabClient({ runnerBin: binPath, cwd: dir });
+    await client.runDev({ experiment: 'exp.yaml', setup: 'npm install' });
+
+    const { readFileSync } = await import('node:fs');
+    const args: string[] = JSON.parse(readFileSync(argsFile, 'utf8'));
+    assert.ok(args.includes('run-dev'));
+    assert.ok(args.includes('--setup'));
+    assert.ok(args.includes('npm install'));
+  });
+
+  test('does not pass --setup when omitted', async () => {
+    const { binPath, argsFile } = makeArgCapturingRunner(dir);
+    const client = new LabClient({ runnerBin: binPath, cwd: dir });
+    await client.runDev({ experiment: 'exp.yaml' });
+
+    const { readFileSync } = await import('node:fs');
+    const args: string[] = JSON.parse(readFileSync(argsFile, 'utf8'));
+    assert.ok(args.includes('run-dev'));
+    assert.ok(!args.includes('--setup'));
+  });
+
+  test('passes --overrides when provided', async () => {
+    const { binPath, argsFile } = makeArgCapturingRunner(dir);
+    const client = new LabClient({ runnerBin: binPath, cwd: dir });
+    await client.runDev({ experiment: 'exp.yaml', overrides: 'ov.json' });
+
+    const { readFileSync } = await import('node:fs');
+    const args: string[] = JSON.parse(readFileSync(argsFile, 'utf8'));
+    assert.ok(args.includes('--overrides'));
+    assert.ok(args.includes('ov.json'));
+  });
+});
+
+// ---------------------------------------------------------------------------
+// LabClient – runExperiment()
+// ---------------------------------------------------------------------------
+describe('LabClient.runExperiment()', () => {
+  let dir: string;
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'sdk-test-'));
+  });
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  test('passes experiment and --json', async () => {
+    const { binPath, argsFile } = makeArgCapturingRunner(dir);
+    const client = new LabClient({ runnerBin: binPath, cwd: dir });
+    await client.runExperiment({ experiment: 'exp.yaml' });
+
+    const { readFileSync } = await import('node:fs');
+    const args: string[] = JSON.parse(readFileSync(argsFile, 'utf8'));
+    assert.ok(args.includes('run-experiment'));
+    assert.ok(args.includes('exp.yaml'));
+    assert.ok(args.includes('--json'));
+  });
+
+  test('passes --overrides when provided', async () => {
+    const { binPath, argsFile } = makeArgCapturingRunner(dir);
+    const client = new LabClient({ runnerBin: binPath, cwd: dir });
+    await client.runExperiment({ experiment: 'exp.yaml', overrides: 'ov.json' });
+
+    const { readFileSync } = await import('node:fs');
+    const args: string[] = JSON.parse(readFileSync(argsFile, 'utf8'));
+    assert.ok(args.includes('--overrides'));
+    assert.ok(args.includes('ov.json'));
+  });
+
+  test('omits --overrides when not set', async () => {
+    const { binPath, argsFile } = makeArgCapturingRunner(dir);
+    const client = new LabClient({ runnerBin: binPath, cwd: dir });
+    await client.runExperiment({ experiment: 'exp.yaml' });
+
+    const { readFileSync } = await import('node:fs');
+    const args: string[] = JSON.parse(readFileSync(argsFile, 'utf8'));
+    assert.ok(!args.includes('--overrides'));
+  });
+});
+
+// ---------------------------------------------------------------------------
+// LabClient – publish()
+// ---------------------------------------------------------------------------
+describe('LabClient.publish()', () => {
+  let dir: string;
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'sdk-test-'));
+  });
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  test('passes --run-dir and --out', async () => {
+    const { binPath, argsFile } = makeArgCapturingRunner(dir);
+    const client = new LabClient({ runnerBin: binPath, cwd: dir });
+    await client.publish({ runDir: '.lab/runs/run1', out: '/tmp/out.zip' });
+
+    const { readFileSync } = await import('node:fs');
+    const args: string[] = JSON.parse(readFileSync(argsFile, 'utf8'));
+    assert.ok(args.includes('publish'));
+    assert.ok(args.includes('--run-dir'));
+    assert.ok(args.includes('.lab/runs/run1'));
+    assert.ok(args.includes('--out'));
+    assert.ok(args.includes('/tmp/out.zip'));
+  });
+
+  test('omits --out when not set', async () => {
+    const { binPath, argsFile } = makeArgCapturingRunner(dir);
+    const client = new LabClient({ runnerBin: binPath, cwd: dir });
+    await client.publish({ runDir: '.lab/runs/run1' });
+
+    const { readFileSync } = await import('node:fs');
+    const args: string[] = JSON.parse(readFileSync(argsFile, 'utf8'));
+    assert.ok(!args.includes('--out'));
+  });
+});
+
+// ---------------------------------------------------------------------------
+// LabClient – validateKnobs()
+// ---------------------------------------------------------------------------
+describe('LabClient.validateKnobs()', () => {
+  let dir: string;
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'sdk-test-'));
+  });
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  test('passes --manifest and --overrides', async () => {
+    const { binPath, argsFile } = makeArgCapturingRunner(dir);
+    const client = new LabClient({ runnerBin: binPath, cwd: dir });
+    await client.validateKnobs({ manifest: 'knobs.json', overrides: 'ov.json' });
+
+    const { readFileSync } = await import('node:fs');
+    const args: string[] = JSON.parse(readFileSync(argsFile, 'utf8'));
+    assert.ok(args.includes('knobs-validate'));
+    assert.ok(args.includes('--manifest'));
+    assert.ok(args.includes('knobs.json'));
+    assert.ok(args.includes('--overrides'));
+    assert.ok(args.includes('ov.json'));
+    assert.ok(args.includes('--json'));
+  });
+});
+
+// ---------------------------------------------------------------------------
+// LabClient – validateHooks()
+// ---------------------------------------------------------------------------
+describe('LabClient.validateHooks()', () => {
+  let dir: string;
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'sdk-test-'));
+  });
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  test('passes --manifest and --events', async () => {
+    const { binPath, argsFile } = makeArgCapturingRunner(dir);
+    const client = new LabClient({ runnerBin: binPath, cwd: dir });
+    await client.validateHooks({ manifest: 'harness.json', events: 'events.jsonl' });
+
+    const { readFileSync } = await import('node:fs');
+    const args: string[] = JSON.parse(readFileSync(argsFile, 'utf8'));
+    assert.ok(args.includes('hooks-validate'));
+    assert.ok(args.includes('--manifest'));
+    assert.ok(args.includes('harness.json'));
+    assert.ok(args.includes('--events'));
+    assert.ok(args.includes('events.jsonl'));
+  });
+});
+
+// ---------------------------------------------------------------------------
+// LabClient – validateSchema()
+// ---------------------------------------------------------------------------
+describe('LabClient.validateSchema()', () => {
+  let dir: string;
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'sdk-test-'));
+  });
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  test('passes --schema and --file', async () => {
+    const { binPath, argsFile } = makeArgCapturingRunner(dir);
+    const client = new LabClient({ runnerBin: binPath, cwd: dir });
+    await client.validateSchema({ schema: 'trial_output_v1', file: 'output.json' });
+
+    const { readFileSync } = await import('node:fs');
+    const args: string[] = JSON.parse(readFileSync(argsFile, 'utf8'));
+    assert.ok(args.includes('schema-validate'));
+    assert.ok(args.includes('--schema'));
+    assert.ok(args.includes('trial_output_v1'));
+    assert.ok(args.includes('--file'));
+    assert.ok(args.includes('output.json'));
+  });
+});
+
+// ---------------------------------------------------------------------------
+// LabClient – error handling edge cases
+// ---------------------------------------------------------------------------
+describe('LabClient error handling', () => {
+  let dir: string;
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'sdk-test-'));
+  });
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  test('throws spawn_failed for nonexistent binary', async () => {
+    const client = new LabClient({
+      runnerBin: join(dir, 'does-not-exist'),
+      cwd: dir,
+    });
+    await assert.rejects(
+      () => client.describe({ experiment: 'e.yaml' }),
+      (err: unknown) => {
+        assert.ok(err instanceof LabRunnerError);
+        assert.equal(err.code, 'spawn_failed');
+        return true;
+      },
+    );
+  });
+
+  test('throws runner_exit_nonzero when exit code > 0 and no stdout', async () => {
+    const bin = makeFakeRunner(dir, 'process.stderr.write("something broke"); process.exit(42);');
+    const client = new LabClient({ runnerBin: bin, cwd: dir });
+    await assert.rejects(
+      () => client.describe({ experiment: 'e.yaml' }),
+      (err: unknown) => {
+        assert.ok(err instanceof LabRunnerError);
+        assert.equal(err.code, 'runner_exit_nonzero');
+        assert.equal(err.exitCode, 42);
+        assert.ok(err.stderr.includes('something broke'));
+        return true;
+      },
+    );
+  });
+
+  test('throws empty_payload when stdout is empty and exit 0', async () => {
+    const bin = makeFakeRunner(dir, 'process.exit(0);');
+    const client = new LabClient({ runnerBin: bin, cwd: dir });
+    await assert.rejects(
+      () => client.describe({ experiment: 'e.yaml' }),
+      (err: unknown) => {
+        assert.ok(err instanceof LabRunnerError);
+        assert.equal(err.code, 'empty_payload');
+        return true;
+      },
+    );
+  });
+
+  test('throws invalid_json when stdout is not JSON', async () => {
+    const bin = makeFakeRunner(dir, 'console.log("not json at all"); process.exit(0);');
+    const client = new LabClient({ runnerBin: bin, cwd: dir });
+    await assert.rejects(
+      () => client.describe({ experiment: 'e.yaml' }),
+      (err: unknown) => {
+        assert.ok(err instanceof LabRunnerError);
+        assert.equal(err.code, 'invalid_json');
+        return true;
+      },
+    );
+  });
+
+  test('throws invalid_payload when JSON is not an object', async () => {
+    const bin = makeFakeRunner(dir, 'console.log("42"); process.exit(0);');
+    const client = new LabClient({ runnerBin: bin, cwd: dir });
+    await assert.rejects(
+      () => client.describe({ experiment: 'e.yaml' }),
+      (err: unknown) => {
+        assert.ok(err instanceof LabRunnerError);
+        assert.equal(err.code, 'invalid_payload');
+        return true;
+      },
+    );
+  });
+
+  test('uses last line of multi-line stdout for JSON parsing', async () => {
+    const bin = makeFakeRunner(
+      dir,
+      `
+console.log("some log line");
+console.log("another log");
+console.log(JSON.stringify({ ok: true, command: 'describe', summary: { experiment: 'e', workload_type:'', dataset:'', tasks:0, replications:0, variant_plan_entries:0, total_trials:0, harness:[], integration_level:'', container_mode:false, network:'', control_path:'', harness_script_exists:false } }));
+process.exit(0);
+`,
+    );
+    const client = new LabClient({ runnerBin: bin, cwd: dir });
+    const res = await client.describe({ experiment: 'e.yaml' });
+    assert.equal(res.ok, true);
+  });
+
+  test('error envelope includes exitCode and command in LabRunnerError', async () => {
+    const bin = makeErrorEnvelopeRunner(dir);
+    const client = new LabClient({ runnerBin: bin, cwd: dir });
+    await assert.rejects(
+      () => client.run({ experiment: 'e.yaml' }),
+      (err: unknown) => {
+        assert.ok(err instanceof LabRunnerError);
+        assert.equal(err.exitCode, 1);
+        assert.ok(err.command.includes('run'));
+        return true;
+      },
+    );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// LabClient – per-call cwd/env overrides
+// ---------------------------------------------------------------------------
+describe('LabClient per-call CommandOptions', () => {
+  let dir: string;
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'sdk-test-'));
+  });
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  test('per-call env is merged into client env', async () => {
+    const bin = makeFakeRunner(
+      dir,
+      `
+const val = process.env.CALL_VAR || 'not set';
+console.log(JSON.stringify({ ok: true, command: 'describe', summary: { call_var: val, experiment:'e', workload_type:'', dataset:'', tasks:0, replications:0, variant_plan_entries:0, total_trials:0, harness:[], integration_level:'', container_mode:false, network:'', control_path:'', harness_script_exists:false } }));
+`,
+    );
+    const client = new LabClient({ runnerBin: bin, cwd: dir });
+    const res = await client.describe({
+      experiment: 'e.yaml',
+      env: { CALL_VAR: 'per-call' },
+    });
+    assert.equal(
+      (res.summary as unknown as Record<string, unknown>).call_var,
+      'per-call',
+    );
+  });
 });

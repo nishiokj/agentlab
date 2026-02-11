@@ -1,6 +1,7 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 use serde_json::{json, Value};
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 #[derive(Parser)]
@@ -33,11 +34,57 @@ enum Commands {
     RunExperiment {
         experiment: PathBuf,
         #[arg(long)]
-        build_image: bool,
-        #[arg(long)]
-        tag: Option<String>,
-        #[arg(long)]
         overrides: Option<PathBuf>,
+        #[arg(long)]
+        json: bool,
+    },
+    Replay {
+        #[arg(long)]
+        run_dir: PathBuf,
+        #[arg(long)]
+        trial_id: String,
+        #[arg(long)]
+        strict: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    Fork {
+        #[arg(long)]
+        run_dir: PathBuf,
+        #[arg(long)]
+        from_trial: String,
+        #[arg(long)]
+        at: String,
+        #[arg(long = "set")]
+        set_values: Vec<String>,
+        #[arg(long)]
+        strict: bool,
+        #[arg(long)]
+        json: bool,
+    },
+    Pause {
+        #[arg(long)]
+        run_dir: PathBuf,
+        #[arg(long)]
+        trial_id: Option<String>,
+        #[arg(long)]
+        label: Option<String>,
+        #[arg(long, default_value_t = 60)]
+        timeout_seconds: u64,
+        #[arg(long)]
+        json: bool,
+    },
+    Resume {
+        #[arg(long)]
+        run_dir: PathBuf,
+        #[arg(long)]
+        trial_id: Option<String>,
+        #[arg(long)]
+        label: Option<String>,
+        #[arg(long = "set")]
+        set_values: Vec<String>,
+        #[arg(long)]
+        strict: bool,
         #[arg(long)]
         json: bool,
     },
@@ -88,28 +135,9 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
-    ImageBuild {
-        experiment: PathBuf,
-        #[arg(long)]
-        tag: Option<String>,
-        #[arg(long)]
-        dockerfile: Option<PathBuf>,
-        #[arg(long)]
-        context: Option<PathBuf>,
-        #[arg(long)]
-        overrides: Option<PathBuf>,
-        #[arg(long)]
-        json: bool,
-    },
     Init {
         #[arg(long)]
         in_place: bool,
-        #[arg(long)]
-        language: Option<String>,
-        #[arg(long, default_value = "agent_harness")]
-        workload_type: String,
-        #[arg(long)]
-        container: bool,
         #[arg(long)]
         force: bool,
     },
@@ -205,41 +233,11 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
         }
         Commands::RunExperiment {
             experiment,
-            build_image,
-            tag,
             overrides,
             json,
         } => {
             let summary =
                 lab_runner::describe_experiment_with_overrides(&experiment, overrides.as_deref())?;
-            let mut docker_build_status: Option<String> = None;
-            if build_image {
-                let image = tag.or(summary.image.clone()).ok_or_else(|| {
-                    anyhow::anyhow!("missing image tag (pass --tag or set runtime.sandbox.image)")
-                })?;
-                let (dockerfile_path, context_path) =
-                    lab_runner::resolve_docker_build_with_overrides(
-                        &experiment,
-                        overrides.as_deref(),
-                    )?;
-                if !dockerfile_path.exists() {
-                    return Err(anyhow::anyhow!(format!(
-                        "dockerfile not found: {}",
-                        dockerfile_path.display()
-                    )));
-                }
-                if !context_path.exists() {
-                    return Err(anyhow::anyhow!(format!(
-                        "context dir not found: {}",
-                        context_path.display()
-                    )));
-                }
-                let status = lab_runner::run_docker_build(&image, &dockerfile_path, &context_path)?;
-                if !json {
-                    println!("docker_build: {}", status);
-                }
-                docker_build_status = Some(status);
-            }
             let result = lab_runner::run_experiment_strict_with_overrides(
                 &experiment,
                 overrides.as_deref(),
@@ -250,14 +248,120 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
                     "command": "run-experiment",
                     "summary": summary_to_json(&summary),
                     "run": run_result_to_json(&result),
-                    "experiment_network_requirement": "none",
-                    "docker_build_status": docker_build_status
+                    "experiment_network_requirement": "none"
                 })));
             }
             print_summary(&summary);
             println!("experiment_network_requirement: none");
             println!("run_id: {}", result.run_id);
             println!("run_dir: {}", result.run_dir.display());
+        }
+        Commands::Replay {
+            run_dir,
+            trial_id,
+            strict,
+            json,
+        } => {
+            let result = lab_runner::replay_trial(&run_dir, &trial_id, strict)?;
+            if json {
+                return Ok(Some(json!({
+                    "ok": true,
+                    "command": "replay",
+                    "replay": replay_result_to_json(&result),
+                })));
+            }
+            println!("replay_id: {}", result.replay_id);
+            println!("replay_dir: {}", result.replay_dir.display());
+            println!("parent_trial_id: {}", result.parent_trial_id);
+            println!("strict: {}", result.strict);
+            println!("replay_grade: {}", result.replay_grade);
+            println!("harness_status: {}", result.harness_status);
+        }
+        Commands::Fork {
+            run_dir,
+            from_trial,
+            at,
+            set_values,
+            strict,
+            json,
+        } => {
+            let set_bindings = parse_set_bindings(&set_values)?;
+            let result = lab_runner::fork_trial(&run_dir, &from_trial, &at, &set_bindings, strict)?;
+            if json {
+                return Ok(Some(json!({
+                    "ok": true,
+                    "command": "fork",
+                    "fork": fork_result_to_json(&result),
+                })));
+            }
+            println!("fork_id: {}", result.fork_id);
+            println!("fork_dir: {}", result.fork_dir.display());
+            println!("parent_trial_id: {}", result.parent_trial_id);
+            println!("selector: {}", result.selector);
+            println!("strict: {}", result.strict);
+            println!(
+                "source_checkpoint: {}",
+                result.source_checkpoint.as_deref().unwrap_or("none")
+            );
+            println!("fallback_mode: {}", result.fallback_mode);
+            println!("replay_grade: {}", result.replay_grade);
+            println!("harness_status: {}", result.harness_status);
+        }
+        Commands::Pause {
+            run_dir,
+            trial_id,
+            label,
+            timeout_seconds,
+            json,
+        } => {
+            let result = lab_runner::pause_run(
+                &run_dir,
+                trial_id.as_deref(),
+                label.as_deref(),
+                timeout_seconds,
+            )?;
+            if json {
+                return Ok(Some(json!({
+                    "ok": true,
+                    "command": "pause",
+                    "pause": pause_result_to_json(&result),
+                })));
+            }
+            println!("run_id: {}", result.run_id);
+            println!("trial_id: {}", result.trial_id);
+            println!("label: {}", result.label);
+            println!("checkpoint_acked: {}", result.checkpoint_acked);
+            println!("stop_acked: {}", result.stop_acked);
+        }
+        Commands::Resume {
+            run_dir,
+            trial_id,
+            label,
+            set_values,
+            strict,
+            json,
+        } => {
+            let set_bindings = parse_set_bindings(&set_values)?;
+            let result = lab_runner::resume_run(
+                &run_dir,
+                trial_id.as_deref(),
+                label.as_deref(),
+                &set_bindings,
+                strict,
+            )?;
+            if json {
+                return Ok(Some(json!({
+                    "ok": true,
+                    "command": "resume",
+                    "resume": resume_result_to_json(&result),
+                })));
+            }
+            println!("trial_id: {}", result.trial_id);
+            println!("selector: {}", result.selector);
+            println!("fork_id: {}", result.fork.fork_id);
+            println!("fork_dir: {}", result.fork.fork_dir.display());
+            println!("replay_grade: {}", result.fork.replay_grade);
+            println!("harness_status: {}", result.fork.harness_status);
         }
         Commands::Describe {
             experiment,
@@ -359,177 +463,77 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
             }
             println!("bundle: {}", out_path.display());
         }
-        Commands::ImageBuild {
-            experiment,
-            tag,
-            dockerfile,
-            context,
-            overrides,
-            json,
-        } => {
-            let summary =
-                lab_runner::describe_experiment_with_overrides(&experiment, overrides.as_deref())?;
-            let image = tag.or(summary.image.clone()).ok_or_else(|| {
-                anyhow::anyhow!("missing image tag (pass --tag or set runtime.sandbox.image)")
-            })?;
-            let (mut dockerfile_path, mut context_path) =
-                lab_runner::resolve_docker_build_with_overrides(&experiment, overrides.as_deref())?;
-            if let Some(df) = dockerfile {
-                dockerfile_path = df;
-            }
-            if let Some(ctx) = context {
-                context_path = ctx;
-            }
-            if !dockerfile_path.exists() {
-                return Err(anyhow::anyhow!(format!(
-                    "dockerfile not found: {}",
-                    dockerfile_path.display()
-                )));
-            }
-            if !context_path.exists() {
-                return Err(anyhow::anyhow!(format!(
-                    "context dir not found: {}",
-                    context_path.display()
-                )));
-            }
-            let status = lab_runner::run_docker_build(&image, &dockerfile_path, &context_path)?;
-            if json {
-                return Ok(Some(json!({
-                    "ok": true,
-                    "command": "image-build",
-                    "image": image,
-                    "dockerfile": dockerfile_path.display().to_string(),
-                    "context": context_path.display().to_string(),
-                    "docker_build": status
-                })));
-            }
-            println!("docker_build: {}", status);
-        }
-        Commands::Init {
-            in_place,
-            language,
-            workload_type,
-            container,
-            force,
-        } => {
+        Commands::Init { in_place, force } => {
             let cwd = std::env::current_dir()?;
             let root = cwd;
             let lab_dir = root.join(".lab");
             std::fs::create_dir_all(&lab_dir)?;
-            let bin_name = std::env::args()
-                .next()
-                .and_then(|s| {
-                    std::path::Path::new(&s)
-                        .file_name()
-                        .map(|p| p.to_string_lossy().to_string())
-                })
-                .unwrap_or_else(|| "lab".to_string());
 
-            let (exp_path, tasks_path) = if in_place {
-                (root.join("experiment.yaml"), root.join("tasks.jsonl"))
+            let exp_path = if in_place {
+                root.join("experiment.yaml")
             } else {
-                (lab_dir.join("experiment.yaml"), lab_dir.join("tasks.jsonl"))
+                lab_dir.join("experiment.yaml")
             };
 
-            if !force {
-                if exp_path.exists() || tasks_path.exists() {
-                    return Err(anyhow::anyhow!(format!(
-                        "init files already exist (use --force or --in-place): {}, {}",
-                        exp_path.display(),
-                        tasks_path.display()
-                    )));
-                }
+            if !force && exp_path.exists() {
+                return Err(anyhow::anyhow!(format!(
+                    "init file already exists (use --force): {}",
+                    exp_path.display()
+                )));
             }
 
-            let detected = detect_language(&root);
-            let lang = language.unwrap_or(detected);
-            if workload_type != "agent_harness" && workload_type != "trainer" {
-                return Err(anyhow::anyhow!(
-                    "invalid --workload-type '{}'; expected 'agent_harness' or 'trainer'",
-                    workload_type
-                ));
-            }
-            let (image, harness_cmd, warn) = defaults_for_language(&lang, &root, &workload_type);
-            let sandbox_block = if container {
-                format!(
-                    "  sandbox:\n    mode: container\n    engine: docker\n    image: {}\n    root_read_only: true\n    run_as_user: \"1000:1000\"\n    hardening:\n      no_new_privileges: true\n      drop_all_caps: true\n    resources:\n      cpu_count: 2\n      memory_mb: 2048\n",
-                    image
-                )
-            } else {
-                "  sandbox:\n    mode: local\n".to_string()
-            };
-
-            let (primary_metrics, secondary_metrics) = if workload_type == "trainer" {
-                ("[primary_metric]", "[train_loss, val_loss, wall_time_s]")
-            } else {
-                ("[success]", "[latency_ms]")
-            };
-            let exp_yaml = format!(
-                "version: '0.3'\nexperiment:\n  id: exp_local\n  name: AgentLab Experiment\n  description: Generated by lab init\n  workload_type: {}\n  owner: you\n  tags: [example]\ndataset:\n  suite_id: local_suite\n  provider: local_jsonl\n  path: {}\n  schema_version: task_jsonl_v1\n  split_id: dev\n  limit: 50\ndesign:\n  sanitization_profile: hermetic_functional_v2\n  comparison: paired\n  replications: 1\n  random_seed: 1337\n  shuffle_tasks: true\n  max_concurrency: 1\nanalysis_plan:\n  primary_metrics: {}\n  secondary_metrics: {}\n  missingness:\n    policy: paired_drop\n    record_reasons: true\n  tests:\n    success: {{ method: paired_bootstrap, ci: 0.95, resamples: 1000 }}\n    latency_ms: {{ method: paired_bootstrap, ci: 0.95, resamples: 1000 }}\n  multiple_comparisons:\n    method: none\n  reporting:\n    effect_sizes: [risk_diff, median_diff]\n    show_task_level_table: true\nbaseline:\n  variant_id: base\n  bindings: {{}}\nvariant_plan: []\nruntime:\n  harness:\n    mode: cli\n    command: {}\n    integration_level: cli_basic\n    input_path: /out/trial_input.json\n    output_path: /out/trial_output.json\n    control_plane:\n      mode: file\n      path: /state/lab_control.json\n{}  network:\n    mode: none\n    allowed_hosts: []\nvalidity:\n  fail_on_state_leak: true\n  fail_on_profile_invariant_violation: true\n",
-                workload_type,
-                if in_place { "tasks.jsonl" } else { "tasks.jsonl" },
-                primary_metrics,
-                secondary_metrics,
-                harness_cmd,
-                sandbox_block
-            );
-
+            let exp_yaml = "\
+version: '0.3'
+experiment:
+  id: ''                              # REQUIRED
+  name: ''                            # REQUIRED
+  workload_type: ''                   # REQUIRED: agent_harness | trainer
+dataset:
+  path: ''                            # REQUIRED: path to tasks.jsonl
+  provider: local_jsonl
+  suite_id: ''                        # REQUIRED
+  schema_version: task_jsonl_v1
+  split_id: ''                        # REQUIRED
+  limit: 0                            # REQUIRED: set > 0
+design:
+  sanitization_profile: ''            # REQUIRED: e.g. hermetic_functional_v2
+  comparison: paired
+  replications: 0                     # REQUIRED: set > 0
+  random_seed: 0                      # REQUIRED
+  shuffle_tasks: true
+  max_concurrency: 1
+baseline:
+  variant_id: ''                      # REQUIRED
+  bindings: {}
+variant_plan: []
+runtime:
+  harness:
+    mode: cli
+    command: []                        # REQUIRED: e.g. [node, ./harness.js, run]
+    integration_level: ''              # REQUIRED: cli_basic | cli_events | otel | sdk_control | sdk_full
+    input_path: /out/trial_input.json
+    output_path: /out/trial_output.json
+    control_plane:
+      mode: file
+      path: /state/lab_control.json
+  sandbox:
+    mode: local
+  network:
+    mode: none
+    allowed_hosts: []
+validity:
+  fail_on_state_leak: true
+  fail_on_profile_invariant_violation: true
+";
             std::fs::write(&exp_path, exp_yaml)?;
-            let tasks_template = if workload_type == "trainer" {
-                "{ \"id\": \"job_0\", \"training\": { \"dataset\": \"dataset_a\", \"model\": \"resnet18\", \"epochs\": 5, \"seed\": 1337 } }\n{ \"id\": \"job_1\", \"training\": { \"dataset\": \"dataset_a\", \"model\": \"resnet18\", \"epochs\": 5, \"seed\": 1338 } }\n"
-            } else {
-                "{ \"id\": \"task_0\", \"prompt\": \"Say hello\" }\n{ \"id\": \"task_1\", \"prompt\": \"Return the number 2\" }\n"
-            };
-            std::fs::write(&tasks_path, tasks_template)?;
-            let knobs_manifest = root.join(".lab").join("knobs").join("manifest.json");
-            let knobs_overrides = root.join(".lab").join("knobs").join("overrides.json");
-            write_knob_files(&knobs_manifest, &knobs_overrides, force)?;
 
             let exp_show = exp_path.strip_prefix(&root).unwrap_or(&exp_path).display();
-            let tasks_show = tasks_path
-                .strip_prefix(&root)
-                .unwrap_or(&tasks_path)
-                .display();
-            let knobs_manifest_show = knobs_manifest
-                .strip_prefix(&root)
-                .unwrap_or(&knobs_manifest)
-                .display();
-            let knobs_overrides_show = knobs_overrides
-                .strip_prefix(&root)
-                .unwrap_or(&knobs_overrides)
-                .display();
             println!("wrote: {}", exp_show);
-            println!("wrote: {}", tasks_show);
-            println!("wrote: {}", knobs_manifest_show);
-            println!("wrote: {}", knobs_overrides_show);
-            if !in_place {
-                println!("note: experiment lives under .lab/; harness paths resolve relative to repo root");
-            }
-            if let Some(w) = warn {
-                println!("assumption: {}", w);
-            }
-            println!("workload_type: {}", workload_type);
-            let exp_arg = exp_path.strip_prefix(&root).unwrap_or(&exp_path).display();
-            println!("next: {} describe {}", bin_name, exp_arg);
             println!(
-                "next: {} describe {} --overrides {}",
-                bin_name, exp_arg, knobs_overrides_show
+                "next: edit {} \u{2014} fill in all fields marked REQUIRED",
+                exp_show
             );
-            if container {
-                println!(
-                    "next: {} run-dev {} --overrides {} --setup \"<install command>\"",
-                    bin_name, exp_arg, knobs_overrides_show
-                );
-                println!(
-                    "next: {} run-experiment {} --overrides {} --build-image",
-                    bin_name, exp_arg, knobs_overrides_show
-                );
-            } else {
-                println!(
-                    "next: {} run {} --overrides {}",
-                    bin_name, exp_arg, knobs_overrides_show
-                );
-            }
+            println!("next: lab describe {}", exp_show);
         }
         Commands::Clean { init, runs } => {
             let root = std::env::current_dir()?;
@@ -537,9 +541,7 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
             if init {
                 let candidates = vec![
                     root.join("experiment.yaml"),
-                    root.join("tasks.jsonl"),
                     lab_dir.join("experiment.yaml"),
-                    lab_dir.join("tasks.jsonl"),
                 ];
                 for p in candidates {
                     if p.exists() {
@@ -585,12 +587,15 @@ fn command_json_mode(command: &Commands) -> bool {
         Commands::Run { json, .. }
         | Commands::RunDev { json, .. }
         | Commands::RunExperiment { json, .. }
+        | Commands::Replay { json, .. }
+        | Commands::Fork { json, .. }
+        | Commands::Pause { json, .. }
+        | Commands::Resume { json, .. }
         | Commands::Describe { json, .. }
         | Commands::KnobsValidate { json, .. }
         | Commands::SchemaValidate { json, .. }
         | Commands::HooksValidate { json, .. }
-        | Commands::Publish { json, .. }
-        | Commands::ImageBuild { json, .. } => *json,
+        | Commands::Publish { json, .. } => *json,
         _ => false,
     }
 }
@@ -600,6 +605,68 @@ fn run_result_to_json(result: &lab_runner::RunResult) -> Value {
         "run_id": result.run_id,
         "run_dir": result.run_dir.display().to_string()
     })
+}
+
+fn replay_result_to_json(result: &lab_runner::ReplayResult) -> Value {
+    json!({
+        "replay_id": result.replay_id,
+        "replay_dir": result.replay_dir.display().to_string(),
+        "parent_trial_id": result.parent_trial_id,
+        "strict": result.strict,
+        "replay_grade": result.replay_grade,
+        "harness_status": result.harness_status,
+    })
+}
+
+fn fork_result_to_json(result: &lab_runner::ForkResult) -> Value {
+    json!({
+        "fork_id": result.fork_id,
+        "fork_dir": result.fork_dir.display().to_string(),
+        "parent_trial_id": result.parent_trial_id,
+        "selector": result.selector,
+        "strict": result.strict,
+        "source_checkpoint": result.source_checkpoint,
+        "fallback_mode": result.fallback_mode,
+        "replay_grade": result.replay_grade,
+        "harness_status": result.harness_status,
+    })
+}
+
+fn pause_result_to_json(result: &lab_runner::PauseResult) -> Value {
+    json!({
+        "run_id": result.run_id,
+        "trial_id": result.trial_id,
+        "label": result.label,
+        "checkpoint_acked": result.checkpoint_acked,
+        "stop_acked": result.stop_acked,
+    })
+}
+
+fn resume_result_to_json(result: &lab_runner::ResumeResult) -> Value {
+    json!({
+        "trial_id": result.trial_id,
+        "selector": result.selector,
+        "fork": fork_result_to_json(&result.fork),
+    })
+}
+
+fn parse_set_bindings(values: &[String]) -> Result<BTreeMap<String, Value>> {
+    let mut out = BTreeMap::new();
+    for raw in values {
+        let (key, val_raw) = raw
+            .split_once('=')
+            .ok_or_else(|| anyhow::anyhow!(format!("invalid --set '{}': expected k=v", raw)))?;
+        if key.trim().is_empty() {
+            return Err(anyhow::anyhow!(format!(
+                "invalid --set '{}': key cannot be empty",
+                raw
+            )));
+        }
+        let parsed =
+            serde_json::from_str::<Value>(val_raw).unwrap_or(Value::String(val_raw.to_string()));
+        out.insert(key.to_string(), parsed);
+    }
+    Ok(out)
 }
 
 fn summary_to_json(summary: &lab_runner::ExperimentSummary) -> Value {
@@ -649,188 +716,6 @@ fn print_summary(summary: &lab_runner::ExperimentSummary) {
     if let Some(p) = &summary.harness_script_resolved {
         println!("harness_script_resolved: {}", p.display());
         println!("harness_script_exists: {}", summary.harness_script_exists);
-    }
-}
-
-fn detect_language(root: &std::path::Path) -> String {
-    if root.join("package.json").exists()
-        || root.join("agentlab/harness.js").exists()
-        || root.join("harness.js").exists()
-        || root.join("agentlab_demo_harness.js").exists()
-        || root.join("src/harness.js").exists()
-    {
-        return "node".to_string();
-    }
-    if root.join("harness.py").exists()
-        || root.join("main.py").exists()
-        || root.join("src/harness.py").exists()
-    {
-        return "python".to_string();
-    }
-    if root.join("Cargo.toml").exists() {
-        return "rust".to_string();
-    }
-    if root.join("go.mod").exists() {
-        return "go".to_string();
-    }
-    if root.join("pyproject.toml").exists() || root.join("requirements.txt").exists() {
-        return "python".to_string();
-    }
-    "unknown".to_string()
-}
-
-fn defaults_for_language(
-    lang: &str,
-    root: &std::path::Path,
-    workload_type: &str,
-) -> (String, String, Option<String>) {
-    let pick = |candidates: &[&str]| -> Option<String> {
-        for c in candidates {
-            let p = root.join(c);
-            if p.exists() {
-                return Some(c.to_string());
-            }
-        }
-        None
-    };
-    if workload_type == "trainer" {
-        let train_node = pick(&["scripts/train.ts", "train.js", "src/train.js"]);
-        let train_py = pick(&["train.py", "src/train.py"]);
-        return match lang {
-            "node" => {
-                if let Some(file) = train_node {
-                    if file == "scripts/train.ts" {
-                        (
-                            "oven/bun:1".to_string(),
-                            "[\"bun\",\"./scripts/train.ts\"]".to_string(),
-                            None,
-                        )
-                    } else {
-                        (
-                            "node:20-bullseye".to_string(),
-                            format!("[\"node\",\"./{}\"]", file),
-                            None,
-                        )
-                    }
-                } else {
-                    (
-                        "node:20-bullseye".to_string(),
-                        "[\"node\",\"./train.js\"]".to_string(),
-                        Some("trainer workload assumes ./train.js entrypoint; update runtime.harness.command if needed".to_string()),
-                    )
-                }
-            }
-            "python" => {
-                let has_train_py = train_py.is_some();
-                (
-                    "python:3.11-slim".to_string(),
-                    format!(
-                        "[\"python3\",\"./{}\"]",
-                        train_py.unwrap_or_else(|| "train.py".to_string())
-                    ),
-                    if !has_train_py {
-                        Some(
-                            "trainer workload assumes ./train.py entrypoint; update runtime.harness.command if needed"
-                                .to_string(),
-                        )
-                    } else {
-                        None
-                    },
-                )
-            }
-            "go" => (
-                "golang:1.22".to_string(),
-                "[\"./train\"]".to_string(),
-                Some(
-                    "trainer workload assumes ./train binary entrypoint; update runtime.harness.command if needed"
-                        .to_string(),
-                ),
-            ),
-            "rust" => (
-                "rust:1.76".to_string(),
-                "[\"./train\"]".to_string(),
-                Some(
-                    "trainer workload assumes ./train binary entrypoint; update runtime.harness.command if needed"
-                        .to_string(),
-                ),
-            ),
-            _ => (
-                "ubuntu:22.04".to_string(),
-                "[\"./train\"]".to_string(),
-                Some(
-                    "trainer workload assumes ./train entrypoint; update runtime.harness.command if needed"
-                        .to_string(),
-                ),
-            ),
-        };
-    }
-    let node_file = pick(&[
-        "agentlab/harness.js",
-        "harness.js",
-        "agentlab_demo_harness.js",
-        "src/harness.js",
-    ]);
-    let py_file = pick(&["harness.py", "main.py", "src/harness.py"]);
-    match lang {
-        "node" => {
-            if let Some(file) = node_file.clone() {
-                if file == "agentlab_demo_harness.js" {
-                    (
-                        "node:20-bullseye".to_string(),
-                        "[\"node\",\"./agentlab_demo_harness.js\",\"run\"]".to_string(),
-                        None,
-                    )
-                } else {
-                    (
-                        "node:20-bullseye".to_string(),
-                        format!("[\"node\",\"./{}\",\"run\"]", file),
-                        Some("assumed 'run' subcommand; update runtime.harness.command if your CLI differs".to_string()),
-                    )
-                }
-            } else {
-                (
-                    "node:20-bullseye".to_string(),
-                    "[\"node\",\"./harness.js\",\"run\"]".to_string(),
-                    Some("runtime.harness.command set to ./harness.js; update if your harness file differs".to_string()),
-                )
-            }
-        }
-        "python" => (
-            "python:3.11-slim".to_string(),
-            format!(
-                "[\"python3\",\"./{}\",\"run\"]",
-                py_file.clone().unwrap_or_else(|| "harness.py".to_string())
-            ),
-            if py_file.is_none() {
-                Some("runtime.harness.command set to ./harness.py; update if your harness file differs".to_string())
-            } else {
-                None
-            },
-        ),
-        "go" => (
-            "golang:1.22".to_string(),
-            "[\"./harness\",\"run\"]".to_string(),
-            Some(
-                "runtime.harness.command set to ./harness; update to your built binary path"
-                    .to_string(),
-            ),
-        ),
-        "rust" => (
-            "rust:1.76".to_string(),
-            "[\"./harness\",\"run\"]".to_string(),
-            Some(
-                "runtime.harness.command set to ./harness; update to your built binary path"
-                    .to_string(),
-            ),
-        ),
-        _ => (
-            "ubuntu:22.04".to_string(),
-            "[\"./harness\",\"run\"]".to_string(),
-            Some(
-                "runtime.harness.command set to ./harness; update to your actual entrypoint"
-                    .to_string(),
-            ),
-        ),
     }
 }
 

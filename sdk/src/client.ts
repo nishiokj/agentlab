@@ -6,8 +6,6 @@ import type {
   DescribeArgs,
   DescribeResponse,
   HooksValidateArgs,
-  ImageBuildArgs,
-  ImageBuildResponse,
   JsonCommandResponse,
   KnobsValidateArgs,
   LabClientOptions,
@@ -90,33 +88,10 @@ export class LabClient {
 
   async runExperiment(args: RunExperimentArgs): Promise<RunResponse> {
     const cmd = ['run-experiment', args.experiment, '--json'];
-    if (args.buildImage) {
-      cmd.push('--build-image');
-    }
-    if (args.tag) {
-      cmd.push('--tag', args.tag);
-    }
     if (args.overrides) {
       cmd.push('--overrides', args.overrides);
     }
     return this.runJson<RunResponse>(cmd, args);
-  }
-
-  async imageBuild(args: ImageBuildArgs): Promise<ImageBuildResponse> {
-    const cmd = ['image-build', args.experiment, '--json'];
-    if (args.tag) {
-      cmd.push('--tag', args.tag);
-    }
-    if (args.dockerfile) {
-      cmd.push('--dockerfile', args.dockerfile);
-    }
-    if (args.context) {
-      cmd.push('--context', args.context);
-    }
-    if (args.overrides) {
-      cmd.push('--overrides', args.overrides);
-    }
-    return this.runJson<ImageBuildResponse>(cmd, args);
   }
 
   async publish(args: PublishArgs): Promise<PublishResponse> {

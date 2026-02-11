@@ -6,8 +6,6 @@ export type {
   DescribeResponse,
   ExperimentSummary,
   HooksValidateArgs,
-  ImageBuildArgs,
-  ImageBuildResponse,
   KnobsValidateArgs,
   LabClientOptions,
   LabErrorEnvelope,

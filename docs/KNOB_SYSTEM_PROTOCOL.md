@@ -48,7 +48,6 @@ If any check fails, command fails.
 - `lab run <experiment> --overrides <path>`
 - `lab run-dev <experiment> --overrides <path>`
 - `lab run-experiment <experiment> --overrides <path>`
-- `lab image-build <experiment> --overrides <path>`
 
 ## UI Contract
 
