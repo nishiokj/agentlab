@@ -2920,6 +2920,222 @@ fn resolve_command_digest_target(command: &[String]) -> Option<&str> {
 mod tests {
     use super::*;
 
+    struct TempDirGuard {
+        path: PathBuf,
+    }
+
+    impl TempDirGuard {
+        fn new(prefix: &str) -> Self {
+            let path = std::env::temp_dir().join(format!(
+                "{}_{}_{}",
+                prefix,
+                std::process::id(),
+                Utc::now().timestamp_micros()
+            ));
+            ensure_dir(&path).expect("temp dir");
+            Self { path }
+        }
+    }
+
+    impl Drop for TempDirGuard {
+        fn drop(&mut self) {
+            let _ = fs::remove_dir_all(&self.path);
+        }
+    }
+
+    fn create_run_dir(prefix: &str, run_id: &str) -> (TempDirGuard, PathBuf) {
+        let root = TempDirGuard::new(prefix);
+        let run_dir = root.path.join(".lab").join("runs").join(run_id);
+        ensure_dir(&run_dir).expect("run dir");
+        (root, run_dir)
+    }
+
+    fn harness_success_command() -> Vec<String> {
+        vec![
+            "sh".to_string(),
+            "-lc".to_string(),
+            "printf '%s' '{\"schema_version\":\"trial_output_v1\",\"outcome\":\"success\",\"checkpoints\":[]}' > \"$AGENTLAB_TRIAL_OUTPUT\"".to_string(),
+        ]
+    }
+
+    fn write_resolved_experiment(
+        run_dir: &Path,
+        integration_level: &str,
+        include_events_path: bool,
+    ) {
+        let mut harness = serde_json::Map::new();
+        harness.insert(
+            "command".to_string(),
+            Value::Array(
+                harness_success_command()
+                    .into_iter()
+                    .map(Value::String)
+                    .collect(),
+            ),
+        );
+        harness.insert(
+            "integration_level".to_string(),
+            Value::String(integration_level.to_string()),
+        );
+        harness.insert(
+            "input_path".to_string(),
+            Value::String("/out/trial_input.json".to_string()),
+        );
+        harness.insert(
+            "output_path".to_string(),
+            Value::String("/out/trial_output.json".to_string()),
+        );
+        harness.insert(
+            "control_plane".to_string(),
+            json!({
+                "path": "/state/lab_control.json"
+            }),
+        );
+        if include_events_path {
+            harness.insert(
+                "events".to_string(),
+                json!({
+                    "path": "/state/harness_events.jsonl"
+                }),
+            );
+        }
+
+        let resolved = json!({
+            "runtime": {
+                "harness": Value::Object(harness),
+                "network": { "mode": "none" }
+            }
+        });
+        atomic_write_json_pretty(&run_dir.join("resolved_experiment.json"), &resolved)
+            .expect("write resolved");
+    }
+
+    fn seed_parent_trial(
+        run_dir: &Path,
+        trial_id: &str,
+        checkpoints: Value,
+        trial_status: &str,
+        pause_label: Option<&str>,
+    ) -> PathBuf {
+        let trial_dir = run_dir.join("trials").join(trial_id);
+        ensure_dir(&trial_dir).expect("trial dir");
+        ensure_dir(&trial_dir.join("workspace")).expect("workspace");
+        ensure_dir(&trial_dir.join("state")).expect("state");
+        ensure_dir(&trial_dir.join("dataset")).expect("dataset");
+
+        fs::write(
+            trial_dir.join("workspace").join("fixture.txt"),
+            "workspace fixture",
+        )
+        .expect("workspace fixture");
+        fs::write(
+            trial_dir.join("dataset").join("tasks.jsonl"),
+            "{\"id\":\"task_1\"}\n",
+        )
+        .expect("dataset file");
+
+        let trial_input = json!({
+            "schema_version": "trial_input_v1",
+            "ids": { "trial_id": trial_id },
+            "bindings": {
+                "existing": "value"
+            },
+            "runtime": {
+                "paths": {
+                    "workspace": trial_dir.join("workspace").to_string_lossy().to_string(),
+                    "state": trial_dir.join("state").to_string_lossy().to_string(),
+                    "dataset": trial_dir.join("dataset").to_string_lossy().to_string(),
+                    "out": trial_dir.join("out").to_string_lossy().to_string(),
+                    "tmp": trial_dir.join("tmp").to_string_lossy().to_string()
+                },
+                "network": { "mode_requested": "none" }
+            }
+        });
+        atomic_write_json_pretty(&trial_dir.join("trial_input.json"), &trial_input)
+            .expect("trial input");
+
+        let trial_output = json!({
+            "schema_version": "trial_output_v1",
+            "outcome": "success",
+            "checkpoints": checkpoints
+        });
+        atomic_write_json_pretty(&trial_dir.join("trial_output.json"), &trial_output)
+            .expect("trial output");
+
+        write_trial_state(
+            &trial_dir,
+            trial_id,
+            trial_status,
+            pause_label,
+            pause_label,
+            if trial_status == "paused" {
+                Some("paused_by_user")
+            } else {
+                None
+            },
+        )
+        .expect("trial state");
+
+        trial_dir
+    }
+
+    fn spawn_pause_ack_writer(control_path: PathBuf, events_path: PathBuf) -> thread::JoinHandle<()> {
+        thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut seen_versions = std::collections::BTreeSet::new();
+            while Instant::now() < deadline {
+                let bytes = match fs::read(&control_path) {
+                    Ok(b) => b,
+                    Err(_) => {
+                        thread::sleep(Duration::from_millis(20));
+                        continue;
+                    }
+                };
+                let value: Value = match serde_json::from_slice(&bytes) {
+                    Ok(v) => v,
+                    Err(_) => {
+                        thread::sleep(Duration::from_millis(20));
+                        continue;
+                    }
+                };
+                let action = value
+                    .pointer("/action")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("continue");
+                if action != "checkpoint" && action != "stop" {
+                    thread::sleep(Duration::from_millis(20));
+                    continue;
+                }
+
+                let version = sha256_bytes(&bytes);
+                if !seen_versions.insert(version.clone()) {
+                    thread::sleep(Duration::from_millis(20));
+                    continue;
+                }
+
+                if let Some(parent) = events_path.parent() {
+                    let _ = ensure_dir(parent);
+                }
+                let ack = json!({
+                    "event_type": "control_ack",
+                    "action_observed": action,
+                    "control_version": version
+                });
+                if let Ok(mut file) = fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(&events_path)
+                {
+                    let _ = writeln!(file, "{}", ack);
+                }
+                if action == "stop" {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(20));
+            }
+        })
+    }
+
     #[test]
     fn resolve_script_path_supports_binary_first_commands() {
         let root = PathBuf::from("/tmp/agentlab_proj");
@@ -3070,6 +3286,385 @@ mod tests {
         let selector = resolve_resume_selector(&trial_dir, None).expect("selector");
         assert_eq!(selector, "checkpoint:b");
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn resolve_resume_selector_errors_when_label_not_found() {
+        let root = TempDirGuard::new("agentlab_resume_missing_label_test");
+        let trial_dir = root.path.join("trial_1");
+        ensure_dir(&trial_dir).expect("trial");
+        let output = json!({
+            "schema_version": "trial_output_v1",
+            "outcome": "success",
+            "checkpoints": [
+                {"path": "/state/ckpt_a", "logical_name": "a", "step": 1}
+            ]
+        });
+        atomic_write_json_pretty(&trial_dir.join("trial_output.json"), &output).expect("write");
+        let err = resolve_resume_selector(&trial_dir, Some("missing")).expect_err("should fail");
+        assert!(
+            err.to_string().contains("resume_checkpoint_not_found"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn parse_fork_selector_rejects_empty_checkpoint_name() {
+        let err = match parse_fork_selector("checkpoint: ") {
+            Ok(_) => panic!("empty checkpoint should fail"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains("checkpoint name empty"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn resolve_selector_checkpoint_non_strict_returns_none_when_path_missing() {
+        let root = TempDirGuard::new("agentlab_fork_selector_path_missing");
+        let trial_dir = root.path.join("trial_1");
+        ensure_dir(&trial_dir).expect("trial");
+        let output = json!({
+            "checkpoints": [
+                {"path": "/state/cp_missing", "logical_name": "cp1", "step": 3}
+            ]
+        });
+        let selector = parse_fork_selector("checkpoint:cp1").expect("selector");
+        let source = resolve_selector_checkpoint(&selector, Some(&output), &trial_dir, false)
+            .expect("selector resolution");
+        assert_eq!(source, None);
+    }
+
+    #[test]
+    fn resolve_selector_checkpoint_strict_requires_existing_checkpoint_path() {
+        let root = TempDirGuard::new("agentlab_fork_selector_strict_missing");
+        let trial_dir = root.path.join("trial_1");
+        ensure_dir(&trial_dir).expect("trial");
+        let output = json!({
+            "checkpoints": [
+                {"path": "/state/cp_missing", "logical_name": "cp1", "step": 3}
+            ]
+        });
+        let selector = parse_fork_selector("checkpoint:cp1").expect("selector");
+        let err = resolve_selector_checkpoint(&selector, Some(&output), &trial_dir, true)
+            .expect_err("strict resolution should fail");
+        assert!(
+            err.to_string().contains("strict_source_unavailable"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn fork_trial_non_strict_falls_back_to_input_only_when_checkpoint_missing() {
+        let (_root, run_dir) = create_run_dir("agentlab_fork_input_fallback", "run_1");
+        write_resolved_experiment(&run_dir, "cli_events", true);
+        seed_parent_trial(
+            &run_dir,
+            "trial_1",
+            json!([{"path": "/state/cp_missing", "logical_name": "cp1", "step": 1}]),
+            "completed",
+            None,
+        );
+
+        let result = fork_trial(
+            &run_dir,
+            "trial_1",
+            "checkpoint:cp1",
+            &BTreeMap::new(),
+            false,
+        )
+        .expect("fork should succeed");
+        assert_eq!(result.fallback_mode, "input_only");
+        assert_eq!(result.source_checkpoint, None);
+
+        let manifest = load_json_file(&result.fork_dir.join("manifest.json")).expect("manifest");
+        assert_eq!(
+            manifest
+                .pointer("/fallback_mode")
+                .and_then(|v| v.as_str())
+                .unwrap_or(""),
+            "input_only"
+        );
+        assert!(manifest.pointer("/source_checkpoint").is_some());
+    }
+
+    #[test]
+    fn fork_trial_strict_requires_sdk_full_integration_level() {
+        let (_root, run_dir) = create_run_dir("agentlab_fork_strict_level", "run_1");
+        write_resolved_experiment(&run_dir, "cli_events", true);
+        seed_parent_trial(
+            &run_dir,
+            "trial_1",
+            json!([{"path": "/state/cp1", "logical_name": "cp1", "step": 1}]),
+            "completed",
+            None,
+        );
+
+        let err = fork_trial(
+            &run_dir,
+            "trial_1",
+            "checkpoint:cp1",
+            &BTreeMap::new(),
+            true,
+        )
+        .err()
+        .expect("strict fork should fail for non-sdk_full");
+        assert!(
+            err.to_string().contains("strict fork requires integration_level sdk_full"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn fork_trial_strict_fails_when_selected_checkpoint_is_unavailable() {
+        let (_root, run_dir) = create_run_dir("agentlab_fork_strict_checkpoint", "run_1");
+        write_resolved_experiment(&run_dir, "sdk_full", true);
+        seed_parent_trial(
+            &run_dir,
+            "trial_1",
+            json!([{"path": "/state/cp_missing", "logical_name": "cp1", "step": 1}]),
+            "completed",
+            None,
+        );
+
+        let err = fork_trial(
+            &run_dir,
+            "trial_1",
+            "checkpoint:cp1",
+            &BTreeMap::new(),
+            true,
+        )
+        .err()
+        .expect("strict fork should fail when checkpoint bytes are unavailable");
+        assert!(
+            err.to_string().contains("strict_source_unavailable"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn pause_run_rejects_target_trial_that_is_not_active() {
+        let (_root, run_dir) = create_run_dir("agentlab_pause_not_active", "run_1");
+        write_resolved_experiment(&run_dir, "cli_events", true);
+        let trial_dir = seed_parent_trial(&run_dir, "trial_1", json!([]), "running", None);
+        let control_path = trial_dir.join("state").join("lab_control.json");
+        write_control_file(&control_path).expect("control file");
+        write_run_control(
+            &run_dir,
+            "run_1",
+            "running",
+            Some("trial_1"),
+            Some(&control_path),
+        )
+        .expect("run control");
+
+        let err = pause_run(&run_dir, Some("trial_2"), Some("pause"), 1)
+            .err()
+            .expect("pause should reject non-active target");
+        assert!(
+            err.to_string().contains("pause_target_not_active"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn pause_run_requires_events_path_for_supported_integration_levels() {
+        let (_root, run_dir) = create_run_dir("agentlab_pause_events_required", "run_1");
+        write_resolved_experiment(&run_dir, "cli_events", false);
+        let trial_dir = seed_parent_trial(&run_dir, "trial_1", json!([]), "running", None);
+        let control_path = trial_dir.join("state").join("lab_control.json");
+        write_control_file(&control_path).expect("control file");
+        write_run_control(
+            &run_dir,
+            "run_1",
+            "running",
+            Some("trial_1"),
+            Some(&control_path),
+        )
+        .expect("run control");
+
+        let err = pause_run(&run_dir, None, Some("pause"), 1)
+            .err()
+            .expect("pause should fail when events path is missing");
+        assert!(
+            err.to_string().contains("pause_requires_events_path"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn pause_run_completes_checkpoint_then_stop_and_updates_state() {
+        let (_root, run_dir) = create_run_dir("agentlab_pause_success", "run_1");
+        write_resolved_experiment(&run_dir, "cli_events", true);
+        let trial_dir = seed_parent_trial(&run_dir, "trial_1", json!([]), "running", None);
+        let control_path = trial_dir.join("state").join("lab_control.json");
+        let events_path = trial_dir.join("state").join("harness_events.jsonl");
+        write_control_file(&control_path).expect("control file");
+        write_run_control(
+            &run_dir,
+            "run_1",
+            "running",
+            Some("trial_1"),
+            Some(&control_path),
+        )
+        .expect("run control");
+
+        let ack_thread = spawn_pause_ack_writer(control_path.clone(), events_path);
+        let paused = pause_run(&run_dir, None, Some("manual_pause"), 2).expect("pause success");
+        ack_thread.join().expect("ack writer thread");
+
+        assert_eq!(paused.run_id, "run_1");
+        assert_eq!(paused.trial_id, "trial_1");
+        assert_eq!(paused.label, "manual_pause");
+        assert!(paused.checkpoint_acked);
+        assert!(paused.stop_acked);
+
+        let run_control = load_json_file(&run_control_path(&run_dir)).expect("run control");
+        assert_eq!(
+            run_control
+                .pointer("/status")
+                .and_then(|v| v.as_str())
+                .unwrap_or(""),
+            "paused"
+        );
+        assert_eq!(
+            run_control
+                .pointer("/active_trial_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or(""),
+            "trial_1"
+        );
+
+        let trial_state = load_json_file(&trial_dir.join("trial_state.json")).expect("trial state");
+        assert_eq!(
+            trial_state
+                .pointer("/status")
+                .and_then(|v| v.as_str())
+                .unwrap_or(""),
+            "paused"
+        );
+        assert_eq!(
+            trial_state
+                .pointer("/pause_label")
+                .and_then(|v| v.as_str())
+                .unwrap_or(""),
+            "manual_pause"
+        );
+        assert_eq!(
+            trial_state
+                .pointer("/checkpoint_selected")
+                .and_then(|v| v.as_str())
+                .unwrap_or(""),
+            "manual_pause"
+        );
+        assert_eq!(
+            trial_state
+                .pointer("/exit_reason")
+                .and_then(|v| v.as_str())
+                .unwrap_or(""),
+            "paused_by_user"
+        );
+    }
+
+    #[test]
+    fn resume_run_requires_run_to_be_paused() {
+        let (_root, run_dir) = create_run_dir("agentlab_resume_not_paused", "run_1");
+        write_resolved_experiment(&run_dir, "sdk_full", true);
+        let trial_dir = seed_parent_trial(
+            &run_dir,
+            "trial_1",
+            json!([{"path": "/state/cp1", "logical_name": "cp1", "step": 1}]),
+            "paused",
+            Some("cp1"),
+        );
+        ensure_dir(&trial_dir.join("state").join("cp1")).expect("checkpoint path");
+        write_run_control(&run_dir, "run_1", "running", Some("trial_1"), None).expect("run control");
+
+        let err = resume_run(&run_dir, None, None, &BTreeMap::new(), false)
+            .err()
+            .expect("resume should fail for non-paused run");
+        assert!(
+            err.to_string().contains("resume_non_paused"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn resume_run_requires_trial_state_to_be_paused() {
+        let (_root, run_dir) = create_run_dir("agentlab_resume_trial_state", "run_1");
+        write_resolved_experiment(&run_dir, "sdk_full", true);
+        let trial_dir = seed_parent_trial(
+            &run_dir,
+            "trial_1",
+            json!([{"path": "/state/cp1", "logical_name": "cp1", "step": 1}]),
+            "completed",
+            None,
+        );
+        ensure_dir(&trial_dir.join("state").join("cp1")).expect("checkpoint path");
+        write_run_control(&run_dir, "run_1", "paused", Some("trial_1"), None).expect("run control");
+
+        let err = resume_run(&run_dir, None, None, &BTreeMap::new(), false)
+            .err()
+            .expect("resume should fail when trial state is not paused");
+        assert!(
+            err.to_string().contains("resume_trial_not_paused"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn resume_run_uses_pause_label_and_forks_with_binding_overrides() {
+        let (_root, run_dir) = create_run_dir("agentlab_resume_success", "run_1");
+        write_resolved_experiment(&run_dir, "sdk_full", true);
+        let trial_dir = seed_parent_trial(
+            &run_dir,
+            "trial_1",
+            json!([
+                {"path": "/state/cp_old", "logical_name": "cp_old", "step": 1},
+                {"path": "/state/cp_resume", "logical_name": "cp_resume", "step": 2}
+            ]),
+            "paused",
+            Some("cp_resume"),
+        );
+        ensure_dir(&trial_dir.join("state").join("cp_resume")).expect("checkpoint path");
+        write_run_control(&run_dir, "run_1", "paused", Some("trial_1"), None).expect("run control");
+
+        let mut set_bindings = BTreeMap::new();
+        set_bindings.insert("resume.override".to_string(), json!(42));
+        let resumed = resume_run(&run_dir, None, None, &set_bindings, false).expect("resume success");
+
+        assert_eq!(resumed.trial_id, "trial_1");
+        assert_eq!(resumed.selector, "checkpoint:cp_resume");
+        assert_eq!(resumed.fork.parent_trial_id, "trial_1");
+        assert_eq!(resumed.fork.fallback_mode, "checkpoint");
+        assert!(resumed.fork.source_checkpoint.is_some());
+
+        let fork_input = load_json_file(&resumed.fork.fork_dir.join("trial_1").join("trial_input.json"))
+            .expect("fork trial input");
+        assert_eq!(
+            fork_input
+                .pointer("/bindings/resume/override")
+                .and_then(|v| v.as_i64())
+                .unwrap_or_default(),
+            42
+        );
+        assert_eq!(
+            fork_input
+                .pointer("/ext/fork/selector")
+                .and_then(|v| v.as_str())
+                .unwrap_or(""),
+            "checkpoint:cp_resume"
+        );
     }
 
     #[test]

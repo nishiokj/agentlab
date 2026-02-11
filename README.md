@@ -87,7 +87,7 @@ cd sdk && npm install && npm run build
 ### Build an experiment
 
 ```ts
-import { ExperimentBuilder, LabClient } from '@agentlab/sdk';
+import { ExperimentBuilder, LabClient, Metric } from '@agentlab/sdk';
 import { writeFileSync, mkdirSync } from 'node:fs';
 
 const builder = ExperimentBuilder.create('prompt_ab', 'Prompt A/B Test')
@@ -125,9 +125,34 @@ const builder = ExperimentBuilder.create('prompt_ab', 'Prompt A/B Test')
   .baseline('control', { model: 'gpt-4o', temperature: 0.0 })
   .addVariant('treatment', { model: 'gpt-4o', temperature: 0.7 })
 
-  // --- analysis ---
-  .primaryMetrics(['success', 'accuracy'])
-  .secondaryMetrics(['latency_ms', 'cost_usd'])
+  // --- metrics ---
+  // Each metric declares exactly where it comes from.
+  //
+  // Runner auto-metrics (always tracked):
+  .metric(Metric.DURATION_MS)
+  //
+  // Event-derived (auto-computed from harness hook events):
+  .metric(Metric.TOKENS_IN)
+  .metric(Metric.TOKENS_OUT)
+  //
+  // Output-derived (extracted from trial_output.json):
+  .metric(Metric.fromOutput('success', '/outcome', {
+    primary: true, weight: 1.0, direction: 'maximize',
+  }))
+  .metric(Metric.fromOutput('accuracy', '/metrics/accuracy', {
+    primary: true, weight: 1.0, direction: 'maximize',
+  }))
+  .metric(Metric.fromOutput('latency_ms', '/metrics/latency_ms', {
+    direction: 'minimize',
+  }))
+  .metric(Metric.fromOutput('cost_usd', '/metrics/cost_usd', {
+    direction: 'minimize',
+  }))
+  //
+  // Artifact-derived (computed from workspace changes):
+  .artifacts({ collect: ['**/*.py', 'output/**'], diff: true })
+  .metric(Metric.FILES_MODIFIED)
+  .metric(Metric.DIFF_LINES)
 
   // --- isolation ---
   // 'none': no network (default, strictest)

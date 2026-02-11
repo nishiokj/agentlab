@@ -1,8 +1,8 @@
 import assert from 'node:assert/strict';
 import test, { describe } from 'node:test';
 
-import { ExperimentBuilder } from '../src/experiment-builder.js';
-import type { ExperimentSpec } from '../src/experiment-builder.js';
+import { ExperimentBuilder, Metric } from '../src/experiment-builder.js';
+import type { ExperimentSpec, MetricDef } from '../src/experiment-builder.js';
 
 // Helper: create a fully configured builder that passes build() validation
 function validBuilder(): ExperimentBuilder {
@@ -46,14 +46,8 @@ describe('ExperimentBuilder structural defaults', () => {
     assert.equal(spec.design.max_concurrency, 1);
   });
 
-  test('default analysis plan has primary and secondary metrics', () => {
-    assert.deepEqual(spec.analysis_plan.primary_metrics, ['success']);
-    assert.deepEqual(spec.analysis_plan.secondary_metrics, ['latency_ms']);
-  });
-
-  test('default tests are generated for all metrics', () => {
-    assert.ok('success' in spec.analysis_plan.tests);
-    assert.ok('latency_ms' in spec.analysis_plan.tests);
+  test('default metrics is empty array', () => {
+    assert.deepEqual(spec.metrics, []);
   });
 
   test('default baseline', () => {
@@ -151,6 +145,287 @@ describe('ExperimentBuilder build() validation', () => {
       () => ExperimentBuilder.create('e', 'n').toYaml(),
       (err: Error) => err.message.includes('required fields not set'),
     );
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Metric class — predefined constants
+// ---------------------------------------------------------------------------
+describe('Metric predefined constants', () => {
+  test('runner auto-metrics have source "runner"', () => {
+    assert.equal(Metric.DURATION_MS.source, 'runner');
+    assert.equal(Metric.DURATION_MS.id, 'duration_ms');
+    assert.equal(Metric.EXIT_CODE.source, 'runner');
+    assert.equal(Metric.EXIT_CODE.id, 'exit_code');
+  });
+
+  test('event auto-metrics have source "events" with aggregation', () => {
+    assert.equal(Metric.TOKENS_IN.source, 'events');
+    assert.equal(Metric.TOKENS_IN.event_type, 'model_call_end');
+    assert.equal(Metric.TOKENS_IN.event_field, 'usage.tokens_in');
+    assert.equal(Metric.TOKENS_IN.aggregate, 'sum');
+
+    assert.equal(Metric.STEP_COUNT.source, 'events');
+    assert.equal(Metric.STEP_COUNT.event_type, 'agent_step_start');
+    assert.equal(Metric.STEP_COUNT.aggregate, 'count');
+
+    assert.equal(Metric.TOOL_CALL_COUNT.source, 'events');
+    assert.equal(Metric.TOOL_CALL_COUNT.event_type, 'tool_call_end');
+    assert.equal(Metric.TOOL_CALL_COUNT.aggregate, 'count');
+  });
+
+  test('all predefined metrics default to weight 0 and primary false', () => {
+    const predefined: MetricDef[] = [
+      Metric.DURATION_MS, Metric.EXIT_CODE,
+      Metric.TOKENS_IN, Metric.TOKENS_OUT,
+      Metric.STEP_COUNT, Metric.TURN_COUNT, Metric.TOOL_CALL_COUNT,
+      Metric.FILES_CREATED, Metric.FILES_MODIFIED,
+      Metric.DIFF_BYTES, Metric.DIFF_LINES,
+    ];
+    for (const m of predefined) {
+      assert.equal(m.weight, 0, `${m.id} weight`);
+      assert.equal(m.primary, false, `${m.id} primary`);
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Metric.fromOutput()
+// ---------------------------------------------------------------------------
+describe('Metric.fromOutput()', () => {
+  test('creates output metric with defaults', () => {
+    const m = Metric.fromOutput('accuracy', '/metrics/accuracy');
+    assert.equal(m.id, 'accuracy');
+    assert.equal(m.source, 'output');
+    assert.equal(m.json_pointer, '/metrics/accuracy');
+    assert.equal(m.weight, 0);
+    assert.equal(m.primary, false);
+    assert.equal(m.direction, undefined);
+  });
+
+  test('creates output metric with all options', () => {
+    const m = Metric.fromOutput('success', '/outcome', {
+      weight: 1.0,
+      direction: 'maximize',
+      primary: true,
+    });
+    assert.equal(m.id, 'success');
+    assert.equal(m.json_pointer, '/outcome');
+    assert.equal(m.weight, 1.0);
+    assert.equal(m.direction, 'maximize');
+    assert.equal(m.primary, true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Metric.fromEvents()
+// ---------------------------------------------------------------------------
+describe('Metric.fromEvents()', () => {
+  test('creates event metric with count aggregate', () => {
+    const m = Metric.fromEvents('error_count', {
+      eventType: 'error',
+      aggregate: 'count',
+    });
+    assert.equal(m.id, 'error_count');
+    assert.equal(m.source, 'events');
+    assert.equal(m.event_type, 'error');
+    assert.equal(m.aggregate, 'count');
+    assert.equal(m.event_field, undefined);
+    assert.equal(m.weight, 0);
+    assert.equal(m.primary, false);
+  });
+
+  test('creates event metric with field aggregation', () => {
+    const m = Metric.fromEvents('avg_model_latency', {
+      eventType: 'model_call_end',
+      eventField: 'timing.duration_ms',
+      aggregate: 'mean',
+      direction: 'minimize',
+      primary: true,
+    });
+    assert.equal(m.event_field, 'timing.duration_ms');
+    assert.equal(m.aggregate, 'mean');
+    assert.equal(m.direction, 'minimize');
+    assert.equal(m.primary, true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Metric artifact constants
+// ---------------------------------------------------------------------------
+describe('Metric artifact constants', () => {
+  test('artifact auto-metrics have source "artifacts"', () => {
+    assert.equal(Metric.FILES_CREATED.source, 'artifacts');
+    assert.equal(Metric.FILES_CREATED.id, 'files_created');
+    assert.equal(Metric.FILES_CREATED.artifact_measure, 'file_count');
+
+    assert.equal(Metric.FILES_MODIFIED.source, 'artifacts');
+    assert.equal(Metric.FILES_MODIFIED.id, 'files_modified');
+    assert.equal(Metric.FILES_MODIFIED.artifact_measure, 'file_count');
+
+    assert.equal(Metric.DIFF_BYTES.source, 'artifacts');
+    assert.equal(Metric.DIFF_BYTES.id, 'diff_bytes');
+    assert.equal(Metric.DIFF_BYTES.artifact_measure, 'diff_bytes');
+
+    assert.equal(Metric.DIFF_LINES.source, 'artifacts');
+    assert.equal(Metric.DIFF_LINES.id, 'diff_lines');
+    assert.equal(Metric.DIFF_LINES.artifact_measure, 'diff_lines');
+  });
+
+  test('all artifact metrics default to weight 0 and primary false', () => {
+    const artifactMetrics: MetricDef[] = [
+      Metric.FILES_CREATED, Metric.FILES_MODIFIED,
+      Metric.DIFF_BYTES, Metric.DIFF_LINES,
+    ];
+    for (const m of artifactMetrics) {
+      assert.equal(m.weight, 0, `${m.id} weight`);
+      assert.equal(m.primary, false, `${m.id} primary`);
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Metric.fromArtifacts()
+// ---------------------------------------------------------------------------
+describe('Metric.fromArtifacts()', () => {
+  test('creates artifact metric with defaults', () => {
+    const m = Metric.fromArtifacts('patch_size', { measure: 'diff_bytes' });
+    assert.equal(m.id, 'patch_size');
+    assert.equal(m.source, 'artifacts');
+    assert.equal(m.artifact_measure, 'diff_bytes');
+    assert.equal(m.artifact_glob, undefined);
+    assert.equal(m.weight, 0);
+    assert.equal(m.primary, false);
+    assert.equal(m.direction, undefined);
+  });
+
+  test('creates artifact metric with glob filter and all options', () => {
+    const m = Metric.fromArtifacts('py_files_changed', {
+      measure: 'file_count',
+      glob: '**/*.py',
+      weight: 0.5,
+      direction: 'minimize',
+      primary: true,
+    });
+    assert.equal(m.id, 'py_files_changed');
+    assert.equal(m.source, 'artifacts');
+    assert.equal(m.artifact_measure, 'file_count');
+    assert.equal(m.artifact_glob, '**/*.py');
+    assert.equal(m.weight, 0.5);
+    assert.equal(m.direction, 'minimize');
+    assert.equal(m.primary, true);
+  });
+
+  test('supports total_bytes measure', () => {
+    const m = Metric.fromArtifacts('output_size', { measure: 'total_bytes' });
+    assert.equal(m.artifact_measure, 'total_bytes');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// ExperimentBuilder.artifacts()
+// ---------------------------------------------------------------------------
+describe('ExperimentBuilder.artifacts()', () => {
+  test('sets artifact collection config', () => {
+    const spec = validBuilder()
+      .artifacts({ collect: ['**/*.py', 'output/**'], diff: true })
+      .build();
+    assert.ok(spec.artifacts);
+    assert.deepEqual(spec.artifacts.collect, ['**/*.py', 'output/**']);
+    assert.equal(spec.artifacts.diff, true);
+    assert.equal(spec.artifacts.base_dir, undefined);
+  });
+
+  test('diff defaults to false', () => {
+    const spec = validBuilder()
+      .artifacts({ collect: ['*.txt'] })
+      .build();
+    assert.ok(spec.artifacts);
+    assert.equal(spec.artifacts.diff, false);
+  });
+
+  test('sets base_dir', () => {
+    const spec = validBuilder()
+      .artifacts({ collect: ['**/*'], diff: true, baseDir: 'workspace/src' })
+      .build();
+    assert.ok(spec.artifacts);
+    assert.equal(spec.artifacts.base_dir, 'workspace/src');
+  });
+
+  test('copies the collect array', () => {
+    const globs = ['*.py'];
+    const spec = validBuilder().artifacts({ collect: globs }).build();
+    globs.push('*.js');
+    assert.deepEqual(spec.artifacts!.collect, ['*.py']);
+  });
+
+  test('returns this for chaining', () => {
+    const builder = validBuilder();
+    assert.equal(builder.artifacts({ collect: ['*'] }), builder);
+  });
+
+  test('artifacts survive build() deep copy', () => {
+    const builder = validBuilder().artifacts({ collect: ['*.py'], diff: true });
+    const spec1 = builder.build();
+    const spec2 = builder.build();
+    assert.notEqual(spec1.artifacts, spec2.artifacts);
+    spec1.artifacts!.collect.push('*.js');
+    assert.deepEqual(spec2.artifacts!.collect, ['*.py']);
+  });
+
+  test('spec has no artifacts section by default', () => {
+    const spec = validBuilder().build();
+    assert.equal(spec.artifacts, undefined);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// ExperimentBuilder.metric()
+// ---------------------------------------------------------------------------
+describe('ExperimentBuilder.metric()', () => {
+  test('adds metrics to spec', () => {
+    const spec = validBuilder()
+      .metric(Metric.DURATION_MS)
+      .metric(Metric.fromOutput('success', '/outcome', { primary: true, weight: 1.0 }))
+      .build();
+    assert.equal(spec.metrics.length, 2);
+    assert.equal(spec.metrics[0].id, 'duration_ms');
+    assert.equal(spec.metrics[1].id, 'success');
+    assert.equal(spec.metrics[1].weight, 1.0);
+    assert.equal(spec.metrics[1].primary, true);
+  });
+
+  test('replaces metric with same id', () => {
+    const spec = validBuilder()
+      .metric(Metric.TOKENS_IN)
+      .metric({ ...Metric.TOKENS_IN, primary: true, weight: 0.5 })
+      .build();
+    assert.equal(spec.metrics.length, 1);
+    assert.equal(spec.metrics[0].id, 'tokens_in');
+    assert.equal(spec.metrics[0].primary, true);
+    assert.equal(spec.metrics[0].weight, 0.5);
+  });
+
+  test('copies the metric def (mutation-safe)', () => {
+    const def = Metric.fromOutput('x', '/x');
+    const spec = validBuilder().metric(def).build();
+    (def as { weight: number }).weight = 999;
+    assert.equal(spec.metrics[0].weight, 0);
+  });
+
+  test('returns this for chaining', () => {
+    const builder = validBuilder();
+    assert.equal(builder.metric(Metric.DURATION_MS), builder);
+  });
+
+  test('metrics survive build() deep copy', () => {
+    const builder = validBuilder()
+      .metric(Metric.fromOutput('a', '/a', { weight: 1.0 }));
+    const spec1 = builder.build();
+    const spec2 = builder.build();
+    assert.notEqual(spec1.metrics, spec2.metrics);
+    spec1.metrics[0].weight = 999;
+    assert.equal(spec2.metrics[0].weight, 1.0);
   });
 });
 
@@ -280,37 +555,6 @@ describe('ExperimentBuilder fluent API', () => {
     assert.equal(spec.design.max_concurrency, 4);
   });
 
-  test('primaryMetrics() regenerates tests', () => {
-    const spec = validBuilder()
-      .primaryMetrics(['accuracy', 'f1'])
-      .build();
-    assert.deepEqual(spec.analysis_plan.primary_metrics, ['accuracy', 'f1']);
-    assert.ok('accuracy' in spec.analysis_plan.tests);
-    assert.ok('f1' in spec.analysis_plan.tests);
-    // secondary still present in tests
-    assert.ok('latency_ms' in spec.analysis_plan.tests);
-  });
-
-  test('secondaryMetrics() regenerates tests', () => {
-    const spec = validBuilder()
-      .secondaryMetrics(['cost', 'tokens'])
-      .build();
-    assert.deepEqual(spec.analysis_plan.secondary_metrics, ['cost', 'tokens']);
-    assert.ok('cost' in spec.analysis_plan.tests);
-    assert.ok('tokens' in spec.analysis_plan.tests);
-    // primary still present
-    assert.ok('success' in spec.analysis_plan.tests);
-  });
-
-  test('duplicate metrics are deduplicated in tests', () => {
-    const spec = validBuilder()
-      .primaryMetrics(['shared'])
-      .secondaryMetrics(['shared'])
-      .build();
-    assert.ok('shared' in spec.analysis_plan.tests);
-    assert.equal(Object.keys(spec.analysis_plan.tests).length, 1);
-  });
-
   test('networkMode() with allowlist', () => {
     const spec = validBuilder()
       .networkMode('allowlist_enforced', ['api.openai.com'])
@@ -368,8 +612,8 @@ describe('ExperimentBuilder chaining', () => {
     assert.equal(builder.sanitizationProfile('p'), builder);
     assert.equal(builder.randomSeed(1), builder);
     assert.equal(builder.maxConcurrency(1), builder);
-    assert.equal(builder.primaryMetrics([]), builder);
-    assert.equal(builder.secondaryMetrics([]), builder);
+    assert.equal(builder.metric(Metric.DURATION_MS), builder);
+    assert.equal(builder.artifacts({ collect: ['*'] }), builder);
     assert.equal(builder.networkMode('none'), builder);
     assert.equal(builder.sandboxImage('x'), builder);
     assert.equal(builder.localSandbox(), builder);
@@ -428,6 +672,30 @@ describe('ExperimentBuilder toYaml()', () => {
     assert.ok(yaml.includes('v1'));
     assert.ok(yaml.includes('0.7'));
   });
+
+  test('YAML contains metric definitions', () => {
+    const yaml = validBuilder()
+      .metric(Metric.TOKENS_IN)
+      .metric(Metric.fromOutput('success', '/outcome', { primary: true, weight: 1.0 }))
+      .toYaml();
+    assert.ok(yaml.includes('tokens_in'));
+    assert.ok(yaml.includes('model_call_end'));
+    assert.ok(yaml.includes('success'));
+    assert.ok(yaml.includes('/outcome'));
+  });
+
+  test('YAML contains artifact config and metrics', () => {
+    const yaml = validBuilder()
+      .artifacts({ collect: ['**/*.py'], diff: true })
+      .metric(Metric.FILES_MODIFIED)
+      .metric(Metric.fromArtifacts('patch', { measure: 'diff_bytes', glob: '**/*.py' }))
+      .toYaml();
+    assert.ok(yaml.includes('artifacts:'));
+    assert.ok(yaml.includes('**/*.py'));
+    assert.ok(yaml.includes('diff: true'));
+    assert.ok(yaml.includes('files_modified'));
+    assert.ok(yaml.includes('diff_bytes'));
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -454,8 +722,23 @@ describe('ExperimentBuilder complex composition', () => {
       .sanitizationProfile('hermetic_functional_v2')
       .randomSeed(1337)
       .maxConcurrency(8)
-      .primaryMetrics(['resolved', 'applied'])
-      .secondaryMetrics(['cost_usd', 'duration_s'])
+      .metric(Metric.DURATION_MS)
+      .metric(Metric.TOKENS_IN)
+      .metric(Metric.TOKENS_OUT)
+      .metric(Metric.fromOutput('resolved', '/metrics/resolved', {
+        primary: true, weight: 1.0, direction: 'maximize',
+      }))
+      .metric(Metric.fromOutput('applied', '/metrics/applied', {
+        primary: true, weight: 1.0, direction: 'maximize',
+      }))
+      .metric(Metric.fromOutput('cost_usd', '/metrics/cost_usd', { direction: 'minimize' }))
+      .metric(Metric.fromOutput('duration_s', '/metrics/duration_s', { direction: 'minimize' }))
+      .metric(Metric.FILES_MODIFIED)
+      .metric(Metric.DIFF_LINES)
+      .metric(Metric.fromArtifacts('py_patch_size', {
+        measure: 'diff_bytes', glob: '**/*.py', direction: 'minimize',
+      }))
+      .artifacts({ collect: ['**/*.py', 'output/**'], diff: true })
       .networkMode('allowlist_enforced', ['api.openai.com', 'api.anthropic.com'])
       .sandboxImage('python:3.11-slim')
       .build();
@@ -473,10 +756,27 @@ describe('ExperimentBuilder complex composition', () => {
     assert.equal(spec.design.max_concurrency, 8);
     assert.equal(spec.design.sanitization_profile, 'hermetic_functional_v2');
     assert.equal(spec.design.random_seed, 1337);
-    assert.deepEqual(spec.analysis_plan.primary_metrics, ['resolved', 'applied']);
+
+    // 10 metrics: duration_ms, tokens_in, tokens_out, resolved, applied, cost_usd, duration_s,
+    //             files_modified, diff_lines, py_patch_size
+    assert.equal(spec.metrics.length, 10);
+    const primary = spec.metrics.filter((m) => m.primary);
+    assert.equal(primary.length, 2);
+    assert.deepEqual(primary.map((m) => m.id).sort(), ['applied', 'resolved']);
+
+    const weighted = spec.metrics.filter((m) => m.weight > 0);
+    assert.equal(weighted.length, 2);
+
+    const artifactMetrics = spec.metrics.filter((m) => m.source === 'artifacts');
+    assert.equal(artifactMetrics.length, 3);
+    assert.deepEqual(artifactMetrics.map((m) => m.id).sort(), ['diff_lines', 'files_modified', 'py_patch_size']);
+
+    // Artifacts config
+    assert.ok(spec.artifacts);
+    assert.deepEqual(spec.artifacts.collect, ['**/*.py', 'output/**']);
+    assert.equal(spec.artifacts.diff, true);
+
     assert.equal(spec.runtime.network.mode, 'allowlist_enforced');
     assert.equal(spec.runtime.sandbox.image, 'python:3.11-slim');
-    // 4 unique metrics in tests
-    assert.equal(Object.keys(spec.analysis_plan.tests).length, 4);
   });
 });

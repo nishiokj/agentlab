@@ -16,6 +16,163 @@ export interface HarnessCliOptions {
   outputPath?: string;
 }
 
+// ---------------------------------------------------------------------------
+// Metrics
+// ---------------------------------------------------------------------------
+
+export type MetricSource = 'runner' | 'events' | 'output' | 'artifacts';
+export type ArtifactMeasure = 'file_count' | 'diff_bytes' | 'diff_lines' | 'total_bytes';
+export type MetricAggregate = 'sum' | 'count' | 'max' | 'min' | 'mean' | 'last';
+
+export interface MetricDef {
+  id: string;
+  source: MetricSource;
+  /** For source: 'output' — JSON pointer into trial_output.json */
+  json_pointer?: string;
+  /** For source: 'events' — which hook event type to aggregate */
+  event_type?: string;
+  /** For source: 'events' — dot-path to the numeric field within the event */
+  event_field?: string;
+  /** For source: 'events' — how to aggregate across events in a trial */
+  aggregate?: MetricAggregate;
+  /** For source: 'artifacts' — what to measure from collected artifacts */
+  artifact_measure?: ArtifactMeasure;
+  /** For source: 'artifacts' — optional glob filter for the measurement */
+  artifact_glob?: string;
+  /** 0 = observe only (default). > 0 = contributes to composite score. */
+  weight: number;
+  /** Whether higher or lower is better. */
+  direction?: 'maximize' | 'minimize';
+  /** Primary metrics are highlighted in analysis summaries. */
+  primary: boolean;
+}
+
+/**
+ * Factory for metric definitions. Predefined constants for runner/event
+ * auto-metrics, plus helpers for output-derived and custom event metrics.
+ */
+export class Metric {
+  // -- Runner auto-metrics (always tracked, no harness involvement) ----------
+
+  static readonly DURATION_MS: MetricDef = {
+    id: 'duration_ms', source: 'runner', weight: 0, primary: false,
+  };
+  static readonly EXIT_CODE: MetricDef = {
+    id: 'exit_code', source: 'runner', weight: 0, primary: false,
+  };
+
+  // -- Event auto-metrics (tracked when integrationLevel >= cli_events) ------
+
+  static readonly TOKENS_IN: MetricDef = {
+    id: 'tokens_in', source: 'events',
+    event_type: 'model_call_end', event_field: 'usage.tokens_in', aggregate: 'sum',
+    weight: 0, primary: false,
+  };
+  static readonly TOKENS_OUT: MetricDef = {
+    id: 'tokens_out', source: 'events',
+    event_type: 'model_call_end', event_field: 'usage.tokens_out', aggregate: 'sum',
+    weight: 0, primary: false,
+  };
+  static readonly STEP_COUNT: MetricDef = {
+    id: 'step_count', source: 'events',
+    event_type: 'agent_step_start', aggregate: 'count',
+    weight: 0, primary: false,
+  };
+  static readonly TURN_COUNT: MetricDef = {
+    id: 'turn_count', source: 'events',
+    event_type: 'model_call_end', aggregate: 'count',
+    weight: 0, primary: false,
+  };
+  static readonly TOOL_CALL_COUNT: MetricDef = {
+    id: 'tool_call_count', source: 'events',
+    event_type: 'tool_call_end', aggregate: 'count',
+    weight: 0, primary: false,
+  };
+
+  // -- Artifact auto-metrics (tracked when artifacts.diff is enabled) --------
+
+  static readonly FILES_CREATED: MetricDef = {
+    id: 'files_created', source: 'artifacts',
+    artifact_measure: 'file_count', weight: 0, primary: false,
+  };
+  static readonly FILES_MODIFIED: MetricDef = {
+    id: 'files_modified', source: 'artifacts',
+    artifact_measure: 'file_count', weight: 0, primary: false,
+  };
+  static readonly DIFF_BYTES: MetricDef = {
+    id: 'diff_bytes', source: 'artifacts',
+    artifact_measure: 'diff_bytes', weight: 0, primary: false,
+  };
+  static readonly DIFF_LINES: MetricDef = {
+    id: 'diff_lines', source: 'artifacts',
+    artifact_measure: 'diff_lines', weight: 0, primary: false,
+  };
+
+  // -- Factories -------------------------------------------------------------
+
+  /** Metric extracted from a field in trial_output.json. */
+  static fromOutput(id: string, jsonPointer: string, options?: {
+    weight?: number;
+    direction?: 'maximize' | 'minimize';
+    primary?: boolean;
+  }): MetricDef {
+    return {
+      id,
+      source: 'output',
+      json_pointer: jsonPointer,
+      weight: options?.weight ?? 0,
+      direction: options?.direction,
+      primary: options?.primary ?? false,
+    };
+  }
+
+  /** Metric computed by aggregating a field across hook events in a trial. */
+  static fromEvents(id: string, options: {
+    eventType: string;
+    eventField?: string;
+    aggregate: MetricAggregate;
+    weight?: number;
+    direction?: 'maximize' | 'minimize';
+    primary?: boolean;
+  }): MetricDef {
+    return {
+      id,
+      source: 'events',
+      event_type: options.eventType,
+      event_field: options.eventField,
+      aggregate: options.aggregate,
+      weight: options?.weight ?? 0,
+      direction: options?.direction,
+      primary: options?.primary ?? false,
+    };
+  }
+
+  /** Metric computed from workspace artifacts collected after a trial. */
+  static fromArtifacts(id: string, options: {
+    measure: ArtifactMeasure;
+    glob?: string;
+    weight?: number;
+    direction?: 'maximize' | 'minimize';
+    primary?: boolean;
+  }): MetricDef {
+    return {
+      id,
+      source: 'artifacts',
+      artifact_measure: options.measure,
+      artifact_glob: options.glob,
+      weight: options?.weight ?? 0,
+      direction: options?.direction,
+      primary: options?.primary ?? false,
+    };
+  }
+
+  private constructor() {} // no instances
+}
+
+// ---------------------------------------------------------------------------
+// ExperimentSpec
+// ---------------------------------------------------------------------------
+
 export interface ExperimentSpec {
   version: '0.3';
   experiment: {
@@ -41,21 +198,14 @@ export interface ExperimentSpec {
     shuffle_tasks: boolean;
     max_concurrency: number;
   };
-  analysis_plan: {
-    primary_metrics: string[];
-    secondary_metrics: string[];
-    missingness: {
-      policy: string;
-      record_reasons: boolean;
-    };
-    tests: Record<string, unknown>;
-    multiple_comparisons: {
-      method: string;
-    };
-    reporting: {
-      effect_sizes: string[];
-      show_task_level_table: boolean;
-    };
+  metrics: MetricDef[];
+  artifacts?: {
+    /** Glob patterns for files to collect from workspace post-trial */
+    collect: string[];
+    /** Compute workspace diff (pre vs post trial snapshot) */
+    diff: boolean;
+    /** Base directory for collection, relative to workspace root */
+    base_dir?: string;
   };
   baseline: {
     variant_id: string;
@@ -103,14 +253,9 @@ export interface ExperimentSpec {
   };
 }
 
-function defaultTests(primaryMetrics: string[], secondaryMetrics: string[]): Record<string, unknown> {
-  const names = Array.from(new Set([...primaryMetrics, ...secondaryMetrics]));
-  const tests: Record<string, unknown> = {};
-  for (const name of names) {
-    tests[name] = { method: 'paired_bootstrap', ci: 0.95, resamples: 1000 };
-  }
-  return tests;
-}
+// ---------------------------------------------------------------------------
+// Builder
+// ---------------------------------------------------------------------------
 
 export class ExperimentBuilder {
   private readonly spec: ExperimentSpec;
@@ -143,22 +288,7 @@ export class ExperimentBuilder {
         shuffle_tasks: true,
         max_concurrency: 1,
       },
-      analysis_plan: {
-        primary_metrics: ['success'],
-        secondary_metrics: ['latency_ms'],
-        missingness: {
-          policy: 'paired_drop',
-          record_reasons: true,
-        },
-        tests: defaultTests(['success'], ['latency_ms']),
-        multiple_comparisons: {
-          method: 'none',
-        },
-        reporting: {
-          effect_sizes: ['risk_diff', 'median_diff'],
-          show_task_level_table: true,
-        },
-      },
+      metrics: [],
       baseline: {
         variant_id: 'base',
         bindings: {},
@@ -252,15 +382,25 @@ export class ExperimentBuilder {
     return this;
   }
 
-  primaryMetrics(values: string[]): this {
-    this.spec.analysis_plan.primary_metrics = [...values];
-    this.spec.analysis_plan.tests = defaultTests(values, this.spec.analysis_plan.secondary_metrics);
+  /** Add a metric definition. Use Metric.* constants or Metric.fromOutput() / Metric.fromEvents(). */
+  metric(def: MetricDef): this {
+    // Replace existing metric with same id (allows overriding predefined defs)
+    const idx = this.spec.metrics.findIndex((m) => m.id === def.id);
+    if (idx >= 0) {
+      this.spec.metrics[idx] = { ...def };
+    } else {
+      this.spec.metrics.push({ ...def });
+    }
     return this;
   }
 
-  secondaryMetrics(values: string[]): this {
-    this.spec.analysis_plan.secondary_metrics = [...values];
-    this.spec.analysis_plan.tests = defaultTests(this.spec.analysis_plan.primary_metrics, values);
+  /** Configure artifact collection from the workspace after each trial. */
+  artifacts(options: { collect: string[]; diff?: boolean; baseDir?: string }): this {
+    this.spec.artifacts = {
+      collect: [...options.collect],
+      diff: options.diff ?? false,
+      base_dir: options.baseDir,
+    };
     return this;
   }
 

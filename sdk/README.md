@@ -17,7 +17,7 @@ cd sdk && npm install && npm run build && npm test
 ## Quick Start
 
 ```ts
-import { ExperimentBuilder, LabClient } from '@agentlab/sdk';
+import { ExperimentBuilder, LabClient, Metric } from '@agentlab/sdk';
 import { writeFileSync, mkdirSync } from 'node:fs';
 
 // 1. Define the experiment
@@ -51,8 +51,22 @@ const builder = ExperimentBuilder.create('prompt_ab', 'Prompt A/B Test')
   .baseline('control', { model: 'gpt-4o', temperature: 0.0 })
   .addVariant('treatment', { model: 'gpt-4o', temperature: 0.7 })
 
-  .primaryMetrics(['success', 'accuracy'])
-  .secondaryMetrics(['latency_ms', 'cost_usd'])
+  // Metrics — each declares its source explicitly
+  .metric(Metric.DURATION_MS)                                          // runner tracks
+  .metric(Metric.TOKENS_IN)                                            // from events
+  .metric(Metric.TOKENS_OUT)                                           // from events
+  .metric(Metric.fromOutput('success', '/outcome', {                   // from trial_output
+    primary: true, weight: 1.0, direction: 'maximize',
+  }))
+  .metric(Metric.fromOutput('cost_usd', '/metrics/cost_usd', {
+    direction: 'minimize',
+  }))
+
+  // Artifacts — collect workspace output and track changes
+  .artifacts({ collect: ['**/*.py', 'output/**'], diff: true })
+  .metric(Metric.FILES_MODIFIED)                                          // from artifacts
+  .metric(Metric.DIFF_LINES)                                              // from artifacts
+
   .networkMode('allowlist_enforced', ['api.openai.com']);
 
 // 2. Write config to disk
@@ -99,8 +113,8 @@ These must be called before `build()` or `toYaml()`:
 | `.baseline(id, bindings)` | Baseline variant with parameter bindings. Default: `{ variant_id: 'base', bindings: {} }`. |
 | `.addVariant(id, bindings)` | Additional variant. Call multiple times for multiple variants. |
 | `.maxConcurrency(n)` | Parallel trial limit. Default: `1`. |
-| `.primaryMetrics(names)` | Primary success metrics for analysis. |
-| `.secondaryMetrics(names)` | Secondary metrics for analysis. |
+| `.metric(def)` | Add a metric definition. See Metrics below. |
+| `.artifacts(opts)` | Configure workspace artifact collection. See Artifacts below. |
 | `.networkMode(mode, hosts?)` | `'none'` (default), `'full'`, or `'allowlist_enforced'` with allowed hosts. |
 | `.sandboxImage(image)` | Docker image name. Sets sandbox mode to `container`. |
 | `.localSandbox()` | Run without container isolation (default). |
@@ -113,6 +127,83 @@ These must be called before `build()` or `toYaml()`:
 | `.toYaml()` | YAML string of the spec. Validates completeness first. |
 
 All setters return `this` for chaining.
+
+### Metrics
+
+Each metric declares exactly where its value comes from. No magic — if a metric isn't declared, it isn't tracked (except runner auto-metrics which are always collected).
+
+**Four sources:**
+
+| Source | What it means | Example |
+|---|---|---|
+| `runner` | Runner measures this automatically | Wall-clock duration, exit code |
+| `events` | Runner aggregates from harness hook events | Token counts, step counts |
+| `output` | Runner extracts from `trial_output.json` | Accuracy, cost, any field your harness writes |
+| `artifacts` | Runner computes from workspace changes | Files created/modified, diff size |
+
+**Predefined constants** (use directly with `.metric()`):
+
+| Constant | Source | What it tracks |
+|---|---|---|
+| `Metric.DURATION_MS` | runner | Trial wall-clock time |
+| `Metric.EXIT_CODE` | runner | Harness process exit code |
+| `Metric.TOKENS_IN` | events | Sum of input tokens from `model_call_end` events |
+| `Metric.TOKENS_OUT` | events | Sum of output tokens from `model_call_end` events |
+| `Metric.STEP_COUNT` | events | Count of `agent_step_start` events |
+| `Metric.TURN_COUNT` | events | Count of `model_call_end` events |
+| `Metric.TOOL_CALL_COUNT` | events | Count of `tool_call_end` events |
+| `Metric.FILES_CREATED` | artifacts | Number of new files in workspace |
+| `Metric.FILES_MODIFIED` | artifacts | Number of modified files in workspace |
+| `Metric.DIFF_BYTES` | artifacts | Total bytes of workspace diff |
+| `Metric.DIFF_LINES` | artifacts | Total lines of workspace diff |
+
+**Factories** for custom metrics:
+
+```ts
+// Extract a value from trial_output.json by JSON pointer
+Metric.fromOutput('accuracy', '/metrics/accuracy', {
+  primary: true,       // highlighted in analysis summaries
+  weight: 1.0,         // contributes to composite score (0 = observe only)
+  direction: 'maximize',
+})
+
+// Aggregate a field across hook events in a trial
+Metric.fromEvents('avg_model_latency', {
+  eventType: 'model_call_end',
+  eventField: 'timing.duration_ms',
+  aggregate: 'mean',    // sum | count | max | min | mean | last
+  direction: 'minimize',
+})
+
+// Measure workspace artifacts (requires .artifacts() config)
+Metric.fromArtifacts('py_patch_size', {
+  measure: 'diff_bytes',  // file_count | diff_bytes | diff_lines | total_bytes
+  glob: '**/*.py',         // optional — scope to matching files
+  direction: 'minimize',
+})
+```
+
+### Artifacts
+
+Configure artifact collection to capture what your harness writes to the workspace. The runner snapshots the workspace before the trial, then collects matching files and computes diffs after the trial completes.
+
+```ts
+builder
+  .artifacts({
+    collect: ['**/*.py', 'output/**'],  // glob patterns for files to preserve
+    diff: true,                          // compute workspace diff (pre vs post)
+    baseDir: 'workspace/src',            // optional: scope collection to subdirectory
+  })
+  .metric(Metric.FILES_MODIFIED)
+  .metric(Metric.DIFF_LINES)
+  .metric(Metric.fromArtifacts('py_changes', {
+    measure: 'diff_bytes',
+    glob: '**/*.py',
+    direction: 'minimize',
+  }))
+```
+
+Collected artifacts and diffs are stored in each trial's directory under the run artifacts.
 
 ## LabClient
 
@@ -218,11 +309,15 @@ try {
 ```ts
 // Classes
 export { LabClient, LabRunnerError } from '@agentlab/sdk';
-export { ExperimentBuilder } from '@agentlab/sdk';
+export { ExperimentBuilder, Metric } from '@agentlab/sdk';
 
 // Types
 export type {
   ExperimentSpec,
+  MetricDef,
+  MetricSource,
+  MetricAggregate,
+  ArtifactMeasure,
   DatasetJsonlOptions,
   HarnessCliOptions,
   LabClientOptions,
