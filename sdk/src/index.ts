@@ -1,9 +1,13 @@
 export { LabClient, LabRunnerError } from './client.js';
-export { ExperimentBuilder } from './experiment-builder.js';
+export { ExperimentBuilder, Metric } from './experiment-builder.js';
 
 export type {
+  AnalysisComparisons,
+  AnalysisSummary,
+  ComparisonEntry,
   DescribeArgs,
   DescribeResponse,
+  EventCounts,
   ExperimentSummary,
   ForkArgs,
   ForkResponse,
@@ -18,6 +22,8 @@ export type {
   PauseResult,
   PublishArgs,
   PublishResponse,
+  ReadAnalysisArgs,
+  ReadAnalysisResponse,
   ReplayArgs,
   ReplayResponse,
   ReplayResult,
@@ -26,10 +32,47 @@ export type {
   ResumeResult,
   RunArgs,
   RunDevArgs,
-  RunExperimentArgs,
   RunResponse,
   SchemaValidateArgs,
   ValidateResponse,
+  VariantSummary,
 } from './types.js';
 
-export type { ExperimentSpec, DatasetJsonlOptions, HarnessCliOptions } from './experiment-builder.js';
+export type {
+  ArtifactMeasure,
+  Bindings,
+  DatasetJsonlOptions,
+  ExperimentSpec,
+  GuardrailDef,
+  HarnessCliOptions,
+  MetricAggregate,
+  MetricDef,
+  MetricSource,
+} from './experiment-builder.js';
+
+export type {
+  ArtifactDecl,
+  CheckpointDecl,
+  ObjectiveDef,
+  TrialError,
+  TrialIds,
+  TrialOutcome,
+  TrialOutput,
+} from './trial-output.js';
+
+export type {
+  AgentStepEndEvent,
+  AgentStepStartEvent,
+  CallOutcome,
+  CallTiming,
+  ControlAckEvent,
+  ControlAction,
+  ErrorEvent,
+  HookEvent,
+  HookEventBase,
+  ModelCallEndEvent,
+  ModelIdentity,
+  RedactionInfo,
+  StepBudgets,
+  ToolCallEndEvent,
+} from './hook-events.js';
