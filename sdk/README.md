@@ -1,6 +1,6 @@
 # @agentlab/sdk
 
-TypeScript SDK for programmatic experiment construction and execution via the AgentLab Rust runner. Define experiments with a fluent builder API, execute them through a typed client, and get structured JSON results — no YAML hand-editing required.
+TypeScript SDK for defining experiments and driving the AgentLab Rust runner. Build experiment configs with a fluent API, execute them through a typed client, get structured JSON results.
 
 ## Install
 
@@ -8,13 +8,10 @@ TypeScript SDK for programmatic experiment construction and execution via the Ag
 npm install @agentlab/sdk
 ```
 
-For local development:
+Local development:
 
 ```bash
-cd sdk
-npm install
-npm run build
-npm test
+cd sdk && npm install && npm run build && npm test
 ```
 
 ## Quick Start
@@ -23,79 +20,115 @@ npm test
 import { ExperimentBuilder, LabClient } from '@agentlab/sdk';
 import { writeFileSync, mkdirSync } from 'node:fs';
 
-// 1. Build an experiment spec
+// 1. Define the experiment
 const builder = ExperimentBuilder.create('prompt_ab', 'Prompt A/B Test')
   .description('Compare prompt v1 vs v2 on coding tasks')
-  .datasetJsonl('tasks.jsonl', { suiteId: 'coding', splitId: 'dev', limit: 50 })
-  .harnessCli(['node', './harness.js', 'run'], { integrationLevel: 'cli_events' })
+
+  // Your dataset — path relative to the directory containing experiment.yaml.
+  .datasetJsonl('./data/tasks.jsonl', {
+    suiteId: 'coding_tasks',
+    splitId: 'dev',
+    limit: 50,
+  })
+
+  // Your harness — the command the runner invokes for EACH trial.
+  // Path is relative to the project root (parent of .lab/).
+  //
+  //   Node:   ['node', './src/harness/run-trial.js']
+  //   Python: ['python', '-m', 'my_agent.harness']
+  //   Binary: ['./bin/evaluate']
+  //
+  // If this path is wrong, every trial fails.
+  .harnessCli(
+    ['node', './src/harness/run-trial.js'],
+    { integrationLevel: 'cli_events' }
+  )
+
   .sanitizationProfile('hermetic_functional_v2')
   .replications(3)
-  .randomSeed(1337)
-  .baseline('control', { prompt: 'prompt:v1' })
-  .addVariant('treatment', { prompt: 'prompt:v2' })
+  .randomSeed(42)
+
+  .baseline('control', { model: 'gpt-4o', temperature: 0.0 })
+  .addVariant('treatment', { model: 'gpt-4o', temperature: 0.7 })
+
   .primaryMetrics(['success', 'accuracy'])
   .secondaryMetrics(['latency_ms', 'cost_usd'])
   .networkMode('allowlist_enforced', ['api.openai.com']);
 
-// 2. Write the YAML spec to disk
+// 2. Write config to disk
 mkdirSync('.lab', { recursive: true });
 writeFileSync('.lab/experiment.yaml', builder.toYaml());
 
-// 3. Run it
+// 3. Validate and run
 const client = new LabClient();
+
 const summary = await client.describe({ experiment: '.lab/experiment.yaml' });
-console.log(`${summary.summary.total_trials} trials planned`);
+console.log(`Planned: ${summary.summary.total_trials} trials`);
 
 const run = await client.runExperiment({ experiment: '.lab/experiment.yaml' });
-console.log(`Run complete: ${run.run.run_id}`);
+console.log(`Done: ${run.run.run_id}`);
 ```
 
 ## ExperimentBuilder
 
-Fluent API for constructing `ExperimentSpec` objects. Requires explicit configuration — `build()` validates completeness and throws listing any missing fields.
+Fluent API for building `ExperimentSpec` objects. All required fields must be explicitly set — `build()` validates completeness and throws listing any missing fields.
 
 ```ts
 const builder = ExperimentBuilder.create('id', 'Name')
 ```
 
-| Method | Required | Description |
-|---|---|---|
-| `.datasetJsonl(path, opts)` | **yes** | Dataset source (`suiteId`, `splitId`, `limit` are required) |
-| `.harnessCli(command, opts)` | **yes** | Harness command (`integrationLevel` is required) |
-| `.sanitizationProfile(value)` | **yes** | Sanitization profile name |
-| `.replications(n)` | **yes** | Number of replications per (task, variant) pair |
-| `.randomSeed(n)` | **yes** | Random seed for reproducibility |
-| `.description(text)` | | Experiment description |
-| `.owner(name)` | | Experiment owner |
-| `.tags(list)` | | Tag array |
-| `.baseline(id, bindings)` | | Baseline variant with parameter bindings |
-| `.addVariant(id, bindings)` | | Additional variant (call multiple times) |
-| `.maxConcurrency(n)` | | Parallel trial limit |
-| `.primaryMetrics(names)` | | Primary success metrics |
-| `.secondaryMetrics(names)` | | Secondary metrics |
-| `.networkMode(mode, hosts?)` | | `'none'`, `'full'`, or `'allowlist_enforced'` with allowed hosts |
-| `.sandboxImage(image)` | | Docker container image |
-| `.localSandbox()` | | Run without container isolation |
-| `.build()` | | Returns a deep-copied `ExperimentSpec` (validates completeness) |
-| `.toYaml()` | | Serializes the spec to YAML (validates completeness) |
+### Required methods
+
+These must be called before `build()` or `toYaml()`:
+
+| Method | What it sets |
+|---|---|
+| `.datasetJsonl(path, opts)` | Dataset source. `opts` requires `suiteId`, `splitId`, `limit`. |
+| `.harnessCli(command, opts)` | Harness command array. `opts` requires `integrationLevel`. |
+| `.sanitizationProfile(value)` | Sanitization profile name (e.g. `'hermetic_functional_v2'`). |
+| `.replications(n)` | How many times each (task, variant) pair runs. |
+| `.randomSeed(n)` | Seed for trial ordering reproducibility. |
+
+### Optional methods
+
+| Method | What it sets |
+|---|---|
+| `.description(text)` | Experiment description. |
+| `.owner(name)` | Experiment owner. |
+| `.tags(list)` | Tag array. |
+| `.baseline(id, bindings)` | Baseline variant with parameter bindings. Default: `{ variant_id: 'base', bindings: {} }`. |
+| `.addVariant(id, bindings)` | Additional variant. Call multiple times for multiple variants. |
+| `.maxConcurrency(n)` | Parallel trial limit. Default: `1`. |
+| `.primaryMetrics(names)` | Primary success metrics for analysis. |
+| `.secondaryMetrics(names)` | Secondary metrics for analysis. |
+| `.networkMode(mode, hosts?)` | `'none'` (default), `'full'`, or `'allowlist_enforced'` with allowed hosts. |
+| `.sandboxImage(image)` | Docker image name. Sets sandbox mode to `container`. |
+| `.localSandbox()` | Run without container isolation (default). |
+
+### Terminal methods
+
+| Method | What it returns |
+|---|---|
+| `.build()` | Deep-copied `ExperimentSpec`. Throws if required fields are missing. |
+| `.toYaml()` | YAML string of the spec. Validates completeness first. |
 
 All setters return `this` for chaining.
 
 ## LabClient
 
-Typed client that spawns the Rust `lab` binary and parses structured JSON responses.
+Spawns the Rust `lab` binary and parses structured JSON responses.
 
 ```ts
 const client = new LabClient({
-  runnerBin: '/path/to/lab', // or set AGENTLAB_RUNNER_BIN
+  runnerBin: '/path/to/lab',   // or set AGENTLAB_RUNNER_BIN env var
   cwd: '/project/root',
   env: { OPENAI_API_KEY: '...' },
 });
 ```
 
-### Runner Discovery
+### Runner discovery
 
-`LabClient` resolves the runner binary in order:
+Resolves the binary in order:
 
 1. `runnerBin` constructor option
 2. `AGENTLAB_RUNNER_BIN` environment variable
@@ -105,30 +138,28 @@ const client = new LabClient({
 
 | Method | Returns | Description |
 |---|---|---|
-| `client.describe(args)` | `DescribeResponse` | Experiment summary without execution |
-| `client.run(args)` | `RunResponse` | Run experiment (optional `container` flag) |
-| `client.runDev(args)` | `RunResponse` | Development run with optional `setup` command |
-| `client.runExperiment(args)` | `RunResponse` | Strict run with network isolation |
-| `client.replay(args)` | `ReplayResponse` | Replay a prior trial from run artifacts |
-| `client.fork(args)` | `ForkResponse` | Fork a trial at selector (`checkpoint`, `step`, `event_seq`) |
-| `client.pause(args)` | `PauseResponse` | Cooperative pause via checkpoint+stop handshake |
-| `client.resume(args)` | `ResumeResponse` | Resume paused trial via checkpoint-based continuation |
-| `client.publish(args)` | `PublishResponse` | Create debug bundle from a run |
-| `client.validateKnobs(args)` | `ValidateResponse` | Validate parameter overrides against manifest |
-| `client.validateHooks(args)` | `ValidateResponse` | Validate event stream against harness manifest |
-| `client.validateSchema(args)` | `ValidateResponse` | Validate JSON file against a schema |
+| `describe(args)` | `DescribeResponse` | Dry-run: planned trials and resolved config |
+| `run(args)` | `RunResponse` | Execute trials (optional `container` flag) |
+| `runDev(args)` | `RunResponse` | Dev run: full network, optional `setup` command |
+| `runExperiment(args)` | `RunResponse` | Strict run: network mode must be `none` |
+| `replay(args)` | `ReplayResponse` | Re-execute a trial from run artifacts |
+| `fork(args)` | `ForkResponse` | Fork a trial at a checkpoint with binding overrides |
+| `pause(args)` | `PauseResponse` | Cooperative pause via checkpoint+stop handshake |
+| `resume(args)` | `ResumeResponse` | Resume a paused trial |
+| `publish(args)` | `PublishResponse` | Create debug bundle from a run |
+| `validateKnobs(args)` | `ValidateResponse` | Validate parameter overrides against manifest |
+| `validateHooks(args)` | `ValidateResponse` | Validate event stream against harness manifest |
+| `validateSchema(args)` | `ValidateResponse` | Validate JSON file against schema |
 
 All commands accept per-call `cwd` and `env` overrides.
 
-### Control lifecycle example
+### Control lifecycle
 
 ```ts
-import { LabClient } from '@agentlab/sdk';
-
 const client = new LabClient();
 const runDir = '.lab/runs/run_20260211_120000';
 
-// 1) Pause a trial at the next safe boundary (checkpoint + stop handshake)
+// Pause at next safe boundary
 const paused = await client.pause({
   runDir,
   trialId: 'trial_001',
@@ -136,7 +167,7 @@ const paused = await client.pause({
   timeoutSeconds: 90,
 });
 
-// 2) Fork from a checkpoint with binding overrides
+// Fork from checkpoint with modified bindings
 const forked = await client.fork({
   runDir,
   fromTrial: paused.pause.trial_id,
@@ -145,7 +176,7 @@ const forked = await client.fork({
   strict: true,
 });
 
-// 3) Resume the paused trial (implemented as checkpoint-based continuation)
+// Resume the original trial
 const resumed = await client.resume({
   runDir,
   trialId: paused.pause.trial_id,
@@ -153,19 +184,17 @@ const resumed = await client.resume({
   set: { max_steps: 50 },
 });
 
-// 4) Replay a trial for validation / debugging
+// Replay for validation
 const replayed = await client.replay({
   runDir,
   trialId: paused.pause.trial_id,
   strict: true,
 });
-
-console.log(forked.fork.fork_id, resumed.resume.fork.fork_id, replayed.replay.replay_id);
 ```
 
-### Error Handling
+### Error handling
 
-All runner failures throw `LabRunnerError` with structured context:
+All runner failures throw `LabRunnerError`:
 
 ```ts
 import { LabRunnerError } from '@agentlab/sdk';
@@ -174,12 +203,12 @@ try {
   await client.run({ experiment: 'experiment.yaml' });
 } catch (err) {
   if (err instanceof LabRunnerError) {
-    console.error(err.code);     // e.g. 'bad_config', 'spawn_failed', 'invalid_json'
-    console.error(err.message);  // Human-readable message
-    console.error(err.command);  // Full command array that was spawned
-    console.error(err.stderr);   // Runner stderr output
-    console.error(err.exitCode); // Process exit code (if available)
-    console.error(err.details);  // Structured error details (if available)
+    err.code;      // 'bad_config', 'spawn_failed', 'invalid_json', etc.
+    err.message;   // Human-readable description
+    err.command;   // Full command array that was spawned
+    err.stderr;    // Runner stderr output
+    err.exitCode;  // Process exit code (if available)
+    err.details;   // Structured error details (if available)
   }
 }
 ```
