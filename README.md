@@ -39,14 +39,14 @@ The Rust CLI (`lab-cli`) is the primary execution engine.
 
 ```bash
 git clone <agentlab-repo>
-cd <agentlab-repo>/rust/agentlab
+cd <agentlab-repo>/rust
 cargo build -p lab-cli --release
 ```
 
 Use from a harness repo:
 
 ```bash
-ln -sf /path/to/agentlab/rust/agentlab/target/release/lab-cli ./lab
+ln -sf /path/to/agentlab/rust/target/release/lab-cli ./lab
 ./lab --help
 ```
 
@@ -60,16 +60,16 @@ Prerequisites:
 1. Initialize:
 
 ```bash
-./lab init --container
+./lab init
 ```
 
-Trainer/deep-learning workload:
+2. Edit the generated experiment file — fill in all fields marked `REQUIRED`:
 
 ```bash
-./lab init --container --workload-type trainer
+$EDITOR .lab/experiment.yaml
 ```
 
-2. Inspect resolved config:
+3. Validate resolved config:
 
 ```bash
 ./lab describe .lab/experiment.yaml
@@ -83,7 +83,7 @@ Optional knob registry:
 ./lab describe .lab/experiment.yaml --overrides .lab/knobs/overrides.json
 ```
 
-3. Dev run (runtime dependency install):
+4. Dev run (runtime dependency install):
 
 ```bash
 ./lab run-dev .lab/experiment.yaml --overrides .lab/knobs/overrides.json --setup "<install command>"
@@ -97,7 +97,7 @@ Optional knob registry:
 - uv: `uv sync --frozen`
 - pip: `pip install -r requirements.txt`
 
-4. Experiment run (strict network-none posture):
+5. Experiment run (strict network-none posture):
 
 ```bash
 ./lab run-experiment .lab/experiment.yaml --overrides .lab/knobs/overrides.json
@@ -107,7 +107,6 @@ Optional knob registry:
 
 - `run-dev`: effective network mode `full`, faster iteration.
 - `run-experiment`: requires effective network mode `none`.
-- `image-build`: build custom runtime image.
 - `knobs-init`: writes `.lab/knobs/manifest.json` + `.lab/knobs/overrides.json`.
 - `knobs-validate`: validates override IDs/types/ranges/options.
 - `clean --init`: removes init files.
@@ -121,7 +120,6 @@ Core commands support `--json` and emit one JSON object:
 ./lab describe .lab/experiment.yaml --json
 ./lab run-dev .lab/experiment.yaml --overrides .lab/knobs/overrides.json --json
 ./lab run-experiment .lab/experiment.yaml --overrides .lab/knobs/overrides.json --json
-./lab image-build .lab/experiment.yaml --json
 ./lab publish --run-dir .lab/runs/<run_id> --json
 ```
 
@@ -143,11 +141,7 @@ Supported:
 - `agent_harness`
 - `trainer`
 
-Set via init:
-
-```bash
-./lab init --workload-type trainer
-```
+Set `experiment.workload_type` in `experiment.yaml`.
 
 Trainer output expectations:
 - `trial_output.objective`: `name`, `value`, optional `direction`
@@ -196,108 +190,67 @@ duckdb agentlab.duckdb < tables/load_duckdb.sql
 
 ## TypeScript SDK (`@agentlab/sdk`)
 
-Local package path: `packages/sdk`
+The SDK provides a programmatic interface for building experiments and driving the Rust runner. Define experiments with a fluent builder, execute via a typed client, and get structured JSON results — no YAML hand-editing required.
+
+Local package path: `sdk/` — see [`sdk/README.md`](sdk/README.md) for full API reference.
 
 ```bash
-cd packages/sdk
+cd sdk
 npm install
 npm run build
 npm test
 ```
 
-Example:
+### Build + Run Example
 
 ```ts
 import { ExperimentBuilder, LabClient } from '@agentlab/sdk';
+import { writeFileSync, mkdirSync } from 'node:fs';
 
-const client = new LabClient({ runnerBin: '/path/to/lab' });
-const experiment = ExperimentBuilder.create('exp_1', 'Prompt A/B')
-  .datasetJsonl('tasks.jsonl', { limit: 50 })
+// Build an experiment spec
+const builder = ExperimentBuilder.create('prompt_ab', 'Prompt A/B Test')
+  .description('Compare prompt v1 vs v2 on coding tasks')
+  .datasetJsonl('tasks.jsonl', { suiteId: 'coding', splitId: 'dev', limit: 50 })
   .harnessCli(['node', './harness.js', 'run'], { integrationLevel: 'cli_events' })
-  .baseline('base', { prompt: 'prompt:v1' })
-  .addVariant('prompt_v2', { prompt: 'prompt:v2' })
-  .build();
+  .sanitizationProfile('hermetic_functional_v2')
+  .replications(3)
+  .randomSeed(1337)
+  .baseline('control', { prompt: 'prompt:v1' })
+  .addVariant('treatment', { prompt: 'prompt:v2' })
+  .primaryMetrics(['success', 'accuracy'])
+  .networkMode('allowlist_enforced', ['api.openai.com']);
 
-// Write to .lab/experiment.yaml, then:
+// Write YAML to disk
+mkdirSync('.lab', { recursive: true });
+writeFileSync('.lab/experiment.yaml', builder.toYaml());
+
+// Execute
+const client = new LabClient();
 const summary = await client.describe({ experiment: '.lab/experiment.yaml' });
+console.log(`${summary.summary.total_trials} trials planned`);
+
 const run = await client.runExperiment({ experiment: '.lab/experiment.yaml' });
-console.log(summary.summary.total_trials, run.run.run_id);
+console.log(`Run complete: ${run.run.run_id}`);
 ```
 
-Runner discovery order:
-1. `runnerBin` option
-2. `AGENTLAB_RUNNER_BIN`
-3. default `lab`
+### Client Commands
 
----
+| Method | Description |
+|---|---|
+| `client.describe(args)` | Experiment summary without execution |
+| `client.run(args)` | Run experiment (optional container mode) |
+| `client.runDev(args)` | Development run with optional setup command |
+| `client.runExperiment(args)` | Strict run with network isolation |
+| `client.publish(args)` | Create debug bundle from a run |
+| `client.validateKnobs(args)` | Validate parameter overrides against manifest |
+| `client.validateHooks(args)` | Validate event stream against harness manifest |
+| `client.validateSchema(args)` | Validate JSON file against a schema |
 
-## Python (Prototype Layer)
+All commands throw `LabRunnerError` on failure with structured `code`, `message`, `details`, `exitCode`, `stderr`, and `command` fields.
 
-This repo also ships a Python prototype CLI/API. It is separate from the Rust runtime binary.
+### Runner Discovery
 
-### Install
-
-```bash
-python3 -m pip install -e .
-```
-
-With GUI extras:
-
-```bash
-python3 -m pip install -e ".[gui]"
-```
-
-If `lab` is missing, check active venv and `PATH`.
-
-### Quickstart (Python CLI)
-
-```bash
-lab init --demo-harness node
-lab run experiment.yaml
-```
-
-Report path:
-- `.lab/runs/<run_id>/report/index.html`
-
-### Python SDK Example
-
-```python
-from agentlab import AgentLabClient, Experiment, VariantPlan
-
-experiment = (
-    Experiment.builder("exp_sdk", "SDK Experiment")
-    .dataset_jsonl("tasks.jsonl", limit=50)
-    .harness_cli(["python3", "./harness.py", "run"], integration_level="cli_basic")
-    .variant_plan(
-        VariantPlan()
-        .set_baseline("base", model="model-a")
-        .add_variant("treatment", model="model-b")
-    )
-    .build()
-)
-
-client = AgentLabClient(base_dir=".")
-result = client.run(experiment)
-print(result.run_id, result.report_dir)
-```
-
----
-
-## GUI (MVP)
-
-Launch:
-
-```bash
-lab-gui
-```
-
-GUI flow:
-- guided setup walkthrough
-- experiment design (variable/parameter, Arm A vs Arm B, controls)
-- run launcher
-- validity-first results view
-
-If GUI cannot find binary, set `Lab Binary` in sidebar:
-- `./lab` (symlink in harness repo)
-- `rust/agentlab/target/debug/lab-cli`
-
+`LabClient` resolves the runner binary in order:
+1. `runnerBin` constructor option
+2. `AGENTLAB_RUNNER_BIN` environment variable
+3. `lab` (assumes on `PATH`)
