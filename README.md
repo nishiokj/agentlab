@@ -99,6 +99,65 @@ flowchart LR
   BMSUM --> RR
 ```
 
+```mermaid
+flowchart TD
+  subgraph ui ["User / CLI"]
+    CLI["lab run / lab-cli --executor"]
+    SDKRUN["ExperimentBuilder / .lab/experiment.yaml"]
+    CLI -->|start| SDKRUN
+  end
+
+  subgraph prep ["Run setup"]
+    DESC["resolve experiment path + find .lab"]
+    CFG["load and validate resolved_experiment_v0_3.json"]
+    VAR["resolve_variant_plan (baseline + variant_plan)"]
+    TASKS["load dataset rows -> task boundaries"]
+    SCH["build trial schedule (task × variant × repl)"]
+    DESC --> CFG --> VAR --> TASKS --> SCH
+  end
+
+  subgraph runloop ["Per-trial execution loop"]
+    CREATE["create .lab/runs/<run_id>/trials/<trial_id>"]
+    PATHS["TrialPaths prepare: workspace/state/dataset/out/tmp"]
+    STAGE["stage project workspace + workspace_files + dataset pack mounts"]
+    INPUT["build trial_input_v1 + task_boundary_v1 ext"]
+    CTRL["resolve control transport (file|uds) + protocol handshake"]
+    START["spawn harness (local_process / local_docker / remote)"]
+    RUN["harness executes task + writes output + optional events"]
+    RETRY{"trial status or outcome requires retry?"}
+    OUTPUT["materialize trial_output from configured output_path"]
+    SNAP["capture stdout/stderr + pre/post snapshots + diffs/patches"]
+    EVID["append evidence_record_v1 + task_chain_state_v1"]
+    STP["optionally pause/stop via run control events"]
+    DONE["write trial outputs, artifacts, chain state"]
+
+    CREATE --> PATHS --> STAGE --> INPUT --> CTRL --> START --> RUN --> OUTPUT
+    OUTPUT --> RETRY
+    RETRY -->|yes, if policy allows| START
+    RETRY -->|no| SNAP --> EVID --> STP --> DONE
+  end
+
+  subgraph adapt ["Benchmark + analysis boundary"]
+    BE["optional benchmark adapter reads trial outputs"]
+    BENEW["benchmark/predictions.jsonl / scores.jsonl / summary.json"]
+    ANAL["summarize_trials -> analysis/summary.json + comparisons"]
+    BE --> BENEW --> ANAL
+  end
+
+  subgraph ship ["Result handoff"]
+    OUT["report run_dir, run_id, artifacts"]
+    CLIENT["SDK LabClient readEvidence/readAnalysis/readBenchmark"]
+    MESH["consumers and experiments' outcome mapper"]
+    OUT --> CLIENT --> MESH
+  end
+
+  SCH --> CREATE
+  DONE --> BE
+  ANAL --> OUT
+```
+
+### End-to-End Runtime Phases
+
 ### Build vs Run Boundary
 
 - Build (SDK): compiles static artifacts only (`ExperimentSpec` + dataset/task boundary rows). No harness execution, no scoring, no mutable runtime state.
@@ -114,12 +173,11 @@ flowchart LR
 4. Runner builds `trial_input_v1` and writes canonical `trial_input.json` with IDs, task, bindings, runtime paths, and optional `ext.task_boundary_v1`.
 5. Runner invokes exactly one harness command.
    - Container mode mounts: `/workspace` (rw), `/harness` (ro project root), `/dataset` (ro), `/state` (rw), `/out` (rw), `/tmp` (tmpfs).
-   - Runner launches the child process with env vars: `AGENTLAB_TRIAL_INPUT`, `AGENTLAB_TRIAL_OUTPUT`, `AGENTLAB_CONTROL_PATH`, `AGENTLAB_HARNESS_ROOT`.
+   - Runner launches the child process with env vars: `AGENTLAB_CONTROL_PATH`, `AGENTLAB_CONTROL_MODE`, `AGENTLAB_HARNESS_ROOT` plus benchmark boundary vars.
 6. Runner resolves trial output deterministically:
-   - if output file exists at `AGENTLAB_TRIAL_OUTPUT`, uses it.
-   - else if last non-empty stdout line is JSON, writes that as `trial_output.json`.
+   - if output file exists at configured `/runtime/harness/output_path`, uses it.
    - else synthesizes an error `trial_output_v1`.
-   - Harness code can ignore those env vars entirely if it already supports stdin/stdout JSON.
+   - harness output path in `trial_input.runtime.paths.out` is the source of truth.
 7. Runner captures evidence: stdout/stderr, optional events ref, workspace pre/post snapshots, incremental+cumulative diffs, derived patches, timing/executor metadata.
 8. Runner appends run-scope evidence boundaries:
    - `.lab/runs/<run_id>/evidence/evidence_records.jsonl`
@@ -618,7 +676,7 @@ The single most common source of failures is wrong paths. Here's how resolution 
 ./lab describe .lab/experiment.yaml
 ```
 
-Look for `harness_script_resolved` and `harness_script_exists` in the output. If the file doesn't exist, fix the `runtime.harness.command` path in your experiment config.
+Look for `harness_script_resolved` in the output. If it is empty, fix the `runtime.harness.command` path in your experiment config.
 
 ### Workload Types
 

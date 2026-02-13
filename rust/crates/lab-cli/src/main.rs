@@ -760,18 +760,15 @@ fn summary_to_json(summary: &lab_runner::ExperimentSummary) -> Value {
         "dataset": summary.dataset_path.display().to_string(),
         "tasks": summary.task_count,
         "replications": summary.replications,
-        "variant_plan_entries": summary.variant_count,
+        "variant_count": summary.variant_count,
         "total_trials": summary.total_trials,
         "harness": summary.harness_command,
         "integration_level": summary.integration_level,
-        "container_mode": summary.container_mode,
         "image": summary.image,
         "network": summary.network_mode,
         "events_path": summary.events_path,
         "tracing": summary.tracing_mode,
         "control_path": summary.control_path,
-        "harness_script_resolved": summary.harness_script_resolved.as_ref().map(|p| p.display().to_string()),
-        "harness_script_exists": summary.harness_script_exists,
         "scheduling": summary.scheduling,
         "state_policy": summary.state_policy,
         "comparison": summary.comparison,
@@ -785,11 +782,10 @@ fn print_summary(summary: &lab_runner::ExperimentSummary) {
     println!("dataset: {}", summary.dataset_path.display());
     println!("tasks: {}", summary.task_count);
     println!("replications: {}", summary.replications);
-    println!("variant_plan_entries: {}", summary.variant_count);
+    println!("variant_count: {}", summary.variant_count);
     println!("total_trials: {}", summary.total_trials);
     println!("harness: {:?}", summary.harness_command);
     println!("integration_level: {}", summary.integration_level);
-    println!("container_mode: {}", summary.container_mode);
     if let Some(image) = &summary.image {
         println!("image: {}", image);
     }
@@ -801,10 +797,6 @@ fn print_summary(summary: &lab_runner::ExperimentSummary) {
         println!("tracing: {}", mode);
     }
     println!("control_path: {}", summary.control_path);
-    if let Some(p) = &summary.harness_script_resolved {
-        println!("harness_script_resolved: {}", p.display());
-        println!("harness_script_exists: {}", summary.harness_script_exists);
-    }
 }
 
 fn write_knob_files(

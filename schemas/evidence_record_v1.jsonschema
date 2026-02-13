@@ -39,13 +39,12 @@
     "runtime": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["executor", "container_mode", "exit_status"],
+      "required": ["executor", "exit_status"],
       "properties": {
         "executor": {
           "type": "string",
           "enum": ["local_docker", "local_process", "remote"]
         },
-        "container_mode": { "type": "boolean" },
         "exit_status": { "type": "string" },
         "duration_ms": { "type": "number", "minimum": 0 }
       }

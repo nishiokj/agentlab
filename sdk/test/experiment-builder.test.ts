@@ -89,8 +89,8 @@ describe('ExperimentBuilder structural defaults', () => {
   });
 
   test('default control plane', () => {
-    assert.equal(spec.runtime.harness.control_plane.mode, 'file');
-    assert.equal(spec.runtime.harness.control_plane.path, '/state/lab_control.json');
+    assert.equal(spec.runtime.harness.control_plane.mode, 'uds');
+    assert.equal(spec.runtime.harness.control_plane.path, '/run/ipc/harness.sock');
   });
 
   test('default sandbox is local mode', () => {

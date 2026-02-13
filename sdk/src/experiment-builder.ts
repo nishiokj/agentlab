@@ -16,6 +16,12 @@ export interface HarnessCliOptions {
   outputPath?: string;
 }
 
+export interface HarnessHostFileStagingEntry {
+  source_from_host: string;
+  destination_path: string;
+  required?: boolean;
+}
+
 // ---------------------------------------------------------------------------
 // Metrics
 // ---------------------------------------------------------------------------
@@ -361,8 +367,11 @@ export interface ExperimentSpec {
       integration_level: string;
       input_path: string;
       output_path: string;
+      env?: Record<string, string>;
+      env_from_host?: string[];
+      host_file_staging?: HarnessHostFileStagingEntry[];
       control_plane: {
-        mode: 'file';
+        mode: 'file' | 'uds';
         path: string;
       };
     };
@@ -450,8 +459,8 @@ export class ExperimentBuilder {
           input_path: '/out/trial_input.json',
           output_path: '/out/trial_output.json',
           control_plane: {
-            mode: 'file',
-            path: '/state/lab_control.json',
+            mode: 'uds',
+            path: '/run/ipc/harness.sock',
           },
         },
         sandbox: { mode: 'local' },
@@ -507,6 +516,46 @@ export class ExperimentBuilder {
     this.spec.runtime.harness.integration_level = options.integrationLevel;
     this.spec.runtime.harness.input_path = options.inputPath ?? this.spec.runtime.harness.input_path;
     this.spec.runtime.harness.output_path = options.outputPath ?? this.spec.runtime.harness.output_path;
+    return this;
+  }
+
+  harnessEnv(env: Record<string, string>): this {
+    this.spec.runtime.harness.env = { ...env };
+    return this;
+  }
+
+  harnessEnvFromHost(keys: string[]): this {
+    this.spec.runtime.harness.env_from_host = [...keys];
+    return this;
+  }
+
+  harnessControlPlane(mode: 'file' | 'uds', path: string): this {
+    this.spec.runtime.harness.control_plane = { mode, path };
+    return this;
+  }
+
+  harnessHostFileStaging(entries: HarnessHostFileStagingEntry[]): this {
+    this.spec.runtime.harness.host_file_staging = entries.map((entry) => ({
+      source_from_host: entry.source_from_host,
+      destination_path: entry.destination_path,
+      required: entry.required ?? true,
+    }));
+    return this;
+  }
+
+  harnessStageHostFile(
+    sourceFromHost: string,
+    destinationPath: string,
+    options?: { required?: boolean },
+  ): this {
+    if (!this.spec.runtime.harness.host_file_staging) {
+      this.spec.runtime.harness.host_file_staging = [];
+    }
+    this.spec.runtime.harness.host_file_staging.push({
+      source_from_host: sourceFromHost,
+      destination_path: destinationPath,
+      required: options?.required ?? true,
+    });
     return this;
   }
 

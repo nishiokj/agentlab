@@ -1,11 +1,10 @@
 # Variant Plan Migration
 
-This project now prefers `variant_plan` over `variants` in experiment configs.
+This project uses `variant_plan` in experiment configs.
 
 ## Why
 
-- `variant_plan` is explicit about intent: this is a planned set of variant entries.
-- `variants` remains valid as a legacy alias.
+`variant_plan` is explicit about intent: this is a planned set of variant entries.
 
 ## Config Migration
 
@@ -33,9 +32,7 @@ variant_plan:
 
 ## Runtime Compatibility
 
-- Python runner: prefers `variant_plan`, falls back to `variants`.
-- Rust runner: prefers `variant_plan`, falls back to `variants`.
-- Run artifact directory remains `variants/` for compatibility.
+- Rust runner requires `variant_plan`. `variants` is not supported.
 
 ## CLI/SDK Naming Guidance
 

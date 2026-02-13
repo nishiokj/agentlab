@@ -88,7 +88,14 @@ function classifyDifficulty(prompt, bindings) {
   };
 }
 
-function writeHarnessManifest(manifestDir, integration) {
+function resolveMountedPath(rawPath) {
+  if (!rawPath) {
+    return null;
+  }
+  return path.isAbsolute(rawPath) ? rawPath : path.join(process.cwd(), rawPath);
+}
+
+function writeHarnessManifest(manifestDir, integration, controlPath, controlMode) {
   if (integration === 'cli_basic') {
     return;
   }
@@ -103,13 +110,13 @@ function writeHarnessManifest(manifestDir, integration) {
       entry_command: ['node', './demos/agentlab_demo_harness.js', 'run'],
     },
     step: { semantics: 'decision_cycle' },
-    control_plane: { mode: 'file', path: '/state/lab_control.json' },
+    control_plane: { mode: controlMode, path: controlPath },
   };
 
   if (integration === 'cli_events') {
     manifest.hooks = {
       schema_version: 'hook_events_v1',
-      events_path: '/out/harness_events.jsonl',
+      events_path: path.join(manifestDir, 'harness_events.jsonl'),
       header_event_emitted: false,
     };
   }
@@ -204,19 +211,39 @@ function emitEvents(params) {
 }
 
 function main() {
-  const inputPath = process.env.AGENTLAB_TRIAL_INPUT || 'trial_input.json';
-  const outputPath = process.env.AGENTLAB_TRIAL_OUTPUT || 'trial_output.json';
-
+  const inputPath = resolveMountedPath('/out/trial_input.json');
+  if (!inputPath) {
+    throw new Error('trial_input missing /out/trial_input.json');
+  }
   const ti = readJson(inputPath);
+  const runtimeOutPath = resolveMountedPath(ti.runtime?.paths?.out);
+  const runtimeWorkspacePath = resolveMountedPath(
+    ti.runtime?.paths?.workspace,
+  );
+  if (!runtimeOutPath) {
+    throw new Error('trial_input missing runtime.paths.out');
+  }
+  if (!runtimeWorkspacePath) {
+    throw new Error('trial_input missing runtime.paths.workspace');
+  }
+  const outputDir = runtimeOutPath;
+  const outputPath = path.join(outputDir, 'trial_output.json');
+  const controlMode = ti.runtime?.control_plane?.mode;
+  const controlPath = ti.runtime?.control_plane?.path;
+  if (!controlMode) {
+    throw new Error('trial_input missing runtime.control_plane.mode');
+  }
+  if (!controlPath) {
+    throw new Error('trial_input missing runtime.control_plane.path');
+  }
   const ids = ti.ids;
   const integration = (ti.design && ti.design.integration_level) || 'cli_basic';
 
   const outDir = path.dirname(outputPath);
-  const runtimeOutDir = ti.runtime?.paths?.out || outDir;
   ensureDir(outDir);
-  ensureDir(runtimeOutDir);
+  ensureDir(runtimeWorkspacePath);
 
-  writeHarnessManifest(runtimeOutDir, integration);
+  writeHarnessManifest(outputDir, integration, controlPath, controlMode);
 
   const prompt =
     ti.task?.input?.prompt ||
@@ -245,8 +272,7 @@ function main() {
     score: difficulty.finalScore,
   };
 
-  const workspaceDir = ti.runtime?.paths?.workspace || process.cwd();
-  const trialArtifactDir = path.join(workspaceDir, 'artifacts', ids.task_id);
+  const trialArtifactDir = path.join(runtimeWorkspacePath, 'artifacts', ids.task_id);
   ensureDir(trialArtifactDir);
 
   const responseArtifactPath = path.join(trialArtifactDir, 'response.json');
@@ -280,7 +306,7 @@ function main() {
     `task_id=${ids.task_id}\npredicted=${difficulty.predictedDifficulty}\noutcome=${outcome}\n`,
   );
 
-  const eventsPath = path.join(runtimeOutDir, 'harness_events.jsonl');
+  const eventsPath = path.join(outputDir, 'harness_events.jsonl');
   emitEvents({
     integration,
     eventsPath,
@@ -311,17 +337,17 @@ function main() {
     },
     artifacts: [
       {
-        path: `/workspace/artifacts/${ids.task_id}/response.json`,
+        path: `${path.join(runtimeWorkspacePath, 'artifacts', ids.task_id, 'response.json')}`,
         logical_name: 'response_json',
         mime_type: 'application/json',
       },
       {
-        path: `/workspace/artifacts/${ids.task_id}/grading.json`,
+        path: `${path.join(runtimeWorkspacePath, 'artifacts', ids.task_id, 'grading.json')}`,
         logical_name: 'grading_json',
         mime_type: 'application/json',
       },
       {
-        path: `/workspace/artifacts/${ids.task_id}/notes.txt`,
+        path: `${path.join(runtimeWorkspacePath, 'artifacts', ids.task_id, 'notes.txt')}`,
         logical_name: 'notes_txt',
         mime_type: 'text/plain',
       },

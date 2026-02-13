@@ -6,7 +6,6 @@ import {
   compileTaskBoundaries,
   createOutcomeBoundary,
   createRunnerBoundaryManifest,
-  EVENT_OUTPUT_CONTRACT_V1,
   INVOCATION_ENV_CONTRACT_V1,
   mapOutcome,
   taskBoundariesToJsonl,
@@ -58,15 +57,11 @@ describe('Runner boundary contracts', () => {
       '/workspace/.agentlab/task-manifest.json',
     );
     assert.equal(WORKSPACE_CONTRACT_V1.artifacts_dir, '/workspace/.agentlab/artifacts');
-
-    assert.equal(EVENT_OUTPUT_CONTRACT_V1.run_events_jsonl, '/state/harness_events.jsonl');
-    assert.equal(EVENT_OUTPUT_CONTRACT_V1.result_summary, '/out/trial_output.json');
   });
 
   test('invocation env contract is fixed', () => {
-    assert.equal(INVOCATION_ENV_CONTRACT_V1.trial_input, 'AGENTLAB_TRIAL_INPUT');
-    assert.equal(INVOCATION_ENV_CONTRACT_V1.trial_output, 'AGENTLAB_TRIAL_OUTPUT');
     assert.equal(INVOCATION_ENV_CONTRACT_V1.control_path, 'AGENTLAB_CONTROL_PATH');
+    assert.equal(INVOCATION_ENV_CONTRACT_V1.control_mode, 'AGENTLAB_CONTROL_MODE');
     assert.equal(INVOCATION_ENV_CONTRACT_V1.harness_root, 'AGENTLAB_HARNESS_ROOT');
   });
 

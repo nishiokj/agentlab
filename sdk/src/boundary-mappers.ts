@@ -20,9 +20,8 @@ export interface WorkspaceContractV1 {
 }
 
 export interface InvocationEnvContractV1 {
-  trial_input: 'AGENTLAB_TRIAL_INPUT';
-  trial_output: 'AGENTLAB_TRIAL_OUTPUT';
   control_path: 'AGENTLAB_CONTROL_PATH';
+  control_mode: 'AGENTLAB_CONTROL_MODE';
   harness_root: 'AGENTLAB_HARNESS_ROOT';
 }
 
@@ -36,17 +35,11 @@ export interface MountSemanticsContractV1 {
   read_only: true;
 }
 
-export interface EventOutputContractV1 {
-  run_events_jsonl: '/state/harness_events.jsonl';
-  result_summary: '/out/trial_output.json';
-}
-
 export interface RunnerBoundaryManifestV1 {
   schema_version: 'runner_boundary_manifest_v1';
   workspace: WorkspaceContractV1;
   mount_semantics: MountSemanticsContractV1;
   invocation: InvocationContractV1;
-  event_output: EventOutputContractV1;
 }
 
 export const WORKSPACE_CONTRACT_V1: WorkspaceContractV1 = {
@@ -56,15 +49,9 @@ export const WORKSPACE_CONTRACT_V1: WorkspaceContractV1 = {
 };
 
 export const INVOCATION_ENV_CONTRACT_V1: InvocationEnvContractV1 = {
-  trial_input: 'AGENTLAB_TRIAL_INPUT',
-  trial_output: 'AGENTLAB_TRIAL_OUTPUT',
   control_path: 'AGENTLAB_CONTROL_PATH',
+  control_mode: 'AGENTLAB_CONTROL_MODE',
   harness_root: 'AGENTLAB_HARNESS_ROOT',
-};
-
-export const EVENT_OUTPUT_CONTRACT_V1: EventOutputContractV1 = {
-  run_events_jsonl: '/state/harness_events.jsonl',
-  result_summary: '/out/trial_output.json',
 };
 
 const MOUNT_SEMANTICS_CONTRACT_V1: MountSemanticsContractV1 = {
@@ -91,7 +78,6 @@ export function createRunnerBoundaryManifest(
       command: [...command],
       env: { ...INVOCATION_ENV_CONTRACT_V1 },
     },
-    event_output: { ...EVENT_OUTPUT_CONTRACT_V1 },
   };
 }
 

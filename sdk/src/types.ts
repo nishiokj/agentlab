@@ -19,18 +19,15 @@ export interface ExperimentSummary {
   dataset: string;
   tasks: number;
   replications: number;
-  variant_plan_entries: number;
+  variant_count: number;
   total_trials: number;
   harness: string[];
   integration_level: string;
-  container_mode: boolean;
   image?: string | null;
   network: string;
   events_path?: string | null;
   tracing?: string | null;
   control_path: string;
-  harness_script_resolved?: string | null;
-  harness_script_exists: boolean;
   scheduling?: SchedulingPolicy;
   state_policy?: StatePolicy;
   comparison?: ComparisonPolicy;
@@ -298,7 +295,6 @@ export interface EvidencePolicy {
 
 export interface EvidenceRuntime {
   executor: 'local_docker' | 'local_process' | 'remote';
-  container_mode: boolean;
   exit_status: string;
   duration_ms?: number;
 }

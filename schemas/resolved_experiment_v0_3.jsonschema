@@ -83,6 +83,18 @@
         "bindings": { "type": "object" }
       }
     },
+    "variant_plan": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": true,
+        "required": ["variant_id", "bindings"],
+        "properties": {
+          "variant_id": { "type": "string", "minLength": 1 },
+          "bindings": { "type": "object" }
+        }
+      }
+    },
     "benchmark": {
       "type": "object",
       "additionalProperties": true,
@@ -127,11 +139,20 @@
             "integration_level": { "type": "string", "minLength": 1 },
             "input_path": { "type": "string", "minLength": 1 },
             "output_path": { "type": "string", "minLength": 1 },
+            "env": {
+              "type": "object",
+              "additionalProperties": { "type": "string" }
+            },
+            "env_from_host": {
+              "type": "array",
+              "items": { "type": "string", "minLength": 1 }
+            },
             "control_plane": {
               "type": "object",
               "additionalProperties": true,
+              "required": ["mode", "path"],
               "properties": {
-                "mode": { "type": "string" },
+                "mode": { "type": "string", "enum": ["file", "uds"] },
                 "path": { "type": "string", "minLength": 1 }
               }
             }

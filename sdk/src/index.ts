@@ -7,7 +7,6 @@ export {
   compileTaskBoundaries,
   taskBoundariesToJsonl,
   assertTaskBoundaryV1,
-  EVENT_OUTPUT_CONTRACT_V1,
   INVOCATION_ENV_CONTRACT_V1,
   WORKSPACE_CONTRACT_V1,
 } from './boundary-mappers.js';
@@ -80,6 +79,7 @@ export type {
   ExperimentSpec,
   GuardrailDef,
   HarnessCliOptions,
+  HarnessHostFileStagingEntry,
   MetricAggregate,
   MetricDef,
   MetricSource,
@@ -118,7 +118,6 @@ export type {
 } from './hook-events.js';
 
 export type {
-  EventOutputContractV1,
   InputMapper,
   InputMapperContext,
   InvocationContractV1,

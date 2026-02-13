@@ -12,15 +12,61 @@ use serde_json::json;
 use serde_json::Value;
 use std::collections::{BTreeMap, HashSet};
 use std::fs;
-use std::io::Write;
+use std::io::{BufWriter, Write};
 #[cfg(unix)]
 use std::os::unix::fs::symlink;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
+#[cfg(unix)]
+use std::os::unix::net::UnixStream;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
 use std::time::{Duration, Instant};
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HarnessControlMode {
+    File,
+    Uds,
+}
+
+impl HarnessControlMode {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::File => "file",
+            Self::Uds => "uds",
+        }
+    }
+
+    fn parse(raw: Option<&str>) -> Result<Self> {
+        match raw.ok_or_else(|| anyhow!("missing control transport mode"))? {
+            "file" => Ok(Self::File),
+            "uds" => Ok(Self::Uds),
+            other => Err(anyhow!("unsupported control transport mode: {}", other)),
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct HarnessControlTransport {
+    mode: HarnessControlMode,
+    harness_path: String,
+    host_path: PathBuf,
+    harness_mount_dir: Option<String>,
+    host_mount_dir: Option<PathBuf>,
+}
+
+impl HarnessControlTransport {
+    fn active(path: HarnessControlMode, host_path: &Path) -> Self {
+        Self {
+            mode: path,
+            harness_path: host_path.to_string_lossy().to_string(),
+            host_path: host_path.to_path_buf(),
+            harness_mount_dir: None,
+            host_mount_dir: None,
+        }
+    }
+}
 
 pub struct RunResult {
     pub run_dir: PathBuf,
@@ -239,14 +285,19 @@ fn write_run_control(
     run_id: &str,
     status: &str,
     active_trial_id: Option<&str>,
-    active_control_path: Option<&Path>,
+    active_control: Option<&HarnessControlTransport>,
 ) -> Result<()> {
     let payload = json!({
         "schema_version": "run_control_v1",
         "run_id": run_id,
         "status": status,
         "active_trial_id": active_trial_id,
-        "active_control_path": active_control_path.map(|p| p.to_string_lossy().to_string()),
+        "active_control_path": active_control
+            .as_ref()
+            .map(|control| control.host_path.to_string_lossy().to_string()),
+        "active_control_mode": active_control
+            .as_ref()
+            .map(|control| control.mode.as_str()),
         "updated_at": Utc::now().to_rfc3339(),
     });
     atomic_write_json_pretty(&run_control_path(run_dir), &payload)
@@ -374,8 +425,6 @@ pub struct ExperimentSummary {
     pub events_path: Option<String>,
     pub tracing_mode: Option<String>,
     pub control_path: String,
-    pub harness_script_resolved: Option<PathBuf>,
-    pub harness_script_exists: bool,
     pub scheduling: String,
     pub state_policy: String,
     pub comparison: String,
@@ -471,6 +520,11 @@ pub fn replay_trial(run_dir: &Path, trial_id: &str, strict: bool) -> Result<Repl
     let run_dir = run_dir
         .canonicalize()
         .map_err(|_| anyhow!("run_dir not found: {}", run_dir.display()))?;
+    let run_id = run_dir
+        .file_name()
+        .and_then(|v| v.to_str())
+        .unwrap_or("run")
+        .to_string();
     let project_root = find_project_root(&run_dir)
         .canonicalize()
         .unwrap_or_else(|_| find_project_root(&run_dir));
@@ -484,6 +538,7 @@ pub fn replay_trial(run_dir: &Path, trial_id: &str, strict: bool) -> Result<Repl
     }
     let json_value: Value = serde_json::from_slice(&fs::read(&resolved_path)?)?;
     let harness = resolve_harness(&json_value, &project_root)?;
+    let harness_env = resolve_harness_env(&harness)?;
     validate_harness_command(&harness.command_raw, &project_root)?;
 
     if strict && harness.integration_level != "sdk_full" {
@@ -538,19 +593,38 @@ pub fn replay_trial(run_dir: &Path, trial_id: &str, strict: bool) -> Result<Repl
     };
     let trial_paths = TrialPaths::new(&replay_trial_dir, &workspace_src, &dataset_src)?;
     trial_paths.prepare()?;
+    stage_host_files_for_trial(&harness, &trial_paths)?;
     materialize_workspace_files(&trial_paths, &task_boundary.workspace_files)?;
 
-    let input_bytes = serde_json::to_vec_pretty(&input)?;
-    let canonical_input = replay_trial_dir.join("trial_input.json");
-    atomic_write_bytes(&canonical_input, &input_bytes)?;
     let container_mode = input
         .pointer("/runtime/paths/workspace")
         .and_then(|v| v.as_str())
         == Some("/workspace");
-    let (input_path, output_path) = prepare_io_paths(&trial_paths, container_mode, &input_bytes)?;
-    let (control_path_harness, control_path_host) =
-        resolve_control_paths(&harness.control_path, &trial_paths, container_mode);
-    write_control_file(&control_path_host)?;
+    let control_transport = resolve_control_paths(&harness, &trial_paths, container_mode)?;
+    set_json_pointer_value(
+        &mut input,
+        "/runtime/control_plane/path",
+        json!(control_transport.harness_path.clone()),
+    )?;
+    set_json_pointer_value(
+        &mut input,
+        "/runtime/control_plane/mode",
+        json!(control_transport.mode.as_str()),
+    )?;
+    let input_bytes = serde_json::to_vec_pretty(&input)?;
+    let canonical_input = replay_trial_dir.join("trial_input.json");
+    atomic_write_bytes(&canonical_input, &input_bytes)?;
+
+    let (input_path, output_path) = prepare_io_paths(
+        &trial_paths,
+        container_mode,
+        &input_bytes,
+        &harness.input_path,
+        &harness.output_path,
+    )?;
+    if control_transport.mode == HarnessControlMode::File {
+        write_control_file(&control_transport.host_path)?;
+    }
     let dynamic_mounts = resolve_task_mounts(
         &project_root,
         &task_boundary.mount_references,
@@ -567,35 +641,33 @@ pub fn replay_trial(run_dir: &Path, trial_id: &str, strict: bool) -> Result<Repl
         run_harness_container(
             &json_value,
             &harness,
+            &harness_env,
             &trial_paths,
             &dynamic_mounts,
             &input_path,
             &output_path,
-            &control_path_harness,
+            &control_transport,
             &command,
             &effective_network_mode,
             None,
+            &run_id,
         )?
     } else {
         let command = resolve_command_local(&harness.command_raw, &project_root);
         run_harness_local(
             &harness,
+            &harness_env,
             &trial_paths,
             &input_path,
             &output_path,
-            &control_path_harness,
+            &control_transport,
+            &run_id,
             &command,
         )?
     };
     let status = proc_result.status;
 
-    if container_mode {
-        let canonical_output = replay_trial_dir.join("trial_output.json");
-        if output_path.exists() {
-            let output_bytes = fs::read(&output_path)?;
-            atomic_write_bytes(&canonical_output, &output_bytes)?;
-        }
-    }
+    materialize_trial_output(&replay_trial_dir, &output_path)?;
 
     let canonical_output = replay_trial_dir.join("trial_output.json");
     let trial_output: Value = if canonical_output.exists() {
@@ -695,6 +767,7 @@ fn fork_trial_inner(
     }
     let json_value: Value = serde_json::from_slice(&fs::read(&resolved_path)?)?;
     let harness = resolve_harness(&json_value, &project_root)?;
+    let harness_env = resolve_harness_env(&harness)?;
     validate_harness_command(&harness.command_raw, &project_root)?;
 
     if strict && harness.integration_level != "sdk_full" {
@@ -796,19 +869,38 @@ fn fork_trial_inner(
     };
     let trial_paths = TrialPaths::new(&fork_trial_dir, &workspace_src, &dataset_src)?;
     trial_paths.prepare()?;
+    stage_host_files_for_trial(&harness, &trial_paths)?;
     materialize_workspace_files(&trial_paths, &task_boundary.workspace_files)?;
 
-    let input_bytes = serde_json::to_vec_pretty(&input)?;
-    let canonical_input = fork_trial_dir.join("trial_input.json");
-    atomic_write_bytes(&canonical_input, &input_bytes)?;
     let container_mode = input
         .pointer("/runtime/paths/workspace")
         .and_then(|v| v.as_str())
         == Some("/workspace");
-    let (input_path, output_path) = prepare_io_paths(&trial_paths, container_mode, &input_bytes)?;
-    let (control_path_harness, control_path_host) =
-        resolve_control_paths(&harness.control_path, &trial_paths, container_mode);
-    write_control_file(&control_path_host)?;
+    let control_transport = resolve_control_paths(&harness, &trial_paths, container_mode)?;
+    set_json_pointer_value(
+        &mut input,
+        "/runtime/control_plane/path",
+        json!(control_transport.harness_path.clone()),
+    )?;
+    set_json_pointer_value(
+        &mut input,
+        "/runtime/control_plane/mode",
+        json!(control_transport.mode.as_str()),
+    )?;
+    let input_bytes = serde_json::to_vec_pretty(&input)?;
+    let canonical_input = fork_trial_dir.join("trial_input.json");
+    atomic_write_bytes(&canonical_input, &input_bytes)?;
+
+    let (input_path, output_path) = prepare_io_paths(
+        &trial_paths,
+        container_mode,
+        &input_bytes,
+        &harness.input_path,
+        &harness.output_path,
+    )?;
+    if control_transport.mode == HarnessControlMode::File {
+        write_control_file(&control_transport.host_path)?;
+    }
     let dynamic_mounts = resolve_task_mounts(
         &project_root,
         &task_boundary.mount_references,
@@ -825,35 +917,33 @@ fn fork_trial_inner(
         run_harness_container(
             &json_value,
             &harness,
+            &harness_env,
             &trial_paths,
             &dynamic_mounts,
             &input_path,
             &output_path,
-            &control_path_harness,
+            &control_transport,
             &command,
             &effective_network_mode,
             None,
+            &run_id,
         )?
     } else {
         let command = resolve_command_local(&harness.command_raw, &project_root);
         run_harness_local(
             &harness,
+            &harness_env,
             &trial_paths,
             &input_path,
             &output_path,
-            &control_path_harness,
+            &control_transport,
+            &run_id,
             &command,
         )?
     };
     let status = proc_result.status;
 
-    if container_mode {
-        let canonical_output = fork_trial_dir.join("trial_output.json");
-        if output_path.exists() {
-            let output_bytes = fs::read(&output_path)?;
-            atomic_write_bytes(&canonical_output, &output_bytes)?;
-        }
-    }
+    materialize_trial_output(&fork_trial_dir, &output_path)?;
 
     let canonical_output = fork_trial_dir.join("trial_output.json");
     let trial_output: Value = if canonical_output.exists() {
@@ -954,6 +1044,18 @@ pub fn pause_run(
         .and_then(|v| v.as_str())
         .map(PathBuf::from)
         .ok_or_else(|| anyhow!("pause_missing_control_path"))?;
+    let control_mode = HarnessControlMode::parse(
+        run_control
+            .pointer("/active_control_mode")
+            .and_then(|v| v.as_str()),
+    )?;
+    if control_mode != HarnessControlMode::File {
+        return Err(anyhow!(
+            "pause_unsupported_control_mode: {}",
+            control_mode.as_str()
+        ));
+    }
+    let control_transport = HarnessControlTransport::active(control_mode, &control_path);
 
     let resolved = load_json_file(&run_dir.join("resolved_experiment.json"))?;
     let integration_level = resolved
@@ -974,8 +1076,8 @@ pub fn pause_run(
     if !trial_dir.exists() {
         return Err(anyhow!("pause_trial_not_found: {}", target_trial));
     }
-    let container_mode = trial_is_container_mode(&trial_dir)?;
-    let events_path = resolve_event_path_for_trial(events_path_cfg, &trial_dir, container_mode);
+    let _container_mode = trial_is_container_mode(&trial_dir)?;
+    let events_path = resolve_event_path_for_trial(events_path_cfg, &trial_dir)?;
 
     let pause_label = label.unwrap_or("pause").to_string();
     let timeout = Duration::from_secs(timeout_seconds.max(1));
@@ -1014,7 +1116,7 @@ pub fn pause_run(
         &run_id,
         "paused",
         Some(&target_trial),
-        Some(&control_path),
+        Some(&control_transport),
     )?;
 
     Ok(PauseResult {
@@ -1162,31 +1264,34 @@ fn trial_is_container_mode(trial_dir: &Path) -> Result<bool> {
 fn resolve_event_path_for_trial(
     events_path: &str,
     trial_dir: &Path,
-    _container_mode: bool,
-) -> PathBuf {
+) -> Result<PathBuf> {
+    if !events_path.starts_with('/') {
+        return Err(anyhow!(
+            "runtime event path must be absolute when resolving trial events: {}",
+            events_path
+        ));
+    }
     if let Some(rest) = events_path.strip_prefix("/state") {
-        return trial_dir.join("state").join(rest.trim_start_matches('/'));
+        return Ok(trial_dir.join("state").join(rest.trim_start_matches('/')));
     }
     if let Some(rest) = events_path.strip_prefix("/out") {
-        return trial_dir.join("out").join(rest.trim_start_matches('/'));
+        return Ok(trial_dir.join("out").join(rest.trim_start_matches('/')));
     }
     if let Some(rest) = events_path.strip_prefix("/workspace") {
-        return trial_dir
+        return Ok(trial_dir
             .join("workspace")
-            .join(rest.trim_start_matches('/'));
+            .join(rest.trim_start_matches('/')));
     }
     if let Some(rest) = events_path.strip_prefix("/dataset") {
-        return trial_dir.join("dataset").join(rest.trim_start_matches('/'));
+        return Ok(trial_dir.join("dataset").join(rest.trim_start_matches('/')));
     }
     if let Some(rest) = events_path.strip_prefix("/tmp") {
-        return trial_dir.join("tmp").join(rest.trim_start_matches('/'));
+        return Ok(trial_dir.join("tmp").join(rest.trim_start_matches('/')));
     }
-    let p = Path::new(events_path);
-    if p.is_absolute() {
-        p.to_path_buf()
-    } else {
-        trial_dir.join("workspace").join(p)
-    }
+    Err(anyhow!(
+        "unsupported runtime event path for trial: {}",
+        events_path
+    ))
 }
 
 fn read_control_seq(control_path: &Path) -> Result<u64> {
@@ -1355,7 +1460,7 @@ fn resolve_selector_checkpoint(
         .get("path")
         .and_then(|v| v.as_str())
         .ok_or_else(|| anyhow!("invalid checkpoint entry: missing path"))?;
-    let resolved = resolve_event_path_for_trial(raw_path, trial_dir, true);
+    let resolved = resolve_event_path_for_trial(raw_path, trial_dir)?;
     if strict && !resolved.exists() {
         return Err(anyhow!(
             "strict_source_unavailable: checkpoint path not found {}",
@@ -1396,6 +1501,7 @@ fn validate_required_fields(json_value: &Value) -> Result<()> {
         "/runtime/harness/input_path",
         "/runtime/harness/output_path",
         "/runtime/harness/control_plane/path",
+        "/runtime/harness/control_plane/mode",
         "/runtime/network/mode",
         "/baseline/variant_id",
     ];
@@ -1411,6 +1517,17 @@ fn validate_required_fields(json_value: &Value) -> Result<()> {
         };
         if is_missing {
             missing.push(*pointer);
+        }
+    }
+    if json_value.pointer("/benchmark").is_some() {
+        let has_adapter_command = match json_value.pointer("/benchmark/adapter/command") {
+            Some(Value::Array(parts)) if !parts.is_empty() => parts
+                .iter()
+                .all(|part| part.as_str().map(|s| !s.trim().is_empty()).unwrap_or(false)),
+            _ => false,
+        };
+        if !has_adapter_command {
+            missing.push("/benchmark/adapter/command");
         }
     }
     if missing.is_empty() {
@@ -1529,6 +1646,7 @@ fn run_experiment_with_behavior(
     let benchmark_config = parse_benchmark_config(&json_value);
 
     let harness = resolve_harness(&json_value, &project_root)?;
+    let harness_env = resolve_harness_env(&harness)?;
     validate_harness_command(&harness.command_raw, &project_root)?;
     let executor_kind = execution.executor.unwrap_or_else(|| {
         if use_container || harness.force_container {
@@ -1607,6 +1725,7 @@ fn run_experiment_with_behavior(
         let trial_paths = TrialPaths::new(&trial_dir, &project_root, &dataset_path)?;
 
         trial_paths.prepare()?;
+        stage_host_files_for_trial(&harness, &trial_paths)?;
         if !matches!(effective_policy.state_policy, StatePolicy::IsolatePerTrial) {
             if let Some(chain_state) = chain_states.get(&chain_key) {
                 restore_workspace_from_snapshot(
@@ -1623,6 +1742,8 @@ fn run_experiment_with_behavior(
             container_mode,
         )?;
 
+        let control_transport = resolve_control_paths(&harness, &trial_paths, container_mode)?;
+
         let input = build_trial_input(
             &json_value,
             &run_id,
@@ -1633,6 +1754,8 @@ fn run_experiment_with_behavior(
             repl,
             &task_boundary,
             &trial_paths,
+            &control_transport.harness_path,
+            control_transport.mode,
             container_mode,
         );
         let input_bytes = serde_json::to_vec_pretty(&input)?;
@@ -1687,19 +1810,23 @@ fn run_experiment_with_behavior(
         });
         atomic_write_json_pretty(&trial_dir.join("trial_metadata.json"), &trial_metadata)?;
 
-        let (input_path, output_path) =
-            prepare_io_paths(&trial_paths, container_mode, &input_bytes)?;
-
-        let (control_path_harness, control_path_host) =
-            resolve_control_paths(&harness.control_path, &trial_paths, container_mode);
+        let (input_path, output_path) = prepare_io_paths(
+            &trial_paths,
+            container_mode,
+            &input_bytes,
+            &harness.input_path,
+            &harness.output_path,
+        )?;
         write_run_control(
             &run_dir,
             &run_id,
             "running",
             Some(&trial_id),
-            Some(&control_path_host),
+            Some(&control_transport),
         )?;
-        write_control_file(&control_path_host)?;
+        if control_transport.mode == HarnessControlMode::File {
+            write_control_file(&control_transport.host_path)?;
+        }
 
         let trial_evidence_dir = trial_dir.join("evidence");
         ensure_dir(&trial_evidence_dir)?;
@@ -1767,14 +1894,16 @@ fn run_experiment_with_behavior(
                 run_harness_container(
                     &json_value,
                     &harness,
+                    &harness_env,
                     &trial_paths,
                     &dynamic_mounts,
                     &input_path,
                     &output_path,
-                    &control_path_harness,
+                    &control_transport,
                     &command,
                     &effective_network_mode,
                     behavior.setup_command.as_deref(),
+                    &run_id,
                 )?
             } else {
                 if behavior.setup_command.is_some() {
@@ -1785,10 +1914,12 @@ fn run_experiment_with_behavior(
                 let command = resolve_command_local(&harness.command_raw, &project_root);
                 run_harness_local(
                     &harness,
+                    &harness_env,
                     &trial_paths,
                     &input_path,
                     &output_path,
-                    &control_path_harness,
+                    &control_transport,
+                    &run_id,
                     &command,
                 )?
             };
@@ -1814,13 +1945,7 @@ fn run_experiment_with_behavior(
                 }
             }
 
-            if container_mode {
-                let canonical_output = trial_dir.join("trial_output.json");
-                if output_path.exists() {
-                    let output_bytes = fs::read(&output_path)?;
-                    atomic_write_bytes(&canonical_output, &output_bytes)?;
-                }
-            }
+            materialize_trial_output(&trial_dir, &output_path)?;
 
             let canonical_output = trial_dir.join("trial_output.json");
             trial_output = if canonical_output.exists() {
@@ -1850,8 +1975,10 @@ fn run_experiment_with_behavior(
         let chain_root_snapshot_manifest =
             collect_workspace_snapshot_manifest(&chain_root_snapshot_path)?;
 
-        let diff_incremental = diff_workspace_snapshots(&pre_snapshot_manifest, &post_snapshot_manifest);
-        let diff_cumulative = diff_workspace_snapshots(&chain_root_snapshot_manifest, &post_snapshot_manifest);
+        let diff_incremental =
+            diff_workspace_snapshots(&pre_snapshot_manifest, &post_snapshot_manifest);
+        let diff_cumulative =
+            diff_workspace_snapshots(&chain_root_snapshot_manifest, &post_snapshot_manifest);
         let patch_incremental = derive_patch_from_diff(&diff_incremental);
         let patch_cumulative = derive_patch_from_diff(&diff_cumulative);
 
@@ -1913,7 +2040,8 @@ fn run_experiment_with_behavior(
         let hook_events_path = harness
             .events_path
             .as_ref()
-            .map(|path| resolve_event_path(path, &trial_paths, container_mode))
+            .map(|path| resolve_event_path(path, &trial_paths))
+            .transpose()?
             .filter(|path| path.exists());
         let hook_events_ref = if let Some(path) = hook_events_path.as_ref() {
             Some(artifact_store.put_file(path)?)
@@ -1945,7 +2073,6 @@ fn run_experiment_with_behavior(
             },
             "runtime": {
                 "executor": executor_kind.as_str(),
-                "container_mode": container_mode,
                 "exit_status": status.as_str(),
                 "duration_ms": trial_duration_ms
             },
@@ -2047,11 +2174,11 @@ fn run_experiment_with_behavior(
         )?;
 
         if let Some(events_path) = harness.events_path.as_ref() {
-            let manifest_path = resolve_harness_manifest_path(&trial_paths, container_mode);
+            let manifest_path = resolve_harness_manifest_path(&trial_paths, container_mode)?;
             if manifest_path.exists() {
                 let manifest = load_manifest(&manifest_path)?;
                 let schema = compile_schema("hook_events_v1.jsonschema")?;
-                let ev_path = resolve_event_path(events_path, &trial_paths, container_mode);
+                let ev_path = resolve_event_path(events_path, &trial_paths)?;
                 if ev_path.exists() {
                     let _ = validate_hooks(&manifest, &ev_path, &schema);
                     let counts = count_event_types(&ev_path)?;
@@ -2068,7 +2195,11 @@ fn run_experiment_with_behavior(
             }
         }
 
-        let control_state = read_control_action(&control_path_host)?;
+        let control_state = if control_transport.mode == HarnessControlMode::File {
+            read_control_action(&control_transport.host_path)?
+        } else {
+            None
+        };
         let pause_requested = control_state
             .as_ref()
             .map(|(action, requested_by, _)| action == "stop" && requested_by == "lab_pause")
@@ -2095,7 +2226,7 @@ fn run_experiment_with_behavior(
                 &run_id,
                 "paused",
                 Some(&trial_id),
-                Some(&control_path_host),
+                Some(&control_transport),
             )?;
             run_paused = true;
             break 'schedule;
@@ -2128,17 +2259,17 @@ fn run_experiment_with_behavior(
     validate_jsonl_against_schema("evidence_record_v1.jsonschema", &evidence_records_path)?;
     validate_jsonl_against_schema("task_chain_state_v1.jsonschema", &task_chain_states_path)?;
 
-    let benchmark_artifacts = process_benchmark_outputs(
-        &project_root,
-        &run_dir,
-        &run_id,
-        &trial_summaries,
-        &benchmark_config,
-        &evidence_records_path,
-        &task_chain_states_path,
-    )?;
-
-    apply_score_records_to_trial_summaries(&mut trial_summaries, &benchmark_artifacts.scores_path)?;
+    if let Some(adapter) = benchmark_config.adapter.as_ref() {
+        let scores_path = process_benchmark_outputs(
+            &project_root,
+            &run_dir,
+            &run_id,
+            adapter,
+            &evidence_records_path,
+            &task_chain_states_path,
+        )?;
+        apply_score_records_to_trial_summaries(&mut trial_summaries, &scores_path)?;
+    }
 
     write_analysis(
         &analysis_dir,
@@ -2236,12 +2367,6 @@ pub fn describe_experiment_with_overrides(
         .ok_or_else(|| anyhow!("missing /experiment/workload_type"))?
         .to_string();
 
-    let harness_script_resolved = resolve_command_script_path(&harness.command_raw, &project_root);
-    let harness_script_exists = harness_script_resolved
-        .as_ref()
-        .map(|p| p.exists())
-        .unwrap_or(true);
-
     let policy_config = parse_policies(&json_value);
     let comparison = json_value
         .pointer("/design/comparison")
@@ -2265,8 +2390,6 @@ pub fn describe_experiment_with_overrides(
         events_path: harness.events_path,
         tracing_mode: harness.tracing_mode,
         control_path: harness.control_path,
-        harness_script_resolved,
-        harness_script_exists,
         scheduling: match policy_config.scheduling {
             SchedulingPolicy::PairedInterleaved => "paired_interleaved".to_string(),
             SchedulingPolicy::VariantSequential => "variant_sequential".to_string(),
@@ -2455,7 +2578,8 @@ fn parse_benchmark_config(json_value: &Value) -> BenchmarkConfig {
     let policy = root.pointer("/policy");
     let mut policy_config = BenchmarkPolicyConfig::default();
     if let Some(p) = policy {
-        policy_config.task_model = parse_task_model(p.pointer("/task_model").and_then(|v| v.as_str()));
+        policy_config.task_model =
+            parse_task_model(p.pointer("/task_model").and_then(|v| v.as_str()));
         if let Some(v) = p.pointer("/scoring_lifecycle").and_then(|v| v.as_str()) {
             policy_config.scoring_lifecycle = v.to_string();
         }
@@ -2482,7 +2606,16 @@ fn parse_benchmark_config(json_value: &Value) -> BenchmarkConfig {
             .and_then(|v| v.as_array())
             .map(|arr| {
                 arr.iter()
-                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .filter_map(|v| {
+                        v.as_str().and_then(|s| {
+                            let trimmed = s.trim();
+                            if trimmed.is_empty() {
+                                None
+                            } else {
+                                Some(trimmed.to_string())
+                            }
+                        })
+                    })
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
@@ -2569,80 +2702,20 @@ fn validate_required_evidence_classes(record: &Value, required: &[String]) -> Re
     Ok(())
 }
 
-#[derive(Debug, Clone)]
-struct BenchmarkArtifactsPaths {
-    scores_path: PathBuf,
-}
-
-fn normalize_benchmark_manifest(
-    run_id: &str,
-    manifest: Option<Value>,
-    policy: &BenchmarkPolicyConfig,
-) -> Value {
-    let mut normalized = manifest.unwrap_or_else(|| json!({}));
-    if !normalized.is_object() {
-        normalized = json!({});
-    }
-    let obj = normalized.as_object_mut().expect("manifest object");
-
-    obj.entry("schema_version".to_string())
-        .or_insert_with(|| json!("benchmark_adapter_manifest_v1"));
-    obj.entry("created_at".to_string())
-        .or_insert_with(|| json!(Utc::now().to_rfc3339()));
-    obj.entry("adapter_id".to_string())
-        .or_insert_with(|| json!("runner_passthrough"));
-    obj.entry("adapter_version".to_string())
-        .or_insert_with(|| json!("0.1.0"));
-
-    if !obj.contains_key("benchmark") {
-        obj.insert(
-            "benchmark".to_string(),
-            json!({
-                "name": "unspecified_benchmark",
-                "version": "unknown",
-                "split": "unknown"
-            }),
-        );
-    } else if let Some(benchmark_obj) = obj.get_mut("benchmark").and_then(|v| v.as_object_mut()) {
-        benchmark_obj
-            .entry("name".to_string())
-            .or_insert_with(|| json!("unspecified_benchmark"));
-        benchmark_obj
-            .entry("split".to_string())
-            .or_insert_with(|| json!("unknown"));
-    }
-
-    obj.entry("execution_mode".to_string())
-        .or_insert_with(|| json!(policy.scoring_lifecycle.clone()));
-    obj.entry("record_schemas".to_string()).or_insert_with(|| {
-        json!({
-            "prediction": "benchmark_prediction_record_v1",
-            "score": "benchmark_score_record_v1"
-        })
-    });
-    obj.entry("evaluator".to_string()).or_insert_with(|| {
-        json!({
-            "name": "runner_passthrough",
-            "version": "0.1.0",
-            "mode": policy.evaluator_mode
-        })
-    });
-    obj.entry("ext".to_string())
-        .or_insert_with(|| json!({"run_id": run_id}));
-
-    normalized
-}
-
-fn benchmark_identity_from_manifest(manifest: &Value) -> (String, String, Option<String>, String) {
+fn benchmark_identity_from_manifest(
+    manifest: &Value,
+) -> Result<(String, String, Option<String>, String)> {
     let adapter_id = manifest
         .pointer("/adapter_id")
         .and_then(|v| v.as_str())
-        .unwrap_or("runner_passthrough")
+        .filter(|v| !v.trim().is_empty())
+        .ok_or_else(|| anyhow!("benchmark adapter manifest missing /adapter_id"))?
         .to_string();
     let name = manifest
         .pointer("/benchmark/name")
         .and_then(|v| v.as_str())
-        .unwrap_or("unspecified_benchmark")
+        .filter(|v| !v.trim().is_empty())
+        .ok_or_else(|| anyhow!("benchmark adapter manifest missing /benchmark/name"))?
         .to_string();
     let version = manifest
         .pointer("/benchmark/version")
@@ -2651,9 +2724,10 @@ fn benchmark_identity_from_manifest(manifest: &Value) -> (String, String, Option
     let split = manifest
         .pointer("/benchmark/split")
         .and_then(|v| v.as_str())
-        .unwrap_or("unknown")
+        .filter(|v| !v.trim().is_empty())
+        .ok_or_else(|| anyhow!("benchmark adapter manifest missing /benchmark/split"))?
         .to_string();
-    (adapter_id, name, version, split)
+    Ok((adapter_id, name, version, split))
 }
 
 fn read_jsonl_records(path: &Path) -> Result<Vec<Value>> {
@@ -2669,18 +2743,6 @@ fn read_jsonl_records(path: &Path) -> Result<Vec<Value>> {
         rows.push(serde_json::from_str::<Value>(line)?);
     }
     Ok(rows)
-}
-
-fn write_jsonl_records(path: &Path, rows: &[Value]) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        ensure_dir(parent)?;
-    }
-    let mut file = fs::File::create(path)?;
-    for row in rows {
-        serde_json::to_writer(&mut file, row)?;
-        writeln!(&mut file)?;
-    }
-    Ok(())
 }
 
 fn validate_json_file_against_schema(schema_name: &str, path: &Path) -> Result<()> {
@@ -2720,14 +2782,8 @@ fn validate_jsonl_against_schema(schema_name: &str, path: &Path) -> Result<()> {
         if line.trim().is_empty() {
             continue;
         }
-        let value: Value = serde_json::from_str(line).map_err(|e| {
-            anyhow!(
-                "invalid json line {} in {}: {}",
-                idx + 1,
-                path.display(),
-                e
-            )
-        })?;
+        let value: Value = serde_json::from_str(line)
+            .map_err(|e| anyhow!("invalid json line {} in {}: {}", idx + 1, path.display(), e))?;
         match schema.validate(&value) {
             Ok(_) => {}
             Err(errors) => {
@@ -2745,15 +2801,6 @@ fn validate_jsonl_against_schema(schema_name: &str, path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn verdict_from_outcome(outcome: &str) -> &'static str {
-    match outcome {
-        "success" => "pass",
-        "missing" => "missing",
-        "error" => "error",
-        _ => "fail",
-    }
-}
-
 fn outcome_from_verdict(verdict: &str) -> &'static str {
     match verdict {
         "pass" => "success",
@@ -2763,12 +2810,12 @@ fn outcome_from_verdict(verdict: &str) -> &'static str {
     }
 }
 
-fn build_benchmark_summary(run_id: &str, manifest: &Value, score_rows: &[Value]) -> Value {
-    let (adapter_id, name, version, split) = benchmark_identity_from_manifest(manifest);
+fn build_benchmark_summary(run_id: &str, manifest: &Value, score_rows: &[Value]) -> Result<Value> {
+    let (adapter_id, name, version, split) = benchmark_identity_from_manifest(manifest)?;
     let evaluator = manifest
         .pointer("/evaluator")
         .cloned()
-        .unwrap_or_else(|| json!({"name": "runner_passthrough", "mode": "custom"}));
+        .ok_or_else(|| anyhow!("benchmark adapter manifest missing /evaluator"))?;
 
     let mut totals = BTreeMap::from([
         ("pass".to_string(), 0usize),
@@ -2854,16 +2901,19 @@ fn build_benchmark_summary(run_id: &str, manifest: &Value, score_rows: &[Value])
         }));
     }
 
-    json!({
+    let mut benchmark = serde_json::Map::new();
+    benchmark.insert("adapter_id".to_string(), json!(adapter_id));
+    benchmark.insert("name".to_string(), json!(name));
+    benchmark.insert("split".to_string(), json!(split));
+    if let Some(version) = version {
+        benchmark.insert("version".to_string(), json!(version));
+    }
+
+    Ok(json!({
         "schema_version": "benchmark_summary_v1",
         "created_at": Utc::now().to_rfc3339(),
         "run_id": run_id,
-        "benchmark": {
-            "adapter_id": adapter_id,
-            "name": name,
-            "version": version,
-            "split": split
-        },
+        "benchmark": Value::Object(benchmark),
         "evaluator": evaluator,
         "totals": {
             "trials": score_rows.len(),
@@ -2873,102 +2923,17 @@ fn build_benchmark_summary(run_id: &str, manifest: &Value, score_rows: &[Value])
             "error": totals.get("error").copied().unwrap_or(0)
         },
         "variants": variants
-    })
-}
-
-fn generate_passthrough_benchmark_records(
-    run_id: &str,
-    manifest: &Value,
-    trial_summaries: &[Value],
-    predictions_path: &Path,
-    scores_path: &Path,
-    summary_path: &Path,
-) -> Result<()> {
-    let (adapter_id, name, version, split) = benchmark_identity_from_manifest(manifest);
-    let evaluator = manifest
-        .pointer("/evaluator")
-        .cloned()
-        .unwrap_or_else(|| json!({"name": "runner_passthrough", "mode": "custom"}));
-
-    let mut prediction_rows = Vec::new();
-    let mut score_rows = Vec::new();
-    for summary in trial_summaries {
-        let ids = json!({
-            "run_id": summary.pointer("/run_id").and_then(|v| v.as_str()).unwrap_or(run_id),
-            "trial_id": summary.pointer("/trial_id").and_then(|v| v.as_str()).unwrap_or(""),
-            "variant_id": summary.pointer("/variant_id").and_then(|v| v.as_str()).unwrap_or(""),
-            "task_id": summary.pointer("/task_id").and_then(|v| v.as_str()).unwrap_or(""),
-            "repl_idx": summary.pointer("/repl_idx").and_then(|v| v.as_u64()).unwrap_or(0),
-        });
-        let outcome = summary
-            .pointer("/outcome")
-            .and_then(|v| v.as_str())
-            .unwrap_or("error");
-        let verdict = verdict_from_outcome(outcome);
-        let primary_metric_name = summary
-            .pointer("/primary_metric_name")
-            .and_then(|v| v.as_str())
-            .unwrap_or("resolved")
-            .to_string();
-        let primary_metric_value = summary
-            .pointer("/primary_metric_value")
-            .and_then(|v| v.as_f64())
-            .unwrap_or(if verdict == "pass" { 1.0 } else { 0.0 });
-
-        prediction_rows.push(json!({
-            "schema_version": "benchmark_prediction_record_v1",
-            "ts": Utc::now().to_rfc3339(),
-            "ids": ids,
-            "benchmark": {
-                "adapter_id": adapter_id.clone(),
-                "name": name.clone(),
-                "version": version.clone(),
-                "split": split.clone()
-            },
-            "prediction": {
-                "kind": "json",
-                "value": {
-                    "outcome": outcome,
-                    "metrics": summary.pointer("/metrics").cloned().unwrap_or(json!({}))
-                }
-            },
-            "metrics": summary.pointer("/metrics").cloned().unwrap_or(json!({}))
-        }));
-
-        score_rows.push(json!({
-            "schema_version": "benchmark_score_record_v1",
-            "ts": Utc::now().to_rfc3339(),
-            "ids": ids,
-            "benchmark": {
-                "adapter_id": adapter_id.clone(),
-                "name": name.clone(),
-                "version": version.clone(),
-                "split": split.clone()
-            },
-            "verdict": verdict,
-            "primary_metric_name": primary_metric_name,
-            "primary_metric_value": primary_metric_value,
-            "metrics": summary.pointer("/metrics").cloned().unwrap_or(json!({})),
-            "evaluator": evaluator.clone()
-        }));
-    }
-
-    write_jsonl_records(predictions_path, &prediction_rows)?;
-    write_jsonl_records(scores_path, &score_rows)?;
-    let summary = build_benchmark_summary(run_id, manifest, &score_rows);
-    atomic_write_json_pretty(summary_path, &summary)?;
-    Ok(())
+    }))
 }
 
 fn process_benchmark_outputs(
     project_root: &Path,
     run_dir: &Path,
     run_id: &str,
-    trial_summaries: &[Value],
-    benchmark_config: &BenchmarkConfig,
+    adapter: &BenchmarkAdapterConfig,
     evidence_records_path: &Path,
     task_chain_states_path: &Path,
-) -> Result<BenchmarkArtifactsPaths> {
+) -> Result<PathBuf> {
     let benchmark_dir = run_dir.join("benchmark");
     ensure_dir(&benchmark_dir)?;
     let manifest_path = benchmark_dir.join("adapter_manifest.json");
@@ -2976,72 +2941,73 @@ fn process_benchmark_outputs(
     let scores_path = benchmark_dir.join("scores.jsonl");
     let summary_path = benchmark_dir.join("summary.json");
 
-    let manifest = normalize_benchmark_manifest(
-        run_id,
-        benchmark_config
-            .adapter
-            .as_ref()
-            .and_then(|a| a.manifest.clone()),
-        &benchmark_config.policy,
-    );
-    atomic_write_json_pretty(&manifest_path, &manifest)?;
+    if let Some(seed_manifest) = adapter.manifest.as_ref() {
+        atomic_write_json_pretty(&manifest_path, seed_manifest)?;
+    }
 
-    if let Some(adapter) = benchmark_config.adapter.as_ref() {
-        if adapter.command.is_empty() {
-            return Err(anyhow!("benchmark adapter command cannot be empty"));
-        }
-        let mut cmd = Command::new(&adapter.command[0]);
-        cmd.args(&adapter.command[1..]);
-        cmd.current_dir(project_root);
-        cmd.env("AGENTLAB_RUN_ID", run_id);
-        cmd.env("AGENTLAB_RUN_DIR", run_dir);
-        cmd.env("AGENTLAB_EVIDENCE_RECORDS_PATH", evidence_records_path);
-        cmd.env("AGENTLAB_TASK_CHAIN_STATES_PATH", task_chain_states_path);
-        cmd.env("AGENTLAB_BENCHMARK_DIR", &benchmark_dir);
-        cmd.env("AGENTLAB_ADAPTER_MANIFEST_PATH", &manifest_path);
-        cmd.env("AGENTLAB_PREDICTIONS_PATH", &predictions_path);
-        cmd.env("AGENTLAB_SCORES_PATH", &scores_path);
-        cmd.env("AGENTLAB_BENCHMARK_SUMMARY_PATH", &summary_path);
-        cmd.stdin(Stdio::null());
-        cmd.stdout(Stdio::inherit());
-        cmd.stderr(Stdio::inherit());
-        let status = cmd.status()?;
-        if !status.success() {
-            return Err(anyhow!(
-                "benchmark adapter command failed with status {}",
-                status
-            ));
-        }
-        if !predictions_path.exists() {
-            return Err(anyhow!(
-                "benchmark adapter did not produce predictions.jsonl"
-            ));
-        }
-        if !scores_path.exists() {
-            return Err(anyhow!("benchmark adapter did not produce scores.jsonl"));
-        }
-        if !summary_path.exists() {
-            let scores = read_jsonl_records(&scores_path)?;
-            let summary = build_benchmark_summary(run_id, &manifest, &scores);
-            atomic_write_json_pretty(&summary_path, &summary)?;
-        }
-    } else {
-        generate_passthrough_benchmark_records(
-            run_id,
-            &manifest,
-            trial_summaries,
-            &predictions_path,
-            &scores_path,
-            &summary_path,
-        )?;
+    if adapter.command.is_empty() {
+        return Err(anyhow!("benchmark adapter command cannot be empty"));
+    }
+    let mut cmd = Command::new(&adapter.command[0]);
+    cmd.args(&adapter.command[1..]);
+    cmd.current_dir(project_root);
+    cmd.env("AGENTLAB_RUN_ID", run_id);
+    cmd.env("AGENTLAB_RUN_DIR", run_dir);
+    cmd.env("AGENTLAB_EVIDENCE_RECORDS_PATH", evidence_records_path);
+    cmd.env("AGENTLAB_TASK_CHAIN_STATES_PATH", task_chain_states_path);
+    cmd.env("AGENTLAB_BENCHMARK_DIR", &benchmark_dir);
+    cmd.env(
+        "AGENTLAB_BENCHMARK_TASKS_PATH",
+        benchmark_dir.join("tasks.jsonl"),
+    );
+    cmd.env(
+        "AGENTLAB_EVALUATOR_LOGS_DIR",
+        benchmark_dir.join("evaluator_logs"),
+    );
+    cmd.env("AGENTLAB_ADAPTER_MANIFEST_PATH", &manifest_path);
+    cmd.env("AGENTLAB_PREDICTIONS_PATH", &predictions_path);
+    cmd.env("AGENTLAB_SCORES_PATH", &scores_path);
+    cmd.env("AGENTLAB_BENCHMARK_SUMMARY_PATH", &summary_path);
+    cmd.stdin(Stdio::null());
+    cmd.stdout(Stdio::inherit());
+    cmd.stderr(Stdio::inherit());
+    let status = cmd.status()?;
+    if !status.success() {
+        return Err(anyhow!(
+            "benchmark adapter command failed with status {}",
+            status
+        ));
+    }
+
+    if !manifest_path.exists() {
+        return Err(anyhow!(
+            "benchmark adapter did not produce adapter_manifest.json"
+        ));
+    }
+    if !predictions_path.exists() {
+        return Err(anyhow!(
+            "benchmark adapter did not produce predictions.jsonl"
+        ));
+    }
+    if !scores_path.exists() {
+        return Err(anyhow!("benchmark adapter did not produce scores.jsonl"));
     }
 
     validate_json_file_against_schema("benchmark_adapter_manifest_v1.jsonschema", &manifest_path)?;
-    validate_jsonl_against_schema("benchmark_prediction_record_v1.jsonschema", &predictions_path)?;
+    validate_jsonl_against_schema(
+        "benchmark_prediction_record_v1.jsonschema",
+        &predictions_path,
+    )?;
     validate_jsonl_against_schema("benchmark_score_record_v1.jsonschema", &scores_path)?;
+    if !summary_path.exists() {
+        let manifest = load_json_file(&manifest_path)?;
+        let scores = read_jsonl_records(&scores_path)?;
+        let summary = build_benchmark_summary(run_id, &manifest, &scores)?;
+        atomic_write_json_pretty(&summary_path, &summary)?;
+    }
     validate_json_file_against_schema("benchmark_summary_v1.jsonschema", &summary_path)?;
 
-    Ok(BenchmarkArtifactsPaths { scores_path })
+    Ok(scores_path)
 }
 
 fn apply_score_records_to_trial_summaries(
@@ -3082,16 +3048,16 @@ fn apply_score_records_to_trial_summaries(
         if let Some(obj) = summary.as_object_mut() {
             obj.insert("outcome".to_string(), json!(mapped_outcome));
             obj.insert("success".to_string(), json!(verdict == "pass"));
-            if let Some(name) = score.pointer("/primary_metric_name").and_then(|v| v.as_str()) {
+            if let Some(name) = score
+                .pointer("/primary_metric_name")
+                .and_then(|v| v.as_str())
+            {
                 obj.insert("primary_metric_name".to_string(), json!(name));
             }
             if let Some(value) = score.pointer("/primary_metric_value") {
                 obj.insert("primary_metric_value".to_string(), value.clone());
             }
-            let mut metrics = obj
-                .get("metrics")
-                .cloned()
-                .unwrap_or_else(|| json!({}));
+            let mut metrics = obj.get("metrics").cloned().unwrap_or_else(|| json!({}));
             if let Some(metrics_obj) = metrics.as_object_mut() {
                 metrics_obj.insert("benchmark_verdict".to_string(), json!(verdict));
             }
@@ -3191,7 +3157,7 @@ fn should_retry_outcome(outcome: &str, exit_status: &str, retry_on: &[String]) -
 
 // ---------------------------------------------------------------------------
 
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 struct Variant {
     id: String,
     bindings: Value,
@@ -3207,6 +3173,9 @@ fn resolve_variant_plan(json_value: &Value) -> Result<(Vec<Variant>, String)> {
         .pointer("/baseline/bindings")
         .cloned()
         .unwrap_or(json!({}));
+    if !baseline_bindings.is_object() {
+        return Err(anyhow!("invalid /baseline/bindings: expected object"));
+    }
 
     let mut variants = Vec::new();
     variants.push(Variant {
@@ -3214,20 +3183,39 @@ fn resolve_variant_plan(json_value: &Value) -> Result<(Vec<Variant>, String)> {
         bindings: baseline_bindings,
     });
 
-    let variant_list = json_value
-        .pointer("/variant_plan")
-        .and_then(|v| v.as_array())
-        .or_else(|| json_value.pointer("/variants").and_then(|v| v.as_array()));
-    if let Some(list) = variant_list {
-        for item in list {
-            let id = item
-                .get("variant_id")
-                .and_then(|v| v.as_str())
-                .unwrap_or("variant")
-                .to_string();
-            let bindings = item.get("bindings").cloned().unwrap_or(json!({}));
-            variants.push(Variant { id, bindings });
+    if json_value.get("variants").is_some() {
+        return Err(anyhow!(
+            "/variants is not supported; use /variant_plan for experiment variant plans"
+        ));
+    }
+
+    let variant_list: &[Value] = match json_value.pointer("/variant_plan") {
+        Some(value) => value.as_array().map(|v| v.as_slice()).ok_or_else(|| {
+            anyhow!("/variant_plan must be an array of {{ variant_id, bindings }} objects")
+        })?,
+        None => &[],
+    };
+    for (idx, item) in variant_list.iter().enumerate() {
+        let id = item
+            .get("variant_id")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| {
+                anyhow!(
+                    "/variant_plan[{}] must include non-empty string variant_id",
+                    idx
+                )
+            })?
+            .to_string();
+        let bindings = item.get("bindings").cloned().unwrap_or(json!({}));
+        if !bindings.is_object() {
+            return Err(anyhow!(
+                "/variant_plan[{}].bindings must be an object",
+                idx
+            ));
         }
+        variants.push(Variant { id, bindings });
     }
     Ok((variants, baseline))
 }
@@ -3633,14 +3621,12 @@ fn parse_task_boundary_from_dataset_task(task: &Value) -> Result<TaskBoundaryMat
 }
 
 fn parse_task_boundary_from_trial_input(input: &Value) -> Result<TaskBoundaryMaterialization> {
-    // Backward compatibility: older trial_input fixtures may not include /task.
     let task_payload = input
         .pointer("/task")
         .cloned()
-        .or_else(|| input.pointer("/dataset/task").cloned())
-        .unwrap_or_else(|| json!({}));
+        .ok_or_else(|| anyhow!("trial_input missing required /task"))?;
     if !task_payload.is_object() {
-        return Err(anyhow!("trial_input task payload must be an object"));
+        return Err(anyhow!("trial_input /task must be an object"));
     }
 
     if let Some(ext) = input.pointer("/ext/task_boundary_v1") {
@@ -3892,6 +3878,64 @@ fn materialize_workspace_files(
     Ok(())
 }
 
+fn copy_staged_host_file(src: &Path, dst: &Path, required: bool, label: &str) -> Result<bool> {
+    if !src.exists() {
+        if required {
+            return Err(anyhow!(
+                "staged host file source missing for {}: {}",
+                label,
+                src.display()
+            ));
+        }
+        return Ok(false);
+    }
+    if !src.is_file() {
+        return Err(anyhow!(
+            "staged host file source is not a file for {}: {}",
+            label,
+            src.display()
+        ));
+    }
+    if let Some(parent) = dst.parent() {
+        ensure_dir(parent)?;
+    }
+    fs::copy(src, dst).map_err(|e| {
+        anyhow!(
+            "failed to copy staged host file {} from {} to {}: {}",
+            label,
+            src.display(),
+            dst.display(),
+            e
+        )
+    })?;
+    Ok(true)
+}
+
+fn stage_host_files_for_trial(harness: &HarnessConfig, paths: &TrialPaths) -> Result<()> {
+    for (idx, spec) in harness.host_file_staging.iter().enumerate() {
+        let dst = map_container_path_to_host(&spec.destination_path, paths)?;
+        copy_staged_host_file(
+            &spec.source_from_host,
+            &dst,
+            spec.required,
+            &format!("#{}", idx),
+        )?;
+        #[cfg(unix)]
+        if dst
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(|name| name == "master.key")
+            .unwrap_or(false)
+            && dst.exists()
+        {
+            let mut perms = fs::metadata(&dst)?.permissions();
+            perms.set_mode(0o600);
+            fs::set_permissions(&dst, perms)?;
+        }
+    }
+    Ok(())
+}
+
 fn task_boundary_ext_value(task_boundary: &TaskBoundaryMaterialization) -> Option<Value> {
     if task_boundary.workspace_files.is_empty()
         && task_boundary.mount_references.is_empty()
@@ -3909,18 +3953,52 @@ fn task_boundary_ext_value(task_boundary: &TaskBoundaryMaterialization) -> Optio
 }
 
 #[derive(Clone)]
+struct HostFileStagingSpec {
+    source_from_host: PathBuf,
+    destination_path: String,
+    required: bool,
+}
+
+#[derive(Clone)]
 struct HarnessConfig {
     command_raw: Vec<String>,
     integration_level: String,
     input_path: String,
     output_path: String,
+    env: BTreeMap<String, String>,
+    env_from_host: Vec<String>,
     events_path: Option<String>,
     control_path: String,
+    control_mode: HarnessControlMode,
     tracing_mode: Option<String>,
     force_container: bool,
+    host_file_staging: Vec<HostFileStagingSpec>,
 }
 
-fn resolve_harness(json_value: &Value, _exp_dir: &Path) -> Result<HarnessConfig> {
+fn resolve_host_path_from_spec(raw: &str, exp_dir: &Path) -> Result<PathBuf> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(anyhow!("path must not be empty"));
+    }
+    let expanded = if trimmed == "~" || trimmed.starts_with("~/") {
+        let home = std::env::var("HOME")
+            .map_err(|_| anyhow!("HOME env var is required to resolve '{}'", trimmed))?;
+        if trimmed == "~" {
+            PathBuf::from(home)
+        } else {
+            Path::new(&home).join(trimmed.trim_start_matches("~/"))
+        }
+    } else {
+        PathBuf::from(trimmed)
+    };
+    if expanded.is_absolute() {
+        Ok(normalize_path(&expanded))
+    } else {
+        Ok(normalize_path(&exp_dir.join(expanded)))
+    }
+}
+
+fn resolve_harness(json_value: &Value, exp_dir: &Path) -> Result<HarnessConfig> {
     let harness = json_value
         .pointer("/runtime/harness")
         .ok_or_else(|| anyhow!("runtime.harness missing"))?;
@@ -3947,6 +4025,48 @@ fn resolve_harness(json_value: &Value, _exp_dir: &Path) -> Result<HarnessConfig>
         .and_then(|v| v.as_str())
         .ok_or_else(|| anyhow!("missing /runtime/harness/output_path"))?
         .to_string();
+    let env = match harness.pointer("/env") {
+        None => BTreeMap::new(),
+        Some(Value::Object(map)) => {
+            let mut parsed = BTreeMap::new();
+            for (key, value) in map {
+                if key.trim().is_empty() {
+                    return Err(anyhow!("runtime.harness.env contains empty key"));
+                }
+                let as_str = value
+                    .as_str()
+                    .ok_or_else(|| anyhow!("runtime.harness.env['{}'] must be a string", key))?;
+                parsed.insert(key.clone(), as_str.to_string());
+            }
+            parsed
+        }
+        Some(_) => {
+            return Err(anyhow!(
+                "runtime.harness.env must be an object<string,string>"
+            ));
+        }
+    };
+    let env_from_host = match harness.pointer("/env_from_host") {
+        None => Vec::new(),
+        Some(Value::Array(items)) => {
+            let mut parsed = Vec::with_capacity(items.len());
+            for value in items {
+                let key = value
+                    .as_str()
+                    .ok_or_else(|| anyhow!("runtime.harness.env_from_host must be a string[]"))?;
+                if key.trim().is_empty() {
+                    return Err(anyhow!(
+                        "runtime.harness.env_from_host contains an empty key"
+                    ));
+                }
+                parsed.push(key.to_string());
+            }
+            parsed
+        }
+        Some(_) => {
+            return Err(anyhow!("runtime.harness.env_from_host must be a string[]"));
+        }
+    };
     let events_path = harness
         .pointer("/events/path")
         .and_then(|v| v.as_str())
@@ -3956,6 +4076,11 @@ fn resolve_harness(json_value: &Value, _exp_dir: &Path) -> Result<HarnessConfig>
         .and_then(|v| v.as_str())
         .ok_or_else(|| anyhow!("missing /runtime/harness/control_plane/path"))?
         .to_string();
+    let control_mode = HarnessControlMode::parse(
+        harness
+            .pointer("/control_plane/mode")
+            .and_then(|v| v.as_str()),
+    )?;
     let tracing_mode = harness
         .pointer("/tracing/mode")
         .and_then(|v| v.as_str())
@@ -3965,17 +4090,90 @@ fn resolve_harness(json_value: &Value, _exp_dir: &Path) -> Result<HarnessConfig>
         .pointer("/runtime/sandbox/mode")
         .and_then(|v| v.as_str())
         == Some("container");
+    let host_file_staging = match harness.pointer("/host_file_staging") {
+        None => Vec::new(),
+        Some(Value::Array(items)) => {
+            let mut parsed = Vec::with_capacity(items.len());
+            for (idx, item) in items.iter().enumerate() {
+                let obj = item.as_object().ok_or_else(|| {
+                    anyhow!(
+                        "runtime.harness.host_file_staging[{}] must be an object",
+                        idx
+                    )
+                })?;
+                let source_raw = obj
+                    .get("source_from_host")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "runtime.harness.host_file_staging[{}].source_from_host missing",
+                            idx
+                        )
+                    })?;
+                let destination_path = obj
+                    .get("destination_path")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "runtime.harness.host_file_staging[{}].destination_path missing",
+                            idx
+                        )
+                    })?
+                    .trim()
+                    .to_string();
+                if destination_path.is_empty() {
+                    return Err(anyhow!(
+                        "runtime.harness.host_file_staging[{}].destination_path must not be empty",
+                        idx
+                    ));
+                }
+                let required = obj
+                    .get("required")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(true);
+                parsed.push(HostFileStagingSpec {
+                    source_from_host: resolve_host_path_from_spec(source_raw, exp_dir)?,
+                    destination_path,
+                    required,
+                });
+            }
+            parsed
+        }
+        Some(_) => {
+            return Err(anyhow!(
+                "runtime.harness.host_file_staging must be an array"
+            ));
+        }
+    };
 
     Ok(HarnessConfig {
         command_raw: command,
         integration_level,
         input_path,
         output_path,
+        env,
+        env_from_host,
         events_path,
         control_path,
+        control_mode,
         tracing_mode,
         force_container,
+        host_file_staging,
     })
+}
+
+fn resolve_harness_env(harness: &HarnessConfig) -> Result<BTreeMap<String, String>> {
+    let mut merged = harness.env.clone();
+    for key in &harness.env_from_host {
+        let value = std::env::var(key).map_err(|_| {
+            anyhow!(
+                "missing required host env var for runtime.harness.env_from_host: {}",
+                key
+            )
+        })?;
+        merged.insert(key.clone(), value);
+    }
+    Ok(merged)
 }
 
 struct TrialPaths {
@@ -4050,6 +4248,8 @@ fn build_trial_input(
     repl: usize,
     task_boundary: &TaskBoundaryMaterialization,
     paths: &TrialPaths,
+    control_path: &str,
+    control_mode: HarnessControlMode,
     container_mode: bool,
 ) -> Value {
     let runtime_paths = if container_mode {
@@ -4069,19 +4269,6 @@ fn build_trial_input(
             "tmp": paths.tmp.to_string_lossy(),
         })
     };
-    let control_path = if container_mode {
-        json_value
-            .pointer("/runtime/harness/control_plane/path")
-            .and_then(|v| v.as_str())
-            .unwrap_or("/state/lab_control.json")
-            .to_string()
-    } else {
-        paths
-            .state
-            .join("lab_control.json")
-            .to_string_lossy()
-            .to_string()
-    };
     let mut runtime = serde_json::Map::new();
     runtime.insert("paths".to_string(), runtime_paths);
     runtime.insert(
@@ -4094,7 +4281,7 @@ fn build_trial_input(
     runtime.insert(
         "control_plane".to_string(),
         json!({
-            "mode": json_value.pointer("/runtime/harness/control_plane/mode").and_then(|v| v.as_str()).unwrap_or("file"),
+            "mode": control_mode.as_str(),
             "path": control_path,
         }),
     );
@@ -4293,11 +4480,7 @@ fn restore_workspace_from_snapshot(snapshot_dir: &Path, workspace_dir: &Path) ->
     Ok(())
 }
 
-fn resolve_chain_label(
-    task_payload: &Value,
-    task_id: &str,
-    state_policy: StatePolicy,
-) -> String {
+fn resolve_chain_label(task_payload: &Value, task_id: &str, state_policy: StatePolicy) -> String {
     let explicit = task_payload
         .get("chain_id")
         .and_then(|v| v.as_str())
@@ -4327,36 +4510,42 @@ struct ProcessRunResult {
 
 fn run_harness_local(
     harness: &HarnessConfig,
+    harness_env: &BTreeMap<String, String>,
     paths: &TrialPaths,
     input_path: &Path,
     output_path: &Path,
-    control_path: &str,
+    control_transport: &HarnessControlTransport,
+    run_id: &str,
     command: &[String],
 ) -> Result<ProcessRunResult> {
     let mut cmd = Command::new(&command[0]);
     cmd.args(&command[1..]);
     cmd.current_dir(&paths.workspace);
-    cmd.env("AGENTLAB_TRIAL_INPUT", &input_path);
-    cmd.env("AGENTLAB_TRIAL_OUTPUT", &output_path);
-    cmd.env("AGENTLAB_CONTROL_PATH", control_path);
+    cmd.env("AGENTLAB_CONTROL_PATH", &control_transport.harness_path);
+    cmd.env("AGENTLAB_CONTROL_MODE", control_transport.mode.as_str());
     cmd.env("AGENTLAB_HARNESS_ROOT", &paths.exp_dir);
+    for (key, value) in harness_env {
+        cmd.env(key, value);
+    }
     if harness.tracing_mode.as_deref() == Some("otlp") {
         cmd.env("OTEL_EXPORTER_OTLP_ENDPOINT", "http://127.0.0.1:4318");
     }
-    run_process_with_trial_io(cmd, input_path, output_path)
+    run_process_with_trial_io(cmd, control_transport, run_id, input_path, output_path)
 }
 
 fn run_harness_container(
     json_value: &Value,
     harness: &HarnessConfig,
+    harness_env: &BTreeMap<String, String>,
     paths: &TrialPaths,
     dynamic_mounts: &[ResolvedMountReference],
     input_path: &Path,
     output_path: &Path,
-    control_path: &str,
+    control_transport: &HarnessControlTransport,
     command: &[String],
     network_mode: &str,
     setup_command: Option<&str>,
+    run_id: &str,
 ) -> Result<ProcessRunResult> {
     let image = json_value
         .pointer("/runtime/sandbox/image")
@@ -4368,9 +4557,7 @@ fn run_harness_container(
     }
 
     let mut cmd = Command::new("docker");
-    // Keep stdin attached so run_process_with_trial_io can pipe trial_input.json
-    // into the containerized harness process.
-    cmd.arg("run").arg("-i").arg("--rm");
+    cmd.arg("run").arg("--rm");
 
     if json_value
         .pointer("/runtime/sandbox/root_read_only")
@@ -4425,6 +4612,14 @@ fn run_harness_container(
     cmd.args(["-v", &format!("{}:/state", paths.state.display())]);
     cmd.args(["-v", &format!("{}:/dataset:ro", paths.dataset.display())]);
     cmd.args(["-v", &format!("{}:/out", paths.out.display())]);
+    if control_transport.mode == HarnessControlMode::Uds {
+        if let (Some(host_mount_dir), Some(mount_dir)) = (
+            control_transport.host_mount_dir.as_ref(),
+            control_transport.harness_mount_dir.as_ref(),
+        ) {
+            cmd.args(["-v", &format!("{}:{}", host_mount_dir.display(), mount_dir)]);
+        }
+    }
     for mount in dynamic_mounts {
         cmd.args([
             "-v",
@@ -4434,13 +4629,18 @@ fn run_harness_container(
     cmd.args(["--tmpfs", "/tmp:rw"]);
     cmd.args(["-w", "/workspace"]);
 
-    cmd.arg("-e")
-        .arg(format!("AGENTLAB_TRIAL_INPUT={}", harness.input_path));
-    cmd.arg("-e")
-        .arg(format!("AGENTLAB_TRIAL_OUTPUT={}", harness.output_path));
-    cmd.arg("-e")
-        .arg(format!("AGENTLAB_CONTROL_PATH={}", control_path));
+    cmd.arg("-e").arg(format!(
+        "AGENTLAB_CONTROL_PATH={}",
+        control_transport.harness_path
+    ));
+    cmd.arg("-e").arg(format!(
+        "AGENTLAB_CONTROL_MODE={}",
+        control_transport.mode.as_str()
+    ));
     cmd.arg("-e").arg("AGENTLAB_HARNESS_ROOT=/harness");
+    for (key, value) in harness_env {
+        cmd.arg("-e").arg(format!("{}={}", key, value));
+    }
 
     if harness.tracing_mode.as_deref() == Some("otlp") {
         cmd.arg("-e")
@@ -4462,7 +4662,7 @@ fn run_harness_container(
     } else {
         cmd.args(command);
     }
-    run_process_with_trial_io(cmd, input_path, output_path)
+    run_process_with_trial_io(cmd, control_transport, run_id, input_path, output_path)
 }
 
 fn resolve_command_local(command: &[String], exp_dir: &Path) -> Vec<String> {
@@ -4575,63 +4775,53 @@ fn validate_harness_command(command: &[String], project_root: &Path) -> Result<(
 
 fn run_process_with_trial_io(
     mut cmd: Command,
+    control_transport: &HarnessControlTransport,
+    run_id: &str,
     input_path: &Path,
     output_path: &Path,
 ) -> Result<ProcessRunResult> {
-    let input_bytes = fs::read(input_path).unwrap_or_default();
-    cmd.stdin(Stdio::piped());
+    if output_path.exists() {
+        if output_path.is_file() {
+            fs::remove_file(output_path)?;
+        } else {
+            return Err(anyhow!(
+                "output path must be a file: {}",
+                output_path.display()
+            ));
+        }
+    }
+
+    cmd.stdin(Stdio::null());
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::inherit());
 
-    let mut child = cmd.spawn()?;
-    if let Some(mut stdin) = child.stdin.take() {
-        let _ = stdin.write_all(&input_bytes);
-    }
-    let output = child.wait_with_output()?;
-
-    if !output_path.exists() {
-        let stdout = String::from_utf8_lossy(&output.stdout);
-        let maybe_json = stdout
-            .lines()
-            .rev()
-            .find(|l| !l.trim().is_empty())
-            .map(|s| s.trim().to_string());
-        if let Some(line) = maybe_json {
-            if serde_json::from_str::<Value>(&line).is_ok() {
-                if let Some(parent) = output_path.parent() {
-                    ensure_dir(parent)?;
-                }
-                atomic_write_bytes(output_path, line.as_bytes())?;
-            }
-        }
-    }
-
-    if !output_path.exists() {
-        let ids = serde_json::from_slice::<Value>(&input_bytes)
-            .ok()
-            .and_then(|v| v.get("ids").cloned())
-            .unwrap_or(json!({}));
-        let stderr_tail = String::from_utf8_lossy(&output.stderr)
-            .lines()
-            .rev()
-            .find(|l| !l.trim().is_empty())
-            .unwrap_or("harness exited without writing trial_output")
-            .to_string();
-        let fallback = json!({
-            "schema_version": "trial_output_v1",
-            "ids": ids,
-            "outcome": "error",
-            "error": {
-                "error_type": "harness_process_error",
-                "message": stderr_tail
-            }
-        });
-        if let Some(parent) = output_path.parent() {
-            ensure_dir(parent)?;
-        }
-        let fallback_bytes = serde_json::to_vec_pretty(&fallback)?;
-        atomic_write_bytes(output_path, &fallback_bytes)?;
-    }
+    let output = if control_transport.mode != HarnessControlMode::File {
+        let mut child = cmd.spawn()?;
+        wait_for_control_transport(&control_transport.host_path, Duration::from_secs(20)).map_err(
+            |err| {
+                let _ = child.kill();
+                let _ = child.wait();
+                err
+            },
+        )?;
+        send_hti_request(
+            &control_transport.host_path,
+            run_id,
+            "start_run",
+            json!({
+                "input_ref": input_path.to_string_lossy().to_string(),
+                "payload": Value::Null
+            }),
+        )
+        .map_err(|err| {
+            let _ = child.kill();
+            let _ = child.wait();
+            err
+        })?;
+        child.wait_with_output()?
+    } else {
+        cmd.output()?
+    };
 
     Ok(ProcessRunResult {
         status: output
@@ -4665,38 +4855,239 @@ fn shell_quote(s: &str) -> String {
     }
 }
 
+fn resolve_trial_io_host_path(
+    path: &str,
+    paths: &TrialPaths,
+    container_mode: bool,
+) -> Result<PathBuf> {
+    if container_mode {
+        return map_container_path_to_host(path, paths);
+    }
+    if !path.starts_with('/') {
+        return Err(anyhow!(
+            "runtime io path must be absolute when using container mount contract: {}",
+            path
+        ));
+    }
+    if path.starts_with("/state")
+        || path.starts_with("/out")
+        || path.starts_with("/harness")
+        || path.starts_with("/workspace")
+        || path.starts_with("/dataset")
+        || path.starts_with("/tmp")
+    {
+        return map_container_path_to_host(path, paths);
+    }
+    Err(anyhow!(
+        "unsupported runtime io path for non-container trials: {}",
+        path
+    ))
+}
+
 fn prepare_io_paths(
     paths: &TrialPaths,
     container_mode: bool,
     input_bytes: &[u8],
+    harness_input_path: &str,
+    harness_output_path: &str,
 ) -> Result<(PathBuf, PathBuf)> {
-    let input_host = if container_mode {
-        let path = paths.out.join("trial_input.json");
-        fs::write(&path, input_bytes)?;
-        path
-    } else {
-        paths.trial_dir.join("trial_input.json")
-    };
-    let output_host = if container_mode {
-        paths.out.join("trial_output.json")
-    } else {
-        paths.trial_dir.join("trial_output.json")
-    };
+    let input_host = resolve_trial_io_host_path(harness_input_path, paths, container_mode)?;
+    if let Some(parent) = input_host.parent() {
+        ensure_dir(parent)?;
+    }
+    fs::write(&input_host, input_bytes)?;
+
+    let output_host = resolve_trial_io_host_path(harness_output_path, paths, container_mode)?;
+    if let Some(parent) = output_host.parent() {
+        ensure_dir(parent)?;
+    }
     Ok((input_host, output_host))
 }
 
+fn materialize_trial_output(trial_dir: &Path, output_path: &Path) -> Result<PathBuf> {
+    let canonical_output = trial_dir.join("trial_output.json");
+    if output_path != canonical_output {
+        if canonical_output.exists() {
+            let _ = fs::remove_file(&canonical_output);
+        }
+        if output_path.exists() {
+            if let Some(parent) = canonical_output.parent() {
+                ensure_dir(parent)?;
+            }
+            fs::copy(output_path, &canonical_output)?;
+        }
+    }
+    Ok(canonical_output)
+}
+
 fn resolve_control_paths(
-    control_path: &str,
+    harness: &HarnessConfig,
     paths: &TrialPaths,
     container_mode: bool,
-) -> (String, PathBuf) {
-    if container_mode {
-        let host_path = map_container_path_to_host(control_path, paths);
-        (control_path.to_string(), host_path)
-    } else {
-        let host = paths.state.join("lab_control.json");
-        (host.to_string_lossy().to_string(), host)
+) -> Result<HarnessControlTransport> {
+    if matches!(harness.control_mode, HarnessControlMode::Uds) && cfg!(not(unix)) {
+        return Err(anyhow!(
+            "uds control transport is only supported on unix platforms"
+        ));
     }
+
+    match harness.control_mode {
+        HarnessControlMode::File => {
+            if container_mode {
+                let host_path = map_container_path_to_host(&harness.control_path, paths)?;
+                Ok(HarnessControlTransport {
+                    mode: HarnessControlMode::File,
+                    harness_path: harness.control_path.clone(),
+                    host_path,
+                    harness_mount_dir: None,
+                    host_mount_dir: None,
+                })
+            } else {
+                let host = resolve_trial_io_host_path(&harness.control_path, paths, false)?;
+                Ok(HarnessControlTransport {
+                    mode: HarnessControlMode::File,
+                    harness_path: host.to_string_lossy().to_string(),
+                    host_path: host,
+                    harness_mount_dir: None,
+                    host_mount_dir: None,
+                })
+            }
+        }
+        HarnessControlMode::Uds => {
+            let resolve_uds_path = |raw: &str| -> Result<String> {
+                let trimmed = raw.trim();
+                if !trimmed.starts_with('/') {
+                    return Err(anyhow!(
+                        "control socket path must be absolute for uds transport: {}",
+                        trimmed
+                    ));
+                }
+                Ok(trimmed.to_string())
+            };
+
+            if !container_mode {
+                let socket_path = resolve_uds_path(&harness.control_path)?;
+                let host_path = PathBuf::from(&socket_path);
+                return Ok(HarnessControlTransport {
+                    mode: HarnessControlMode::Uds,
+                    harness_path: host_path.to_string_lossy().to_string(),
+                    host_path,
+                    harness_mount_dir: None,
+                    host_mount_dir: None,
+                });
+            }
+            let socket_path = resolve_uds_path(&harness.control_path)?;
+            let socket_path = Path::new(&socket_path);
+            let harness_mount_dir = socket_path
+                .parent()
+                .and_then(|v| v.to_str())
+                .ok_or_else(|| {
+                    anyhow!(
+                        "control socket path must include a parent directory: {}",
+                        socket_path.display()
+                    )
+                })?
+                .to_string();
+            let socket_name = socket_path
+                .file_name()
+                .and_then(|v| v.to_str())
+                .ok_or_else(|| {
+                    anyhow!(
+                        "control socket path must include a socket file name: {}",
+                        socket_path.display()
+                    )
+                })?
+                .to_string();
+            let host_mount_dir = paths.state.join("agentlab_ipc");
+            ensure_dir(&host_mount_dir)?;
+            let host_path = host_mount_dir.join(&socket_name);
+            let harness_path = format!(
+                "{}/{}",
+                harness_mount_dir.trim_end_matches('/'),
+                socket_name
+            );
+
+            Ok(HarnessControlTransport {
+                mode: HarnessControlMode::Uds,
+                harness_path,
+                host_path,
+                harness_mount_dir: Some(harness_mount_dir),
+                host_mount_dir: Some(host_mount_dir),
+            })
+        }
+    }
+}
+
+fn wait_for_control_transport(path: &Path, timeout: Duration) -> Result<()> {
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        return Err(anyhow!(
+            "uds control transport is not supported on this platform at runtime"
+        ));
+    }
+
+    #[cfg(unix)]
+    {
+        let deadline = Instant::now() + timeout;
+        let mut last_err: Option<std::io::Error> = None;
+        while Instant::now() < deadline {
+            if path.exists() {
+                match UnixStream::connect(path) {
+                    Ok(_) => return Ok(()),
+                    Err(err) => last_err = Some(err),
+                }
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+
+        if let Some(err) = last_err {
+            return Err(anyhow!(
+                "control_transport_unavailable: path={}, timeout={:?}, error={}",
+                path.display(),
+                timeout,
+                err
+            ));
+        }
+        Err(anyhow!(
+            "control_transport_unavailable: path={}, timeout={:?}",
+            path.display(),
+            timeout
+        ))
+    }
+}
+
+fn hti_request(message_type: &str, request_id: &str, payload: Value) -> Value {
+    json!({
+        "request_id": request_id,
+        "type": message_type,
+        "timestamp": Utc::now().to_rfc3339(),
+        "payload": payload,
+    })
+}
+
+fn send_hti_request(
+    path: &Path,
+    request_id: &str,
+    message_type: &str,
+    payload: Value,
+) -> Result<()> {
+    let encoded = serde_json::to_string(&hti_request(message_type, request_id, payload))?;
+    #[cfg(unix)]
+    {
+        let mut stream = BufWriter::new(UnixStream::connect(path)?);
+        stream.write_all(encoded.as_bytes())?;
+        stream.write_all(b"\n")?;
+        stream.flush()?;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (path, request_id, message_type, encoded);
+        return Err(anyhow!(
+            "uds control transport is not supported on this platform"
+        ));
+    }
+    Ok(())
 }
 
 fn write_control_file(path: &Path) -> Result<()> {
@@ -4725,9 +5116,18 @@ fn write_control_action(
     Ok(version)
 }
 
-fn resolve_event_path(events_path: &str, paths: &TrialPaths, _container_mode: bool) -> PathBuf {
-    if events_path.starts_with("/out")
-        || events_path.starts_with("/state")
+fn resolve_event_path(
+    events_path: &str,
+    paths: &TrialPaths,
+) -> Result<PathBuf> {
+    if !events_path.starts_with('/') {
+        return Err(anyhow!(
+            "runtime event path must be absolute when using container mounts: {}",
+            events_path
+        ));
+    }
+    if events_path.starts_with("/state")
+        || events_path.starts_with("/out")
         || events_path.starts_with("/harness")
         || events_path.starts_with("/workspace")
         || events_path.starts_with("/dataset")
@@ -4735,27 +5135,18 @@ fn resolve_event_path(events_path: &str, paths: &TrialPaths, _container_mode: bo
     {
         map_container_path_to_host(events_path, paths)
     } else {
-        let p = Path::new(events_path);
-        if p.is_absolute() {
-            p.to_path_buf()
-        } else {
-            paths.workspace.join(p)
-        }
+        Err(anyhow!(
+            "unsupported runtime event path: {}",
+            events_path
+        ))
     }
 }
 
-fn resolve_harness_manifest_path(paths: &TrialPaths, container_mode: bool) -> PathBuf {
+fn resolve_harness_manifest_path(paths: &TrialPaths, container_mode: bool) -> Result<PathBuf> {
     if container_mode {
         map_container_path_to_host("/out/harness_manifest.json", paths)
     } else {
-        let direct = paths.trial_dir.join("harness_manifest.json");
-        if direct.exists() {
-            direct
-        } else if paths.workspace.join("harness_manifest.json").exists() {
-            paths.workspace.join("harness_manifest.json")
-        } else {
-            paths.out.join("harness_manifest.json")
-        }
+        Ok(paths.out.join("harness_manifest.json"))
     }
 }
 
@@ -4888,22 +5279,32 @@ fn apply_materialization_policy(trial_dir: &Path, mode: MaterializationMode) -> 
     Ok(())
 }
 
-fn map_container_path_to_host(path: &str, paths: &TrialPaths) -> PathBuf {
-    if let Some(rest) = path.strip_prefix("/state") {
-        paths.state.join(rest.trim_start_matches('/'))
-    } else if let Some(rest) = path.strip_prefix("/out") {
-        paths.out.join(rest.trim_start_matches('/'))
-    } else if let Some(rest) = path.strip_prefix("/harness") {
-        paths.exp_dir.join(rest.trim_start_matches('/'))
-    } else if let Some(rest) = path.strip_prefix("/workspace") {
-        paths.workspace.join(rest.trim_start_matches('/'))
-    } else if let Some(rest) = path.strip_prefix("/dataset") {
-        paths.dataset.join(rest.trim_start_matches('/'))
-    } else if let Some(rest) = path.strip_prefix("/tmp") {
-        paths.tmp.join(rest.trim_start_matches('/'))
-    } else {
-        paths.trial_dir.join(path.trim_start_matches('/'))
+fn map_container_path_to_host(path: &str, paths: &TrialPaths) -> Result<PathBuf> {
+    let raw = path.trim();
+    if raw.is_empty() {
+        return Err(anyhow!("container path is empty"));
     }
+    if !raw.starts_with('/') {
+        return Err(anyhow!("container path must be absolute: {}", raw));
+    }
+
+    let (base, rest) = if let Some(rest) = raw.strip_prefix("/state") {
+        (paths.state.as_path(), rest)
+    } else if let Some(rest) = raw.strip_prefix("/out") {
+        (paths.out.as_path(), rest)
+    } else if let Some(rest) = raw.strip_prefix("/harness") {
+        (paths.exp_dir.as_path(), rest)
+    } else if let Some(rest) = raw.strip_prefix("/workspace") {
+        (paths.workspace.as_path(), rest)
+    } else if let Some(rest) = raw.strip_prefix("/dataset") {
+        (paths.dataset.as_path(), rest)
+    } else if let Some(rest) = raw.strip_prefix("/tmp") {
+        (paths.tmp.as_path(), rest)
+    } else {
+        return Err(anyhow!("unsupported container mount path: {}", raw));
+    };
+
+    Ok(base.join(rest.trim_start_matches('/')))
 }
 
 fn count_event_types(events_path: &Path) -> Result<BTreeMap<String, usize>> {
@@ -5036,7 +5437,7 @@ mod tests {
         vec![
             "sh".to_string(),
             "-lc".to_string(),
-            "printf '%s' '{\"schema_version\":\"trial_output_v1\",\"outcome\":\"success\",\"checkpoints\":[]}' > \"$AGENTLAB_TRIAL_OUTPUT\"".to_string(),
+            "printf '%s' '{\"schema_version\":\"trial_output_v1\",\"outcome\":\"success\",\"checkpoints\":[]}'".to_string(),
         ]
     }
 
@@ -5070,6 +5471,7 @@ mod tests {
         harness.insert(
             "control_plane".to_string(),
             json!({
+                "mode": "file",
                 "path": "/state/lab_control.json"
             }),
         );
@@ -5119,6 +5521,9 @@ mod tests {
         let trial_input = json!({
             "schema_version": "trial_input_v1",
             "ids": { "trial_id": trial_id },
+            "task": {
+                "id": "task_1"
+            },
             "bindings": {
                 "existing": "value"
             },
@@ -5248,6 +5653,96 @@ mod tests {
         let resolved = resolve_command_local(&cmd, &root);
         assert_eq!(resolved[0], root.join("harness").to_string_lossy());
         assert_eq!(resolved[1], "run");
+    }
+
+    #[test]
+    fn resolve_harness_parses_host_file_staging_entries() {
+        let root = TempDirGuard::new("agentlab_host_file_staging_parse");
+        let exp_dir = root.path.join("exp");
+        ensure_dir(&exp_dir).expect("exp dir");
+        let spec = json!({
+            "runtime": {
+                "harness": {
+                    "mode": "cli",
+                    "command": ["sh", "-lc", "echo ok"],
+                    "integration_level": "cli_basic",
+                    "input_path": "/out/trial_input.json",
+                    "output_path": "/out/trial_output.json",
+                    "control_plane": { "mode": "file", "path": "/state/lab_control.json" },
+                    "host_file_staging": [
+                        {
+                            "source_from_host": "./secrets/graphd.db",
+                            "destination_path": "/state/.graphd/graphd.db",
+                            "required": true
+                        }
+                    ]
+                },
+                "sandbox": { "mode": "container" }
+            }
+        });
+
+        let harness = resolve_harness(&spec, &exp_dir).expect("resolve harness");
+        assert_eq!(harness.host_file_staging.len(), 1);
+        let entry = &harness.host_file_staging[0];
+        assert_eq!(
+            entry.source_from_host,
+            normalize_path(&exp_dir.join("secrets/graphd.db"))
+        );
+        assert_eq!(entry.destination_path, "/state/.graphd/graphd.db");
+        assert!(entry.required);
+    }
+
+    #[test]
+    fn stage_host_files_for_trial_copies_into_trial_namespaces() {
+        let root = TempDirGuard::new("agentlab_host_file_staging_copy");
+        let exp_dir = root.path.join("exp");
+        ensure_dir(&exp_dir).expect("exp");
+        fs::write(exp_dir.join("fixture.txt"), "fixture").expect("exp fixture");
+        let dataset_src = root.path.join("tasks.jsonl");
+        fs::write(&dataset_src, "{\"id\":\"task_1\"}\n").expect("dataset");
+        let trial_dir = root.path.join("trial_1");
+        ensure_dir(&trial_dir).expect("trial");
+        let paths = TrialPaths::new(&trial_dir, &exp_dir, &dataset_src).expect("paths");
+        paths.prepare().expect("prepare");
+
+        let source_db = root.path.join("graphd.db");
+        fs::write(&source_db, "db-bytes").expect("source db");
+
+        let harness = HarnessConfig {
+            command_raw: vec![],
+            integration_level: "cli_basic".to_string(),
+            input_path: "/out/trial_input.json".to_string(),
+            output_path: "/out/trial_output.json".to_string(),
+            env: BTreeMap::new(),
+            env_from_host: vec![],
+            events_path: None,
+            control_path: "/state/lab_control.json".to_string(),
+            control_mode: HarnessControlMode::File,
+            tracing_mode: None,
+            force_container: true,
+            host_file_staging: vec![
+                HostFileStagingSpec {
+                    source_from_host: source_db.clone(),
+                    destination_path: "/state/.graphd/graphd.db".to_string(),
+                    required: true,
+                },
+                HostFileStagingSpec {
+                    source_from_host: root.path.join("missing-wal"),
+                    destination_path: "/state/.graphd/graphd.db-wal".to_string(),
+                    required: false,
+                },
+            ],
+        };
+
+        stage_host_files_for_trial(&harness, &paths).expect("stage host files");
+        assert_eq!(
+            fs::read_to_string(paths.state.join(".graphd").join("graphd.db")).expect("staged db"),
+            "db-bytes"
+        );
+        assert!(
+            !paths.state.join(".graphd").join("graphd.db-wal").exists(),
+            "optional missing source should not create destination"
+        );
     }
 
     #[test]
@@ -5540,13 +6035,15 @@ mod tests {
         write_resolved_experiment(&run_dir, "cli_events", true);
         let trial_dir = seed_parent_trial(&run_dir, "trial_1", json!([]), "running", None);
         let control_path = trial_dir.join("state").join("lab_control.json");
+        let control_transport =
+            HarnessControlTransport::active(HarnessControlMode::File, &control_path);
         write_control_file(&control_path).expect("control file");
         write_run_control(
             &run_dir,
             "run_1",
             "running",
             Some("trial_1"),
-            Some(&control_path),
+            Some(&control_transport),
         )
         .expect("run control");
 
@@ -5566,13 +6063,15 @@ mod tests {
         write_resolved_experiment(&run_dir, "cli_events", false);
         let trial_dir = seed_parent_trial(&run_dir, "trial_1", json!([]), "running", None);
         let control_path = trial_dir.join("state").join("lab_control.json");
+        let control_transport =
+            HarnessControlTransport::active(HarnessControlMode::File, &control_path);
         write_control_file(&control_path).expect("control file");
         write_run_control(
             &run_dir,
             "run_1",
             "running",
             Some("trial_1"),
-            Some(&control_path),
+            Some(&control_transport),
         )
         .expect("run control");
 
@@ -5593,13 +6092,15 @@ mod tests {
         let trial_dir = seed_parent_trial(&run_dir, "trial_1", json!([]), "running", None);
         let control_path = trial_dir.join("state").join("lab_control.json");
         let events_path = trial_dir.join("state").join("harness_events.jsonl");
+        let control_transport =
+            HarnessControlTransport::active(HarnessControlMode::File, &control_path);
         write_control_file(&control_path).expect("control file");
         write_run_control(
             &run_dir,
             "run_1",
             "running",
             Some("trial_1"),
-            Some(&control_path),
+            Some(&control_transport),
         )
         .expect("run control");
 
@@ -5672,8 +6173,17 @@ mod tests {
             Some("cp1"),
         );
         ensure_dir(&trial_dir.join("state").join("cp1")).expect("checkpoint path");
-        write_run_control(&run_dir, "run_1", "running", Some("trial_1"), None)
-            .expect("run control");
+        let control_path = trial_dir.join("state").join("lab_control.json");
+        let control_transport =
+            HarnessControlTransport::active(HarnessControlMode::File, &control_path);
+        write_run_control(
+            &run_dir,
+            "run_1",
+            "running",
+            Some("trial_1"),
+            Some(&control_transport),
+        )
+        .expect("run control");
 
         let err = resume_run(&run_dir, None, None, &BTreeMap::new(), false)
             .err()
@@ -5697,7 +6207,17 @@ mod tests {
             None,
         );
         ensure_dir(&trial_dir.join("state").join("cp1")).expect("checkpoint path");
-        write_run_control(&run_dir, "run_1", "paused", Some("trial_1"), None).expect("run control");
+        let control_path = trial_dir.join("state").join("lab_control.json");
+        let control_transport =
+            HarnessControlTransport::active(HarnessControlMode::File, &control_path);
+        write_run_control(
+            &run_dir,
+            "run_1",
+            "paused",
+            Some("trial_1"),
+            Some(&control_transport),
+        )
+        .expect("run control");
 
         let err = resume_run(&run_dir, None, None, &BTreeMap::new(), false)
             .err()
@@ -5724,7 +6244,17 @@ mod tests {
             Some("cp_resume"),
         );
         ensure_dir(&trial_dir.join("state").join("cp_resume")).expect("checkpoint path");
-        write_run_control(&run_dir, "run_1", "paused", Some("trial_1"), None).expect("run control");
+        let control_path = trial_dir.join("state").join("lab_control.json");
+        let control_transport =
+            HarnessControlTransport::active(HarnessControlMode::File, &control_path);
+        write_run_control(
+            &run_dir,
+            "run_1",
+            "paused",
+            Some("trial_1"),
+            Some(&control_transport),
+        )
+        .expect("run control");
 
         let mut set_bindings = BTreeMap::new();
         set_bindings.insert("resume.override".to_string(), json!(42));
@@ -5856,6 +6386,161 @@ mod tests {
     }
 
     #[test]
+    fn resolve_variant_plan_rejects_legacy_variants_field() {
+        let spec = json!({
+            "baseline": { "variant_id": "base", "bindings": {} },
+            "variants": [
+                { "variant_id": "old", "bindings": { "temperature": 0.7 } }
+            ]
+        });
+
+        let err = resolve_variant_plan(&spec).expect_err("legacy variants should fail");
+        assert!(
+            err.to_string().contains("/variants is not supported"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn resolve_variant_plan_rejects_bad_variant_plan_entry() {
+        let spec = json!({
+            "baseline": { "variant_id": "base", "bindings": {} },
+            "variant_plan": [
+                { "bindings": { "temperature": 0.8 } },
+                { "variant_id": "t2", "bindings": [] }
+            ]
+        });
+
+        let err = resolve_variant_plan(&spec).expect_err("bad variant plan should fail");
+        assert!(
+            err.to_string().contains("variant_plan[0]"),
+            "unexpected error: {}",
+            err
+        );
+
+        let spec = json!({
+            "baseline": { "variant_id": "base", "bindings": {} },
+            "variant_plan": [
+                { "variant_id": "t2", "bindings": [] }
+            ]
+        });
+        let err = resolve_variant_plan(&spec).expect_err("bad variant bindings type should fail");
+        assert!(
+            err.to_string().contains("variant_plan[0].bindings"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn resolve_variant_plan_uses_baseline_when_no_variant_plan_present() {
+        let spec = json!({
+            "baseline": { "variant_id": "base", "bindings": {} }
+        });
+
+        let (variants, baseline_id) = resolve_variant_plan(&spec).expect("baseline only");
+        assert_eq!(baseline_id, "base");
+        assert_eq!(variants.len(), 1);
+        assert_eq!(variants[0].id, "base");
+    }
+
+    #[test]
+    fn validate_required_fields_requires_benchmark_adapter_command() {
+        let spec = json!({
+            "version": "0.3",
+            "experiment": { "id": "e", "name": "n", "workload_type": "agent_harness" },
+            "dataset": { "path": "tasks.jsonl", "provider": "local_jsonl", "suite_id": "s", "schema_version": "v1", "split_id": "dev", "limit": 50 },
+            "design": { "sanitization_profile": "hermetic_functional_v2", "comparison": "paired", "replications": 1, "random_seed": 1337, "shuffle_tasks": true, "max_concurrency": 1 },
+            "baseline": { "variant_id": "base", "bindings": {} },
+            "benchmark": {
+                "policy": { "task_model": "independent" }
+            },
+            "runtime": {
+                "harness": { "mode": "cli", "command": ["node", "h.js"], "integration_level": "cli_basic", "input_path": "/out/in.json", "output_path": "/out/out.json", "control_plane": { "mode": "file", "path": "/state/ctl.json" } },
+                "sandbox": { "mode": "local" },
+                "network": { "mode": "none", "allowed_hosts": [] }
+            }
+        });
+        let err = validate_required_fields(&spec).expect_err("should fail");
+        assert!(
+            err.to_string().contains("/benchmark/adapter/command"),
+            "missing benchmark adapter command: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn process_benchmark_outputs_generates_summary_when_missing() {
+        let root = TempDirGuard::new("agentlab_benchmark_adapter_summary");
+        let project_root = root.path.join("project");
+        let run_dir = root.path.join("run");
+        ensure_dir(&project_root).expect("project root");
+        ensure_dir(&run_dir).expect("run dir");
+
+        let evidence_dir = run_dir.join("evidence");
+        ensure_dir(&evidence_dir).expect("evidence dir");
+        let evidence_records_path = evidence_dir.join("evidence_records.jsonl");
+        let task_chain_states_path = evidence_dir.join("task_chain_states.jsonl");
+        fs::write(&evidence_records_path, "").expect("evidence records");
+        fs::write(&task_chain_states_path, "").expect("task chain states");
+
+        let adapter = BenchmarkAdapterConfig {
+            command: vec![
+                "/bin/sh".to_string(),
+                "-c".to_string(),
+                r#"cat >"$AGENTLAB_ADAPTER_MANIFEST_PATH" <<'JSON'
+{"schema_version":"benchmark_adapter_manifest_v1","adapter_id":"demo_adapter","adapter_version":"1.0.0","benchmark":{"name":"demo_suite","split":"dev"},"execution_mode":"predict_then_score","record_schemas":{"prediction":"benchmark_prediction_record_v1","score":"benchmark_score_record_v1"},"evaluator":{"name":"demo_eval","mode":"custom"}}
+JSON
+cat >"$AGENTLAB_PREDICTIONS_PATH" <<'JSONL'
+{"schema_version":"benchmark_prediction_record_v1","ids":{"run_id":"run_123","trial_id":"trial_1","variant_id":"base","task_id":"task_1","repl_idx":0},"benchmark":{"adapter_id":"demo_adapter","name":"demo_suite","split":"dev"},"prediction":{"kind":"json","value":{"patch":"diff --git"}}}
+JSONL
+cat >"$AGENTLAB_SCORES_PATH" <<'JSONL'
+{"schema_version":"benchmark_score_record_v1","ids":{"run_id":"run_123","trial_id":"trial_1","variant_id":"base","task_id":"task_1","repl_idx":0},"benchmark":{"adapter_id":"demo_adapter","name":"demo_suite","split":"dev"},"verdict":"pass","primary_metric_name":"resolved","primary_metric_value":1.0,"metrics":{"resolved":1.0},"evaluator":{"name":"demo_eval","mode":"custom"}}
+JSONL
+"#
+                .to_string(),
+            ],
+            manifest: None,
+        };
+
+        let scores_path = process_benchmark_outputs(
+            &project_root,
+            &run_dir,
+            "run_123",
+            &adapter,
+            &evidence_records_path,
+            &task_chain_states_path,
+        )
+        .expect("benchmark processing should succeed");
+        assert!(scores_path.exists(), "scores path should exist");
+
+        let summary_path = run_dir.join("benchmark").join("summary.json");
+        let summary = load_json_file(&summary_path).expect("summary");
+        assert_eq!(
+            summary
+                .pointer("/schema_version")
+                .and_then(|v| v.as_str())
+                .unwrap_or(""),
+            "benchmark_summary_v1"
+        );
+        assert_eq!(
+            summary
+                .pointer("/benchmark/adapter_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or(""),
+            "demo_adapter"
+        );
+        assert_eq!(
+            summary
+                .pointer("/totals/pass")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0),
+            1
+        );
+    }
+
+    #[test]
     fn parse_task_boundary_extracts_runtime_fields() {
         let task = json!({
             "schema_version": "task_boundary_v1",
@@ -5917,7 +6602,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_task_boundary_from_trial_input_legacy_without_task_defaults_empty() {
+    fn parse_task_boundary_from_trial_input_requires_task() {
         let input = json!({
             "schema_version": "trial_input_v1",
             "ids": { "trial_id": "trial_1" },
@@ -5928,18 +6613,13 @@ mod tests {
             }
         });
 
-        let parsed = parse_task_boundary_from_trial_input(&input).expect("parse legacy input");
-        assert_eq!(
-            parsed
-                .task_payload
-                .as_object()
-                .map(|obj| obj.len())
-                .unwrap_or_default(),
-            0
+        let err =
+            parse_task_boundary_from_trial_input(&input).expect_err("should require task field");
+        assert!(
+            err.to_string().contains("missing required /task"),
+            "unexpected error: {}",
+            err
         );
-        assert!(parsed.workspace_files.is_empty());
-        assert!(parsed.mount_references.is_empty());
-        assert!(parsed.limits.is_empty());
     }
 
     #[test]
@@ -6069,6 +6749,8 @@ mod tests {
             0,
             &task_boundary,
             &paths,
+            "/state/lab_control.json",
+            HarnessControlMode::File,
             true,
         );
 

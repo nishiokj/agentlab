@@ -24,8 +24,10 @@ In local (non-container) mode, the harness is executed with:
 
 - CWD set to the trial output directory (`.../.lab/runs/<run_id>/trials/<trial_id>/`).
 - Env vars:
-  - `AGENTLAB_TRIAL_INPUT` = absolute path to `trial_input.json`
-  - `AGENTLAB_TRIAL_OUTPUT` = absolute path to `trial_output.json`
+  - `AGENTLAB_CONTROL_PATH` = transport path (`/run/ipc/harness.sock` for UDS by default)
+  - `AGENTLAB_CONTROL_MODE` = `uds` or `file`
+  - `AGENTLAB_HARNESS_ROOT` = experiment root mounted as `/harness` in container mode
+- `trial_input_path` and `trial_output_path` are provided by `/runtime/harness/input_path` and `/runtime/harness/output_path` and are mounted inside the trial context.
 
 ## `tasks.jsonl`
 

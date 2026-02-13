@@ -461,7 +461,7 @@ Derived guarantees (grades) must be computed from the integration level actually
       "additionalProperties": false,
       "required": ["mode", "path"],
       "properties": {
-        "mode": { "type": "string", "enum": ["file", "sdk"] },
+        "mode": { "type": "string", "enum": ["file", "uds"] },
         "path": { "type": "string", "minLength": 1 },
         "format_version": { "type": "string", "default": "control_plane_v1" }
       }
@@ -837,7 +837,7 @@ Derived guarantees (grades) must be computed from the integration level actually
           "additionalProperties": false,
           "required": ["mode", "path"],
           "properties": {
-            "mode": { "type": "string", "enum": ["file", "sdk"] },
+            "mode": { "type": "string", "enum": ["file", "uds"] },
             "path": { "type": "string", "minLength": 1 }
           }
         },

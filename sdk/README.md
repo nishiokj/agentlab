@@ -146,12 +146,54 @@ The harness image should stay generic (runtime + your harness code/deps). Task-s
    - `/task` from the boundary `task`.
    - `/runtime/budgets` from `limits.max_steps|max_total_tokens|max_tool_calls` when present.
    - `/runtime/timeouts/trial_seconds` from `limits.trial_seconds` when present.
-7. The runner invokes exactly one harness command with env contracts (`AGENTLAB_TRIAL_INPUT`, `AGENTLAB_TRIAL_OUTPUT`, `AGENTLAB_CONTROL_PATH`, `AGENTLAB_HARNESS_ROOT`).
-8. The runner persists trial artifacts plus run-scope boundaries:
+7. The runner invokes exactly one harness command with env contracts:
+   - `AGENTLAB_CONTROL_PATH` (`/run/ipc/harness.sock`)
+   - `AGENTLAB_CONTROL_MODE` (`uds` or `file`)
+   - `AGENTLAB_HARNESS_ROOT`
+8. Runner ownership of control transport:
+   - Host creates an IPC dir and mounts it to `/run/ipc` in-container.
+   - Harness reads the socket path from `AGENTLAB_CONTROL_PATH` and speaks the standard envelope over NDJSON in container mode.
+   - Local mode can use either mode depending on experiment config.
+   - Runner uses process completion + `trial_output` to mark trial completion in the current build.
+9. The runner persists trial artifacts plus run-scope boundaries:
    - `.lab/runs/<run_id>/trials/<trial_id>/...` (trial input/output, logs, snapshots, diffs, trial metadata)
    - `.lab/runs/<run_id>/evidence/evidence_records.jsonl` (`evidence_record_v1`)
    - `.lab/runs/<run_id>/evidence/task_chain_states.jsonl` (`task_chain_state_v1`)
    - `.lab/runs/<run_id>/benchmark/{adapter_manifest,predictions,scores,summary}` (adapter/evaluator outputs)
+
+### Harness Transport Interface (HTI) contract
+
+The runner and harness exchange a tiny orchestration protocol so harnesses can vary independently of the runner.
+
+- The runner and harness agree on **connection mode** via env:
+  - `AGENTLAB_CONTROL_MODE` (`uds` or `file`)
+  - `AGENTLAB_CONTROL_PATH`
+- Messages are framed as **NDJSON** by default (one JSON object per line).
+
+Minimal runner→harness requests:
+
+- `ping`
+- `start_run`
+- `cancel_run`
+- optional `shutdown`
+
+Minimal harness→runner events:
+
+- `run_started`
+- `run_finished` (completion signal)
+- optional: `log`, `progress`, `artifact`
+
+`run_finished` is part of the control contract, but the current Rust runner completion path is still based on process exit + output and does not block on this event yet.
+
+All messages include `request_id` (run id) and `type`.
+Optional metadata payload fields are intentionally opaque to the runner.
+
+Example request/response:
+
+```json
+{"type":"start_run","request_id":"run_20260211_120000","payload":{"input_ref":"./state/trial_input.json","harness_payload":{"model":"gpt-4o"}}}
+{"type":"run_finished","request_id":"run_20260211_120000","payload":{"status":"success","artifact_paths":["/state/trial_output.json"]}}
+```
 
 ### OutcomeMapper (implemented by you)
 
@@ -225,8 +267,7 @@ const benchmark = await client.readBenchmark({ runDir: run.run.run_dir });
 The SDK exports versioned, fixed contracts for interoperability across entrypoints and harness variants:
 
 - `WORKSPACE_CONTRACT_V1` (`/workspace`, manifest path, artifacts dir)
-- `INVOCATION_ENV_CONTRACT_V1` (env vars + one-command invocation model)
-- `EVENT_OUTPUT_CONTRACT_V1` (run events JSONL + result summary path)
+- `INVOCATION_ENV_CONTRACT_V1` (env vars + one-command invocation model, including control plane vars)
 - `createRunnerBoundaryManifest(command)` (versioned manifest object)
 
 ## ExperimentBuilder
