@@ -121,7 +121,7 @@ flowchart TD
     PATHS["TrialPaths prepare: workspace/state/dataset/out/tmp"]
     STAGE["stage project workspace + workspace_files + dataset pack mounts"]
     INPUT["build trial_input_v1 + task_boundary_v1 ext"]
-    CTRL["resolve control transport (file|uds) + protocol handshake"]
+    CTRL["resolve control transport (uds|file) + protocol handshake"]
     START["spawn harness (local_process / local_docker / remote)"]
     RUN["harness executes task + writes output + optional events"]
     RETRY{"trial status or outcome requires retry?"}
@@ -174,6 +174,7 @@ flowchart TD
 5. Runner invokes exactly one harness command.
    - Container mode mounts: `/workspace` (rw), `/harness` (ro project root), `/dataset` (ro), `/state` (rw), `/out` (rw), `/tmp` (tmpfs).
    - Runner launches the child process with env vars: `AGENTLAB_CONTROL_PATH`, `AGENTLAB_CONTROL_MODE`, `AGENTLAB_HARNESS_ROOT` plus benchmark boundary vars.
+   - Default control transport is `uds` (`/run/ipc/harness.sock`); `file` is the explicit alternative.
 6. Runner resolves trial output deterministically:
    - if output file exists at configured `/runtime/harness/output_path`, uses it.
    - else synthesizes an error `trial_output_v1`.
@@ -376,8 +377,8 @@ The `integrationLevel` controls how much telemetry your harness emits:
 | `cli_basic` | Harness reads input, writes output. No events. |
 | `cli_events` | Harness also writes `harness_events.jsonl` with step/turn events. |
 | `otel` | Events via OpenTelemetry spans. |
-| `sdk_control` | Harness reads the control plane file for pause/stop signals. |
-| `sdk_full` | Full bidirectional control. |
+| `sdk_control` | Harness uses the control channel (selected by `runtime.harness.control_plane.mode`: `file` or `uds`) for pause/stop signals. |
+| `sdk_full` | Full bidirectional control over the selected transport. |
 
 ### LabClient
 
