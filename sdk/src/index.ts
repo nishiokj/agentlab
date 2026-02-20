@@ -75,11 +75,15 @@ export type {
   Bindings,
   ComparisonPolicy,
   DatasetJsonlOptions,
+  DependencyAssetEntry,
   DesignPolicies,
   ExperimentSpec,
+  AgentRuntimeMode,
+  AgentRuntimeOverrides,
+  KnownAgentRef,
+  CustomAgentImage,
   GuardrailDef,
-  HarnessCliOptions,
-  HarnessHostFileStagingEntry,
+  DependencyFileStagingEntry,
   MetricAggregate,
   MetricDef,
   MetricSource,
@@ -87,7 +91,6 @@ export type {
   RetryPolicy,
   RetryTrigger,
   SchedulingPolicy,
-  StatePolicy,
 } from './experiment-builder.js';
 
 export type {

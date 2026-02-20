@@ -138,7 +138,7 @@ How many times each (variant, task) pair is executed. Indexed by `repl_idx`. **I
 - Appears in: `trial_input_v1.workload.type`, `workload_adapter_manifest_v1.workload_type`, `ExperimentSummary.workload_type`, CLI `--workload-type` flag
 
 **Sanitization Profile**
-- Values: `replay_strict_v2`, `hermetic_functional_v2`, `perf_benchmark_v2`
+- Values: `replay_strict`, `hermetic_functional`, `perf_benchmark`
 - Appears in: `trial_input_v1.design.sanitization_profile`, `state_inventory_v1.sanitization_profile`, `ExperimentSpec.design.sanitization_profile` (SDK)
 
 **Execution Mode** (adapters)

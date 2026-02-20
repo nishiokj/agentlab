@@ -10,7 +10,7 @@ Reduce API friction without adding surface area. Two changes: restore strict-saf
 
 ### Problem
 
-`build()` currently requires 9 fields. Six of those have exactly one obvious default. Users must call `.sanitizationProfile('hermetic_functional_v2')` and `.randomSeed(42)` every time, even though there's no real choice being made.
+`build()` currently requires 9 fields. Six of those have exactly one obvious default. Users must call `.sanitizationProfile('hermetic_functional')` and `.randomSeed(42)` every time, even though there's no real choice being made.
 
 ### Change
 
@@ -18,7 +18,7 @@ Restore defaults for fields that have a single strict-safe value. `build()` vali
 
 | Field | Current default | New default | Rationale |
 |---|---|---|---|
-| `sanitization_profile` | `''` (sentinel) | `'hermetic_functional_v2'` | Only profile that exists |
+| `sanitization_profile` | `''` (sentinel) | `'hermetic_functional'` | Only profile that exists |
 | `replications` | `0` (sentinel) | `1` | Run once is the obvious starting point |
 | `random_seed` | `0` (sentinel) | `1` | Reproducible by default; change when you need different ordering |
 | `dataset.path` | `''` (sentinel) | `''` (sentinel) | **No default** — only the user knows where their data is |

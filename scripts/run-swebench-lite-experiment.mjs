@@ -161,7 +161,7 @@ async function main() {
       limit: safeLimit,
     })
     .harnessCli(harnessCommand, { integrationLevel })
-    .sanitizationProfile('hermetic_functional_v2')
+    .sanitizationProfile('hermetic_functional')
     .replications(replications)
     .randomSeed(randomSeed)
     .maxConcurrency(maxConcurrency)

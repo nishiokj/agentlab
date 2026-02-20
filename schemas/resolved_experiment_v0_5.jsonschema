@@ -1,12 +1,12 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://agent-lab.local/schemas/resolved_experiment_v0_3.json",
-  "title": "Resolved Experiment v0.3",
+  "$id": "https://agent-lab.local/schemas/resolved_experiment_v0_5.json",
+  "title": "Resolved Experiment v0.5",
   "type": "object",
   "additionalProperties": true,
   "required": ["version", "experiment", "dataset", "design", "baseline", "runtime"],
   "properties": {
-    "version": { "const": "0.3" },
+    "version": { "const": "0.5" },
     "experiment": {
       "type": "object",
       "additionalProperties": true,
@@ -48,7 +48,6 @@
           "additionalProperties": false,
           "properties": {
             "scheduling": { "type": "string", "enum": ["paired_interleaved", "variant_sequential", "randomized"] },
-            "state": { "type": "string", "enum": ["isolate_per_trial", "persist_per_task", "accumulate"] },
             "comparison": { "type": "string", "enum": ["paired", "unpaired", "none"] },
             "retry": {
               "type": "object",
@@ -70,7 +69,7 @@
               }
             }
           },
-          "required": ["scheduling", "state", "comparison", "retry"]
+          "required": ["scheduling", "comparison", "retry"]
         }
       }
     },
@@ -127,96 +126,154 @@
     "runtime": {
       "type": "object",
       "additionalProperties": true,
-      "required": ["harness", "sandbox", "network"],
-      "allOf": [
-        {
-          "if": {
-            "properties": {
-              "sandbox": {
-                "type": "object",
-                "properties": { "mode": { "const": "container" } },
-                "required": ["mode"]
-              }
-            },
-            "required": ["sandbox"]
-          },
-          "then": {
-            "properties": {
-              "sandbox": {
-                "type": "object",
-                "required": ["image"]
-              }
-            }
-          }
-        },
-        {
-          "if": {
-            "properties": {
-              "sandbox": {
-                "type": "object",
-                "properties": {
-                  "mode": { "not": { "const": "container" } }
-                },
-                "required": ["mode"]
-              }
-            },
-            "required": ["sandbox"]
-          },
-          "then": {
-            "properties": {
-              "harness": {
-                "type": "object",
-                "required": ["command"]
-              }
-            }
-          }
-        }
-      ],
+      "required": ["agent", "dependencies", "policy"],
       "properties": {
-        "harness": {
+        "agent": {
           "type": "object",
           "additionalProperties": true,
           "required": ["mode"],
           "properties": {
-            "mode": { "type": "string" },
-            "command": { "type": "array", "items": { "type": "string" }, "minItems": 1 },
-            "integration_level": { "type": "string", "minLength": 1 },
-            "input_path": { "type": "string", "minLength": 1 },
-            "output_path": { "type": "string", "minLength": 1 },
-            "env": {
+            "mode": { "type": "string", "enum": ["known_agent_ref", "custom_image"] },
+            "known_agent_ref": {
               "type": "object",
-              "additionalProperties": { "type": "string" }
+              "additionalProperties": false,
+              "required": ["id", "version"],
+              "properties": {
+                "id": { "type": "string", "minLength": 1 },
+                "version": { "type": "string", "minLength": 1 },
+                "registry": { "type": "string", "minLength": 1 }
+              }
             },
-            "env_from_host": {
-              "type": "array",
-              "items": { "type": "string", "minLength": 1 }
+            "custom_image": {
+              "type": "object",
+              "additionalProperties": true,
+              "required": ["entrypoint"],
+              "properties": {
+                "image": { "type": "string", "minLength": 1 },
+                "entrypoint": {
+                  "type": "array",
+                  "items": { "type": "string", "minLength": 1 },
+                  "minItems": 1
+                }
+              }
             },
-            "control_plane": {
+            "overrides": {
               "type": "object",
               "additionalProperties": true,
               "properties": {
-                "mode": { "type": "string", "enum": ["file", "uds"] },
-                "path": { "type": "string", "minLength": 1 }
+                "args": {
+                  "type": "array",
+                  "items": { "type": "string", "minLength": 1 }
+                },
+                "env": {
+                  "type": "object",
+                  "additionalProperties": { "type": "string" }
+                },
+                "env_from_host": {
+                  "type": "array",
+                  "items": { "type": "string", "minLength": 1 }
+                }
               }
             }
           }
         },
-        "sandbox": {
+        "dependencies": {
           "type": "object",
           "additionalProperties": true,
-          "required": ["mode"],
           "properties": {
-            "mode": { "type": "string" },
-            "image": { "type": "string", "minLength": 1 }
+            "assets": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["source_from_host", "mount_path"],
+                "properties": {
+                  "id": { "type": "string", "minLength": 1 },
+                  "source_from_host": { "type": "string", "minLength": 1 },
+                  "mount_path": { "type": "string", "minLength": 1 },
+                  "read_only": { "type": "boolean" },
+                  "required": { "type": "boolean" }
+                }
+              }
+            },
+            "file_staging": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["source_from_host", "destination_path"],
+                "properties": {
+                  "source_from_host": { "type": "string", "minLength": 1 },
+                  "destination_path": { "type": "string", "minLength": 1 },
+                  "required": { "type": "boolean" }
+                }
+              }
+            },
+            "services": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "additionalProperties": true,
+                "required": ["id", "kind", "path"],
+                "properties": {
+                  "id": { "type": "string", "minLength": 1 },
+                  "kind": { "type": "string", "minLength": 1 },
+                  "path": { "type": "string", "minLength": 1 }
+                }
+              }
+            }
           }
         },
-        "network": {
+        "policy": {
           "type": "object",
           "additionalProperties": true,
-          "required": ["mode", "allowed_hosts"],
+          "required": ["timeout_ms", "network", "sandbox"],
           "properties": {
-            "mode": { "type": "string" },
-            "allowed_hosts": { "type": "array", "items": { "type": "string" } }
+            "timeout_ms": { "type": "integer", "minimum": 1 },
+            "network": {
+              "type": "object",
+              "additionalProperties": true,
+              "required": ["mode", "allowed_hosts"],
+              "properties": {
+                "mode": { "type": "string", "enum": ["none", "full", "allowlist_enforced"] },
+                "allowed_hosts": { "type": "array", "items": { "type": "string", "minLength": 1 } }
+              }
+            },
+            "sandbox": {
+              "type": "object",
+              "additionalProperties": true,
+              "required": ["mode"],
+              "properties": {
+                "mode": { "type": "string", "enum": ["container", "local"] },
+                "image": { "type": "string", "minLength": 1 },
+                "root_read_only": { "type": "boolean" },
+                "run_as_user": { "type": "string", "minLength": 1 },
+                "hardening": {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "properties": {
+                    "no_new_privileges": { "type": "boolean" },
+                    "drop_all_caps": { "type": "boolean" }
+                  }
+                },
+                "resources": {
+                  "type": "object",
+                  "additionalProperties": true,
+                  "properties": {
+                    "cpu_count": { "type": "integer", "minimum": 1 },
+                    "memory_mb": { "type": "integer", "minimum": 1 }
+                  }
+                }
+              }
+            }
+          }
+        },
+        "telemetry": {
+          "type": "object",
+          "additionalProperties": true,
+          "properties": {
+            "trajectory_path": { "type": "string", "minLength": 1 },
+            "causal_extraction": { "type": "string", "minLength": 1 }
           }
         }
       }

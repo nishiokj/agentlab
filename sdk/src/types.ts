@@ -1,4 +1,4 @@
-import type { SchedulingPolicy, StatePolicy, ComparisonPolicy } from './experiment-builder.js';
+import type { SchedulingPolicy, ComparisonPolicy } from './experiment-builder.js';
 
 export type JsonMap = Record<string, unknown>;
 
@@ -21,15 +21,12 @@ export interface ExperimentSummary {
   replications: number;
   variant_count: number;
   total_trials: number;
-  harness: string[];
-  integration_level: string;
+  agent_loop: string[];
   image?: string | null;
   network: string;
-  events_path?: string | null;
-  tracing?: string | null;
-  control_path: string;
+  trajectory_path?: string | null;
+  causal_extraction?: string | null;
   scheduling?: SchedulingPolicy;
-  state_policy?: StatePolicy;
   comparison?: ComparisonPolicy;
   retry_max_attempts?: number;
 }
@@ -287,7 +284,7 @@ export interface CommonTrialIds {
 }
 
 export interface EvidencePolicy {
-  state_policy?: 'isolate_per_trial' | 'persist_per_task' | 'accumulate';
+  state_policy?: 'isolate_per_trial';
   task_model?: 'independent' | 'dependent';
   chain_id?: string;
   chain_step_index?: number;

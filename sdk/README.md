@@ -1,6 +1,12 @@
 # @agentlab/sdk
 
-TypeScript SDK for defining experiments and driving the AgentLab Rust runner. Build experiment configs with a fluent API, execute them through a typed client, get structured JSON results.
+TypeScript SDK for authoring AgentLab `version: '0.5'` experiments and invoking the Rust runner.
+
+The SDK is runtime-agent-first:
+
+1. You declare `runtime.agent`, `runtime.dependencies`, and `runtime.policy`.
+2. Runner owns container/process execution, isolation, and causal artifact extraction.
+3. Your agent loop is just a command invoked once per trial.
 
 ## Install
 
@@ -11,664 +17,272 @@ npm install @agentlab/sdk
 Local development:
 
 ```bash
-cd sdk && npm install && npm run build && npm test
+cd sdk
+npm install
+npm run build
+npm test
 ```
 
 ## Quick Start
 
 ```ts
 import { ExperimentBuilder, LabClient, Metric } from '@agentlab/sdk';
-import { writeFileSync, mkdirSync } from 'node:fs';
+import { mkdirSync, writeFileSync } from 'node:fs';
 
-// 1. Define the experiment
-const builder = ExperimentBuilder.create('prompt_ab', 'Prompt A/B Test')
-  .description('Compare prompt v1 vs v2 on coding tasks')
-
-  // Your dataset — path relative to the directory containing experiment.yaml.
-  .datasetJsonl('./data/tasks.jsonl', {
-    suiteId: 'coding_tasks',
-    splitId: 'dev',
-    limit: 50,
+const builder = ExperimentBuilder.create('rex_ab', 'Rex Prompt A/B')
+  .description('Compare prompt variants on curated coding tasks')
+  .datasetJsonl('./data/tasks.boundary.jsonl', {
+    suiteId: 'swebench_lite_curated',
+    splitId: 'test',
+    limit: 10,
   })
 
-  // Your harness — the command the runner invokes for EACH trial.
-  // Path is relative to the project root (parent of .lab/).
-  //
-  //   Node:   ['node', './src/harness/run-trial.js']
-  //   Python: ['python', '-m', 'my_agent.harness']
-  //   Binary: ['./bin/evaluate']
-  //
-  // If this path is wrong, every trial fails.
-  .harnessCli(
-    ['node', './src/harness/run-trial.js'],
-    { integrationLevel: 'cli_events' }
+  // Runtime boundary: runner executes this in an isolated trial container.
+  .customAgentImage(
+    'ghcr.io/acme/rex-agent@sha256:0123456789abcdef...',
+    ['python', '-m', 'rex.run_trial'],
   )
+  .agentEnvFromHost(['OPENAI_API_KEY'])
 
-  .baseline('control', { model: 'gpt-4o', temperature: 0.0 })
-  .addVariant('treatment', { model: 'gpt-4o', temperature: 0.7 })
+  // Dependency boundary: stage host files into trial paths.
+  .dependencyAssets([
+    {
+      id: 'sqlite-main',
+      source_from_host: './deps/sqlite/main.db',
+      mount_path: '/agentlab/deps/sqlite/main.db',
+      read_only: true,
+      required: true,
+    },
+    {
+      id: 'ast-index',
+      source_from_host: './deps/ast/index.tar.zst',
+      mount_path: '/agentlab/deps/ast/index.tar.zst',
+      required: false,
+    },
+  ])
 
-  // Metrics — each declares its source explicitly
-  .metric(Metric.DURATION_MS)                                          // runner tracks
-  .metric(Metric.TOKENS_IN)                                            // from events
-  .metric(Metric.TOKENS_OUT)                                           // from events
-  .metric(Metric.fromOutput('success', '/outcome', {                   // from trial_output
-    primary: true, weight: 1.0, direction: 'maximize',
+  .baseline('control', { model: 'gpt-4o-mini', prompt: 'v1' })
+  .addVariant('treatment', { model: 'gpt-4o-mini', prompt: 'treatment_prompt' })
+
+  .metric(Metric.DURATION_MS)
+  .metric(Metric.fromOutput('solved', '/metrics/solved', {
+    primary: true,
+    weight: 1,
+    direction: 'maximize',
   }))
-  .metric(Metric.fromOutput('cost_usd', '/metrics/cost_usd', {
-    direction: 'minimize',
-  }))
 
-  // Artifacts — collect workspace output and track changes
-  .artifacts({ collect: ['**/*.py', 'output/**'], diff: true })
-  .metric(Metric.FILES_MODIFIED)                                          // from artifacts
-  .metric(Metric.DIFF_LINES)                                              // from artifacts
+  .timeoutMs(600_000)
+  .networkMode('none');
 
-  .networkMode('allowlist_enforced', ['api.openai.com']);
-
-// 2. Write config to disk
 mkdirSync('.lab', { recursive: true });
 writeFileSync('.lab/experiment.yaml', builder.toYaml());
 
-// 3. Validate and run
-const client = new LabClient();
+const client = new LabClient({ cwd: process.cwd() });
+const run = await client.run({
+  experiment: '.lab/experiment.yaml',
+  executor: 'local_docker',
+  materialize: 'outputs_only',
+});
 
-const summary = await client.describe({ experiment: '.lab/experiment.yaml' });
-console.log(`Planned: ${summary.summary.total_trials} trials`);
-
-const run = await client.run({ experiment: '.lab/experiment.yaml' });
-console.log(`Done: ${run.run.run_id}`);
+console.log(run.run.run_id);
 ```
 
-## Boundary Mappers (Input + Outcome)
+## What You Need To Bring
 
-Use boundary mappers when you want strict, typed control over what crosses the runner boundary.
+1. A dataset JSONL (`dataset.path`) with one JSON object per line.
+2. An agent runtime declaration:
+   - `runtime.agent.mode: known_agent_ref`, or
+   - `runtime.agent.mode: custom_image`.
+3. At least one baseline variant (`.baseline(...)`).
+4. Optional treatment variants (`.addVariant(...)`) and metrics (`.metric(...)`).
+5. Optional staged dependency assets (`.dependencyAssets(...)`).
 
-### InputMapper (implemented by you)
+You do not provide a control-plane protocol, runner socket wiring, or runner state handling.
 
-All benchmark inputs must compile into exactly:
+## Runtime Agent Modes
 
-- `task`
-- `workspace_files`
-- `mount_references`
-- `limits`
+### `known_agent_ref`
 
-This boundary is `TaskBoundaryV1` (`schema_version: "task_boundary_v1"`). If your input cannot be represented this way, you need a new runner capability (for example: GPU, network policy, privileged syscall), not a new task boundary type.
+Use this when the runner should resolve a pre-registered runtime by id/version.
 
 ```ts
-import {
-  compileTaskBoundaries,
-  taskBoundariesToJsonl,
-  type InputMapper,
-} from '@agentlab/sdk';
-
-type RawRow = {
-  id: string;
-  prompt: string;
-  fixturePackSha256: string;
-};
-
-const mapper: InputMapper<RawRow> = {
-  map(row, { index }) {
-    return {
-      schema_version: 'task_boundary_v1',
-      task: { id: row.id, prompt: row.prompt, index },
-      workspace_files: [
-        { path: 'README.md', content: `task ${row.id}` },
-      ],
-      mount_references: [
-        {
-          dataset_pack_ref: `sha256:${row.fixturePackSha256}`,
-          mount_path: '/workspace/dataset',
-          read_only: true,
-        },
-      ],
-      limits: { max_steps: 32, trial_seconds: 300 },
-    };
-  },
-};
-
-const compiled = compileTaskBoundaries(rawRows, mapper);
-const jsonl = taskBoundariesToJsonl(compiled);
+builder.agentRef('rex_daemon', '1.2.0', { registry: 'internal' });
 ```
 
-### Runtime materialization model (implemented by the Runner)
+Runner resolves manifests from:
 
-`workspace_files` and `mount_references` are **not** baked into your harness image at container build time.
+1. `.lab/agents/<registry>/<id>/<version>.json` (if `registry` provided)
+2. `.lab/agents/<id>/<version>.json`
 
-The harness image should stay generic (runtime + your harness code/deps). Task-specific materialization happens per trial:
-
-1. The runner creates trial directories (`workspace/`, `state/`, `dataset/`, `out/`, `tmp/`).
-2. The runner writes `workspace_files` into the trial `workspace/` (supports `utf8` and `base64` content).
-3. The runner resolves each `mount_references[*].dataset_pack_ref` from `.lab/dataset_packs/sha256/<digest>`.
-4. In container mode, those resolved dataset packs are bind-mounted read-only to `mount_path` under `/workspace/...`.
-5. In local-process mode, `mount_references` are rejected (mount refs require container execution).
-6. The runner builds `trial_input_v1` with:
-   - `/task` from the boundary `task`.
-   - `/runtime/budgets` from `limits.max_steps|max_total_tokens|max_tool_calls` when present.
-   - `/runtime/timeouts/trial_seconds` from `limits.trial_seconds` when present.
-7. The runner invokes exactly one harness command with env contracts:
-   - `AGENTLAB_CONTROL_PATH` (`/run/ipc/harness.sock`)
-   - `AGENTLAB_CONTROL_MODE` (`uds` or `file`)
-   - `AGENTLAB_HARNESS_ROOT`
-8. Runner ownership of control transport:
-   - Host creates an IPC dir and mounts it to `/run/ipc` in-container.
-   - Harness reads the socket path from `AGENTLAB_CONTROL_PATH` and speaks the standard envelope over NDJSON in container mode.
-   - Local mode can use either mode depending on experiment config.
-   - Runner uses process completion + `trial_output` to mark trial completion in the current build.
-9. The runner persists trial artifacts plus run-scope boundaries:
-   - `.lab/runs/<run_id>/trials/<trial_id>/...` (trial input/output, logs, snapshots, diffs, trial metadata)
-   - `.lab/runs/<run_id>/evidence/evidence_records.jsonl` (`evidence_record_v1`)
-   - `.lab/runs/<run_id>/evidence/task_chain_states.jsonl` (`task_chain_state_v1`)
-   - `.lab/runs/<run_id>/benchmark/{adapter_manifest,predictions,scores,summary}` (adapter/evaluator outputs)
-
-### Harness Transport Interface (HTI) contract
-
-The runner and harness exchange a tiny orchestration protocol so harnesses can vary independently of the runner.
-
-- The runner and harness agree on **connection mode** via env:
-  - `AGENTLAB_CONTROL_MODE` (`uds` or `file`)
-  - `AGENTLAB_CONTROL_PATH`
-- Messages are framed as **NDJSON** by default (one JSON object per line).
-
-Minimal runner→harness requests:
-
-- `ping`
-- `start_run`
-- `cancel_run`
-- optional `shutdown`
-
-Minimal harness→runner events:
-
-- `run_started`
-- `run_finished` (completion signal)
-- optional: `log`, `progress`, `artifact`
-
-`run_finished` is part of the control contract, but the current Rust runner completion path is still based on process exit + output and does not block on this event yet.
-
-All messages include `request_id` (run id) and `type`.
-Optional metadata payload fields are intentionally opaque to the runner.
-
-Example request/response:
+Manifest shape:
 
 ```json
-{"type":"start_run","request_id":"run_20260211_120000","payload":{"input_ref":"./state/trial_input.json","harness_payload":{"model":"gpt-4o"}}}
-{"type":"run_finished","request_id":"run_20260211_120000","payload":{"status":"success","artifact_paths":["/state/trial_output.json"]}}
-```
-
-### OutcomeMapper (implemented by you)
-
-`OutcomeMapper` is user-implemented mapping from runner-emitted boundary to your domain outcome.
-
-`OutcomeBoundaryV1` includes:
-
-- `run_events` (typed `HookEvent[]`, JSONL event stream boundary)
-- `result_summary` (typed summary extracted from `trial_output_v1`)
-
-```ts
-import {
-  createOutcomeBoundary,
-  mapOutcome,
-  type OutcomeMapper,
-  type TrialOutput,
-  type HookEvent,
-} from '@agentlab/sdk';
-
-const mapper: OutcomeMapper<{ pass: boolean; tokenIn: number }> = {
-  map(boundary) {
-    const tokenIn = boundary.run_events
-      .filter((e) => e.event_type === 'model_call_end')
-      .reduce((acc, e) => acc + (e.usage?.tokens_in ?? 0), 0);
-    return {
-      pass: boundary.result_summary.outcome === 'success',
-      tokenIn,
-    };
-  },
-};
-
-const boundary = createOutcomeBoundary(trialOutput as TrialOutput, runEvents as HookEvent[]);
-const result = await mapOutcome(boundary, mapper);
-```
-
-### What your SDK script receives from `run()`
-
-`client.run(...)` returns run metadata plus artifact paths, not pre-mapped domain outcomes.
-
-Your script is responsible for loading trial artifacts and applying your `OutcomeMapper`:
-
-```ts
-import { readFileSync } from 'node:fs';
-import { createOutcomeBoundary, mapOutcome, type HookEvent, type TrialOutput } from '@agentlab/sdk';
-
-const run = await client.run({ experiment: '.lab/experiment.yaml' });
-const trialDir = `${run.run.run_dir}/trials/trial_1`;
-console.log(run.artifacts?.evidence_records_path);
-console.log(run.artifacts?.benchmark_summary_path);
-
-const trialOutput = JSON.parse(
-  readFileSync(`${trialDir}/trial_output.json`, 'utf8'),
-) as TrialOutput;
-
-const runEvents = readFileSync(`${trialDir}/state/harness_events.jsonl`, 'utf8')
-  .trim()
-  .split('\n')
-  .filter(Boolean)
-  .map((line) => JSON.parse(line) as HookEvent);
-
-const boundary = createOutcomeBoundary(trialOutput, runEvents);
-const mapped = await mapOutcome(boundary, mapper);
-
-// Optional: read typed run-scope boundaries
-const evidence = await client.readEvidence({ runDir: run.run.run_dir });
-const benchmark = await client.readBenchmark({ runDir: run.run.run_dir });
-```
-
-### Standardized runtime contracts (v1)
-
-The SDK exports versioned, fixed contracts for interoperability across entrypoints and harness variants:
-
-- `WORKSPACE_CONTRACT_V1` (`/workspace`, manifest path, artifacts dir)
-- `INVOCATION_ENV_CONTRACT_V1` (env vars + one-command invocation model, including control plane vars)
-- `createRunnerBoundaryManifest(command)` (versioned manifest object)
-
-## ExperimentBuilder
-
-Fluent API for building `ExperimentSpec` objects. All required fields must be explicitly set — `build()` validates completeness and throws listing any missing fields.
-
-```ts
-const builder = ExperimentBuilder.create('id', 'Name')
-```
-
-### Required methods
-
-These must be called before `build()` or `toYaml()`:
-
-| Method | What it sets |
-|---|---|
-| `.datasetJsonl(path, opts)` | Dataset source. `opts` requires `suiteId`, `splitId`, `limit`. |
-| `.harnessCli(command, opts)` | Harness command array. `opts` requires `integrationLevel`. |
-
-### Optional methods
-
-| Method | What it sets | Default |
-|---|---|---|
-| `.sanitizationProfile(value)` | Sanitization profile name. | `'hermetic_functional_v2'` |
-| `.replications(n)` | How many times each (task, variant) pair runs. | `1` |
-| `.randomSeed(n)` | Seed for trial ordering reproducibility. | `1` |
-| `.description(text)` | Experiment description. | |
-| `.owner(name)` | Experiment owner. | |
-| `.tags(list)` | Tag array. | |
-| `.baseline(id, bindings)` | Baseline variant with parameter bindings. | `{ variant_id: 'base', bindings: {} }` |
-| `.addVariant(id, bindings)` | Additional variant. Call multiple times for multiple variants. | |
-| `.maxConcurrency(n)` | Parallel trial limit. | `1` |
-| `.metric(def)` | Add a metric definition. See Metrics below. | |
-| `.guardrail(def)` | Add a budget guardrail. See Guardrails below. | |
-| `.artifacts(opts)` | Configure workspace artifact collection. See Artifacts below. | |
-| `.benchmark(config)` | Configure benchmark policy + adapter command/manifest (optional). | |
-| `.networkMode(mode, hosts?)` | `'none'`, `'full'`, or `'allowlist_enforced'` with allowed hosts. | `'none'` |
-| `.sandboxImage(image)` | Docker image name. Sets sandbox mode to `container`. | |
-| `.localSandbox()` | Run without container isolation. | `local` |
-
-### Terminal methods
-
-| Method | What it returns |
-|---|---|
-| `.build()` | Deep-copied `ExperimentSpec`. Throws if required fields are missing. |
-| `.toYaml()` | YAML string of the spec. Validates completeness first. |
-
-All setters return `this` for chaining.
-
-### Metrics
-
-Each metric declares exactly where its value comes from. No magic — if a metric isn't declared, it isn't tracked (except runner auto-metrics which are always collected).
-
-**Four sources:**
-
-| Source | What it means | Example |
-|---|---|---|
-| `runner` | Runner measures this automatically | Wall-clock duration, exit code |
-| `events` | Runner aggregates from harness hook events | Token counts, step counts |
-| `output` | Runner extracts from `trial_output.json` | Accuracy, cost, any field your harness writes |
-| `artifacts` | Runner computes from workspace changes | Files created/modified, diff size |
-
-**Predefined constants** (use directly with `.metric()`):
-
-| Constant | Source | What it tracks |
-|---|---|---|
-| `Metric.DURATION_MS` | runner | Trial wall-clock time |
-| `Metric.EXIT_CODE` | runner | Harness process exit code |
-| `Metric.TOKENS_IN` | events | Sum of input tokens from `model_call_end` events |
-| `Metric.TOKENS_OUT` | events | Sum of output tokens from `model_call_end` events |
-| `Metric.STEP_COUNT` | events | Count of `agent_step_start` events |
-| `Metric.TURN_COUNT` | events | Count of `model_call_end` events |
-| `Metric.TOOL_CALL_COUNT` | events | Count of `tool_call_end` events |
-| `Metric.FILES_CREATED` | artifacts | Number of new files in workspace |
-| `Metric.FILES_MODIFIED` | artifacts | Number of modified files in workspace |
-| `Metric.DIFF_BYTES` | artifacts | Total bytes of workspace diff |
-| `Metric.DIFF_LINES` | artifacts | Total lines of workspace diff |
-
-**Factories** for custom metrics:
-
-```ts
-// Extract a value from trial_output.json by JSON pointer
-Metric.fromOutput('accuracy', '/metrics/accuracy', {
-  primary: true,       // highlighted in analysis summaries
-  weight: 1.0,         // contributes to composite score (0 = observe only)
-  direction: 'maximize',
-})
-
-// Aggregate a field across hook events in a trial
-Metric.fromEvents('avg_model_latency', {
-  eventType: 'model_call_end',
-  eventField: 'timing.duration_ms',
-  aggregate: 'mean',    // sum | count | max | min | mean | last
-  direction: 'minimize',
-})
-
-// Measure workspace artifacts (requires .artifacts() config)
-Metric.fromArtifacts('py_patch_size', {
-  measure: 'diff_bytes',  // file_count | diff_bytes | diff_lines | total_bytes
-  glob: '**/*.py',         // optional — scope to matching files
-  direction: 'minimize',
-})
-```
-
-### Artifacts
-
-Configure artifact collection to capture what your harness writes to the workspace. The runner snapshots the workspace before the trial, then collects matching files and computes diffs after the trial completes.
-
-```ts
-builder
-  .artifacts({
-    collect: ['**/*.py', 'output/**'],  // glob patterns for files to preserve
-    diff: true,                          // compute workspace diff (pre vs post)
-    baseDir: 'workspace/src',            // optional: scope collection to subdirectory
-  })
-  .metric(Metric.FILES_MODIFIED)
-  .metric(Metric.DIFF_LINES)
-  .metric(Metric.fromArtifacts('py_changes', {
-    measure: 'diff_bytes',
-    glob: '**/*.py',
-    direction: 'minimize',
-  }))
-```
-
-Collected artifacts and diffs are stored in each trial's directory under the run artifacts.
-
-### Guardrails
-
-Budget guardrails set upper bounds on metrics. When a trial exceeds a guardrail limit, the runner fails it. Guardrails reference metrics by `metric_id` — the metric must also be declared via `.metric()`.
-
-```ts
-builder
-  .metric(Metric.TOKENS_IN)
-  .metric(Metric.TOKENS_OUT)
-  .metric(Metric.DURATION_MS)
-  .metric(Metric.TOOL_CALL_COUNT)
-  .guardrail(Metric.maxTokensIn(50_000))     // fail trial if input tokens exceed 50k
-  .guardrail(Metric.maxTokensOut(10_000))     // fail trial if output tokens exceed 10k
-  .guardrail(Metric.maxDuration(300_000))     // fail trial if wall-clock exceeds 5 minutes
-  .guardrail(Metric.maxToolCalls(100))        // fail trial if tool calls exceed 100
-```
-
-**Predefined guardrail factories:**
-
-| Factory | metric_id | What it limits |
-|---|---|---|
-| `Metric.maxTokensIn(n)` | `tokens_in` | Total input tokens per trial |
-| `Metric.maxTokensOut(n)` | `tokens_out` | Total output tokens per trial |
-| `Metric.maxDuration(ms)` | `duration_ms` | Trial wall-clock time in ms |
-| `Metric.maxToolCalls(n)` | `tool_call_count` | Number of tool invocations |
-| `Metric.maxTurns(n)` | `turn_count` | Number of model turns |
-| `Metric.maxCost(n)` | `cost_usd` | Cost (requires `cost_usd` output metric) |
-
-Custom guardrails work with any metric:
-
-```ts
-builder
-  .metric(Metric.fromOutput('cost_usd', '/metrics/cost_usd'))
-  .guardrail({ metric_id: 'cost_usd', max: 5.0 })
-```
-
-Guardrails are lazy — no `guardrails:` section appears in the YAML unless you add at least one. Calling `.guardrail()` with the same `metric_id` replaces the previous entry.
-
-## LabClient
-
-Spawns the Rust `lab` binary and parses structured JSON responses.
-
-```ts
-const client = new LabClient({
-  runnerBin: '/path/to/lab',   // or set AGENTLAB_RUNNER_BIN env var
-  cwd: '/project/root',
-  env: { OPENAI_API_KEY: '...' },
-});
-```
-
-### Runner discovery
-
-Resolves the binary in order:
-
-1. `runnerBin` constructor option
-2. `AGENTLAB_RUNNER_BIN` environment variable
-3. `lab` (assumes on `PATH`)
-
-### Commands
-
-| Method | Returns | Description |
-|---|---|---|
-| `describe(args)` | `DescribeResponse` | Dry-run: planned trials and resolved config |
-| `run(args)` | `RunResponse` | Execute trials with configured network and sandbox mode |
-| `runDev(args)` | `RunResponse` | Dev run: full network, optional `setup` command |
-| `replay(args)` | `ReplayResponse` | Re-execute a trial from run artifacts |
-| `fork(args)` | `ForkResponse` | Fork a trial at a checkpoint with binding overrides |
-| `pause(args)` | `PauseResponse` | Cooperative pause via checkpoint+stop handshake |
-| `resume(args)` | `ResumeResponse` | Resume a paused trial |
-| `publish(args)` | `PublishResponse` | Create debug bundle from a run |
-| `validateKnobs(args)` | `ValidateResponse` | Validate parameter overrides against manifest |
-| `validateHooks(args)` | `ValidateResponse` | Validate event stream against harness manifest |
-| `validateSchema(args)` | `ValidateResponse` | Validate JSON file against schema |
-| `readAnalysis(args)` | `ReadAnalysisResponse` | Read analysis summary and comparisons from a run directory |
-| `readEvidence(args)` | `ReadEvidenceResponse` | Read `evidence_record_v1` + `task_chain_state_v1` JSONL |
-| `readBenchmark(args)` | `ReadBenchmarkResponse` | Read benchmark adapter manifest/predictions/scores/summary |
-
-All commands accept per-call `cwd` and `env` overrides.
-
-### Analysis access
-
-After a run completes, `readAnalysis()` reads the analysis files from the run directory. This is pure file I/O — no CLI spawn.
-
-```ts
-const result = await client.readAnalysis({ runDir: '.lab/runs/run_20260211_120000' });
-
-// Per-variant summary
-for (const [id, variant] of Object.entries(result.summary.variants)) {
-  console.log(`${id}: ${variant.success_rate} success, ${variant.event_counts.model_call_end} LLM calls`);
-}
-
-// Pairwise comparisons
-for (const cmp of result.comparisons.comparisons) {
-  console.log(`${cmp.baseline} vs ${cmp.variant}: ${cmp.baseline_success_rate} → ${cmp.variant_success_rate}`);
-}
-```
-
-### Control lifecycle
-
-```ts
-const client = new LabClient();
-const runDir = '.lab/runs/run_20260211_120000';
-
-// Pause at next safe boundary
-const paused = await client.pause({
-  runDir,
-  trialId: 'trial_001',
-  label: 'before_tool_call',
-  timeoutSeconds: 90,
-});
-
-// Fork from checkpoint with modified bindings
-const forked = await client.fork({
-  runDir,
-  fromTrial: paused.pause.trial_id,
-  at: 'checkpoint:before_tool_call',
-  set: { model: 'gpt-4.1-mini', temperature: 0.2 },
-  strict: true,
-});
-
-// Resume the original trial
-const resumed = await client.resume({
-  runDir,
-  trialId: paused.pause.trial_id,
-  label: 'before_tool_call',
-  set: { max_steps: 50 },
-});
-
-// Replay for validation
-const replayed = await client.replay({
-  runDir,
-  trialId: paused.pause.trial_id,
-  strict: true,
-});
-```
-
-### Error handling
-
-All runner failures throw `LabRunnerError`:
-
-```ts
-import { LabRunnerError } from '@agentlab/sdk';
-
-try {
-  await client.run({ experiment: 'experiment.yaml' });
-} catch (err) {
-  if (err instanceof LabRunnerError) {
-    err.code;      // 'bad_config', 'spawn_failed', 'invalid_json', etc.
-    err.message;   // Human-readable description
-    err.command;   // Full command array that was spawned
-    err.stderr;    // Runner stderr output
-    err.exitCode;  // Process exit code (if available)
-    err.details;   // Structured error details (if available)
+{
+  "image": "ghcr.io/acme/rex-agent@sha256:...",
+  "entrypoint": ["python", "-m", "rex.run_trial"],
+  "default_env": {
+    "PYTHONUNBUFFERED": "1"
   }
 }
 ```
 
-## Trial Output Types
+### `custom_image`
 
-Type declarations mirroring `trial_output_v1.jsonschema`. Use these to type-check what your harness writes.
-
-```ts
-import type { TrialOutput, TrialIds, TrialOutcome } from '@agentlab/sdk';
-
-const output: TrialOutput = {
-  schema_version: 'trial_output_v1',
-  ids: { run_id: 'run_001', trial_id: 'trial_001', variant_id: 'baseline', task_id: 'task_001', repl_idx: 0 },
-  outcome: 'success',
-  answer: 'The fix is ...',
-  metrics: { accuracy: 0.95, cost_usd: 0.12 },
-  objective: { name: 'resolved', value: 1.0, direction: 'maximize' },
-  artifacts: [{ path: '/out/patch.diff', logical_name: 'solution_diff' }],
-  checkpoints: [{ path: '/state/cp1.json', logical_name: 'after_analysis', step: 3 }],
-};
-```
-
-| Type | What it represents |
-|---|---|
-| `TrialOutput` | Top-level trial output object |
-| `TrialIds` | `{ run_id, trial_id, variant_id, task_id, repl_idx }` — shared with event types |
-| `TrialOutcome` | `'success' \| 'failure' \| 'missing' \| 'error'` |
-| `TrialError` | `{ error_type?, message?, stack? }` |
-| `ArtifactDecl` | `{ path, logical_name?, mime_type? }` |
-| `CheckpointDecl` | `{ path, logical_name?, step?, epoch? }` |
-| `ObjectiveDef` | `{ name, value, direction? }` |
-
-## Event Stream Types
-
-Typed discriminated union for the `harness_events.jsonl` event stream (at `cli_events` integration level and above). Enables structural diffing of variant behavior — same task, two variants, compare step-by-step what each agent did.
+Use this when you provide image + command directly.
 
 ```ts
-import type { HookEvent, ModelCallEndEvent } from '@agentlab/sdk';
-
-function analyzeEvents(events: HookEvent[]) {
-  for (const e of events) {
-    switch (e.event_type) {
-      case 'agent_step_start':
-        console.log(`Step ${e.step_index} started`);
-        break;
-      case 'model_call_end':
-        console.log(`Model call: ${e.usage?.tokens_in} in, ${e.usage?.tokens_out} out`);
-        break;
-      case 'tool_call_end':
-        console.log(`Tool: ${e.tool.name} — ${e.outcome.status}`);
-        break;
-      case 'error':
-        console.log(`Error: ${e.message}`);
-        break;
-    }
-  }
-}
+builder.customAgentImage(
+  'ghcr.io/acme/rex-agent@sha256:...',
+  ['python', '-m', 'rex.run_trial'],
+);
 ```
 
-**6 event types** (discriminated on `event_type`):
+You can also set command/env through:
 
-| Type | Key fields | Purpose |
-|---|---|---|
-| `AgentStepStartEvent` | `step_index` | Opens an agent step |
-| `AgentStepEndEvent` | `step_index`, `budgets?` | Closes a step with running budget totals |
-| `ModelCallEndEvent` | `call_id`, `outcome`, `model?`, `usage?`, `timing?` | Records an LLM call |
-| `ToolCallEndEvent` | `call_id`, `tool`, `outcome`, `timing?` | Records a tool invocation |
-| `ControlAckEvent` | `step_index`, `control_version`, `action_observed` | Acknowledges control plane signal |
-| `ErrorEvent` | `message`, `error_type?`, `stack?` | General error |
+1. `.agentLoop(command)` (sets `custom_image.entrypoint`)
+2. `.agentArgs(args)`
+3. `.agentEnv(env)`
+4. `.agentEnvFromHost(keys)`
 
-**Shared sub-types:** `CallOutcome`, `StepBudgets`, `ModelIdentity`, `CallTiming`, `RedactionInfo`, `HookEventBase`
+Legacy aliases remain exported:
 
-## Exports
+1. `.agentLoopEnv(...)`
+2. `.agentLoopEnvFromHost(...)`
+
+## Command Semantics
+
+1. Runner executes exactly one command per trial.
+2. In container mode, command runs inside the selected image with working dir `/agentlab/workspace`.
+3. In local mode, command runs in the per-trial workspace directory on host.
+4. `runtime.agent` commands are treated as literal tokens; runner does not rewrite them to host paths.
+5. `${AGENTLAB_*}` placeholders in command tokens are expanded by runner before launch.
+
+Practical implication: the command must be valid in the runtime environment you selected (image or local process).
+
+## Dependencies: Intuitive Staging
+
+Preferred API:
+
+1. `.dependencyAssets(entries)`
+2. `.stageDependencyAsset(sourceFromHost, mountPath, options?)`
+
+Entry fields:
+
+1. `source_from_host`: host file path (supports `~`; relative paths resolve from project root, parent of `.lab`).
+2. `mount_path`: absolute path exposed in trial filesystem (usually under `/agentlab/deps/...`).
+3. `read_only` (optional): when true, runner marks copied file read-only in trial.
+4. `required` (optional, default true): if false, missing source is tolerated.
+
+Compatibility alias:
+
+1. `.dependencyFileStaging(...)`
+2. `.stageDependencyFile(...)`
+
+## What Goes Into The Trial Container
+
+For each trial, runner prepares and mounts:
+
+1. `/agentlab/in` (read-only): `task.json`, `bindings.json`, `dependencies.json`, `policy.json`
+2. `/agentlab/workspace` (read-write): workspace copy seeded from project root
+3. `/agentlab/deps` (read-write): staged dependency assets
+4. `/agentlab/out` (read-write): `result.json`, optional `trajectory.jsonl`
+5. `/agentlab/state` (read-write): runner internal state and metadata
+6. `/dataset` (read-only): dataset copy for the trial
+
+If task boundaries include `mount_references`, dataset packs are additionally mounted read-only to their declared paths.
+
+## Agent Env Contract
+
+Runner sets these env vars for your command:
+
+1. `AGENTLAB_TASK_PATH`
+2. `AGENTLAB_BINDINGS_PATH`
+3. `AGENTLAB_DEPENDENCIES_PATH`
+4. `AGENTLAB_POLICY_PATH`
+5. `AGENTLAB_RESULT_PATH`
+6. `AGENTLAB_TRAJECTORY_PATH`
+7. `AGENTLAB_TIMEOUT_MS`
+8. `AGENTLAB_RUN_ID`
+9. `AGENTLAB_TRIAL_ID`
+10. `AGENTLAB_VARIANT_ID`
+11. `AGENTLAB_TASK_ID`
+12. `AGENTLAB_REPL_IDX`
+
+Your loop should write `agent_result_v1` JSON to `AGENTLAB_RESULT_PATH`.
+
+## Running From Another Directory
+
+You can build and run experiments from any folder as long as you pass the right `cwd` and experiment path.
 
 ```ts
-// Classes
-export { LabClient, LabRunnerError } from '@agentlab/sdk';
-export { ExperimentBuilder, Metric } from '@agentlab/sdk';
-
-// Experiment builder types
-export type {
-  ExperimentSpec, MetricDef, MetricSource, MetricAggregate,
-  ArtifactMeasure, GuardrailDef, Bindings,
-  DatasetJsonlOptions, HarnessCliOptions,
-  BenchmarkTypePolicy, BenchmarkAdapterConfig, BenchmarkConfig,
-} from '@agentlab/sdk';
-
-// Client types
-export type {
-  LabClientOptions, LabErrorEnvelope, LabErrorPayload,
-  DescribeArgs, DescribeResponse, ExperimentSummary,
-  RunArgs, RunDevArgs, RunResponse,
-  ReplayArgs, ReplayResponse,
-  ForkArgs, ForkResponse,
-  PauseArgs, PauseResponse,
-  ResumeArgs, ResumeResponse,
-  PublishArgs, PublishResponse,
-  KnobsValidateArgs, HooksValidateArgs, SchemaValidateArgs,
-  ValidateResponse,
-  ReadAnalysisArgs, ReadAnalysisResponse,
-  ReadEvidenceArgs, ReadEvidenceResponse,
-  ReadBenchmarkArgs, ReadBenchmarkResponse,
-  RunArtifacts,
-  AnalysisSummary, AnalysisComparisons, ComparisonEntry,
-  VariantSummary, EventCounts,
-  EvidenceRecord, TaskChainStateRecord,
-  BenchmarkAdapterManifest, BenchmarkPredictionRecord, BenchmarkScoreRecord, BenchmarkSummary,
-} from '@agentlab/sdk';
-
-// Trial output types
-export type {
-  TrialOutput, TrialIds, TrialOutcome, TrialError,
-  ArtifactDecl, CheckpointDecl, ObjectiveDef,
-} from '@agentlab/sdk';
-
-// Event stream types
-export type {
-  HookEvent, HookEventBase,
-  AgentStepStartEvent, AgentStepEndEvent,
-  ModelCallEndEvent, ToolCallEndEvent,
-  ControlAckEvent, ErrorEvent,
-  CallOutcome, StepBudgets, ModelIdentity,
-  CallTiming, RedactionInfo,
-} from '@agentlab/sdk';
+const client = new LabClient({ cwd: '/absolute/path/to/project' });
+await client.run({ experiment: '.lab/experiment.yaml' });
 ```
+
+Resolution rules:
+
+1. `dataset.path` is resolved relative to the experiment file directory.
+2. `runtime.dependencies.*.source_from_host` is resolved relative to project root (parent of `.lab`) when relative.
+3. `known_agent_ref` manifests are resolved under that same project root (`.lab/agents/...`).
+
+## ExperimentBuilder API (Primary)
+
+Required before `build()`:
+
+1. `.datasetJsonl(path, opts)`
+2. One runtime agent mode:
+   - `.agentRef(...)`, or
+   - `.agentLoop(...)` / `.customAgentImage(...)`
+
+Common optional setters:
+
+1. `.baseline(id, bindings)`
+2. `.addVariant(id, bindings)`
+3. `.metric(def)`
+4. `.guardrail(def)`
+5. `.artifacts({ collect, diff, baseDir? })`
+6. `.networkMode('none' | 'full' | 'allowlist_enforced', hosts?)`
+7. `.sandboxImage(image)`
+8. `.localSandbox()`
+9. `.timeoutMs(ms)`
+
+## LabClient API (Primary)
+
+Runner commands:
+
+1. `describe(args)`
+2. `run(args)`
+3. `runDev(args)`
+4. `replay(args)`
+5. `fork(args)`
+6. `pause(args)`
+7. `resume(args)`
+8. `publish(args)`
+
+Run artifact readers:
+
+1. `readAnalysis(args)`
+2. `readEvidence(args)`
+3. `readBenchmark(args)`
+
+Validation helpers:
+
+1. `validateKnobs(args)`
+2. `validateHooks(args)`
+3. `validateSchema(args)`
+
+## Output Files
+
+Canonical per-trial result is:
+
+1. `.lab/runs/<run_id>/trials/<trial_id>/result.json`
+
+Compatibility mirror (temporary):
+
+1. `.lab/runs/<run_id>/trials/<trial_id>/trial_output.json`
+
+## Current Runtime Notes
+
+1. `networkMode('allowlist_enforced', ...)` is not yet implemented by the Rust container executor.
+2. Container reproducibility is strongest when image references are pinned by digest (`image@sha256:...`).
+3. Prefer `runtime.agent` APIs; `runtime.agent_loop` is legacy fallback behavior.

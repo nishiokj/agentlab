@@ -791,7 +791,7 @@ Derived guarantees (grades) must be computed from the integration level actually
       "properties": {
         "sanitization_profile": {
           "type": "string",
-          "enum": ["replay_strict_v2", "hermetic_functional_v2", "perf_benchmark_v2"]
+          "enum": ["replay_strict", "hermetic_functional", "perf_benchmark"]
         },
         "integration_level": {
           "type": "string",
@@ -960,7 +960,7 @@ Derived guarantees (grades) must be computed from the integration level actually
     "schema_version": { "const": "state_inventory_v1" },
     "sanitization_profile": {
       "type": "string",
-      "enum": ["replay_strict_v2", "hermetic_functional_v2", "perf_benchmark_v2"]
+      "enum": ["replay_strict", "hermetic_functional", "perf_benchmark"]
     },
     "integration_level": {
       "type": "string",

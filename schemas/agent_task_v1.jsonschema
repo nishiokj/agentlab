@@ -1,0 +1,97 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agent-lab.local/schemas/agent_task_v1.json",
+  "title": "Agent Task v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "ids", "task", "bindings", "dependencies", "policy"],
+  "properties": {
+    "schema_version": { "const": "agent_task_v1" },
+    "ids": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["run_id", "trial_id", "variant_id", "task_id", "repl_idx"],
+      "properties": {
+        "run_id": { "type": "string", "minLength": 1 },
+        "trial_id": { "type": "string", "minLength": 1 },
+        "variant_id": { "type": "string", "minLength": 1 },
+        "task_id": { "type": "string", "minLength": 1 },
+        "repl_idx": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "task": {
+      "type": "object",
+      "additionalProperties": true,
+      "description": "Benchmark task payload. Schema is benchmark-specific."
+    },
+    "bindings": {
+      "type": "object",
+      "additionalProperties": true,
+      "description": "Variant bindings/primitives; interpreted by the agent loop."
+    },
+    "dependencies": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "services": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": true,
+            "required": ["id", "kind", "path"],
+            "properties": {
+              "id": { "type": "string", "minLength": 1 },
+              "kind": { "type": "string", "minLength": 1 },
+              "path": { "type": "string", "minLength": 1 }
+            }
+          }
+        }
+      }
+    },
+    "policy": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["timeout_ms", "network", "sandbox"],
+      "properties": {
+        "timeout_ms": { "type": "integer", "minimum": 1 },
+        "network": {
+          "type": "object",
+          "additionalProperties": true,
+          "required": ["mode", "allowed_hosts"],
+          "properties": {
+            "mode": { "type": "string", "enum": ["none", "full", "allowlist_enforced"] },
+            "allowed_hosts": { "type": "array", "items": { "type": "string", "minLength": 1 } }
+          }
+        },
+        "sandbox": {
+          "type": "object",
+          "additionalProperties": true,
+          "required": ["mode"],
+          "properties": {
+            "mode": { "type": "string", "enum": ["container", "local"] },
+            "image": { "type": "string", "minLength": 1 },
+            "root_read_only": { "type": "boolean" },
+            "run_as_user": { "type": "string", "minLength": 1 },
+            "hardening": {
+              "type": "object",
+              "additionalProperties": true,
+              "properties": {
+                "no_new_privileges": { "type": "boolean" },
+                "drop_all_caps": { "type": "boolean" }
+              }
+            },
+            "resources": {
+              "type": "object",
+              "additionalProperties": true,
+              "properties": {
+                "cpu_count": { "type": "integer", "minimum": 1 },
+                "memory_mb": { "type": "integer", "minimum": 1 }
+              }
+            }
+          }
+        }
+      }
+    },
+    "ext": { "type": "object", "additionalProperties": true }
+  }
+}

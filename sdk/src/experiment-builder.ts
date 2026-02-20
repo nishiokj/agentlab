@@ -10,15 +10,17 @@ export interface DatasetJsonlOptions {
   limit: number;
 }
 
-export interface HarnessCliOptions {
-  integrationLevel: 'cli_basic' | 'cli_events' | 'otel' | 'sdk_control' | 'sdk_full';
-  inputPath?: string;
-  outputPath?: string;
-}
-
-export interface HarnessHostFileStagingEntry {
+export interface DependencyFileStagingEntry {
   source_from_host: string;
   destination_path: string;
+  required?: boolean;
+}
+
+export interface DependencyAssetEntry {
+  id?: string;
+  source_from_host: string;
+  mount_path: string;
+  read_only?: boolean;
   required?: boolean;
 }
 
@@ -42,7 +44,7 @@ export interface GuardrailDef {
 export interface MetricDef {
   id: string;
   source: MetricSource;
-  /** For source: 'output' — JSON pointer into trial_output.json */
+  /** For source: 'output' — JSON pointer into result.json */
   json_pointer?: string;
   /** For source: 'events' — which hook event type to aggregate */
   event_type?: string;
@@ -67,7 +69,7 @@ export interface MetricDef {
  * auto-metrics, plus helpers for output-derived and custom event metrics.
  */
 export class Metric {
-  // -- Runner auto-metrics (always tracked, no harness involvement) ----------
+  // -- Runner auto-metrics (always tracked, no agent involvement) ------------
 
   static readonly DURATION_MS: MetricDef = {
     id: 'duration_ms', source: 'runner', weight: 0, primary: false,
@@ -125,7 +127,7 @@ export class Metric {
 
   // -- Factories -------------------------------------------------------------
 
-  /** Metric extracted from a field in trial_output.json. */
+  /** Metric extracted from a field in result.json. */
   static fromOutput(id: string, jsonPointer: string, options?: {
     weight?: number;
     direction?: 'maximize' | 'minimize';
@@ -215,7 +217,6 @@ export class Metric {
 // ---------------------------------------------------------------------------
 
 export type SchedulingPolicy = 'paired_interleaved' | 'variant_sequential' | 'randomized';
-export type StatePolicy = 'isolate_per_trial' | 'persist_per_task' | 'accumulate';
 export type ComparisonPolicy = 'paired' | 'unpaired' | 'none';
 
 export type RetryTrigger = 'error' | 'timeout' | 'failure';
@@ -231,7 +232,6 @@ export interface PruningPolicy {
 
 export interface DesignPolicies {
   scheduling: SchedulingPolicy;
-  state: StatePolicy;
   comparison: ComparisonPolicy;
   retry: RetryPolicy;
   pruning?: PruningPolicy;
@@ -259,10 +259,28 @@ export interface BenchmarkConfig {
   adapter?: BenchmarkAdapterConfig;
 }
 
+export type AgentRuntimeMode = 'known_agent_ref' | 'custom_image';
+
+export interface KnownAgentRef {
+  id: string;
+  version: string;
+  registry?: string;
+}
+
+export interface CustomAgentImage {
+  image?: string;
+  entrypoint: string[];
+}
+
+export interface AgentRuntimeOverrides {
+  args?: string[];
+  env?: Record<string, string>;
+  env_from_host?: string[];
+}
+
 function copyPolicies(p: DesignPolicies): DesignPolicies {
   return {
     scheduling: p.scheduling,
-    state: p.state,
     comparison: p.comparison,
     retry: {
       max_attempts: p.retry.max_attempts,
@@ -281,28 +299,24 @@ const DEFAULT_RETRY: RetryPolicy = { max_attempts: 1 };
 export const ExperimentType = {
   AB_TEST: {
     scheduling: 'paired_interleaved',
-    state: 'isolate_per_trial',
     comparison: 'paired',
     retry: { ...DEFAULT_RETRY },
   } satisfies DesignPolicies,
 
   MULTI_VARIANT: {
     scheduling: 'paired_interleaved',
-    state: 'isolate_per_trial',
     comparison: 'paired',
     retry: { ...DEFAULT_RETRY },
   } satisfies DesignPolicies,
 
   PARAMETER_SWEEP: {
     scheduling: 'variant_sequential',
-    state: 'isolate_per_trial',
     comparison: 'unpaired',
     retry: { ...DEFAULT_RETRY },
   } satisfies DesignPolicies,
 
   REGRESSION: {
     scheduling: 'variant_sequential',
-    state: 'isolate_per_trial',
     comparison: 'none',
     retry: { max_attempts: 3, retry_on: ['error'] },
   } satisfies DesignPolicies,
@@ -313,7 +327,7 @@ export const ExperimentType = {
 // ---------------------------------------------------------------------------
 
 export interface ExperimentSpec {
-  version: '0.3';
+  version: '0.5';
   experiment: {
     id: string;
     name: string;
@@ -361,38 +375,46 @@ export interface ExperimentSpec {
     adapter?: BenchmarkAdapterConfig;
   };
   runtime: {
-    harness: {
-      mode: 'cli';
-      command: string[];
-      integration_level: string;
-      input_path: string;
-      output_path: string;
-      env?: Record<string, string>;
-      env_from_host?: string[];
-      host_file_staging?: HarnessHostFileStagingEntry[];
-      control_plane: {
-        mode: 'file' | 'uds';
+    agent: {
+      mode: AgentRuntimeMode;
+      known_agent_ref?: KnownAgentRef;
+      custom_image?: CustomAgentImage;
+      overrides?: AgentRuntimeOverrides;
+    };
+    dependencies: {
+      assets?: DependencyAssetEntry[];
+      file_staging?: DependencyFileStagingEntry[];
+      services?: Array<{
+        id: string;
+        kind: string;
         path: string;
+      }>;
+    };
+    policy: {
+      timeout_ms: number;
+      network: {
+        mode: 'none' | 'full' | 'allowlist_enforced';
+        allowed_hosts: string[];
+      };
+      sandbox: {
+        mode: 'container' | 'local';
+        engine?: 'docker';
+        image?: string;
+        root_read_only?: boolean;
+        run_as_user?: string;
+        hardening?: {
+          no_new_privileges: boolean;
+          drop_all_caps: boolean;
+        };
+        resources?: {
+          cpu_count: number;
+          memory_mb: number;
+        };
       };
     };
-    sandbox: {
-      mode: 'container' | 'local';
-      engine?: 'docker';
-      image?: string;
-      root_read_only?: boolean;
-      run_as_user?: string;
-      hardening?: {
-        no_new_privileges: boolean;
-        drop_all_caps: boolean;
-      };
-      resources?: {
-        cpu_count: number;
-        memory_mb: number;
-      };
-    };
-    network: {
-      mode: 'none' | 'full' | 'allowlist_enforced';
-      allowed_hosts: string[];
+    telemetry?: {
+      trajectory_path?: string;
+      causal_extraction?: string;
     };
   };
   validity: {
@@ -423,7 +445,7 @@ export class ExperimentBuilder {
 
   private constructor(id: string, name: string) {
     this.spec = {
-      version: '0.3',
+      version: '0.5',
       experiment: {
         id,
         name,
@@ -438,7 +460,7 @@ export class ExperimentBuilder {
         limit: 0,
       },
       design: {
-        sanitization_profile: 'hermetic_functional_v2',
+        sanitization_profile: 'hermetic_functional',
         comparison: 'paired',
         replications: 1,
         random_seed: 1,
@@ -452,21 +474,29 @@ export class ExperimentBuilder {
       },
       variant_plan: [],
       runtime: {
-        harness: {
-          mode: 'cli',
-          command: [],
-          integration_level: '',
-          input_path: '/out/trial_input.json',
-          output_path: '/out/trial_output.json',
-          control_plane: {
-            mode: 'uds',
-            path: '/run/ipc/harness.sock',
+        agent: {
+          mode: 'custom_image',
+          custom_image: {
+            entrypoint: [],
+          },
+          overrides: {
+            args: [],
+            env: {},
+            env_from_host: [],
           },
         },
-        sandbox: { mode: 'local' },
-        network: {
-          mode: 'none',
-          allowed_hosts: [],
+        dependencies: {
+          assets: [],
+          file_staging: [],
+          services: [],
+        },
+        policy: {
+          timeout_ms: 600_000,
+          sandbox: { mode: 'local' },
+          network: {
+            mode: 'none',
+            allowed_hosts: [],
+          },
         },
       },
       validity: {
@@ -511,52 +541,142 @@ export class ExperimentBuilder {
     return this;
   }
 
-  harnessCli(command: string[], options: HarnessCliOptions): this {
-    this.spec.runtime.harness.command = [...command];
-    this.spec.runtime.harness.integration_level = options.integrationLevel;
-    this.spec.runtime.harness.input_path = options.inputPath ?? this.spec.runtime.harness.input_path;
-    this.spec.runtime.harness.output_path = options.outputPath ?? this.spec.runtime.harness.output_path;
+  private ensureAgentOverrides(): AgentRuntimeOverrides {
+    if (!this.spec.runtime.agent.overrides) {
+      this.spec.runtime.agent.overrides = {};
+    }
+    return this.spec.runtime.agent.overrides;
+  }
+
+  private ensureCustomImage(): CustomAgentImage {
+    if (!this.spec.runtime.agent.custom_image) {
+      this.spec.runtime.agent.custom_image = { entrypoint: [] };
+    }
+    return this.spec.runtime.agent.custom_image;
+  }
+
+  agentRef(id: string, version: string, options?: { registry?: string }): this {
+    this.spec.runtime.agent.mode = 'known_agent_ref';
+    this.spec.runtime.agent.known_agent_ref = {
+      id,
+      version,
+      registry: options?.registry,
+    };
+    this.spec.runtime.agent.custom_image = undefined;
     return this;
   }
 
-  harnessEnv(env: Record<string, string>): this {
-    this.spec.runtime.harness.env = { ...env };
+  customAgentImage(image: string, entrypoint: string[]): this {
+    this.spec.runtime.agent.mode = 'custom_image';
+    this.spec.runtime.agent.known_agent_ref = undefined;
+    this.spec.runtime.agent.custom_image = {
+      image,
+      entrypoint: [...entrypoint],
+    };
+    this.spec.runtime.policy.sandbox.mode = 'container';
+    this.spec.runtime.policy.sandbox.image = image;
     return this;
   }
 
-  harnessEnvFromHost(keys: string[]): this {
-    this.spec.runtime.harness.env_from_host = [...keys];
+  agentLoop(command: string[]): this {
+    this.spec.runtime.agent.mode = 'custom_image';
+    this.spec.runtime.agent.known_agent_ref = undefined;
+    const custom = this.ensureCustomImage();
+    custom.entrypoint = [...command];
     return this;
   }
 
-  harnessControlPlane(mode: 'file' | 'uds', path: string): this {
-    this.spec.runtime.harness.control_plane = { mode, path };
+  agentArgs(args: string[]): this {
+    const overrides = this.ensureAgentOverrides();
+    overrides.args = [...args];
     return this;
   }
 
-  harnessHostFileStaging(entries: HarnessHostFileStagingEntry[]): this {
-    this.spec.runtime.harness.host_file_staging = entries.map((entry) => ({
+  agentEnv(env: Record<string, string>): this {
+    const overrides = this.ensureAgentOverrides();
+    overrides.env = { ...env };
+    return this;
+  }
+
+  agentLoopEnv(env: Record<string, string>): this {
+    return this.agentEnv(env);
+  }
+
+  agentEnvFromHost(keys: string[]): this {
+    const overrides = this.ensureAgentOverrides();
+    overrides.env_from_host = [...keys];
+    return this;
+  }
+
+  agentLoopEnvFromHost(keys: string[]): this {
+    return this.agentEnvFromHost(keys);
+  }
+
+  dependencyAssets(entries: DependencyAssetEntry[]): this {
+    this.spec.runtime.dependencies.assets = entries.map((entry) => ({
+      id: entry.id,
       source_from_host: entry.source_from_host,
-      destination_path: entry.destination_path,
+      mount_path: entry.mount_path,
+      read_only: entry.read_only ?? false,
+      required: entry.required ?? true,
+    }));
+    this.spec.runtime.dependencies.file_staging = this.spec.runtime.dependencies.assets.map((entry) => ({
+      source_from_host: entry.source_from_host,
+      destination_path: entry.mount_path,
       required: entry.required ?? true,
     }));
     return this;
   }
 
-  harnessStageHostFile(
+  dependencyFileStaging(entries: DependencyFileStagingEntry[]): this {
+    this.spec.runtime.dependencies.file_staging = entries.map((entry) => ({
+      source_from_host: entry.source_from_host,
+      destination_path: entry.destination_path,
+      required: entry.required ?? true,
+    }));
+    this.spec.runtime.dependencies.assets = entries.map((entry) => ({
+      source_from_host: entry.source_from_host,
+      mount_path: entry.destination_path,
+      read_only: false,
+      required: entry.required ?? true,
+    }));
+    return this;
+  }
+
+  stageDependencyAsset(
+    sourceFromHost: string,
+    mountPath: string,
+    options?: { id?: string; readOnly?: boolean; required?: boolean },
+  ): this {
+    if (!this.spec.runtime.dependencies.assets) {
+      this.spec.runtime.dependencies.assets = [];
+    }
+    this.spec.runtime.dependencies.assets.push({
+      id: options?.id,
+      source_from_host: sourceFromHost,
+      mount_path: mountPath,
+      read_only: options?.readOnly ?? false,
+      required: options?.required ?? true,
+    });
+    if (!this.spec.runtime.dependencies.file_staging) {
+      this.spec.runtime.dependencies.file_staging = [];
+    }
+    this.spec.runtime.dependencies.file_staging.push({
+      source_from_host: sourceFromHost,
+      destination_path: mountPath,
+      required: options?.required ?? true,
+    });
+    return this;
+  }
+
+  stageDependencyFile(
     sourceFromHost: string,
     destinationPath: string,
     options?: { required?: boolean },
   ): this {
-    if (!this.spec.runtime.harness.host_file_staging) {
-      this.spec.runtime.harness.host_file_staging = [];
-    }
-    this.spec.runtime.harness.host_file_staging.push({
-      source_from_host: sourceFromHost,
-      destination_path: destinationPath,
+    return this.stageDependencyAsset(sourceFromHost, destinationPath, {
       required: options?.required ?? true,
     });
-    return this;
   }
 
   baseline(variantId: string, bindings: Bindings): this {
@@ -655,19 +775,28 @@ export class ExperimentBuilder {
   }
 
   networkMode(mode: 'none' | 'full' | 'allowlist_enforced', allowedHosts: string[] = []): this {
-    this.spec.runtime.network.mode = mode;
-    this.spec.runtime.network.allowed_hosts = [...allowedHosts];
+    this.spec.runtime.policy.network.mode = mode;
+    this.spec.runtime.policy.network.allowed_hosts = [...allowedHosts];
     return this;
   }
 
   sandboxImage(image: string): this {
-    this.spec.runtime.sandbox.mode = 'container';
-    this.spec.runtime.sandbox.image = image;
+    this.spec.runtime.policy.sandbox.mode = 'container';
+    this.spec.runtime.policy.sandbox.image = image;
+    if (this.spec.runtime.agent.mode === 'custom_image') {
+      const custom = this.ensureCustomImage();
+      custom.image = image;
+    }
     return this;
   }
 
   localSandbox(): this {
-    this.spec.runtime.sandbox = { mode: 'local' };
+    this.spec.runtime.policy.sandbox = { mode: 'local' };
+    return this;
+  }
+
+  timeoutMs(value: number): this {
+    this.spec.runtime.policy.timeout_ms = value;
     return this;
   }
 
@@ -679,8 +808,35 @@ export class ExperimentBuilder {
     if (!this.spec.dataset.suite_id) missing.push('dataset suite_id (call .datasetJsonl() with suiteId)');
     if (!this.spec.dataset.split_id) missing.push('dataset split_id (call .datasetJsonl() with splitId)');
     if (this.spec.dataset.limit <= 0) missing.push('dataset limit (call .datasetJsonl() with limit > 0)');
-    if (this.spec.runtime.harness.command.length === 0) missing.push('harness command (call .harnessCli())');
-    if (!this.spec.runtime.harness.integration_level) missing.push('harness integration_level (call .harnessCli() with integrationLevel)');
+    if (!this.spec.runtime.agent.mode) {
+      missing.push('runtime agent mode (call .agentRef() or .agentLoop()/customAgentImage())');
+    } else if (this.spec.runtime.agent.mode === 'known_agent_ref') {
+      const known = this.spec.runtime.agent.known_agent_ref;
+      if (!known?.id || known.id.trim().length === 0) {
+        missing.push('runtime.agent.known_agent_ref.id (call .agentRef())');
+      }
+      if (!known?.version || known.version.trim().length === 0) {
+        missing.push('runtime.agent.known_agent_ref.version (call .agentRef())');
+      }
+    } else if (this.spec.runtime.agent.mode === 'custom_image') {
+      const entrypoint = this.spec.runtime.agent.custom_image?.entrypoint ?? [];
+      if (entrypoint.length === 0 || entrypoint.some((part) => part.trim().length === 0)) {
+        missing.push('runtime.agent.custom_image.entrypoint (call .agentLoop() or .customAgentImage())');
+      }
+    }
+    if (this.spec.runtime.policy.timeout_ms <= 0) {
+      missing.push('policy timeout_ms (call .timeoutMs() with > 0)');
+    }
+    if (this.spec.runtime.policy.sandbox.mode === 'container') {
+      const customImage = this.spec.runtime.agent.custom_image?.image;
+      const policyImage = this.spec.runtime.policy.sandbox.image;
+      const hasImage = this.spec.runtime.agent.mode === 'known_agent_ref'
+        || (!!customImage && customImage.trim().length > 0)
+        || (!!policyImage && policyImage.trim().length > 0);
+      if (!hasImage) {
+        missing.push('container image (call .customAgentImage(), .sandboxImage(), or use .agentRef())');
+      }
+    }
     if (missing.length > 0) {
       throw new Error(
         `ExperimentBuilder: required fields not set:\n${missing.map((m) => `  - ${m}`).join('\n')}`,

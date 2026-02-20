@@ -15,7 +15,7 @@ dataset:
   limit: 4
 
 design:
-  sanitization_profile: hermetic_functional_v2
+  sanitization_profile: hermetic_functional
   comparison: paired
   replications: 1
   random_seed: 42
