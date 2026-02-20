@@ -27,7 +27,7 @@ Source of truth:
 The active boundaries are:
 
 1. Task boundary: dataset row -> `task_boundary_v1` payload.
-2. Agent loop boundary: one command invocation with fixed mounts/env contract.
+2. Agent runtime boundary: one command invocation with fixed mounts/env contract.
 3. Dependency boundary: file staging + service descriptors exposed to the trial.
 4. Policy boundary: timeout/network/sandbox enforced by runner.
 5. Analysis boundary: trajectory/events/artifacts normalized into run-level tables.
@@ -73,9 +73,9 @@ This means the trial payload contains both task semantics and variant semantics,
 ```yaml
 version: '0.5'
 experiment:
-  id: swebench_agent_loop
-  name: SWE-bench Agent Loop
-  workload_type: agent_loop
+  id: swebench_agent_runtime
+  name: SWE-bench Agent Runtime
+  workload_type: agent_runtime
 
 dataset:
   path: ./data/tasks.boundary.jsonl
@@ -106,6 +106,9 @@ variant_plan:
 runtime:
   agent:
     mode: custom_image # known_agent_ref | custom_image
+    adapter:
+      id: prebuilt.rex_jesus # optional: builtin.command_contract | prebuilt.codex_cli | prebuilt.rex_jesus
+      version: v1
     custom_image:
       image: ghcr.io/org/agent-runtime@sha256:...
       entrypoint: ["python", "-m", "my_agent.run_trial"]
@@ -115,12 +118,12 @@ runtime:
       env_from_host: ["OPENAI_API_KEY"]
 
   dependencies:
-    assets:
+    file_staging:
       - source_from_host: ./deps/sqlite/main.db
-        mount_path: /agentlab/deps/sqlite/main.db
+        destination_path: /agentlab/deps/sqlite/main.db
         required: true
       - source_from_host: ./deps/ast/index.tar.zst
-        mount_path: /agentlab/deps/ast/index.tar.zst
+        destination_path: /agentlab/deps/ast/index.tar.zst
         required: false
     services:
       - id: sqlite-main
@@ -154,7 +157,7 @@ validity:
   fail_on_profile_invariant_violation: true
 ```
 
-## Agent Loop Runtime Contract
+## Agent Runtime Contract
 
 Runner mounts (container mode):
 
@@ -164,7 +167,7 @@ Runner mounts (container mode):
 4. `/agentlab/workspace` (rw)
 5. `/agentlab/deps` (rw/ro based on staging/policy)
 
-Runner env vars provided to the agent loop:
+Runner env vars provided to the runtime command:
 
 1. `AGENTLAB_TASK_PATH`
 2. `AGENTLAB_BINDINGS_PATH`
@@ -185,7 +188,7 @@ Not part of this contract:
 2. No required control socket/file protocol for successful trial completion.
 3. No runner-managed cross-trial chain state semantics for agent execution.
 
-## Minimal Agent Loop Program
+## Minimal Runtime Program
 
 Your program should:
 
@@ -203,7 +206,7 @@ bindings = json.load(open(os.environ["AGENTLAB_BINDINGS_PATH"], "r", encoding="u
 deps = json.load(open(os.environ["AGENTLAB_DEPENDENCIES_PATH"], "r", encoding="utf-8"))
 policy = json.load(open(os.environ["AGENTLAB_POLICY_PATH"], "r", encoding="utf-8"))
 
-# ... run your agent loop ...
+# ... run your runtime command ...
 
 result = {
     "schema_version": "agent_result_v1",
@@ -231,6 +234,7 @@ Minimum inputs for a runnable experiment:
 2. Agent runtime (`runtime.agent`):
    - `known_agent_ref`, or
    - `custom_image`.
+   - optional explicit adapter identity (`runtime.agent.adapter`).
 3. Baseline variant bindings (plus optional treatments).
 4. Policy (`timeout`, `network`, `sandbox`).
 5. Optional dependency assets/services for sqlite, AST indexes, or other local state.
@@ -247,12 +251,20 @@ Minimum inputs for a runnable experiment:
 
 The command is executed by runner inside that runtime context. It is not a host-side path lookup API.
 
+Optional adapter identity:
+
+1. `runtime.agent.adapter.id` + `runtime.agent.adapter.version`
+2. Built-in ids:
+   - `builtin.command_contract@v1`
+   - `prebuilt.codex_cli@v1`
+   - `prebuilt.rex_jesus@v1`
+
 For reproducible frozen agents:
 
 1. Build agent image with runtime + code.
 2. Pin image by digest (`image@sha256:...`).
 3. Use `known_agent_ref` manifest or `custom_image` to point at that digest.
-4. Stage large mutable inputs (sqlite/db/index files) via `runtime.dependencies.assets`.
+4. Stage large mutable inputs (sqlite/db/index files) via `runtime.dependencies.file_staging`.
 
 ## Path and CWD Semantics
 
@@ -261,7 +273,7 @@ You can run from any shell directory if you pass the experiment path correctly.
 Resolution behavior:
 
 1. `dataset.path` resolves relative to the experiment file directory.
-2. `runtime.dependencies.assets[*].source_from_host` resolves relative to project root (parent of `.lab`) when relative.
+2. `runtime.dependencies.file_staging[*].source_from_host` resolves relative to project root (parent of `.lab`) when relative.
 3. `runtime.agent` entrypoint tokens are treated as literal command tokens; runner does not rewrite them to host paths.
 
 ## CLI Quick Start
@@ -325,18 +337,17 @@ Per trial:
 5. `trials/<trial_id>/in/policy.json`
 6. `trials/<trial_id>/out/result.json` (agent-written contract file)
 7. `trials/<trial_id>/result.json` (runner-canonicalized output)
-8. `trials/<trial_id>/trial_output.json` (temporary compatibility mirror)
-9. `trials/<trial_id>/out/trajectory.jsonl` (if emitted)
-10. `trials/<trial_id>/workspace/`
-11. `trials/<trial_id>/deps/`
-12. `trials/<trial_id>/trial_state.json`
+8. `trials/<trial_id>/out/trajectory.jsonl` (if emitted)
+9. `trials/<trial_id>/workspace/`
+10. `trials/<trial_id>/deps/`
+11. `trials/<trial_id>/trial_state.json`
 
 ## Scaling Status
 
 Current status:
 
 1. Contract has `design.max_concurrency`.
-2. Main execution loop is still sequential while `agent_loop` contract stabilizes.
+2. Main execution loop is still sequential while adapter-runtime parallel execution lands.
 
 Planned Phase 2:
 
@@ -352,7 +363,7 @@ See full details in:
 
 ## Notes
 
-1. If your agent needs sqlite indices, AST stores, or similar assets, use `runtime.dependencies.assets` + `runtime.dependencies.services`.
+1. If your agent needs sqlite indices, AST stores, or similar assets, use `runtime.dependencies.file_staging` + `runtime.dependencies.services`.
 2. For reproducibility in container mode, pin `runtime.policy.sandbox.image` by digest (`image@sha256:...`).
 3. `runtime.agent.mode: known_agent_ref` resolves from `.lab/agents/<registry>/<id>/<version>.json` (or `.lab/agents/<id>/<version>.json` without registry).
-4. Keep agent loop implementations stateless across trials; each trial should be self-sufficient and isolated.
+4. Keep agent runtime implementations stateless across trials; each trial should be self-sufficient and isolated.

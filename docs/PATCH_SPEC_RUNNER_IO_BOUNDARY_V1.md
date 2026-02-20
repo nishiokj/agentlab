@@ -24,7 +24,7 @@ Runner Core return boundary is:
 1. `R0` Run identity: `{run_id, run_dir}`
 2. `R1` Run lifecycle state file: `runtime/run_control.json`
 3. `R2` Trial lifecycle state files: `trials/<trial_id>/trial_state.json`
-4. `R3` Trial artifacts: `trial_input.json`, `trial_output.json`, stdout/stderr, snapshots
+4. `R3` Trial artifacts: `trial_input.json`, `result.json`, stdout/stderr, snapshots
 5. `R4` Evidence ledgers: `evidence/evidence_records.jsonl`, `evidence/task_chain_states.jsonl`
 6. `R5` Adapter artifacts (if adapter configured): `benchmark/{adapter_manifest,predictions,scores,summary}`
 

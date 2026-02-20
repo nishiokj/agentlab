@@ -1,7 +1,14 @@
 import assert from 'node:assert/strict';
 import test, { describe } from 'node:test';
 
-import { ExperimentBuilder, ExperimentType, Metric } from '../src/experiment-builder.js';
+import {
+  BUILTIN_COMMAND_ADAPTER,
+  ExperimentBuilder,
+  ExperimentType,
+  Metric,
+  PREBUILT_CODEX_ADAPTER,
+  PREBUILT_REX_JESUS_ADAPTER,
+} from '../src/experiment-builder.js';
 import type { DesignPolicies, MetricDef } from '../src/experiment-builder.js';
 
 function validBuilder(): ExperimentBuilder {
@@ -96,6 +103,23 @@ describe('ExperimentBuilder validation', () => {
       .build();
     assert.equal(spec.variant_plan.length, 1);
   });
+
+  test('build throws when adapter id/version are incomplete', () => {
+    assert.throws(
+      () => validBuilder().agentAdapter('prebuilt.codex_cli', '').build(),
+      (err: Error) => {
+        assert.ok(err.message.includes('runtime.agent.adapter.version'));
+        return true;
+      },
+    );
+    assert.throws(
+      () => validBuilder().agentAdapter('', 'v1').build(),
+      (err: Error) => {
+        assert.ok(err.message.includes('runtime.agent.adapter.id'));
+        return true;
+      },
+    );
+  });
 });
 
 describe('ExperimentBuilder runtime APIs', () => {
@@ -119,6 +143,20 @@ describe('ExperimentBuilder runtime APIs', () => {
     assert.equal(spec.runtime.agent.known_agent_ref?.version, '1.2.3');
     assert.equal(spec.runtime.agent.known_agent_ref?.registry, 'local');
     assert.equal(spec.runtime.agent.custom_image, undefined);
+  });
+
+  test('agent adapter helpers set prebuilt and builtin adapter refs', () => {
+    const prebuiltCodex = validBuilder().usePrebuiltCodexAdapter().build();
+    assert.equal(prebuiltCodex.runtime.agent.adapter?.id, PREBUILT_CODEX_ADAPTER.id);
+    assert.equal(prebuiltCodex.runtime.agent.adapter?.version, PREBUILT_CODEX_ADAPTER.version);
+
+    const prebuiltRex = validBuilder().usePrebuiltRexJesusAdapter('v2').build();
+    assert.equal(prebuiltRex.runtime.agent.adapter?.id, PREBUILT_REX_JESUS_ADAPTER.id);
+    assert.equal(prebuiltRex.runtime.agent.adapter?.version, 'v2');
+
+    const builtin = validBuilder().useBuiltinAdapter().build();
+    assert.equal(builtin.runtime.agent.adapter?.id, BUILTIN_COMMAND_ADAPTER.id);
+    assert.equal(builtin.runtime.agent.adapter?.version, BUILTIN_COMMAND_ADAPTER.version);
   });
 
   test('networkMode and timeoutMs are applied', () => {

@@ -68,6 +68,13 @@
               "properties": {
                 "max_consecutive_failures": { "type": "integer", "minimum": 1 }
               }
+            },
+            "task_boundary": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "require_workspace_materialization": { "type": "boolean" }
+              }
             }
           },
           "required": ["scheduling", "state", "comparison", "retry"]
