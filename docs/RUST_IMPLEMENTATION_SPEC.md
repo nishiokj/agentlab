@@ -128,8 +128,9 @@ Replace the Python “local best-effort runner” with a Rust one, preserving be
 - Process spawn: `std::process::Command`
 - Deterministically resolve relative command path args to absolute based on experiment directory.
 - Provide env vars:
-  - `AGENTLAB_TRIAL_INPUT`
-  - `AGENTLAB_TRIAL_OUTPUT`
+  - `AGENTLAB_CONTROL_PATH`
+  - `AGENTLAB_CONTROL_MODE`
+  - `AGENTLAB_HARNESS_ROOT`
 - CWD set to the trial directory.
 
 ### Acceptance

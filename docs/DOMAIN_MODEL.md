@@ -124,7 +124,7 @@ How many times each (variant, task) pair is executed. Indexed by `repl_idx`. **I
 - **Decision**: Image presence determines mode. If `image` is set → container. If absent → local. No separate mode field needed.
 
 **Control Plane Mode** — binary
-- Values: `file`, `sdk`
+- Values: `file`, `uds`
 - Appears in: `harness_manifest_v1.control_plane.mode`, `trial_input_v1.runtime.control_plane.mode`, `ExperimentSpec.runtime.harness.control_plane.mode` (SDK)
 
 **Tracing Mode** — genuinely multi-valued
@@ -138,7 +138,7 @@ How many times each (variant, task) pair is executed. Indexed by `repl_idx`. **I
 - Appears in: `trial_input_v1.workload.type`, `workload_adapter_manifest_v1.workload_type`, `ExperimentSummary.workload_type`, CLI `--workload-type` flag
 
 **Sanitization Profile**
-- Values: `replay_strict_v2`, `hermetic_functional_v2`, `perf_benchmark_v2`
+- Values: `replay_strict`, `hermetic_functional`, `perf_benchmark`
 - Appears in: `trial_input_v1.design.sanitization_profile`, `state_inventory_v1.sanitization_profile`, `ExperimentSpec.design.sanitization_profile` (SDK)
 
 **Execution Mode** (adapters)
@@ -766,7 +766,7 @@ Rust `default_attestation()` emits field names that don't match `attestation_v1.
 Currently sets `ids.run_id` to the experiment_id, not the actual run_id. Fix: pass actual `run_id` into the function.
 
 ### D11: Remove `/variants` fallback in `resolve_variant_plan()`
-Rust silently falls back from `/variant_plan` to `/variants`. Undocumented compat cruft. Remove it.
+Removed: `variants` is no longer accepted as a fallback for `/variant_plan`.
 
 ### D12: Field name alignment across surfaces
 The describe summary fields must use the same names in Rust struct, CLI JSON output, and SDK type. Canonical names (Rust struct is source of truth, CLI JSON and SDK mirror it):

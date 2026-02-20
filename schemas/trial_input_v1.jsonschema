@@ -48,7 +48,7 @@
       "properties": {
         "sanitization_profile": {
           "type": "string",
-          "enum": ["replay_strict_v2", "hermetic_functional_v2", "perf_benchmark_v2"]
+          "enum": ["replay_strict", "hermetic_functional", "perf_benchmark"]
         },
         "integration_level": {
           "type": "string",
@@ -94,7 +94,7 @@
           "additionalProperties": false,
           "required": ["mode", "path"],
           "properties": {
-            "mode": { "type": "string", "enum": ["file", "sdk"] },
+            "mode": { "type": "string", "enum": ["file", "uds"] },
             "path": { "type": "string", "minLength": 1 }
           }
         },

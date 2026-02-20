@@ -551,11 +551,11 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
             }
 
             let exp_yaml = "\
-version: '0.3'
+version: '0.5'
 experiment:
   id: ''                              # REQUIRED
   name: ''                            # REQUIRED
-  workload_type: ''                   # REQUIRED: agent_harness | trainer
+  workload_type: ''                   # REQUIRED: agent_loop | trainer
 dataset:
   path: ''                            # REQUIRED: path to tasks.jsonl
   provider: local_jsonl
@@ -564,7 +564,7 @@ dataset:
   split_id: ''                        # REQUIRED
   limit: 0                            # REQUIRED: set > 0
 design:
-  sanitization_profile: ''            # REQUIRED: e.g. hermetic_functional_v2
+  sanitization_profile: ''            # REQUIRED: e.g. hermetic_functional
   comparison: paired
   replications: 0                     # REQUIRED: set > 0
   random_seed: 0                      # REQUIRED
@@ -575,20 +575,33 @@ baseline:
   bindings: {}
 variant_plan: []
 runtime:
-  harness:
-    mode: cli
-    command: []                        # REQUIRED: e.g. [node, ./harness.js, run]
-    integration_level: ''              # REQUIRED: cli_basic | cli_events | otel | sdk_control | sdk_full
-    input_path: /out/trial_input.json
-    output_path: /out/trial_output.json
-    control_plane:
-      mode: file
-      path: /state/lab_control.json
-  sandbox:
-    mode: local
-  network:
-    mode: none
-    allowed_hosts: []
+  agent:
+    mode: custom_image                 # REQUIRED: known_agent_ref | custom_image
+    known_agent_ref:
+      id: ''                           # REQUIRED when mode=known_agent_ref
+      version: ''                      # REQUIRED when mode=known_agent_ref
+      registry: ''                     # optional
+    custom_image:
+      image: ''                        # REQUIRED when mode=custom_image and sandbox.mode=container
+      entrypoint: []                   # REQUIRED when mode=custom_image
+    overrides:
+      args: []
+      env: {}
+      env_from_host: []
+  dependencies:
+    assets: []
+    services: []
+  policy:
+    timeout_ms: 600000
+    sandbox:
+      mode: local
+      image: ''                        # REQUIRED when mode=container
+    network:
+      mode: none
+      allowed_hosts: []
+  telemetry:
+    trajectory_path: /agentlab/out/trajectory.jsonl
+    causal_extraction: event_envelope_v1
 validity:
   fail_on_state_leak: true
   fail_on_profile_invariant_violation: true
@@ -760,18 +773,13 @@ fn summary_to_json(summary: &lab_runner::ExperimentSummary) -> Value {
         "dataset": summary.dataset_path.display().to_string(),
         "tasks": summary.task_count,
         "replications": summary.replications,
-        "variant_plan_entries": summary.variant_count,
+        "variant_count": summary.variant_count,
         "total_trials": summary.total_trials,
-        "harness": summary.harness_command,
-        "integration_level": summary.integration_level,
-        "container_mode": summary.container_mode,
+        "agent_loop": summary.agent_loop_command,
         "image": summary.image,
         "network": summary.network_mode,
-        "events_path": summary.events_path,
-        "tracing": summary.tracing_mode,
-        "control_path": summary.control_path,
-        "harness_script_resolved": summary.harness_script_resolved.as_ref().map(|p| p.display().to_string()),
-        "harness_script_exists": summary.harness_script_exists,
+        "trajectory_path": summary.trajectory_path,
+        "causal_extraction": summary.causal_extraction,
         "scheduling": summary.scheduling,
         "state_policy": summary.state_policy,
         "comparison": summary.comparison,
@@ -785,25 +793,18 @@ fn print_summary(summary: &lab_runner::ExperimentSummary) {
     println!("dataset: {}", summary.dataset_path.display());
     println!("tasks: {}", summary.task_count);
     println!("replications: {}", summary.replications);
-    println!("variant_plan_entries: {}", summary.variant_count);
+    println!("variant_count: {}", summary.variant_count);
     println!("total_trials: {}", summary.total_trials);
-    println!("harness: {:?}", summary.harness_command);
-    println!("integration_level: {}", summary.integration_level);
-    println!("container_mode: {}", summary.container_mode);
+    println!("agent_loop: {:?}", summary.agent_loop_command);
     if let Some(image) = &summary.image {
         println!("image: {}", image);
     }
     println!("network: {}", summary.network_mode);
-    if let Some(events) = &summary.events_path {
-        println!("events_path: {}", events);
+    if let Some(path) = &summary.trajectory_path {
+        println!("trajectory_path: {}", path);
     }
-    if let Some(mode) = &summary.tracing_mode {
-        println!("tracing: {}", mode);
-    }
-    println!("control_path: {}", summary.control_path);
-    if let Some(p) = &summary.harness_script_resolved {
-        println!("harness_script_resolved: {}", p.display());
-        println!("harness_script_exists: {}", summary.harness_script_exists);
+    if let Some(mode) = &summary.causal_extraction {
+        println!("causal_extraction: {}", mode);
     }
 }
 
@@ -844,29 +845,28 @@ fn write_knob_files(
       "scientific_role": "control"
     },
     {
-      "id": "runtime.network.mode",
+      "id": "runtime.policy.network.mode",
       "label": "Network Mode",
-      "json_pointer": "/runtime/network/mode",
+      "json_pointer": "/runtime/policy/network/mode",
       "type": "string",
       "options": ["none", "full", "allowlist_enforced"],
       "role": "infra",
       "scientific_role": "invariant"
     },
     {
-      "id": "runtime.harness.integration_level",
-      "label": "Integration Level",
-      "json_pointer": "/runtime/harness/integration_level",
+      "id": "runtime.agent.custom_image.entrypoint",
+      "label": "Agent Entrypoint",
+      "json_pointer": "/runtime/agent/custom_image/entrypoint",
       "type": "string",
-      "options": ["cli_basic", "cli_events", "otel", "sdk_control", "sdk_full"],
-      "role": "harness",
-      "scientific_role": "confound"
+      "role": "agent",
+      "scientific_role": "treatment"
     },
     {
-      "id": "runtime.harness.command",
-      "label": "Harness Command",
-      "json_pointer": "/runtime/harness/command",
-      "type": "array",
-      "role": "harness",
+      "id": "runtime.policy.sandbox.image",
+      "label": "Sandbox Image",
+      "json_pointer": "/runtime/policy/sandbox/image",
+      "type": "string",
+      "role": "infra",
       "scientific_role": "treatment",
       "autotune": { "enabled": false, "requires_human_approval": true }
     }

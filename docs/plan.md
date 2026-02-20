@@ -19,7 +19,7 @@ Agent Lab is an experiment harness for agentic systems that prioritizes auditabi
 
 ## Critical Invariants
 - Only mounted state surfaces are writable; root FS read‑only.
-- Profiles enforce invariants (replay_strict_v2, hermetic_functional_v2, perf_benchmark_v2).
+- Profiles enforce invariants (replay_strict, hermetic_functional, perf_benchmark).
 - Every run/trial emits grades; results without grades are “debug only.”
 - Events are hash‑chained and stored in a stable envelope; payloads are content‑addressed artifacts with redaction applied.
 - Registration (resolved spec + digest) occurs before run start.

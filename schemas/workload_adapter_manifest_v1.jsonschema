@@ -19,7 +19,7 @@
     "adapter_version": { "type": "string", "minLength": 1 },
     "workload_type": {
       "type": "string",
-      "enum": ["agent_harness", "trainer", "custom"]
+      "enum": ["agent_loop", "trainer", "custom"]
     },
     "execution": {
       "type": "object",
@@ -39,8 +39,8 @@
       "additionalProperties": false,
       "required": ["trial_input_schema", "trial_output_schema"],
       "properties": {
-        "trial_input_schema": { "const": "trial_input_v1" },
-        "trial_output_schema": { "const": "trial_output_v1" },
+        "trial_input_schema": { "const": "agent_task_v1" },
+        "trial_output_schema": { "const": "agent_result_v1" },
         "hook_schema": { "type": "string" }
       }
     },

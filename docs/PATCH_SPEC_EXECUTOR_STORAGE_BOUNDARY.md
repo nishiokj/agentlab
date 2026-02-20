@@ -238,7 +238,7 @@ Implementations:
 
 - Default local behavior remains the same (`materialize=full`).
 - Existing `.lab/runs/<run_id>/...` layout preserved for local mode.
-- Existing harness CLI contract (`AGENTLAB_TRIAL_INPUT`, `AGENTLAB_TRIAL_OUTPUT`) remains valid.
+- Legacy harness CLI env contract (`AGENTLAB_TRIAL_INPUT`, `AGENTLAB_TRIAL_OUTPUT`) has been superseded by control-path invocation in this track.
 
 ---
 

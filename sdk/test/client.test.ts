@@ -35,10 +35,9 @@ const json = args.includes('--json');
 
 const summary = {
   experiment: 'exp1', workload_type: 'agent_harness', dataset: 'tasks.jsonl',
-  tasks: 2, replications: 1, variant_plan_entries: 1, total_trials: 2,
-  harness: ['node','./harness.js','run'], integration_level: 'cli_basic',
-  container_mode: false, network: 'none', control_path: '/state/lab_control.json',
-  harness_script_exists: true,
+  tasks: 2, replications: 1, variant_count: 1, total_trials: 2,
+  agent_loop: ['node','./agent_loop.js','run'], integration_level: 'cli_basic',
+  network: 'none', control_path: '/state/lab_control.json',
 };
 
 const payloads = {
@@ -167,7 +166,7 @@ describe('LabClient constructor', () => {
         dir,
         `
 const val = process.env.MY_CUSTOM_VAR || 'not set';
-console.log(JSON.stringify({ ok: true, command: 'describe', summary: { custom_var: val, experiment: 'e', workload_type:'', dataset:'', tasks:0, replications:0, variant_plan_entries:0, total_trials:0, harness:[], integration_level:'', container_mode:false, network:'', control_path:'', harness_script_exists:false } }));
+console.log(JSON.stringify({ ok: true, command: 'describe', summary: { custom_var: val, experiment: 'e', workload_type:'', dataset:'', tasks:0, replications:0, variant_count:0, total_trials:0, agent_loop:[], integration_level:'', network:'', control_path:'' } }));
 `,
       );
       const client = new LabClient({
@@ -660,13 +659,13 @@ describe('LabClient.validateHooks()', () => {
   test('passes --manifest and --events', async () => {
     const { binPath, argsFile } = makeArgCapturingRunner(dir);
     const client = new LabClient({ runnerBin: binPath, cwd: dir });
-    await client.validateHooks({ manifest: 'harness.json', events: 'events.jsonl' });
+    await client.validateHooks({ manifest: 'agent_loop.json', events: 'events.jsonl' });
 
     const { readFileSync } = await import('node:fs');
     const args: string[] = JSON.parse(readFileSync(argsFile, 'utf8'));
     assert.ok(args.includes('hooks-validate'));
     assert.ok(args.includes('--manifest'));
-    assert.ok(args.includes('harness.json'));
+    assert.ok(args.includes('agent_loop.json'));
     assert.ok(args.includes('--events'));
     assert.ok(args.includes('events.jsonl'));
   });
@@ -788,7 +787,7 @@ describe('LabClient error handling', () => {
       `
 console.log("some log line");
 console.log("another log");
-console.log(JSON.stringify({ ok: true, command: 'describe', summary: { experiment: 'e', workload_type:'', dataset:'', tasks:0, replications:0, variant_plan_entries:0, total_trials:0, harness:[], integration_level:'', container_mode:false, network:'', control_path:'', harness_script_exists:false } }));
+console.log(JSON.stringify({ ok: true, command: 'describe', summary: { experiment: 'e', workload_type:'', dataset:'', tasks:0, replications:0, variant_count:0, total_trials:0, agent_loop:[], integration_level:'', network:'', control_path:'' } }));
 process.exit(0);
 `,
     );
@@ -830,7 +829,7 @@ describe('LabClient per-call CommandOptions', () => {
       dir,
       `
 const val = process.env.CALL_VAR || 'not set';
-console.log(JSON.stringify({ ok: true, command: 'describe', summary: { call_var: val, experiment:'e', workload_type:'', dataset:'', tasks:0, replications:0, variant_plan_entries:0, total_trials:0, harness:[], integration_level:'', container_mode:false, network:'', control_path:'', harness_script_exists:false } }));
+console.log(JSON.stringify({ ok: true, command: 'describe', summary: { call_var: val, experiment:'e', workload_type:'', dataset:'', tasks:0, replications:0, variant_count:0, total_trials:0, agent_loop:[], integration_level:'', network:'', control_path:'' } }));
 `,
     );
     const client = new LabClient({ runnerBin: bin, cwd: dir });
@@ -987,7 +986,6 @@ describe('LabClient.readEvidence() and readBenchmark()', () => {
         },
         runtime: {
           executor: 'local_process',
-          container_mode: false,
           exit_status: '0',
         },
         evidence: {

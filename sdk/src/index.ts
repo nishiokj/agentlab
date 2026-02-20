@@ -7,7 +7,6 @@ export {
   compileTaskBoundaries,
   taskBoundariesToJsonl,
   assertTaskBoundaryV1,
-  EVENT_OUTPUT_CONTRACT_V1,
   INVOCATION_ENV_CONTRACT_V1,
   WORKSPACE_CONTRACT_V1,
 } from './boundary-mappers.js';
@@ -76,10 +75,15 @@ export type {
   Bindings,
   ComparisonPolicy,
   DatasetJsonlOptions,
+  DependencyAssetEntry,
   DesignPolicies,
   ExperimentSpec,
+  AgentRuntimeMode,
+  AgentRuntimeOverrides,
+  KnownAgentRef,
+  CustomAgentImage,
   GuardrailDef,
-  HarnessCliOptions,
+  DependencyFileStagingEntry,
   MetricAggregate,
   MetricDef,
   MetricSource,
@@ -87,7 +91,6 @@ export type {
   RetryPolicy,
   RetryTrigger,
   SchedulingPolicy,
-  StatePolicy,
 } from './experiment-builder.js';
 
 export type {
@@ -118,7 +121,6 @@ export type {
 } from './hook-events.js';
 
 export type {
-  EventOutputContractV1,
   InputMapper,
   InputMapperContext,
   InvocationContractV1,
