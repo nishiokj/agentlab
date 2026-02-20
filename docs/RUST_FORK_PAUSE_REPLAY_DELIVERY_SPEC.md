@@ -67,7 +67,7 @@ lab replay --run-dir .lab/runs/<run_id> --trial-id <trial_id> [--strict] [--json
 ```
 
 Behavior:
-- Loads parent trial artifacts (`trial_input.json`, `trial_output.json`, hooks/traces when present).
+- Loads parent trial artifacts (`trial_input.json`, `result.json`, hooks/traces when present).
 - Executes a replay trial and writes under:
   - `.lab/runs/<run_id>/replays/<replay_id>/...`
 - Emits a result envelope compatible with existing `--json` style.
@@ -143,11 +143,15 @@ Fields:
 - `run_id`
 - `status: running|completed|failed|paused`
 - `active_trial_id: string|null`
-- `active_control_path: string|null` (host path)
+- `active_adapter: object|null`
+  - `id: string`
+  - `version: string`
+  - `command_path: string` (host path)
+  - `events_path: string|null`
 - `updated_at`
 
 Purpose:
-- `lab pause` can discover the currently active trial and control file.
+- `lab pause` can discover the currently active trial and adapter control channel.
 
 ### 7.2 Trial lifecycle state
 
@@ -250,7 +254,7 @@ Changes:
 - Add unit tests for lifecycle transitions.
 
 Acceptance:
-- During run, `active_trial_id` and `active_control_path` are correct.
+- During run, `active_trial_id` and `active_adapter` are correct.
 - Trial transitions to `completed` or `failed` are always recorded.
 
 ### Milestone B: Replay MVP

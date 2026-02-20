@@ -260,6 +260,25 @@ export interface BenchmarkConfig {
 }
 
 export type AgentRuntimeMode = 'known_agent_ref' | 'custom_image';
+export interface AgentAdapterRef {
+  id: string;
+  version: string;
+}
+
+export const BUILTIN_COMMAND_ADAPTER: AgentAdapterRef = {
+  id: 'builtin.command_contract',
+  version: 'v1',
+};
+
+export const PREBUILT_CODEX_ADAPTER: AgentAdapterRef = {
+  id: 'prebuilt.codex_cli',
+  version: 'v1',
+};
+
+export const PREBUILT_REX_JESUS_ADAPTER: AgentAdapterRef = {
+  id: 'prebuilt.rex_jesus',
+  version: 'v1',
+};
 
 export interface KnownAgentRef {
   id: string;
@@ -377,6 +396,7 @@ export interface ExperimentSpec {
   runtime: {
     agent: {
       mode: AgentRuntimeMode;
+      adapter?: AgentAdapterRef;
       known_agent_ref?: KnownAgentRef;
       custom_image?: CustomAgentImage;
       overrides?: AgentRuntimeOverrides;
@@ -553,6 +573,23 @@ export class ExperimentBuilder {
       this.spec.runtime.agent.custom_image = { entrypoint: [] };
     }
     return this.spec.runtime.agent.custom_image;
+  }
+
+  agentAdapter(id: string, version = 'v1'): this {
+    this.spec.runtime.agent.adapter = { id, version };
+    return this;
+  }
+
+  useBuiltinAdapter(version = 'v1'): this {
+    return this.agentAdapter(BUILTIN_COMMAND_ADAPTER.id, version);
+  }
+
+  usePrebuiltCodexAdapter(version = 'v1'): this {
+    return this.agentAdapter(PREBUILT_CODEX_ADAPTER.id, version);
+  }
+
+  usePrebuiltRexJesusAdapter(version = 'v1'): this {
+    return this.agentAdapter(PREBUILT_REX_JESUS_ADAPTER.id, version);
   }
 
   agentRef(id: string, version: string, options?: { registry?: string }): this {
@@ -823,6 +860,14 @@ export class ExperimentBuilder {
       if (entrypoint.length === 0 || entrypoint.some((part) => part.trim().length === 0)) {
         missing.push('runtime.agent.custom_image.entrypoint (call .agentLoop() or .customAgentImage())');
       }
+    }
+    const adapterId = this.spec.runtime.agent.adapter?.id?.trim() ?? '';
+    const adapterVersion = this.spec.runtime.agent.adapter?.version?.trim() ?? '';
+    if (adapterId.length === 0 && adapterVersion.length > 0) {
+      missing.push('runtime.agent.adapter.id (call .agentAdapter() with a non-empty id)');
+    }
+    if (adapterVersion.length === 0 && adapterId.length > 0) {
+      missing.push('runtime.agent.adapter.version (call .agentAdapter() with a non-empty version)');
     }
     if (this.spec.runtime.policy.timeout_ms <= 0) {
       missing.push('policy timeout_ms (call .timeoutMs() with > 0)');

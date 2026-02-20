@@ -29,7 +29,7 @@ Runner supports two materialization channels in task boundary:
 1. `workspace_files`: inline file writes into trial workspace.
 2. `mount_references`: container-only mounts via `dataset_pack_ref: sha256:...`.
 
-For SWE-bench tasks, runner currently requires non-empty `workspace_files` or `mount_references`, but does not natively resolve repo/commit to checkout.
+When `design.policies.task_boundary.require_workspace_materialization` is `true`, runner requires non-empty `workspace_files` or `mount_references` for every task boundary entry. This is policy-driven and benchmark-agnostic.
 
 Result: mapper must currently know mount internals or runs degrade to prompt-only workspaces.
 

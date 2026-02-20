@@ -6,19 +6,19 @@ use lab_analysis::{summarize_trial, write_analysis};
 use lab_core::{
     canonical_json_digest, ensure_dir, runner_runtime_host_paths, sha256_bytes, sha256_file,
     ArtifactStore, RunnerRuntimeHostPaths, AGENTLAB_AGENTLABD_START_REQUEST_PATH,
-    AGENTLAB_AGENTLABD_START_RESPONSE_PATH, AGENTLAB_CONTRACT_BIN_DIR, AGENTLAB_CONTRACT_IN_DIR,
-    AGENTLAB_CONTRACT_OUT_DIR, AGENTLAB_CONTRACT_STATE_DIR, AGENTLAB_CONTRACT_WORKSPACE_DIR,
-    AGENTLAB_CONTRACT_DEPS_DIR, AGENTLAB_CONTROL_PATH, AGENTLAB_DEPENDENCIES_PATH,
-    AGENTLAB_ENV_AGENTLABD_START_REQUEST, AGENTLAB_ENV_AGENTLABD_START_RESPONSE,
-    AGENTLAB_ENV_BINDINGS_PATH, AGENTLAB_ENV_DEPENDENCIES_PATH, AGENTLAB_ENV_LAUNCH_MODE,
-    AGENTLAB_ENV_POLICY_PATH, AGENTLAB_ENV_REPL_IDX, AGENTLAB_ENV_RESULT_PATH,
-    AGENTLAB_ENV_RUN_ID, AGENTLAB_ENV_TASK_ID, AGENTLAB_ENV_TASK_PATH, AGENTLAB_ENV_TIMEOUT_MS,
-    AGENTLAB_ENV_TRAJECTORY_PATH, AGENTLAB_ENV_TRIAL_EVENTS, AGENTLAB_ENV_TRIAL_ID,
-    AGENTLAB_ENV_TRIAL_INPUT, AGENTLAB_ENV_TRIAL_OUTPUT, AGENTLAB_ENV_VARIANT_ID,
-    AGENTLAB_HARNESS_INVOCATION_PATH, AGENTLAB_POLICY_PATH, AGENTLAB_RESULT_PATH,
-    AGENTLAB_RUNNER_ENTRYPOINT_PATH, AGENTLAB_TASK_PATH, AGENTLAB_TRAJECTORY_PATH,
-    AGENTLAB_TRIAL_EVENTS_PATH, AGENTLAB_TRIAL_INPUT_PATH, AGENTLAB_TRIAL_OUTPUT_PATH,
-    AGENTLAB_BINDINGS_PATH,
+    AGENTLAB_AGENTLABD_START_RESPONSE_PATH, AGENTLAB_BINDINGS_PATH, AGENTLAB_CONTRACT_BIN_DIR,
+    AGENTLAB_CONTRACT_DEPS_DIR, AGENTLAB_CONTRACT_IN_DIR, AGENTLAB_CONTRACT_OUT_DIR,
+    AGENTLAB_CONTRACT_STATE_DIR, AGENTLAB_CONTRACT_WORKSPACE_DIR, AGENTLAB_CONTROL_PATH,
+    AGENTLAB_DEPENDENCIES_PATH, AGENTLAB_ENV_AGENTLABD_START_REQUEST,
+    AGENTLAB_ENV_AGENTLABD_START_RESPONSE, AGENTLAB_ENV_BINDINGS_PATH,
+    AGENTLAB_ENV_DEPENDENCIES_PATH, AGENTLAB_ENV_LAUNCH_MODE, AGENTLAB_ENV_POLICY_PATH,
+    AGENTLAB_ENV_REPL_IDX, AGENTLAB_ENV_RESULT_PATH, AGENTLAB_ENV_RUN_ID, AGENTLAB_ENV_TASK_ID,
+    AGENTLAB_ENV_TASK_PATH, AGENTLAB_ENV_TIMEOUT_MS, AGENTLAB_ENV_TRAJECTORY_PATH,
+    AGENTLAB_ENV_TRIAL_EVENTS, AGENTLAB_ENV_TRIAL_ID, AGENTLAB_ENV_TRIAL_INPUT,
+    AGENTLAB_ENV_TRIAL_OUTPUT, AGENTLAB_ENV_VARIANT_ID, AGENTLAB_HARNESS_INVOCATION_PATH,
+    AGENTLAB_POLICY_PATH, AGENTLAB_RESULT_PATH, AGENTLAB_RUNNER_ENTRYPOINT_PATH,
+    AGENTLAB_TASK_PATH, AGENTLAB_TRAJECTORY_PATH, AGENTLAB_TRIAL_EVENTS_PATH,
+    AGENTLAB_TRIAL_INPUT_PATH,
 };
 use lab_hooks::{load_manifest, validate_hooks};
 use lab_provenance::{default_attestation, write_attestation};
@@ -28,13 +28,11 @@ use serde_json::json;
 use serde_json::Value;
 use std::collections::{BTreeMap, HashSet};
 use std::fs;
-use std::io::{BufWriter, Write};
+use std::io::Write;
 #[cfg(unix)]
 use std::os::unix::fs::symlink;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
-#[cfg(unix)]
-use std::os::unix::net::UnixStream;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
@@ -47,12 +45,10 @@ const DEFAULT_CONTAINER_POLICY_PATH: &str = AGENTLAB_POLICY_PATH;
 const DEFAULT_CONTAINER_RESULT_PATH: &str = AGENTLAB_RESULT_PATH;
 const DEFAULT_CONTAINER_TRAJECTORY_PATH: &str = AGENTLAB_TRAJECTORY_PATH;
 const DEFAULT_CONTAINER_TRIAL_INPUT_PATH: &str = AGENTLAB_TRIAL_INPUT_PATH;
-const DEFAULT_CONTAINER_TRIAL_OUTPUT_PATH: &str = AGENTLAB_RESULT_PATH;
 const DEFAULT_CONTAINER_EVENTS_PATH: &str = AGENTLAB_TRIAL_EVENTS_PATH;
 const DEFAULT_CONTAINER_CONTROL_PATH: &str = AGENTLAB_CONTROL_PATH;
+const CANONICAL_TRIAL_RESULT_FILENAME: &str = "result.json";
 const RUNNER_OWNED_ENTRYPOINT_SHIM: &str = include_str!("agentlab_entrypoint.sh");
-const OCI_HARNESS_LABEL_KEYS: &[&str] = &["io.agentlab.harness", "org.agentlab.harness"];
-const OCI_HARNESS_LABEL_PREFIXES: &[&str] = &["io.agentlab.harness", "org.agentlab.harness"];
 const WORKSPACE_EVIDENCE_EXCLUDE_PREFIXES: &[&str] = &[
     "logs",
     ".haiku",
@@ -64,26 +60,135 @@ const WORKSPACE_EVIDENCE_EXCLUDE_PREFIXES: &[&str] = &[
     "auth-states",
 ];
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum HarnessControlMode {
-    File,
-    Uds,
+const BUILTIN_COMMAND_ADAPTER_ID: &str = "builtin.command_contract";
+const BUILTIN_COMMAND_ADAPTER_VERSION: &str = "v1";
+const PREBUILT_CODEX_ADAPTER_ID: &str = "prebuilt.codex_cli";
+const PREBUILT_REX_JESUS_ADAPTER_ID: &str = "prebuilt.rex_jesus";
+const PREBUILT_AGENT_ADAPTER_VERSION: &str = "v1";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct AgentAdapterRef {
+    id: String,
+    version: String,
 }
 
-impl HarnessControlMode {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::File => "file",
-            Self::Uds => "uds",
+impl Default for AgentAdapterRef {
+    fn default() -> Self {
+        Self {
+            id: BUILTIN_COMMAND_ADAPTER_ID.to_string(),
+            version: BUILTIN_COMMAND_ADAPTER_VERSION.to_string(),
         }
     }
+}
 
-    fn parse(raw: Option<&str>) -> Result<Self> {
-        match raw.ok_or_else(|| anyhow!("missing control transport mode"))? {
-            "file" => Ok(Self::File),
-            "uds" => Ok(Self::Uds),
-            other => Err(anyhow!("unsupported control transport mode: {}", other)),
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AgentAdapterCapabilities {
+    pause: bool,
+    control_ack: bool,
+    event_stream: bool,
+    strict_replay: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ActiveAdapterControl {
+    adapter_id: String,
+    adapter_version: String,
+    command_path: String,
+    #[serde(default)]
+    events_path: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct AdapterRunRequest<'a> {
+    runtime_experiment: &'a Value,
+    runtime: &'a AgentLoopConfig,
+    runtime_env: &'a BTreeMap<String, String>,
+    runtime_overrides_env: &'a BTreeMap<String, String>,
+    container_mode: bool,
+    trial_paths: &'a TrialPaths,
+    dynamic_mounts: &'a [ResolvedMountReference],
+    io_paths: &'a PreparedTrialIo,
+    network_mode: &'a str,
+    setup_command: Option<&'a str>,
+    run_id: &'a str,
+}
+
+#[derive(Debug, Clone)]
+struct AdapterPauseRequest<'a> {
+    control: &'a ActiveAdapterControl,
+    label: &'a str,
+    timeout: Duration,
+}
+
+#[derive(Debug, Clone)]
+struct AdapterPauseAck {
+    checkpoint_acked: bool,
+    stop_acked: bool,
+}
+
+trait AgentAdapter {
+    fn capabilities(&self) -> AgentAdapterCapabilities;
+
+    fn run_trial(&self, request: &AdapterRunRequest<'_>) -> Result<ProcessRunResult>;
+
+    fn active_control(
+        &self,
+        request: &AdapterRunRequest<'_>,
+    ) -> Result<Option<ActiveAdapterControl>>;
+
+    fn pause_trial(&self, request: &AdapterPauseRequest<'_>) -> Result<AdapterPauseAck>;
+}
+
+#[derive(Debug, Clone, Copy)]
+struct BuiltinCommandAdapter;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PrebuiltAdapterFlavor {
+    CodexCli,
+    RexJesus,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PrebuiltCommandAdapter {
+    flavor: PrebuiltAdapterFlavor,
+}
+
+fn supported_agent_adapters() -> &'static [(&'static str, &'static str)] {
+    &[
+        (BUILTIN_COMMAND_ADAPTER_ID, BUILTIN_COMMAND_ADAPTER_VERSION),
+        (PREBUILT_CODEX_ADAPTER_ID, PREBUILT_AGENT_ADAPTER_VERSION),
+        (
+            PREBUILT_REX_JESUS_ADAPTER_ID,
+            PREBUILT_AGENT_ADAPTER_VERSION,
+        ),
+    ]
+}
+
+fn adapter_registry_entry(adapter_ref: &AgentAdapterRef) -> Result<Box<dyn AgentAdapter>> {
+    match (adapter_ref.id.as_str(), adapter_ref.version.as_str()) {
+        (BUILTIN_COMMAND_ADAPTER_ID, BUILTIN_COMMAND_ADAPTER_VERSION) => {
+            Ok(Box::new(BuiltinCommandAdapter))
         }
+        (PREBUILT_CODEX_ADAPTER_ID, PREBUILT_AGENT_ADAPTER_VERSION) => {
+            Ok(Box::new(PrebuiltCommandAdapter {
+                flavor: PrebuiltAdapterFlavor::CodexCli,
+            }))
+        }
+        (PREBUILT_REX_JESUS_ADAPTER_ID, PREBUILT_AGENT_ADAPTER_VERSION) => {
+            Ok(Box::new(PrebuiltCommandAdapter {
+                flavor: PrebuiltAdapterFlavor::RexJesus,
+            }))
+        }
+        _ => Err(anyhow!(
+            "unsupported runtime.agent adapter '{}@{}'; supported: {}",
+            adapter_ref.id,
+            adapter_ref.version,
+            supported_agent_adapters()
+                .iter()
+                .map(|(id, version)| format!("{}@{}", id, version))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )),
     }
 }
 
@@ -108,65 +213,6 @@ impl HarnessLaunchMode {
             other => Err(anyhow!("unsupported launch mode: {}", other)),
         }
     }
-}
-
-#[derive(Debug, Clone)]
-struct HarnessControlTransport {
-    mode: HarnessControlMode,
-    harness_path: String,
-    host_path: PathBuf,
-    harness_mount_dir: Option<String>,
-    host_mount_dir: Option<PathBuf>,
-}
-
-impl HarnessControlTransport {
-    fn active(path: HarnessControlMode, host_path: &Path) -> Self {
-        Self {
-            mode: path,
-            harness_path: host_path.to_string_lossy().to_string(),
-            host_path: host_path.to_path_buf(),
-            harness_mount_dir: None,
-            host_mount_dir: None,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct HarnessInvocationMetadata {
-    schema_version: String,
-    kind: String,
-    cmd: String,
-    #[serde(default)]
-    args: Vec<String>,
-    #[serde(default)]
-    integration_level: Option<String>,
-    #[serde(default)]
-    default_timeout_ms: Option<u64>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum HarnessInvocationSource {
-    RuntimeSpec,
-    OciLabel,
-    ImageFile,
-}
-
-impl HarnessInvocationSource {
-    fn as_str(self) -> &'static str {
-        match self {
-            Self::RuntimeSpec => "runtime_spec",
-            Self::OciLabel => "oci_label",
-            Self::ImageFile => "image_file",
-        }
-    }
-}
-
-#[derive(Debug, Clone)]
-struct ResolvedHarnessInvocation {
-    command: Vec<String>,
-    source: HarnessInvocationSource,
-    integration_level: Option<String>,
-    default_timeout_ms: Option<u64>,
 }
 
 pub struct RunResult {
@@ -298,14 +344,15 @@ pub fn validate_knob_overrides(manifest_path: &Path, overrides_path: &Path) -> R
     Ok(())
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RunBehavior {
     pub setup_command: Option<String>,
     pub network_mode_override: Option<String>,
     pub require_network_none: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ExecutorKind {
     LocalDocker,
     LocalProcess,
@@ -322,7 +369,8 @@ impl ExecutorKind {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum MaterializationMode {
     None,
     MetadataOnly,
@@ -341,12 +389,29 @@ impl MaterializationMode {
     }
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RunExecutionOptions {
     pub executor: Option<ExecutorKind>,
     pub materialize: Option<MaterializationMode>,
     pub remote_endpoint: Option<String>,
     pub remote_token_env: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RunSessionState {
+    schema_version: String,
+    run_id: String,
+    behavior: RunBehavior,
+    execution: RunExecutionOptions,
+}
+
+fn normalize_execution_options(execution: &RunExecutionOptions) -> RunExecutionOptions {
+    RunExecutionOptions {
+        executor: execution.executor,
+        materialize: Some(execution.materialize.unwrap_or(MaterializationMode::Full)),
+        remote_endpoint: execution.remote_endpoint.clone(),
+        remote_token_env: execution.remote_token_env.clone(),
+    }
 }
 
 fn atomic_write_bytes(path: &Path, bytes: &[u8]) -> Result<()> {
@@ -381,24 +446,58 @@ fn run_control_path(run_dir: &Path) -> PathBuf {
     run_dir.join("runtime").join("run_control.json")
 }
 
+fn run_session_state_path(run_dir: &Path) -> PathBuf {
+    run_dir.join("runtime").join("run_session_state.json")
+}
+
+fn write_run_session_state(
+    run_dir: &Path,
+    run_id: &str,
+    behavior: &RunBehavior,
+    execution: &RunExecutionOptions,
+) -> Result<()> {
+    let state = RunSessionState {
+        schema_version: "run_session_state_v1".to_string(),
+        run_id: run_id.to_string(),
+        behavior: behavior.clone(),
+        execution: normalize_execution_options(execution),
+    };
+    let payload = serde_json::to_value(state)?;
+    atomic_write_json_pretty(&run_session_state_path(run_dir), &payload)
+}
+
+fn load_run_session_state(run_dir: &Path) -> Result<RunSessionState> {
+    let path = run_session_state_path(run_dir);
+    if !path.exists() {
+        return Err(anyhow!(
+            "run_session_state.json not found — this run predates continue behavior persistence"
+        ));
+    }
+    let bytes = fs::read(path)?;
+    Ok(serde_json::from_slice(&bytes)?)
+}
+
 fn write_run_control(
     run_dir: &Path,
     run_id: &str,
     status: &str,
     active_trial_id: Option<&str>,
-    active_control: Option<&HarnessControlTransport>,
+    active_control: Option<&ActiveAdapterControl>,
 ) -> Result<()> {
+    let active_adapter = active_control.map(|control| {
+        json!({
+            "id": control.adapter_id,
+            "version": control.adapter_version,
+            "command_path": control.command_path,
+            "events_path": control.events_path,
+        })
+    });
     let payload = json!({
         "schema_version": "run_control_v1",
         "run_id": run_id,
         "status": status,
         "active_trial_id": active_trial_id,
-        "active_control_path": active_control
-            .as_ref()
-            .map(|control| control.host_path.to_string_lossy().to_string()),
-        "active_control_mode": active_control
-            .as_ref()
-            .map(|control| control.mode.as_str()),
+        "active_adapter": active_adapter,
         "updated_at": Utc::now().to_rfc3339(),
     });
     atomic_write_json_pretty(&run_control_path(run_dir), &payload)
@@ -614,6 +713,433 @@ pub fn run_experiment_strict_with_overrides(
     )
 }
 
+/// Derive the project root from a run directory path.
+/// Run dirs live at `{project_root}/.lab/runs/{run_id}/`, so we navigate up 3 levels.
+fn find_project_root_from_run_dir(run_dir: &Path) -> Result<PathBuf> {
+    // run_dir = {root}/.lab/runs/{run_id}
+    let root = run_dir
+        .parent() // .lab/runs
+        .and_then(|p| p.parent()) // .lab
+        .and_then(|p| p.parent()) // root
+        .ok_or_else(|| {
+            anyhow!(
+                "cannot derive project root from run_dir: {}",
+                run_dir.display()
+            )
+        })?;
+    Ok(root.to_path_buf())
+}
+
+/// Walk all `{run_dir}/trials/trial_*/` directories, read result.json +
+/// trial_metadata.json, and produce a summary for each via `summarize_trial`.
+fn rebuild_all_trial_summaries(
+    run_dir: &Path,
+    run_id: &str,
+    workload_type: &str,
+    variants: &[Variant],
+) -> Result<(
+    Vec<Value>,
+    BTreeMap<String, BTreeMap<String, usize>>,
+    BTreeMap<String, BTreeMap<String, usize>>,
+)> {
+    let trials_dir = run_dir.join("trials");
+    let mut trial_summaries = Vec::new();
+    let mut event_counts: BTreeMap<String, BTreeMap<String, usize>> = BTreeMap::new();
+    let mut trial_event_counts: BTreeMap<String, BTreeMap<String, usize>> = BTreeMap::new();
+
+    if !trials_dir.exists() {
+        return Ok((trial_summaries, event_counts, trial_event_counts));
+    }
+
+    let mut entries: Vec<_> = fs::read_dir(&trials_dir)?
+        .filter_map(|e| e.ok())
+        .filter(|e| {
+            e.file_name()
+                .to_str()
+                .is_some_and(|n| n.starts_with("trial_"))
+        })
+        .collect();
+    entries.sort_by_key(|e| e.file_name());
+
+    for entry in entries {
+        let trial_dir = entry.path();
+        let trial_id = entry.file_name().to_str().unwrap_or("unknown").to_string();
+
+        let metadata_path = trial_dir.join("trial_metadata.json");
+        let output_path = trial_dir.join(CANONICAL_TRIAL_RESULT_FILENAME);
+        let state_path = trial_dir.join("trial_state.json");
+
+        if !metadata_path.exists() {
+            continue;
+        }
+
+        let metadata: Value = serde_json::from_slice(&fs::read(&metadata_path)?)?;
+        let trial_output: Value = if output_path.exists() {
+            serde_json::from_slice(&fs::read(&output_path)?)?
+        } else {
+            json!({"schema_version": "agent_result_v1", "outcome": "error"})
+        };
+
+        let variant_id = metadata
+            .pointer("/ids/variant_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
+        let task_id = metadata
+            .pointer("/ids/task_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
+        let task_idx = metadata
+            .pointer("/ids/task_index")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as usize;
+        let repl = metadata
+            .pointer("/ids/repl_idx")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as usize;
+
+        let bindings = variants
+            .iter()
+            .find(|v| v.id == variant_id)
+            .map(|v| v.bindings.clone())
+            .unwrap_or(json!({}));
+
+        let status = if state_path.exists() {
+            let state: Value = serde_json::from_slice(&fs::read(&state_path)?)?;
+            let trial_status = state
+                .get("status")
+                .and_then(|v| v.as_str())
+                .unwrap_or("failed");
+            if trial_status == "completed" {
+                "0".to_string()
+            } else {
+                "1".to_string()
+            }
+        } else {
+            "1".to_string()
+        };
+
+        let container_mode = metadata
+            .pointer("/runtime/container_mode")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let integration_level = metadata
+            .pointer("/runtime/integration_level")
+            .and_then(|v| v.as_str())
+            .unwrap_or("agent_loop");
+        let network_requested = metadata
+            .pointer("/runtime/network_mode_requested")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
+        let network_effective = metadata
+            .pointer("/runtime/network_mode_effective")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
+
+        let summary = summarize_trial(
+            run_id,
+            &trial_output,
+            &trial_id,
+            workload_type,
+            variant_id,
+            task_idx,
+            task_id,
+            repl,
+            &bindings,
+            status,
+            container_mode,
+            integration_level,
+            network_requested,
+            network_effective,
+        );
+        trial_summaries.push(summary);
+
+        // Rebuild event counts from events files
+        let events_path = trial_dir.join("out").join("events.jsonl");
+        let state_events = trial_dir.join("state").join("events.jsonl");
+        let events_file = if events_path.exists() {
+            Some(events_path)
+        } else if state_events.exists() {
+            Some(state_events)
+        } else {
+            None
+        };
+        if let Some(path) = events_file {
+            if let Ok(counts) = count_event_types(&path) {
+                let trial_map = trial_event_counts.entry(trial_id.clone()).or_default();
+                for (k, v) in counts.into_iter() {
+                    *trial_map.entry(k.clone()).or_default() += v;
+                    *event_counts
+                        .entry(variant_id.to_string())
+                        .or_default()
+                        .entry(k)
+                        .or_default() += v;
+                }
+            }
+        }
+    }
+
+    Ok((trial_summaries, event_counts, trial_event_counts))
+}
+
+/// Continue a previously interrupted run from where it stopped.
+///
+/// Loads persisted run session + `schedule_progress.json`, validates the run is
+/// in a continuable terminal state, reconstructs experiment parameters,
+/// verifies schedule integrity, and re-enters the trial loop from the next
+/// unprocessed slot.
+pub fn continue_run(run_dir: &Path) -> Result<RunResult> {
+    let _op_lock = acquire_run_operation_lock(run_dir)?;
+    let run_dir = run_dir
+        .canonicalize()
+        .unwrap_or_else(|_| run_dir.to_path_buf());
+
+    // 1. Validate run status is terminal and continuable.
+    let control_path = run_control_path(&run_dir);
+    let control: Value = serde_json::from_slice(&fs::read(&control_path)?)?;
+    let run_status = control
+        .get("status")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown");
+    match run_status {
+        "failed" | "paused" | "interrupted" => {}
+        "completed" => return Err(anyhow!("run already completed — nothing to continue")),
+        "running" => {
+            return Err(anyhow!(
+                "run is currently active — cannot continue a running experiment"
+            ))
+        }
+        other => return Err(anyhow!("unexpected run status: {}", other)),
+    }
+
+    let run_id = control
+        .get("run_id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow!("missing run_id in run_control.json"))?
+        .to_string();
+    let run_session = load_run_session_state(&run_dir)?;
+    if run_session.run_id != run_id {
+        return Err(anyhow!(
+            "run session state mismatch: run_control has {}, run_session_state has {}",
+            run_id,
+            run_session.run_id
+        ));
+    }
+    let behavior = run_session.behavior;
+    let execution = run_session.execution;
+
+    // 2. Load schedule progress
+    let progress_path = schedule_progress_path(&run_dir);
+    if !progress_path.exists() {
+        return Err(anyhow!(
+            "schedule_progress.json not found — this run predates continue support"
+        ));
+    }
+    let progress: ScheduleProgress = serde_json::from_slice(&fs::read(&progress_path)?)?;
+    if progress.next_schedule_index >= progress.total_slots {
+        return Err(anyhow!(
+            "all {} schedule slots were already processed — nothing to continue",
+            progress.total_slots
+        ));
+    }
+
+    // 3. Load resolved experiment
+    let resolved_path = run_dir.join("resolved_experiment.json");
+    let json_value: Value = serde_json::from_slice(&fs::read(&resolved_path)?)?;
+    let policy_config = parse_policies(&json_value);
+    let project_root = find_project_root_from_run_dir(&run_dir)?;
+    let project_root = project_root
+        .canonicalize()
+        .unwrap_or_else(|_| project_root.clone());
+
+    let workload_type = json_value
+        .pointer("/experiment/workload_type")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow!("missing /experiment/workload_type in resolved experiment"))?
+        .to_string();
+
+    // 4. Reject non-IsolatePerTrial state policies
+    if !matches!(policy_config.state, StatePolicy::IsolatePerTrial) {
+        return Err(anyhow!(
+            "continue_run only supports IsolatePerTrial state policy; \
+             this run uses {:?} — chain state recovery is not yet implemented",
+            policy_config.state
+        ));
+    }
+
+    // 5. Reconstruct schedule and verify it matches
+    let (variants, baseline_id) = resolve_variant_plan(&json_value)?;
+    let exp_dir = resolved_path
+        .parent()
+        .unwrap_or(Path::new("."))
+        .to_path_buf();
+    let dataset_path = resolve_dataset_path(&json_value, &exp_dir)?;
+    let tasks = load_tasks(&dataset_path, &json_value)?;
+    let replications = json_value
+        .pointer("/design/replications")
+        .and_then(|v| v.as_u64())
+        .ok_or_else(|| anyhow!("missing /design/replications"))? as usize;
+    let random_seed = json_value
+        .pointer("/design/random_seed")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(1);
+
+    let reconstructed_schedule = build_trial_schedule(
+        variants.len(),
+        tasks.len(),
+        replications,
+        policy_config.scheduling,
+        random_seed,
+    );
+
+    if reconstructed_schedule != progress.schedule {
+        return Err(anyhow!(
+            "schedule mismatch — the experiment configuration has changed since this run was \
+             created; cannot safely continue (reconstructed {} slots vs stored {})",
+            reconstructed_schedule.len(),
+            progress.schedule.len()
+        ));
+    }
+
+    let schedule = reconstructed_schedule;
+    let use_container = progress.use_container;
+    let materialize_mode = execution.materialize.unwrap_or(MaterializationMode::Full);
+
+    // 6. Mark run as running again
+    write_run_control(&run_dir, &run_id, "running", None, None)?;
+    let mut run_guard = RunControlGuard::new(&run_dir, &run_id);
+
+    // 7. Reconstruct variant runtime profiles
+    let mut variant_runtime_profiles = Vec::with_capacity(variants.len());
+    for variant in &variants {
+        variant_runtime_profiles.push(resolve_variant_runtime_profile(
+            &json_value,
+            variant,
+            &project_root,
+            use_container,
+            &behavior,
+            &execution,
+        )?);
+    }
+    let run_integration_level = variant_runtime_profiles
+        .first()
+        .map(|profile| profile.harness.integration_level.clone())
+        .unwrap_or_else(|| "agent_loop".to_string());
+    let all_container_mode = variant_runtime_profiles
+        .iter()
+        .all(|profile| profile.container_mode);
+
+    let benchmark_config = parse_benchmark_config(&json_value);
+
+    // 8. Restore loop accumulators from progress
+    let mut consecutive_failures: BTreeMap<usize, usize> = progress.consecutive_failures.clone();
+    let mut pruned_variants: HashSet<usize> = progress.pruned_variants.iter().copied().collect();
+    let mut chain_states: BTreeMap<String, ChainRuntimeState> = BTreeMap::new();
+
+    let trials_dir = run_dir.join("trials");
+    ensure_dir(&trials_dir)?;
+    let analysis_dir = run_dir.join("analysis");
+    ensure_dir(&analysis_dir)?;
+    let evidence_dir = run_dir.join("evidence");
+    ensure_dir(&evidence_dir)?;
+    let evidence_records_path = evidence_dir.join("evidence_records.jsonl");
+    let task_chain_states_path = evidence_dir.join("task_chain_states.jsonl");
+    let artifact_store = ArtifactStore::new(run_dir.join("artifacts"));
+
+    // Accumulators for new trials only (old summaries rebuilt at the end)
+    let mut trial_summaries = Vec::new();
+    let mut event_counts: BTreeMap<String, BTreeMap<String, usize>> = BTreeMap::new();
+    let mut trial_event_counts: BTreeMap<String, BTreeMap<String, usize>> = BTreeMap::new();
+
+    let mut schedule_progress = progress.clone();
+    let mut trial_index: usize = schedule_progress.next_trial_index;
+
+    execute_schedule_engine(
+        ScheduleEngineMode::ContinueRun,
+        &run_dir,
+        &run_id,
+        &workload_type,
+        &project_root,
+        &dataset_path,
+        &variants,
+        &tasks,
+        &schedule,
+        &policy_config,
+        &benchmark_config,
+        &variant_runtime_profiles,
+        &behavior,
+        materialize_mode,
+        &policy_config.task_boundary,
+        &trials_dir,
+        &evidence_dir,
+        &evidence_records_path,
+        &task_chain_states_path,
+        &artifact_store,
+        &mut schedule_progress,
+        &mut trial_index,
+        &mut consecutive_failures,
+        &mut pruned_variants,
+        &mut chain_states,
+        &mut trial_summaries,
+        &mut event_counts,
+        &mut trial_event_counts,
+    )?;
+
+    // 10. Rebuild ALL trial summaries (old + new) and re-run analysis
+    let (all_trial_summaries, all_event_counts, all_trial_event_counts) =
+        rebuild_all_trial_summaries(&run_dir, &run_id, &workload_type, &variants)?;
+
+    validate_jsonl_against_schema("evidence_record_v1.jsonschema", &evidence_records_path)?;
+    validate_jsonl_against_schema("task_chain_state_v1.jsonschema", &task_chain_states_path)?;
+
+    let mut all_trial_summaries = all_trial_summaries;
+    if let Some(adapter) = benchmark_config.adapter.as_ref() {
+        let scores_path = process_benchmark_outputs(
+            &project_root,
+            &run_dir,
+            &run_id,
+            adapter,
+            &evidence_records_path,
+            &task_chain_states_path,
+        )?;
+        apply_score_records_to_trial_summaries(&mut all_trial_summaries, &scores_path)?;
+    }
+
+    write_analysis(
+        &analysis_dir,
+        &all_trial_summaries,
+        &baseline_id,
+        &all_event_counts,
+        &all_trial_event_counts,
+    )?;
+
+    let resolved_digest = canonical_json_digest(&json_value);
+    let grades = json!({
+        "schema_version": "grades_v1",
+        "integration_level": run_integration_level,
+        "replay_grade": "best_effort",
+        "isolation_grade": if all_container_mode {"bounded"} else {"leaky"},
+        "comparability_grade": "unknown",
+        "provenance_grade": "recorded",
+        "privacy_grade": "unknown"
+    });
+
+    let att = default_attestation(
+        &resolved_digest,
+        None,
+        grades.clone(),
+        vec![],
+        json!({"name": "unknown"}),
+        "hooks",
+    );
+    write_attestation(&run_dir, att)?;
+    run_guard.complete("completed")?;
+
+    Ok(RunResult {
+        run_dir: run_dir.to_path_buf(),
+        run_id,
+    })
+}
+
 pub fn replay_trial(run_dir: &Path, trial_id: &str, strict: bool) -> Result<ReplayResult> {
     let _op_lock = acquire_run_operation_lock(run_dir)?;
     let run_dir = run_dir
@@ -636,32 +1162,7 @@ pub fn replay_trial(run_dir: &Path, trial_id: &str, strict: bool) -> Result<Repl
         ));
     }
     let json_value: Value = serde_json::from_slice(&fs::read(&resolved_path)?)?;
-    let mut harness = resolve_agent_loop(&json_value, &project_root)?;
-    let container_mode = json_value
-        .pointer("/runtime/policy/sandbox/mode")
-        .and_then(|v| v.as_str())
-        == Some("container");
-    let replay_executor = if container_mode {
-        ExecutorKind::LocalDocker
-    } else {
-        ExecutorKind::LocalProcess
-    };
-    let invocation =
-        resolve_harness_invocation(&json_value, &harness, &project_root, replay_executor)?;
-    let invocation_default_timeout_ms = invocation.default_timeout_ms;
-    harness.command_raw = invocation.command;
-    if let Some(integration_level) = invocation.integration_level.clone() {
-        harness.integration_level = integration_level;
-    }
-    let harness_env = resolve_agent_loop_env(&harness)?;
-
-    if strict && harness.integration_level != "sdk_full" {
-        return Err(anyhow!(
-            "strict replay requires integration_level sdk_full (found: {})",
-            harness.integration_level
-        ));
-    }
-
+    let policy_config = parse_policies(&json_value);
     let parent_trial_dir = run_dir.join("trials").join(trial_id);
     if !parent_trial_dir.exists() {
         return Err(anyhow!("parent trial not found: {}", trial_id));
@@ -674,6 +1175,38 @@ pub fn replay_trial(run_dir: &Path, trial_id: &str, strict: bool) -> Result<Repl
         ));
     }
     let mut input: Value = serde_json::from_slice(&fs::read(&parent_input_path)?)?;
+    let (variants, _) = resolve_variant_plan(&json_value)?;
+    let variant_id = input
+        .pointer("/ids/variant_id")
+        .and_then(|v| v.as_str())
+        .or_else(|| {
+            json_value
+                .pointer("/baseline/variant_id")
+                .and_then(|v| v.as_str())
+        })
+        .unwrap_or("");
+    let variant = find_variant_by_id(&variants, variant_id)?;
+    let runtime_profile = resolve_variant_runtime_profile(
+        &json_value,
+        variant,
+        &project_root,
+        false,
+        &RunBehavior::default(),
+        &RunExecutionOptions::default(),
+    )?;
+    let harness = runtime_profile.harness;
+    let harness_env = runtime_profile.harness_env;
+    let container_mode = runtime_profile.container_mode;
+    let invocation_default_timeout_ms = runtime_profile.invocation_default_timeout_ms;
+    let effective_network_mode = runtime_profile.effective_network_mode;
+    let runtime_experiment = runtime_profile.experiment;
+
+    if strict && harness.integration_level != "sdk_full" {
+        return Err(anyhow!(
+            "strict replay requires integration_level sdk_full (found: {})",
+            harness.integration_level
+        ));
+    }
 
     let replay_id = format!("replay_{}", Utc::now().format("%Y%m%d_%H%M%S"));
     let replay_dir = run_dir.join("replays").join(&replay_id);
@@ -686,7 +1219,7 @@ pub fn replay_trial(run_dir: &Path, trial_id: &str, strict: bool) -> Result<Repl
         Value::String(replay_trial_id.clone()),
     )?;
     let task_boundary = parse_task_boundary_from_trial_input(&input)?;
-    validate_task_boundary_workspace_materialization(&task_boundary)?;
+    validate_task_boundary_workspace_materialization(&task_boundary, &policy_config.task_boundary)?;
 
     let dataset_src = first_file_in_dir(&parent_trial_dir.join("dataset"))?;
     let replay_trial_dir = replay_dir.join("trial_1");
@@ -711,17 +1244,12 @@ pub fn replay_trial(run_dir: &Path, trial_id: &str, strict: bool) -> Result<Repl
     stage_dependencies_for_trial(&harness, &trial_paths)?;
     materialize_workspace_files(&trial_paths, &task_boundary.workspace_files)?;
 
-    let control_transport = resolve_control_paths(&harness, &trial_paths, container_mode)?;
     set_json_pointer_value(
         &mut input,
         "/runtime/control_plane/path",
-        json!(control_transport.harness_path.clone()),
+        json!(DEFAULT_CONTAINER_CONTROL_PATH),
     )?;
-    set_json_pointer_value(
-        &mut input,
-        "/runtime/control_plane/mode",
-        json!(control_transport.mode.as_str()),
-    )?;
+    set_json_pointer_value(&mut input, "/runtime/control_plane/mode", json!("file"))?;
     let input_bytes = serde_json::to_vec_pretty(&input)?;
     let canonical_input = replay_trial_dir.join("trial_input.json");
     atomic_write_bytes(&canonical_input, &input_bytes)?;
@@ -733,60 +1261,31 @@ pub fn replay_trial(run_dir: &Path, trial_id: &str, strict: bool) -> Result<Repl
         &io_paths,
         resolve_trial_timeout_ms(&input, invocation_default_timeout_ms),
     );
-    if control_transport.mode == HarnessControlMode::File {
-        write_control_file(&control_transport.host_path)?;
-    }
     let dynamic_mounts = resolve_task_mounts(
         &project_root,
         &task_boundary.mount_references,
         container_mode,
     )?;
-
-    let effective_network_mode = input
-        .pointer("/runtime/policy/network/mode_requested")
-        .and_then(|v| v.as_str())
-        .unwrap_or("none")
-        .to_string();
-    let proc_result = if container_mode {
-        run_agent_loop_container(
-            &json_value,
-            &harness,
-            &harness_env,
-            &trial_paths,
-            &dynamic_mounts,
-            &io_paths.input_host,
-            &io_paths.output_host,
-            &io_paths.invocation_host,
-            &io_paths.agentlabd_start_request_host,
-            &io_paths.agentlabd_start_response_host,
-            &control_transport,
-            &harness.command_raw,
-            &effective_network_mode,
-            None,
-            &run_id,
-            &runtime_env,
-        )?
-    } else {
-        run_agent_loop_local(
-            &harness,
-            &harness_env,
-            &trial_paths,
-            &io_paths.input_host,
-            &io_paths.output_host,
-            &io_paths.invocation_host,
-            &io_paths.agentlabd_start_request_host,
-            &io_paths.agentlabd_start_response_host,
-            &control_transport,
-            &run_id,
-            &harness.command_raw,
-            &runtime_env,
-        )?
+    let adapter = adapter_registry_entry(&harness.adapter_ref)?;
+    let run_request = AdapterRunRequest {
+        runtime_experiment: &runtime_experiment,
+        runtime: &harness,
+        runtime_env: &runtime_env,
+        runtime_overrides_env: &harness_env,
+        container_mode,
+        trial_paths: &trial_paths,
+        dynamic_mounts: &dynamic_mounts,
+        io_paths: &io_paths,
+        network_mode: effective_network_mode.as_str(),
+        setup_command: None,
+        run_id: &run_id,
     };
+    let proc_result = adapter.run_trial(&run_request)?;
     let status = proc_result.status;
 
-    materialize_trial_output(&replay_trial_dir, &io_paths.output_host)?;
+    materialize_trial_result(&replay_trial_dir, &io_paths.output_host)?;
 
-    let canonical_output = replay_trial_dir.join("trial_output.json");
+    let canonical_output = replay_trial_dir.join(CANONICAL_TRIAL_RESULT_FILENAME);
     let trial_output: Value = if canonical_output.exists() {
         serde_json::from_slice(&fs::read(&canonical_output)?)?
     } else {
@@ -883,32 +1382,7 @@ fn fork_trial_inner(
         ));
     }
     let json_value: Value = serde_json::from_slice(&fs::read(&resolved_path)?)?;
-    let mut harness = resolve_agent_loop(&json_value, &project_root)?;
-    let container_mode = json_value
-        .pointer("/runtime/policy/sandbox/mode")
-        .and_then(|v| v.as_str())
-        == Some("container");
-    let fork_executor = if container_mode {
-        ExecutorKind::LocalDocker
-    } else {
-        ExecutorKind::LocalProcess
-    };
-    let invocation =
-        resolve_harness_invocation(&json_value, &harness, &project_root, fork_executor)?;
-    let invocation_default_timeout_ms = invocation.default_timeout_ms;
-    harness.command_raw = invocation.command;
-    if let Some(integration_level) = invocation.integration_level.clone() {
-        harness.integration_level = integration_level;
-    }
-    let harness_env = resolve_agent_loop_env(&harness)?;
-
-    if strict && harness.integration_level != "sdk_full" {
-        return Err(anyhow!(
-            "strict fork requires integration_level sdk_full (found: {})",
-            harness.integration_level
-        ));
-    }
-
+    let policy_config = parse_policies(&json_value);
     let parent_trial_dir = run_dir.join("trials").join(from_trial);
     if !parent_trial_dir.exists() {
         return Err(anyhow!("parent trial not found: {}", from_trial));
@@ -920,7 +1394,7 @@ fn fork_trial_inner(
             parent_input_path.display()
         ));
     }
-    let parent_output_path = parent_trial_dir.join("trial_output.json");
+    let parent_output_path = parent_trial_dir.join(CANONICAL_TRIAL_RESULT_FILENAME);
     let parent_output = if parent_output_path.exists() {
         Some(serde_json::from_slice::<Value>(&fs::read(
             &parent_output_path,
@@ -929,6 +1403,46 @@ fn fork_trial_inner(
         None
     };
     let parsed_selector = parse_fork_selector(selector)?;
+
+    let run_id = run_dir
+        .file_name()
+        .and_then(|v| v.to_str())
+        .unwrap_or("run")
+        .to_string();
+
+    let mut input: Value = serde_json::from_slice(&fs::read(&parent_input_path)?)?;
+    let (variants, _) = resolve_variant_plan(&json_value)?;
+    let variant_id = input
+        .pointer("/ids/variant_id")
+        .and_then(|v| v.as_str())
+        .or_else(|| {
+            json_value
+                .pointer("/baseline/variant_id")
+                .and_then(|v| v.as_str())
+        })
+        .unwrap_or("");
+    let variant = find_variant_by_id(&variants, variant_id)?;
+    let runtime_profile = resolve_variant_runtime_profile(
+        &json_value,
+        variant,
+        &project_root,
+        false,
+        &RunBehavior::default(),
+        &RunExecutionOptions::default(),
+    )?;
+    let harness = runtime_profile.harness;
+    let harness_env = runtime_profile.harness_env;
+    let container_mode = runtime_profile.container_mode;
+    let invocation_default_timeout_ms = runtime_profile.invocation_default_timeout_ms;
+    let effective_network_mode = runtime_profile.effective_network_mode;
+    let runtime_experiment = runtime_profile.experiment;
+
+    if strict && harness.integration_level != "sdk_full" {
+        return Err(anyhow!(
+            "strict fork requires integration_level sdk_full (found: {})",
+            harness.integration_level
+        ));
+    }
     let source_checkpoint = resolve_selector_checkpoint(
         &parsed_selector,
         parent_output.as_ref(),
@@ -942,13 +1456,6 @@ fn fork_trial_inner(
         ));
     }
 
-    let run_id = run_dir
-        .file_name()
-        .and_then(|v| v.to_str())
-        .unwrap_or("run")
-        .to_string();
-
-    let mut input: Value = serde_json::from_slice(&fs::read(&parent_input_path)?)?;
     let fork_id = format!("fork_{}", Utc::now().format("%Y%m%d_%H%M%S"));
     let fork_dir = run_dir.join("forks").join(&fork_id);
     ensure_dir(&fork_dir)?;
@@ -971,7 +1478,7 @@ fn fork_trial_inner(
         }),
     )?;
     let task_boundary = parse_task_boundary_from_trial_input(&input)?;
-    validate_task_boundary_workspace_materialization(&task_boundary)?;
+    validate_task_boundary_workspace_materialization(&task_boundary, &policy_config.task_boundary)?;
 
     let dataset_src = first_file_in_dir(&parent_trial_dir.join("dataset"))?;
     let fork_trial_dir = fork_dir.join("trial_1");
@@ -1005,17 +1512,12 @@ fn fork_trial_inner(
     stage_dependencies_for_trial(&harness, &trial_paths)?;
     materialize_workspace_files(&trial_paths, &task_boundary.workspace_files)?;
 
-    let control_transport = resolve_control_paths(&harness, &trial_paths, container_mode)?;
     set_json_pointer_value(
         &mut input,
         "/runtime/control_plane/path",
-        json!(control_transport.harness_path.clone()),
+        json!(DEFAULT_CONTAINER_CONTROL_PATH),
     )?;
-    set_json_pointer_value(
-        &mut input,
-        "/runtime/control_plane/mode",
-        json!(control_transport.mode.as_str()),
-    )?;
+    set_json_pointer_value(&mut input, "/runtime/control_plane/mode", json!("file"))?;
     let input_bytes = serde_json::to_vec_pretty(&input)?;
     let canonical_input = fork_trial_dir.join("trial_input.json");
     atomic_write_bytes(&canonical_input, &input_bytes)?;
@@ -1027,60 +1529,31 @@ fn fork_trial_inner(
         &io_paths,
         resolve_trial_timeout_ms(&input, invocation_default_timeout_ms),
     );
-    if control_transport.mode == HarnessControlMode::File {
-        write_control_file(&control_transport.host_path)?;
-    }
     let dynamic_mounts = resolve_task_mounts(
         &project_root,
         &task_boundary.mount_references,
         container_mode,
     )?;
-
-    let effective_network_mode = input
-        .pointer("/runtime/policy/network/mode_requested")
-        .and_then(|v| v.as_str())
-        .unwrap_or("none")
-        .to_string();
-    let proc_result = if container_mode {
-        run_agent_loop_container(
-            &json_value,
-            &harness,
-            &harness_env,
-            &trial_paths,
-            &dynamic_mounts,
-            &io_paths.input_host,
-            &io_paths.output_host,
-            &io_paths.invocation_host,
-            &io_paths.agentlabd_start_request_host,
-            &io_paths.agentlabd_start_response_host,
-            &control_transport,
-            &harness.command_raw,
-            &effective_network_mode,
-            None,
-            &run_id,
-            &runtime_env,
-        )?
-    } else {
-        run_agent_loop_local(
-            &harness,
-            &harness_env,
-            &trial_paths,
-            &io_paths.input_host,
-            &io_paths.output_host,
-            &io_paths.invocation_host,
-            &io_paths.agentlabd_start_request_host,
-            &io_paths.agentlabd_start_response_host,
-            &control_transport,
-            &run_id,
-            &harness.command_raw,
-            &runtime_env,
-        )?
+    let adapter = adapter_registry_entry(&harness.adapter_ref)?;
+    let run_request = AdapterRunRequest {
+        runtime_experiment: &runtime_experiment,
+        runtime: &harness,
+        runtime_env: &runtime_env,
+        runtime_overrides_env: &harness_env,
+        container_mode,
+        trial_paths: &trial_paths,
+        dynamic_mounts: &dynamic_mounts,
+        io_paths: &io_paths,
+        network_mode: effective_network_mode.as_str(),
+        setup_command: None,
+        run_id: &run_id,
     };
+    let proc_result = adapter.run_trial(&run_request)?;
     let status = proc_result.status;
 
-    materialize_trial_output(&fork_trial_dir, &io_paths.output_host)?;
+    materialize_trial_result(&fork_trial_dir, &io_paths.output_host)?;
 
-    let canonical_output = fork_trial_dir.join("trial_output.json");
+    let canonical_output = fork_trial_dir.join(CANONICAL_TRIAL_RESULT_FILENAME);
     let trial_output: Value = if canonical_output.exists() {
         serde_json::from_slice(&fs::read(&canonical_output)?)?
     } else {
@@ -1174,23 +1647,11 @@ pub fn pause_run(
     } else {
         active_trial.ok_or_else(|| anyhow!("pause_no_active_trial"))?
     };
-    let control_path = run_control
-        .pointer("/active_control_path")
-        .and_then(|v| v.as_str())
-        .map(PathBuf::from)
-        .ok_or_else(|| anyhow!("pause_missing_control_path"))?;
-    let control_mode = HarnessControlMode::parse(
-        run_control
-            .pointer("/active_control_mode")
-            .and_then(|v| v.as_str()),
-    )?;
-    if control_mode != HarnessControlMode::File {
-        return Err(anyhow!(
-            "pause_unsupported_control_mode: {}",
-            control_mode.as_str()
-        ));
-    }
-    let control_transport = HarnessControlTransport::active(control_mode, &control_path);
+    let active_adapter_value = run_control
+        .pointer("/active_adapter")
+        .cloned()
+        .ok_or_else(|| anyhow!("pause_missing_active_adapter"))?;
+    let active_control: ActiveAdapterControl = serde_json::from_value(active_adapter_value)?;
 
     let trial_dir = run_dir.join("trials").join(&target_trial);
     if !trial_dir.exists() {
@@ -1198,50 +1659,56 @@ pub fn pause_run(
     }
     let resolved = load_json_file(&run_dir.join("resolved_experiment.json"))?;
     let trial_input = load_json_file(&trial_dir.join("trial_input.json"))?;
-    let integration_level = resolved
-        .pointer("/runtime/harness/integration_level")
+    let project_root = find_project_root(&run_dir)
+        .canonicalize()
+        .unwrap_or_else(|_| find_project_root(&run_dir));
+    let (variants, _) = resolve_variant_plan(&resolved)?;
+    let variant_id = trial_input
+        .pointer("/ids/variant_id")
         .and_then(|v| v.as_str())
         .or_else(|| {
-            trial_input
-                .pointer("/design/integration_level")
+            resolved
+                .pointer("/baseline/variant_id")
                 .and_then(|v| v.as_str())
         })
-        .unwrap_or("cli_basic");
-    if integration_level == "cli_basic" {
+        .unwrap_or("");
+    let variant = find_variant_by_id(&variants, variant_id)?;
+    let runtime_profile = resolve_variant_runtime_profile(
+        &resolved,
+        variant,
+        &project_root,
+        false,
+        &RunBehavior::default(),
+        &RunExecutionOptions::default(),
+    )?;
+    let adapter = adapter_registry_entry(&runtime_profile.harness.adapter_ref)?;
+    let capabilities = adapter.capabilities();
+    if !capabilities.pause {
         return Err(anyhow!(
-            "unsupported_for_integration_level: pause requires cli_events or higher"
+            "pause_unsupported_capability: adapter '{}@{}' does not support pause",
+            runtime_profile.harness.adapter_ref.id,
+            runtime_profile.harness.adapter_ref.version
         ));
     }
-    let events_path_cfg = resolved
-        .pointer("/runtime/harness/events/path")
-        .and_then(|v| v.as_str())
-        .unwrap_or(DEFAULT_CONTAINER_EVENTS_PATH);
-    let _container_mode = trial_is_container_mode(&trial_dir)?;
-    let events_path = resolve_event_path_for_trial(events_path_cfg, &trial_dir)?;
+    if runtime_profile.harness.adapter_ref.id != active_control.adapter_id
+        || runtime_profile.harness.adapter_ref.version != active_control.adapter_version
+    {
+        return Err(anyhow!(
+            "pause_adapter_mismatch: active run control is '{}@{}' but trial runtime resolved '{}@{}'",
+            active_control.adapter_id,
+            active_control.adapter_version,
+            runtime_profile.harness.adapter_ref.id,
+            runtime_profile.harness.adapter_ref.version
+        ));
+    }
 
     let pause_label = label.unwrap_or("pause").to_string();
     let timeout = Duration::from_secs(timeout_seconds.max(1));
-    let deadline = Instant::now() + timeout;
-
-    let seq_checkpoint = read_control_seq(&control_path)? + 1;
-    let checkpoint_version = write_control_action(
-        &control_path,
-        seq_checkpoint,
-        "checkpoint",
-        Some(&pause_label),
-        "lab_pause",
-    )?;
-    wait_for_control_ack(&events_path, "checkpoint", &checkpoint_version, deadline)?;
-
-    let seq_stop = read_control_seq(&control_path)? + 1;
-    let stop_version = write_control_action(
-        &control_path,
-        seq_stop,
-        "stop",
-        Some(&pause_label),
-        "lab_pause",
-    )?;
-    wait_for_control_ack(&events_path, "stop", &stop_version, deadline)?;
+    let pause_ack = adapter.pause_trial(&AdapterPauseRequest {
+        control: &active_control,
+        label: &pause_label,
+        timeout,
+    })?;
 
     write_trial_state(
         &trial_dir,
@@ -1256,19 +1723,19 @@ pub fn pause_run(
         &run_id,
         "paused",
         Some(&target_trial),
-        Some(&control_transport),
+        Some(&active_control),
     )?;
 
     Ok(PauseResult {
         run_id,
         trial_id: target_trial,
         label: pause_label,
-        checkpoint_acked: true,
-        stop_acked: true,
+        checkpoint_acked: pause_ack.checkpoint_acked,
+        stop_acked: pause_ack.stop_acked,
     })
 }
 
-pub fn resume_run(
+pub fn resume_trial(
     run_dir: &Path,
     trial_id: Option<&str>,
     label: Option<&str>,
@@ -1337,9 +1804,9 @@ fn load_json_file(path: &Path) -> Result<Value> {
 }
 
 fn resolve_resume_selector(trial_dir: &Path, preferred_label: Option<&str>) -> Result<String> {
-    let output_path = trial_dir.join("trial_output.json");
+    let output_path = trial_dir.join(CANONICAL_TRIAL_RESULT_FILENAME);
     if !output_path.exists() {
-        return Err(anyhow!("resume_no_trial_output: {}", output_path.display()));
+        return Err(anyhow!("resume_no_trial_result: {}", output_path.display()));
     }
     let output = load_json_file(&output_path)?;
     let checkpoints = output
@@ -1393,57 +1860,193 @@ fn resolve_resume_selector(trial_dir: &Path, preferred_label: Option<&str>) -> R
     Err(anyhow!("resume_no_checkpoint_token"))
 }
 
-fn trial_is_container_mode(trial_dir: &Path) -> Result<bool> {
-    let input = load_json_file(&trial_dir.join("trial_input.json"))?;
-    let workspace_path = input
-        .pointer("/runtime/paths/workspace")
-        .and_then(|v| v.as_str());
-    Ok(workspace_path == Some("/workspace")
-        || workspace_path == Some(AGENTLAB_CONTRACT_WORKSPACE_DIR))
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ContractPathRoot {
+    In,
+    State,
+    Out,
+    Deps,
+    Workspace,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ContractPathMode {
+    ContainerMount,
+    RuntimeIo,
+    RuntimeEvents,
+}
+
+#[derive(Debug, Clone)]
+struct ContractPathHostRoots {
+    in_dir: PathBuf,
+    state_dir: PathBuf,
+    out_dir: PathBuf,
+    deps_dir: PathBuf,
+    workspace_dir: PathBuf,
+}
+
+impl ContractPathHostRoots {
+    fn from_trial_paths(paths: &TrialPaths) -> Self {
+        Self {
+            in_dir: paths.in_dir.clone(),
+            state_dir: paths.state.clone(),
+            out_dir: paths.out.clone(),
+            deps_dir: paths.deps.clone(),
+            workspace_dir: paths.workspace.clone(),
+        }
+    }
+
+    fn from_trial_dir(trial_dir: &Path) -> Self {
+        Self {
+            in_dir: trial_dir.join("in"),
+            state_dir: trial_dir.join("state"),
+            out_dir: trial_dir.join("out"),
+            deps_dir: trial_dir.join("deps"),
+            workspace_dir: trial_dir.join("workspace"),
+        }
+    }
+
+    fn base_for(&self, root: ContractPathRoot) -> &Path {
+        match root {
+            ContractPathRoot::In => self.in_dir.as_path(),
+            ContractPathRoot::State => self.state_dir.as_path(),
+            ContractPathRoot::Out => self.out_dir.as_path(),
+            ContractPathRoot::Deps => self.deps_dir.as_path(),
+            ContractPathRoot::Workspace => self.workspace_dir.as_path(),
+        }
+    }
+}
+
+fn strip_contract_prefix<'a>(path: &'a str, prefix: &str) -> Option<&'a str> {
+    if path == prefix {
+        return Some("");
+    }
+    let rest = path.strip_prefix(prefix)?;
+    if rest.starts_with('/') {
+        Some(rest)
+    } else {
+        None
+    }
+}
+
+fn resolve_contract_path_components(path: &str) -> Option<(ContractPathRoot, &str)> {
+    if let Some(rest) = strip_contract_prefix(path, AGENTLAB_CONTRACT_IN_DIR) {
+        return Some((ContractPathRoot::In, rest));
+    }
+    if let Some(rest) = strip_contract_prefix(path, AGENTLAB_CONTRACT_STATE_DIR) {
+        return Some((ContractPathRoot::State, rest));
+    }
+    if let Some(rest) = strip_contract_prefix(path, AGENTLAB_CONTRACT_OUT_DIR) {
+        return Some((ContractPathRoot::Out, rest));
+    }
+    if let Some(rest) = strip_contract_prefix(path, AGENTLAB_CONTRACT_DEPS_DIR) {
+        return Some((ContractPathRoot::Deps, rest));
+    }
+    if let Some(rest) = strip_contract_prefix(path, AGENTLAB_CONTRACT_WORKSPACE_DIR) {
+        return Some((ContractPathRoot::Workspace, rest));
+    }
+    None
+}
+
+fn mode_allows_root(mode: ContractPathMode, root: ContractPathRoot) -> bool {
+    match mode {
+        ContractPathMode::ContainerMount | ContractPathMode::RuntimeIo => matches!(
+            root,
+            ContractPathRoot::In
+                | ContractPathRoot::State
+                | ContractPathRoot::Out
+                | ContractPathRoot::Deps
+                | ContractPathRoot::Workspace
+        ),
+        ContractPathMode::RuntimeEvents => matches!(
+            root,
+            ContractPathRoot::In
+                | ContractPathRoot::State
+                | ContractPathRoot::Out
+                | ContractPathRoot::Workspace
+        ),
+    }
+}
+
+fn map_contract_path_to_host(
+    path: &str,
+    roots: &ContractPathHostRoots,
+    mode: ContractPathMode,
+) -> Result<PathBuf> {
+    let raw = match mode {
+        ContractPathMode::ContainerMount => path.trim(),
+        ContractPathMode::RuntimeIo | ContractPathMode::RuntimeEvents => path,
+    };
+    if raw.is_empty() {
+        return Err(match mode {
+            ContractPathMode::ContainerMount => anyhow!("container path is empty"),
+            ContractPathMode::RuntimeIo => anyhow!(
+                "runtime io path must be absolute when using container mount contract: {}",
+                raw
+            ),
+            ContractPathMode::RuntimeEvents => anyhow!(
+                "runtime event path must be absolute when resolving trial events: {}",
+                raw
+            ),
+        });
+    }
+    if !raw.starts_with('/') {
+        return Err(match mode {
+            ContractPathMode::ContainerMount => anyhow!("container path must be absolute: {}", raw),
+            ContractPathMode::RuntimeIo => anyhow!(
+                "runtime io path must be absolute when using container mount contract: {}",
+                raw
+            ),
+            ContractPathMode::RuntimeEvents => anyhow!(
+                "runtime event path must be absolute when resolving trial events: {}",
+                raw
+            ),
+        });
+    }
+
+    let Some((root, rest)) = resolve_contract_path_components(raw) else {
+        return Err(match mode {
+            ContractPathMode::ContainerMount => {
+                anyhow!("unsupported container mount path: {}", raw)
+            }
+            ContractPathMode::RuntimeIo => {
+                anyhow!(
+                    "unsupported runtime io path for non-container trials: {}",
+                    raw
+                )
+            }
+            ContractPathMode::RuntimeEvents => {
+                anyhow!("unsupported runtime event path for trial: {}", raw)
+            }
+        });
+    };
+
+    if !mode_allows_root(mode, root) {
+        return Err(match mode {
+            ContractPathMode::ContainerMount => {
+                anyhow!("unsupported container mount path: {}", raw)
+            }
+            ContractPathMode::RuntimeIo => {
+                anyhow!(
+                    "unsupported runtime io path for non-container trials: {}",
+                    raw
+                )
+            }
+            ContractPathMode::RuntimeEvents => {
+                anyhow!("unsupported runtime event path for trial: {}", raw)
+            }
+        });
+    }
+
+    Ok(roots.base_for(root).join(rest.trim_start_matches('/')))
 }
 
 fn resolve_event_path_for_trial(events_path: &str, trial_dir: &Path) -> Result<PathBuf> {
-    if !events_path.starts_with('/') {
-        return Err(anyhow!(
-            "runtime event path must be absolute when resolving trial events: {}",
-            events_path
-        ));
-    }
-    if let Some(rest) = events_path.strip_prefix("/state") {
-        return Ok(trial_dir.join("state").join(rest.trim_start_matches('/')));
-    }
-    if let Some(rest) = events_path.strip_prefix(AGENTLAB_CONTRACT_STATE_DIR) {
-        return Ok(trial_dir.join("state").join(rest.trim_start_matches('/')));
-    }
-    if let Some(rest) = events_path.strip_prefix(AGENTLAB_CONTRACT_OUT_DIR) {
-        return Ok(trial_dir.join("out").join(rest.trim_start_matches('/')));
-    }
-    if let Some(rest) = events_path.strip_prefix(AGENTLAB_CONTRACT_WORKSPACE_DIR) {
-        return Ok(trial_dir
-            .join("workspace")
-            .join(rest.trim_start_matches('/')));
-    }
-    if let Some(rest) = events_path.strip_prefix(AGENTLAB_CONTRACT_IN_DIR) {
-        return Ok(trial_dir.join("in").join(rest.trim_start_matches('/')));
-    }
-    if let Some(rest) = events_path.strip_prefix("/out") {
-        return Ok(trial_dir.join("out").join(rest.trim_start_matches('/')));
-    }
-    if let Some(rest) = events_path.strip_prefix("/workspace") {
-        return Ok(trial_dir
-            .join("workspace")
-            .join(rest.trim_start_matches('/')));
-    }
-    if let Some(rest) = events_path.strip_prefix("/dataset") {
-        return Ok(trial_dir.join("dataset").join(rest.trim_start_matches('/')));
-    }
-    if let Some(rest) = events_path.strip_prefix("/tmp") {
-        return Ok(trial_dir.join("tmp").join(rest.trim_start_matches('/')));
-    }
-    Err(anyhow!(
-        "unsupported runtime event path for trial: {}",
-        events_path
-    ))
+    map_contract_path_to_host(
+        events_path,
+        &ContractPathHostRoots::from_trial_dir(trial_dir),
+        ContractPathMode::RuntimeEvents,
+    )
 }
 
 fn read_control_seq(control_path: &Path) -> Result<u64> {
@@ -1454,36 +2057,14 @@ fn read_control_seq(control_path: &Path) -> Result<u64> {
     Ok(value.pointer("/seq").and_then(|v| v.as_u64()).unwrap_or(0))
 }
 
-fn read_control_action(control_path: &Path) -> Result<Option<(String, String, Option<String>)>> {
-    if !control_path.exists() {
-        return Ok(None);
-    }
-    let value = load_json_file(control_path)?;
-    let action = value
-        .pointer("/action")
-        .and_then(|v| v.as_str())
-        .unwrap_or("continue")
-        .to_string();
-    let requested_by = value
-        .pointer("/requested_by")
-        .and_then(|v| v.as_str())
-        .unwrap_or("run_loop")
-        .to_string();
-    let label = value
-        .pointer("/label")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string());
-    Ok(Some((action, requested_by, label)))
-}
-
-fn wait_for_control_ack(
+fn wait_for_adapter_control_ack(
     events_path: &Path,
     action: &str,
     control_version: &str,
     deadline: Instant,
 ) -> Result<()> {
     loop {
-        if has_control_ack(events_path, action, control_version)? {
+        if adapter_control_ack_received(events_path, action, control_version)? {
             return Ok(());
         }
         if Instant::now() >= deadline {
@@ -1498,7 +2079,11 @@ fn wait_for_control_ack(
     }
 }
 
-fn has_control_ack(events_path: &Path, action: &str, control_version: &str) -> Result<bool> {
+fn adapter_control_ack_received(
+    events_path: &Path,
+    action: &str,
+    control_version: &str,
+) -> Result<bool> {
     if !events_path.exists() {
         return Ok(false);
     }
@@ -1672,54 +2257,44 @@ fn validate_required_fields(json_value: &Value) -> Result<()> {
     let agent_mode = json_value
         .pointer("/runtime/agent/mode")
         .and_then(|v| v.as_str());
-    if json_value.pointer("/runtime/agent").is_some() {
-        if agent_mode.is_none() {
-            missing.push("/runtime/agent/mode");
-        }
-        match agent_mode {
-            Some("known_agent_ref") => {
-                let id = json_value
-                    .pointer("/runtime/agent/known_agent_ref/id")
-                    .and_then(|v| v.as_str())
-                    .map(|v| v.trim().to_string())
-                    .unwrap_or_default();
-                if id.is_empty() {
-                    missing.push("/runtime/agent/known_agent_ref/id");
-                }
-                let version = json_value
-                    .pointer("/runtime/agent/known_agent_ref/version")
-                    .and_then(|v| v.as_str())
-                    .map(|v| v.trim().to_string())
-                    .unwrap_or_default();
-                if version.is_empty() {
-                    missing.push("/runtime/agent/known_agent_ref/version");
-                }
+    if json_value.pointer("/runtime/agent").is_none() {
+        missing.push("/runtime/agent");
+    }
+    if agent_mode.is_none() {
+        missing.push("/runtime/agent/mode");
+    }
+    match agent_mode {
+        Some("known_agent_ref") => {
+            let id = json_value
+                .pointer("/runtime/agent/known_agent_ref/id")
+                .and_then(|v| v.as_str())
+                .map(|v| v.trim().to_string())
+                .unwrap_or_default();
+            if id.is_empty() {
+                missing.push("/runtime/agent/known_agent_ref/id");
             }
-            Some("custom_image") => {
-                let has_entrypoint = match json_value
-                    .pointer("/runtime/agent/custom_image/entrypoint")
-                {
-                    Some(Value::Array(parts)) if !parts.is_empty() => parts
-                        .iter()
-                        .all(|part| part.as_str().map(|s| !s.trim().is_empty()).unwrap_or(false)),
-                    _ => false,
-                };
-                if !has_entrypoint {
-                    missing.push("/runtime/agent/custom_image/entrypoint");
-                }
+            let version = json_value
+                .pointer("/runtime/agent/known_agent_ref/version")
+                .and_then(|v| v.as_str())
+                .map(|v| v.trim().to_string())
+                .unwrap_or_default();
+            if version.is_empty() {
+                missing.push("/runtime/agent/known_agent_ref/version");
             }
-            _ => {}
         }
-    } else {
-        let has_runtime_command = match json_value.pointer("/runtime/agent_loop/command") {
-            Some(Value::Array(parts)) if !parts.is_empty() => parts
-                .iter()
-                .all(|part| part.as_str().map(|s| !s.trim().is_empty()).unwrap_or(false)),
-            _ => false,
-        };
-        if !has_runtime_command {
-            missing.push("/runtime/agent_loop/command");
+        Some("custom_image") => {
+            let has_entrypoint = match json_value.pointer("/runtime/agent/custom_image/entrypoint")
+            {
+                Some(Value::Array(parts)) if !parts.is_empty() => parts
+                    .iter()
+                    .all(|part| part.as_str().map(|s| !s.trim().is_empty()).unwrap_or(false)),
+                _ => false,
+            };
+            if !has_entrypoint {
+                missing.push("/runtime/agent/custom_image/entrypoint");
+            }
         }
+        _ => {}
     }
     let sandbox_mode = json_value
         .pointer("/runtime/policy/sandbox/mode")
@@ -1770,161 +2345,71 @@ fn validate_required_fields(json_value: &Value) -> Result<()> {
     }
 }
 
-fn run_experiment_with_behavior(
-    path: &Path,
-    use_container: bool,
-    behavior: RunBehavior,
-    overrides_path: Option<&Path>,
-    execution: RunExecutionOptions,
-) -> Result<RunResult> {
-    let exp_dir = path
-        .parent()
-        .unwrap_or(Path::new("."))
-        .canonicalize()
-        .unwrap_or_else(|_| PathBuf::from("."));
-    let project_root = find_project_root(&exp_dir)
-        .canonicalize()
-        .unwrap_or_else(|_| find_project_root(&exp_dir));
-    let raw_yaml = fs::read_to_string(path)?;
-    let yaml_value: serde_yaml::Value = serde_yaml::from_str(&raw_yaml)?;
-    let mut json_value: Value = serde_json::to_value(yaml_value)?;
-    if let Some(overrides_path) = overrides_path {
-        json_value = apply_experiment_overrides(json_value, overrides_path, &project_root)?;
-    }
-    validate_required_fields(&json_value)?;
-    let workload_type = json_value
-        .pointer("/experiment/workload_type")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| anyhow!("missing /experiment/workload_type"))?
-        .to_string();
-    let configured_network_mode = json_value
-        .pointer("/runtime/policy/network/mode")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| anyhow!("missing /runtime/policy/network/mode"))?;
-    let effective_network_mode = behavior
-        .network_mode_override
-        .as_deref()
-        .unwrap_or(configured_network_mode)
-        .to_string();
-    if behavior.require_network_none && effective_network_mode != "none" {
-        return Err(anyhow!(
-            "run-experiment requires network mode 'none' (current effective mode: {})",
-            effective_network_mode
-        ));
-    }
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScheduleEngineMode {
+    FreshRun,
+    ContinueRun,
+}
 
-    let materialize_mode = execution.materialize.unwrap_or(MaterializationMode::Full);
-    if matches!(execution.executor, Some(ExecutorKind::Remote)) {
-        let endpoint = execution
-            .remote_endpoint
-            .as_deref()
-            .ok_or_else(|| anyhow!("remote executor requires --remote-endpoint"))?;
-        let token_env = execution.remote_token_env.as_deref().unwrap_or("unset");
-        return Err(anyhow!(
-            "remote executor is not implemented yet (endpoint: {}, token_env: {})",
-            endpoint,
-            token_env
-        ));
-    }
-
-    let run_id = format!("run_{}", Utc::now().format("%Y%m%d_%H%M%S"));
-    let run_dir = project_root.join(".lab").join("runs").join(&run_id);
-    ensure_dir(&run_dir)?;
-    write_run_control(&run_dir, &run_id, "running", None, None)?;
-    let mut run_guard = RunControlGuard::new(&run_dir, &run_id);
-
-    let resolved_path = run_dir.join("resolved_experiment.json");
-    atomic_write_json_pretty(&resolved_path, &json_value)?;
-    let resolved_digest = canonical_json_digest(&json_value);
-    atomic_write_bytes(
-        &run_dir.join("resolved_experiment.digest"),
-        resolved_digest.as_bytes(),
-    )?;
-
-    let manifest = json!({
-        "schema_version": "manifest_v1",
-        "run_id": run_id,
-        "runner_version": "rust-0.3.0",
-        "created_at": Utc::now().to_rfc3339(),
-    });
-    atomic_write_json_pretty(&run_dir.join("manifest.json"), &manifest)?;
-
-    let dataset_path = resolve_dataset_path(&json_value, &exp_dir)?;
-    let tasks = load_tasks(&dataset_path, &json_value)?;
-
-    let (variants, baseline_id) = resolve_variant_plan(&json_value)?;
-    let replications = json_value
-        .pointer("/design/replications")
-        .and_then(|v| v.as_u64())
-        .ok_or_else(|| anyhow!("missing /design/replications"))? as usize;
-
-    let trials_dir = run_dir.join("trials");
-    ensure_dir(&trials_dir)?;
-
-    let analysis_dir = run_dir.join("analysis");
-    ensure_dir(&analysis_dir)?;
-
-    let evidence_dir = run_dir.join("evidence");
-    ensure_dir(&evidence_dir)?;
-    let evidence_records_path = evidence_dir.join("evidence_records.jsonl");
-    let task_chain_states_path = evidence_dir.join("task_chain_states.jsonl");
-    let artifact_store = ArtifactStore::new(run_dir.join("artifacts"));
-    let benchmark_config = parse_benchmark_config(&json_value);
-
-    let mut harness = resolve_agent_loop(&json_value, &project_root)?;
-    let harness_env = resolve_agent_loop_env(&harness)?;
-    let executor_kind = execution.executor.unwrap_or_else(|| {
-        if use_container || harness.force_container {
-            ExecutorKind::LocalDocker
-        } else {
-            ExecutorKind::LocalProcess
-        }
-    });
-    let invocation =
-        resolve_harness_invocation(&json_value, &harness, &project_root, executor_kind)?;
-    let invocation_source = invocation.source;
-    let invocation_default_timeout_ms = invocation.default_timeout_ms;
-    harness.command_raw = invocation.command;
-    if let Some(integration_level) = invocation.integration_level.clone() {
-        harness.integration_level = integration_level;
-    }
-    let container_mode = matches!(executor_kind, ExecutorKind::LocalDocker);
-
-    let mut trial_summaries = Vec::new();
-    let mut event_counts: BTreeMap<String, BTreeMap<String, usize>> = BTreeMap::new();
-    let mut trial_event_counts: BTreeMap<String, BTreeMap<String, usize>> = BTreeMap::new();
-
-    let policy_config = parse_policies(&json_value);
-    let random_seed = json_value
-        .pointer("/design/random_seed")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(1);
-    let schedule = build_trial_schedule(
-        variants.len(),
-        tasks.len(),
-        replications,
-        policy_config.scheduling,
-        random_seed,
-    );
-
-    // Per-variant consecutive failure tracking (for pruning)
-    let mut consecutive_failures: BTreeMap<usize, usize> = BTreeMap::new();
-    let mut pruned_variants: HashSet<usize> = HashSet::new();
-    let mut chain_states: BTreeMap<String, ChainRuntimeState> = BTreeMap::new();
-
-    let mut trial_index: usize = 0;
-    let mut run_paused = false;
-    'schedule: for slot in &schedule {
-        // Skip pruned variants
+fn execute_schedule_engine(
+    mode: ScheduleEngineMode,
+    run_dir: &Path,
+    run_id: &str,
+    workload_type: &str,
+    project_root: &Path,
+    dataset_path: &Path,
+    variants: &[Variant],
+    tasks: &[Value],
+    schedule: &[TrialSlot],
+    policy_config: &PolicyConfig,
+    benchmark_config: &BenchmarkConfig,
+    variant_runtime_profiles: &[VariantRuntimeProfile],
+    behavior: &RunBehavior,
+    materialize_mode: MaterializationMode,
+    task_boundary_policy: &TaskBoundaryPolicy,
+    trials_dir: &Path,
+    evidence_dir: &Path,
+    evidence_records_path: &Path,
+    task_chain_states_path: &Path,
+    artifact_store: &ArtifactStore,
+    schedule_progress: &mut ScheduleProgress,
+    trial_index: &mut usize,
+    consecutive_failures: &mut BTreeMap<usize, usize>,
+    pruned_variants: &mut HashSet<usize>,
+    chain_states: &mut BTreeMap<String, ChainRuntimeState>,
+    trial_summaries: &mut Vec<Value>,
+    event_counts: &mut BTreeMap<String, BTreeMap<String, usize>>,
+    trial_event_counts: &mut BTreeMap<String, BTreeMap<String, usize>>,
+) -> Result<()> {
+    for schedule_idx in schedule_progress.next_schedule_index..schedule.len() {
+        let slot = &schedule[schedule_idx];
         if pruned_variants.contains(&slot.variant_idx) {
+            schedule_progress.completed_slots.push(SlotCompletion {
+                schedule_index: schedule_idx,
+                trial_id: String::new(),
+                status: "skipped_pruned".to_string(),
+            });
+            schedule_progress.next_schedule_index = schedule_idx + 1;
+            schedule_progress.updated_at = Utc::now().to_rfc3339();
+            write_schedule_progress(run_dir, schedule_progress)?;
             continue;
         }
 
         let variant = &variants[slot.variant_idx];
+        let variant_runtime = &variant_runtime_profiles[slot.variant_idx];
+        let harness = &variant_runtime.harness;
+        let harness_env = &variant_runtime.harness_env;
+        let trial_experiment = &variant_runtime.experiment;
+        let invocation_source = variant_runtime.invocation_source;
+        let invocation_default_timeout_ms = variant_runtime.invocation_default_timeout_ms;
+        let executor_kind = variant_runtime.executor_kind;
+        let container_mode = variant_runtime.container_mode;
+        let configured_network_mode = variant_runtime.configured_network_mode.as_str();
+        let effective_network_mode = variant_runtime.effective_network_mode.as_str();
         let task_idx = slot.task_idx;
         let task = &tasks[task_idx];
         let task_boundary = parse_task_boundary_from_dataset_task(task)?;
-        validate_task_boundary_workspace_materialization(&task_boundary)?;
+        validate_task_boundary_workspace_materialization(&task_boundary, task_boundary_policy)?;
         let repl = slot.repl_idx;
         let task_id = task_boundary
             .task_payload
@@ -1933,7 +2418,7 @@ fn run_experiment_with_behavior(
             .map(|s| s.to_string())
             .unwrap_or_else(|| format!("task_{}", task_idx));
         let effective_policy = resolve_effective_task_policy(
-            &policy_config,
+            policy_config,
             &benchmark_config.policy,
             &task_boundary.task_payload,
         );
@@ -1949,17 +2434,16 @@ fn run_experiment_with_behavior(
             .map(|state| state.step_index + 1)
             .unwrap_or(0);
 
-        trial_index += 1;
-        let trial_id = format!("trial_{}", trial_index);
+        *trial_index += 1;
+        let trial_id = format!("trial_{}", *trial_index);
         let trial_dir = trials_dir.join(&trial_id);
         ensure_dir(&trial_dir)?;
         write_trial_state(&trial_dir, &trial_id, "running", None, None, None)?;
         let mut trial_guard = TrialStateGuard::new(&trial_dir, &trial_id);
 
-        let trial_paths = TrialPaths::new(&trial_dir, &project_root, &dataset_path)?;
-
+        let trial_paths = TrialPaths::new(&trial_dir, project_root, dataset_path)?;
         trial_paths.prepare(false)?;
-        stage_dependencies_for_trial(&harness, &trial_paths)?;
+        stage_dependencies_for_trial(harness, &trial_paths)?;
         if !matches!(effective_policy.state_policy, StatePolicy::IsolatePerTrial) {
             if let Some(chain_state) = chain_states.get(&chain_key) {
                 restore_workspace_from_snapshot(
@@ -1971,22 +2455,20 @@ fn run_experiment_with_behavior(
 
         materialize_workspace_files(&trial_paths, &task_boundary.workspace_files)?;
         let dynamic_mounts = resolve_task_mounts(
-            &project_root,
+            project_root,
             &task_boundary.mount_references,
             container_mode,
         )?;
 
-        let control_transport = resolve_control_paths(&harness, &trial_paths, container_mode)?;
-
         let input = build_agent_task(
-            &json_value,
-            &run_id,
+            trial_experiment,
+            run_id,
             &trial_id,
             variant,
             task_idx,
             repl,
             &task_boundary,
-            &harness,
+            harness,
         );
         let input_bytes = serde_json::to_vec_pretty(&input)?;
         let canonical_input_path = trial_dir.join("trial_input.json");
@@ -1995,11 +2477,18 @@ fn run_experiment_with_behavior(
         let trial_metadata = json!({
             "schema_version": "trial_metadata_v1",
             "ids": {
-                "run_id": run_id.as_str(),
+                "run_id": run_id,
                 "trial_id": trial_id.as_str(),
                 "variant_id": variant.id.as_str(),
                 "task_id": task_id.as_str(),
-                "repl_idx": repl
+                "repl_idx": repl,
+                "task_index": task_idx
+            },
+            "runtime": {
+                "container_mode": container_mode,
+                "integration_level": harness.integration_level.as_str(),
+                "network_mode_requested": configured_network_mode,
+                "network_mode_effective": effective_network_mode
             },
             "policy_merge": {
                 "global_defaults": {
@@ -2042,21 +2531,33 @@ fn run_experiment_with_behavior(
 
         let io_paths = prepare_io_paths(&trial_paths, container_mode, &input_bytes)?;
         let runtime_env = build_runtime_contract_env(
-            &run_id,
+            run_id,
             &input,
             &io_paths,
             resolve_trial_timeout_ms(&input, invocation_default_timeout_ms),
         );
+        let adapter = adapter_registry_entry(&harness.adapter_ref)?;
+        let control_run_request = AdapterRunRequest {
+            runtime_experiment: trial_experiment,
+            runtime: harness,
+            runtime_env: &runtime_env,
+            runtime_overrides_env: harness_env,
+            container_mode,
+            trial_paths: &trial_paths,
+            dynamic_mounts: &dynamic_mounts,
+            io_paths: &io_paths,
+            network_mode: effective_network_mode,
+            setup_command: None,
+            run_id,
+        };
+        let active_control = adapter.active_control(&control_run_request)?;
         write_run_control(
-            &run_dir,
-            &run_id,
+            run_dir,
+            run_id,
             "running",
             Some(&trial_id),
-            Some(&control_transport),
+            active_control.as_ref(),
         )?;
-        if control_transport.mode == HarnessControlMode::File {
-            write_control_file(&control_transport.host_path)?;
-        }
 
         let trial_evidence_dir = trial_dir.join("evidence");
         ensure_dir(&trial_evidence_dir)?;
@@ -2088,7 +2589,6 @@ fn run_experiment_with_behavior(
                 (pre_snapshot_ref.clone(), root_workspace)
             };
 
-        // Retry loop
         let mut status = String::new();
         let mut trial_output: Value =
             json!({"schema_version": "agent_result_v1", "outcome": "error"});
@@ -2098,7 +2598,7 @@ fn run_experiment_with_behavior(
             let mut otel_manifest = None;
             if harness.tracing_mode == Some("otlp".to_string()) {
                 if container_mode
-                    && json_value
+                    && trial_experiment
                         .pointer("/runtime/policy/network/mode")
                         .and_then(|v| v.as_str())
                         == Some("none")
@@ -2123,46 +2623,25 @@ fn run_experiment_with_behavior(
                 }
             }
 
-            let proc_result = if matches!(executor_kind, ExecutorKind::LocalDocker) {
-                run_agent_loop_container(
-                    &json_value,
-                    &harness,
-                    &harness_env,
-                    &trial_paths,
-                    &dynamic_mounts,
-                    &io_paths.input_host,
-                    &io_paths.output_host,
-                    &io_paths.invocation_host,
-                    &io_paths.agentlabd_start_request_host,
-                    &io_paths.agentlabd_start_response_host,
-                    &control_transport,
-                    &harness.command_raw,
-                    &effective_network_mode,
-                    behavior.setup_command.as_deref(),
-                    &run_id,
-                    &runtime_env,
-                )?
-            } else {
-                if behavior.setup_command.is_some() {
-                    return Err(anyhow!(
-                        "setup command is only supported for container runs"
-                    ));
-                }
-                run_agent_loop_local(
-                    &harness,
-                    &harness_env,
-                    &trial_paths,
-                    &io_paths.input_host,
-                    &io_paths.output_host,
-                    &io_paths.invocation_host,
-                    &io_paths.agentlabd_start_request_host,
-                    &io_paths.agentlabd_start_response_host,
-                    &control_transport,
-                    &run_id,
-                    &harness.command_raw,
-                    &runtime_env,
-                )?
+            let setup_command = match mode {
+                ScheduleEngineMode::FreshRun => behavior.setup_command.as_deref(),
+                ScheduleEngineMode::ContinueRun => None,
             };
+
+            let run_request = AdapterRunRequest {
+                runtime_experiment: trial_experiment,
+                runtime: harness,
+                runtime_env: &runtime_env,
+                runtime_overrides_env: harness_env,
+                container_mode: matches!(executor_kind, ExecutorKind::LocalDocker),
+                trial_paths: &trial_paths,
+                dynamic_mounts: &dynamic_mounts,
+                io_paths: &io_paths,
+                network_mode: effective_network_mode,
+                setup_command,
+                run_id,
+            };
+            let proc_result = adapter.run_trial(&run_request)?;
             status = proc_result.status;
             atomic_write_bytes(
                 &trial_dir.join("harness_stdout.log"),
@@ -2185,9 +2664,8 @@ fn run_experiment_with_behavior(
                 }
             }
 
-            materialize_trial_output(&trial_dir, &io_paths.output_host)?;
-
-            let canonical_output = trial_dir.join("trial_output.json");
+            materialize_trial_result(&trial_dir, &io_paths.output_host)?;
+            let canonical_output = trial_dir.join(CANONICAL_TRIAL_RESULT_FILENAME);
             trial_output = if canonical_output.exists() {
                 serde_json::from_slice(&fs::read(&canonical_output)?)?
             } else {
@@ -2198,13 +2676,11 @@ fn run_experiment_with_behavior(
                 .get("outcome")
                 .and_then(|v| v.as_str())
                 .unwrap_or("error");
-
-            // Check if retry is needed (skip on last attempt)
             let is_last_attempt = attempt + 1 >= policy_config.retry_max_attempts;
             if !is_last_attempt && should_retry_outcome(outcome, &status, &policy_config.retry_on) {
-                continue; // retry
+                continue;
             }
-            break; // success or exhausted retries
+            break;
         }
 
         let post_snapshot_manifest = collect_workspace_snapshot_manifest(&trial_paths.workspace)?;
@@ -2214,7 +2690,6 @@ fn run_experiment_with_behavior(
 
         let chain_root_snapshot_manifest =
             collect_workspace_snapshot_manifest(&chain_root_snapshot_path)?;
-
         let diff_incremental =
             diff_workspace_snapshots(&pre_snapshot_manifest, &post_snapshot_manifest);
         let diff_cumulative =
@@ -2264,7 +2739,7 @@ fn run_experiment_with_behavior(
             );
         }
 
-        let canonical_output = trial_dir.join("trial_output.json");
+        let canonical_output = trial_dir.join(CANONICAL_TRIAL_RESULT_FILENAME);
         let trial_input_ref = artifact_store.put_file(&canonical_input_path)?;
         let trial_output_ref = artifact_store.put_file(&canonical_output)?;
 
@@ -2293,12 +2768,11 @@ fn run_experiment_with_behavior(
         };
 
         let trial_duration_ms = trial_started_at.elapsed().as_secs_f64() * 1000.0;
-
         let mut evidence_record = json!({
             "schema_version": "evidence_record_v1",
             "ts": Utc::now().to_rfc3339(),
             "ids": {
-                "run_id": run_id.as_str(),
+                "run_id": run_id,
                 "trial_id": trial_id.as_str(),
                 "variant_id": variant.id.as_str(),
                 "task_id": task_id.as_str(),
@@ -2335,18 +2809,18 @@ fn run_experiment_with_behavior(
                 "patch_cumulative_ref": patch_cumulative_ref.clone()
             },
             "paths": {
-                "trial_dir": rel_to_run_dir(&trial_dir, &run_dir),
-                "trial_input": rel_to_run_dir(&canonical_input_path, &run_dir),
-                "trial_output": rel_to_run_dir(&canonical_output, &run_dir),
-                "stdout": rel_to_run_dir(&stdout_path, &run_dir),
-                "stderr": rel_to_run_dir(&stderr_path, &run_dir),
-                "hook_events": hook_events_path.as_ref().map(|p| rel_to_run_dir(p, &run_dir)),
-                "workspace_pre_snapshot": rel_to_run_dir(&pre_snapshot_path, &run_dir),
-                "workspace_post_snapshot": rel_to_run_dir(&post_snapshot_path, &run_dir),
-                "diff_incremental": rel_to_run_dir(&diff_incremental_path, &run_dir),
-                "diff_cumulative": rel_to_run_dir(&diff_cumulative_path, &run_dir),
-                "patch_incremental": rel_to_run_dir(&patch_incremental_path, &run_dir),
-                "patch_cumulative": rel_to_run_dir(&patch_cumulative_path, &run_dir)
+                "trial_dir": rel_to_run_dir(&trial_dir, run_dir),
+                "trial_input": rel_to_run_dir(&canonical_input_path, run_dir),
+                "trial_output": rel_to_run_dir(&canonical_output, run_dir),
+                "stdout": rel_to_run_dir(&stdout_path, run_dir),
+                "stderr": rel_to_run_dir(&stderr_path, run_dir),
+                "hook_events": hook_events_path.as_ref().map(|p| rel_to_run_dir(p, run_dir)),
+                "workspace_pre_snapshot": rel_to_run_dir(&pre_snapshot_path, run_dir),
+                "workspace_post_snapshot": rel_to_run_dir(&post_snapshot_path, run_dir),
+                "diff_incremental": rel_to_run_dir(&diff_incremental_path, run_dir),
+                "diff_cumulative": rel_to_run_dir(&diff_cumulative_path, run_dir),
+                "patch_incremental": rel_to_run_dir(&patch_incremental_path, run_dir),
+                "patch_cumulative": rel_to_run_dir(&patch_cumulative_path, run_dir)
             }
         });
 
@@ -2377,12 +2851,12 @@ fn run_experiment_with_behavior(
             &evidence_record,
             &effective_policy.required_evidence_classes,
         )?;
-        append_jsonl(&evidence_records_path, &evidence_record)?;
+        append_jsonl(evidence_records_path, &evidence_record)?;
 
         let chain_state_record = json!({
             "schema_version": "task_chain_state_v1",
             "ts": Utc::now().to_rfc3339(),
-            "run_id": run_id.as_str(),
+            "run_id": run_id,
             "chain_id": chain_key.as_str(),
             "task_model": effective_policy.task_model.as_str(),
             "step_index": chain_step_index,
@@ -2410,33 +2884,34 @@ fn run_experiment_with_behavior(
                     .map(|state| state.latest_snapshot_ref.clone())
             }
         });
-        append_jsonl(&task_chain_states_path, &chain_state_record)?;
+        append_jsonl(task_chain_states_path, &chain_state_record)?;
 
         let summary = summarize_trial(
-            &run_id,
+            run_id,
             &trial_output,
             &trial_id,
-            &workload_type,
+            workload_type,
             &variant.id,
             task_idx,
             &task_id,
             repl,
+            &variant.bindings,
             status.clone(),
             container_mode,
             &harness.integration_level,
             configured_network_mode,
-            &effective_network_mode,
+            effective_network_mode,
         );
         trial_summaries.push(summary);
 
         write_state_inventory(
             &trial_dir,
-            &json_value,
-            &harness,
+            trial_experiment,
+            harness,
             container_mode,
             &trial_paths,
-            &resolve_exec_digest(&harness.command_raw, &project_root)?,
-            &effective_network_mode,
+            &resolve_exec_digest(&harness.command_raw, project_root)?,
+            effective_network_mode,
             invocation_source.as_str(),
         )?;
 
@@ -2465,14 +2940,13 @@ fn run_experiment_with_behavior(
             trial_guard.complete("completed", None)?;
             *consecutive_failures.entry(slot.variant_idx).or_default() = 0;
         } else if status != "0" {
-            trial_guard.complete("failed", Some("agent_loop_exit_nonzero"))?;
+            trial_guard.complete("failed", Some("agent_exit_nonzero"))?;
             *consecutive_failures.entry(slot.variant_idx).or_default() += 1;
         } else {
             trial_guard.complete("failed", Some("result_error"))?;
             *consecutive_failures.entry(slot.variant_idx).or_default() += 1;
         }
 
-        // Pruning check
         if let Some(max_failures) = policy_config.pruning_max_consecutive_failures {
             let count = consecutive_failures
                 .get(&slot.variant_idx)
@@ -2483,10 +2957,204 @@ fn run_experiment_with_behavior(
             }
         }
 
-        write_run_control(&run_dir, &run_id, "running", None, None)?;
+        write_run_control(run_dir, run_id, "running", None, None)?;
         apply_materialization_policy(&trial_dir, materialize_mode)?;
+
+        let slot_status = if status == "0" && outcome != "error" {
+            "completed"
+        } else {
+            "failed"
+        };
+        schedule_progress.completed_slots.push(SlotCompletion {
+            schedule_index: schedule_idx,
+            trial_id: trial_id.clone(),
+            status: slot_status.to_string(),
+        });
+        schedule_progress.next_schedule_index = schedule_idx + 1;
+        schedule_progress.next_trial_index = *trial_index;
+        schedule_progress.pruned_variants = pruned_variants.iter().copied().collect();
+        schedule_progress.consecutive_failures = consecutive_failures.clone();
+        schedule_progress.updated_at = Utc::now().to_rfc3339();
+        write_schedule_progress(run_dir, schedule_progress)?;
     }
 
+    Ok(())
+}
+
+fn run_experiment_with_behavior(
+    path: &Path,
+    use_container: bool,
+    behavior: RunBehavior,
+    overrides_path: Option<&Path>,
+    execution: RunExecutionOptions,
+) -> Result<RunResult> {
+    let exp_dir = path
+        .parent()
+        .unwrap_or(Path::new("."))
+        .canonicalize()
+        .unwrap_or_else(|_| PathBuf::from("."));
+    let project_root = find_project_root(&exp_dir)
+        .canonicalize()
+        .unwrap_or_else(|_| find_project_root(&exp_dir));
+    let raw_yaml = fs::read_to_string(path)?;
+    let yaml_value: serde_yaml::Value = serde_yaml::from_str(&raw_yaml)?;
+    let mut json_value: Value = serde_json::to_value(yaml_value)?;
+    if let Some(overrides_path) = overrides_path {
+        json_value = apply_experiment_overrides(json_value, overrides_path, &project_root)?;
+    }
+    validate_required_fields(&json_value)?;
+    let workload_type = json_value
+        .pointer("/experiment/workload_type")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow!("missing /experiment/workload_type"))?
+        .to_string();
+
+    let execution = normalize_execution_options(&execution);
+    let materialize_mode = execution.materialize.unwrap_or(MaterializationMode::Full);
+    if matches!(execution.executor, Some(ExecutorKind::Remote)) {
+        let endpoint = execution
+            .remote_endpoint
+            .as_deref()
+            .ok_or_else(|| anyhow!("remote executor requires --remote-endpoint"))?;
+        let token_env = execution.remote_token_env.as_deref().unwrap_or("unset");
+        return Err(anyhow!(
+            "remote executor is not implemented yet (endpoint: {}, token_env: {})",
+            endpoint,
+            token_env
+        ));
+    }
+
+    let run_id = format!("run_{}", Utc::now().format("%Y%m%d_%H%M%S"));
+    let run_dir = project_root.join(".lab").join("runs").join(&run_id);
+    ensure_dir(&run_dir)?;
+    write_run_control(&run_dir, &run_id, "running", None, None)?;
+    write_run_session_state(&run_dir, &run_id, &behavior, &execution)?;
+    let mut run_guard = RunControlGuard::new(&run_dir, &run_id);
+
+    let resolved_path = run_dir.join("resolved_experiment.json");
+    atomic_write_json_pretty(&resolved_path, &json_value)?;
+    let resolved_digest = canonical_json_digest(&json_value);
+    atomic_write_bytes(
+        &run_dir.join("resolved_experiment.digest"),
+        resolved_digest.as_bytes(),
+    )?;
+
+    let manifest = json!({
+        "schema_version": "manifest_v1",
+        "run_id": run_id,
+        "runner_version": "rust-0.3.0",
+        "created_at": Utc::now().to_rfc3339(),
+    });
+    atomic_write_json_pretty(&run_dir.join("manifest.json"), &manifest)?;
+
+    let dataset_path = resolve_dataset_path(&json_value, &exp_dir)?;
+    let tasks = load_tasks(&dataset_path, &json_value)?;
+
+    let (variants, baseline_id) = resolve_variant_plan(&json_value)?;
+    let replications = json_value
+        .pointer("/design/replications")
+        .and_then(|v| v.as_u64())
+        .ok_or_else(|| anyhow!("missing /design/replications"))? as usize;
+
+    let trials_dir = run_dir.join("trials");
+    ensure_dir(&trials_dir)?;
+
+    let analysis_dir = run_dir.join("analysis");
+    ensure_dir(&analysis_dir)?;
+
+    let evidence_dir = run_dir.join("evidence");
+    ensure_dir(&evidence_dir)?;
+    let evidence_records_path = evidence_dir.join("evidence_records.jsonl");
+    let task_chain_states_path = evidence_dir.join("task_chain_states.jsonl");
+    let artifact_store = ArtifactStore::new(run_dir.join("artifacts"));
+    let benchmark_config = parse_benchmark_config(&json_value);
+    let mut variant_runtime_profiles = Vec::with_capacity(variants.len());
+    for variant in &variants {
+        variant_runtime_profiles.push(resolve_variant_runtime_profile(
+            &json_value,
+            variant,
+            &project_root,
+            use_container,
+            &behavior,
+            &execution,
+        )?);
+    }
+    let run_integration_level = variant_runtime_profiles
+        .first()
+        .map(|profile| profile.harness.integration_level.clone())
+        .unwrap_or_else(|| "agent_loop".to_string());
+    let all_container_mode = variant_runtime_profiles
+        .iter()
+        .all(|profile| profile.container_mode);
+
+    let mut trial_summaries = Vec::new();
+    let mut event_counts: BTreeMap<String, BTreeMap<String, usize>> = BTreeMap::new();
+    let mut trial_event_counts: BTreeMap<String, BTreeMap<String, usize>> = BTreeMap::new();
+
+    let policy_config = parse_policies(&json_value);
+    let random_seed = json_value
+        .pointer("/design/random_seed")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(1);
+    let schedule = build_trial_schedule(
+        variants.len(),
+        tasks.len(),
+        replications,
+        policy_config.scheduling,
+        random_seed,
+    );
+
+    // Per-variant consecutive failure tracking (for pruning)
+    let mut consecutive_failures: BTreeMap<usize, usize> = BTreeMap::new();
+    let mut pruned_variants: HashSet<usize> = HashSet::new();
+    let mut chain_states: BTreeMap<String, ChainRuntimeState> = BTreeMap::new();
+
+    let mut schedule_progress = ScheduleProgress {
+        schema_version: "schedule_progress_v1".to_string(),
+        run_id: run_id.clone(),
+        total_slots: schedule.len(),
+        next_schedule_index: 0,
+        next_trial_index: 0,
+        schedule: schedule.clone(),
+        completed_slots: Vec::new(),
+        pruned_variants: Vec::new(),
+        consecutive_failures: BTreeMap::new(),
+        use_container,
+        updated_at: Utc::now().to_rfc3339(),
+    };
+    write_schedule_progress(&run_dir, &schedule_progress)?;
+
+    let mut trial_index: usize = 0;
+    execute_schedule_engine(
+        ScheduleEngineMode::FreshRun,
+        &run_dir,
+        &run_id,
+        &workload_type,
+        &project_root,
+        &dataset_path,
+        &variants,
+        &tasks,
+        &schedule,
+        &policy_config,
+        &benchmark_config,
+        &variant_runtime_profiles,
+        &behavior,
+        materialize_mode,
+        &policy_config.task_boundary,
+        &trials_dir,
+        &evidence_dir,
+        &evidence_records_path,
+        &task_chain_states_path,
+        &artifact_store,
+        &mut schedule_progress,
+        &mut trial_index,
+        &mut consecutive_failures,
+        &mut pruned_variants,
+        &mut chain_states,
+        &mut trial_summaries,
+        &mut event_counts,
+        &mut trial_event_counts,
+    )?;
     validate_jsonl_against_schema("evidence_record_v1.jsonschema", &evidence_records_path)?;
     validate_jsonl_against_schema("task_chain_state_v1.jsonschema", &task_chain_states_path)?;
 
@@ -2512,9 +3180,9 @@ fn run_experiment_with_behavior(
 
     let grades = json!({
         "schema_version": "grades_v1",
-        "integration_level": harness.integration_level,
+        "integration_level": run_integration_level,
         "replay_grade": "best_effort",
-        "isolation_grade": if container_mode {"bounded"} else {"leaky"},
+        "isolation_grade": if all_container_mode {"bounded"} else {"leaky"},
         "comparability_grade": "unknown",
         "provenance_grade": "recorded",
         "privacy_grade": "unknown"
@@ -2529,11 +3197,7 @@ fn run_experiment_with_behavior(
         "hooks",
     );
     write_attestation(&run_dir, att)?;
-    if run_paused {
-        run_guard.complete("paused")?;
-    } else {
-        run_guard.complete("completed")?;
-    }
+    run_guard.complete("completed")?;
 
     Ok(RunResult { run_dir, run_id })
 }
@@ -2572,22 +3236,30 @@ pub fn describe_experiment_with_overrides(
     let variant_count = variants.len();
     let total_trials = task_count * replications * variant_count;
 
-    let agent_loop = resolve_agent_loop(&json_value, &project_root)?;
-    let container_mode = json_value
-        .pointer("/runtime/policy/sandbox/mode")
-        .and_then(|v| v.as_str())
-        == Some("container");
+    let baseline_variant = variants
+        .first()
+        .ok_or_else(|| anyhow!("no variants available in experiment"))?;
+    let runtime_profile = resolve_variant_runtime_profile(
+        &json_value,
+        baseline_variant,
+        &project_root,
+        false,
+        &RunBehavior::default(),
+        &RunExecutionOptions::default(),
+    )?;
+    let VariantRuntimeProfile {
+        experiment: runtime_experiment,
+        harness: agent_loop,
+        container_mode,
+        configured_network_mode: network_mode,
+        ..
+    } = runtime_profile;
     let image = agent_loop.container_image.clone().or_else(|| {
-        json_value
+        runtime_experiment
             .pointer("/runtime/policy/sandbox/image")
             .and_then(|v| v.as_str())
             .map(|s| s.to_string())
     });
-    let network_mode = json_value
-        .pointer("/runtime/policy/network/mode")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| anyhow!("missing /runtime/policy/network/mode"))?
-        .to_string();
 
     let exp_id = json_value
         .pointer("/experiment/id")
@@ -2721,12 +3393,26 @@ struct ChainRuntimeState {
 }
 
 #[derive(Debug, Clone)]
+struct TaskBoundaryPolicy {
+    require_workspace_materialization: bool,
+}
+
+impl Default for TaskBoundaryPolicy {
+    fn default() -> Self {
+        Self {
+            require_workspace_materialization: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
 struct PolicyConfig {
     scheduling: SchedulingPolicy,
     state: StatePolicy,
     retry_max_attempts: usize,
     retry_on: Vec<String>,
     pruning_max_consecutive_failures: Option<usize>,
+    task_boundary: TaskBoundaryPolicy,
 }
 
 impl Default for PolicyConfig {
@@ -2737,6 +3423,7 @@ impl Default for PolicyConfig {
             retry_max_attempts: 1,
             retry_on: vec![],
             pruning_max_consecutive_failures: None,
+            task_boundary: TaskBoundaryPolicy::default(),
         }
     }
 }
@@ -2752,7 +3439,8 @@ fn parse_policies(json_value: &Value) -> PolicyConfig {
         Some("randomized") => SchedulingPolicy::Randomized,
         _ => SchedulingPolicy::VariantSequential,
     };
-    let state = StatePolicy::IsolatePerTrial;
+    let state = parse_state_policy_value(p.pointer("/state").and_then(|v| v.as_str()))
+        .unwrap_or(StatePolicy::IsolatePerTrial);
     let retry_max_attempts = p
         .pointer("/retry/max_attempts")
         .and_then(|v| v.as_u64())
@@ -2770,6 +3458,10 @@ fn parse_policies(json_value: &Value) -> PolicyConfig {
         .pointer("/pruning/max_consecutive_failures")
         .and_then(|v| v.as_u64())
         .map(|v| v as usize);
+    let require_workspace_materialization = p
+        .pointer("/task_boundary/require_workspace_materialization")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
 
     PolicyConfig {
         scheduling,
@@ -2777,6 +3469,9 @@ fn parse_policies(json_value: &Value) -> PolicyConfig {
         retry_max_attempts,
         retry_on,
         pruning_max_consecutive_failures,
+        task_boundary: TaskBoundaryPolicy {
+            require_workspace_materialization,
+        },
     }
 }
 
@@ -2790,6 +3485,8 @@ fn parse_task_model(value: Option<&str>) -> TaskModel {
 fn parse_state_policy_value(value: Option<&str>) -> Option<StatePolicy> {
     match value {
         Some("isolate_per_trial") => Some(StatePolicy::IsolatePerTrial),
+        Some("persist_per_task") => Some(StatePolicy::PersistPerTask),
+        Some("accumulate") => Some(StatePolicy::Accumulate),
         _ => None,
     }
 }
@@ -2892,7 +3589,7 @@ fn resolve_effective_task_policy(
         });
 
     EffectiveTaskPolicy {
-        state_policy: StatePolicy::IsolatePerTrial,
+        state_policy: state_override.unwrap_or(experiment_policy.state),
         task_model: task_model_override.unwrap_or(benchmark_policy.task_model),
         scoring_lifecycle: scoring_lifecycle_override
             .unwrap_or_else(|| benchmark_policy.scoring_lifecycle.clone()),
@@ -3292,7 +3989,7 @@ fn apply_score_records_to_trial_summaries(
     Ok(())
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 struct TrialSlot {
     variant_idx: usize,
     task_idx: usize,
@@ -3364,6 +4061,39 @@ fn build_trial_schedule(
     slots
 }
 
+// --- Schedule progress tracking for resumable runs ---
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SlotCompletion {
+    schedule_index: usize,
+    trial_id: String,
+    status: String, // "completed" | "failed" | "skipped_pruned"
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ScheduleProgress {
+    schema_version: String,
+    run_id: String,
+    total_slots: usize,
+    next_schedule_index: usize,
+    next_trial_index: usize,
+    schedule: Vec<TrialSlot>,
+    completed_slots: Vec<SlotCompletion>,
+    pruned_variants: Vec<usize>,
+    consecutive_failures: BTreeMap<usize, usize>,
+    use_container: bool,
+    updated_at: String,
+}
+
+fn schedule_progress_path(run_dir: &Path) -> PathBuf {
+    run_dir.join("runtime").join("schedule_progress.json")
+}
+
+fn write_schedule_progress(run_dir: &Path, progress: &ScheduleProgress) -> Result<()> {
+    let value = serde_json::to_value(progress)?;
+    atomic_write_json_pretty(&schedule_progress_path(run_dir), &value)
+}
+
 fn should_retry_outcome(outcome: &str, exit_status: &str, retry_on: &[String]) -> bool {
     if retry_on.is_empty() {
         // When retry_on is unspecified, retry on any non-success
@@ -3386,6 +4116,7 @@ fn should_retry_outcome(outcome: &str, exit_status: &str, retry_on: &[String]) -
 struct Variant {
     id: String,
     bindings: Value,
+    runtime_overrides: Option<Value>,
 }
 
 fn resolve_variant_plan(json_value: &Value) -> Result<(Vec<Variant>, String)> {
@@ -3401,11 +4132,17 @@ fn resolve_variant_plan(json_value: &Value) -> Result<(Vec<Variant>, String)> {
     if !baseline_bindings.is_object() {
         return Err(anyhow!("invalid /baseline/bindings: expected object"));
     }
+    let baseline_runtime_overrides = match json_value.pointer("/baseline/runtime_overrides") {
+        None | Some(Value::Null) => None,
+        Some(Value::Object(_)) => json_value.pointer("/baseline/runtime_overrides").cloned(),
+        Some(_) => return Err(anyhow!("/baseline/runtime_overrides must be an object")),
+    };
 
     let mut variants = Vec::new();
     variants.push(Variant {
         id: baseline.clone(),
         bindings: baseline_bindings,
+        runtime_overrides: baseline_runtime_overrides,
     });
 
     if json_value.get("variants").is_some() {
@@ -3437,9 +4174,72 @@ fn resolve_variant_plan(json_value: &Value) -> Result<(Vec<Variant>, String)> {
         if !bindings.is_object() {
             return Err(anyhow!("/variant_plan[{}].bindings must be an object", idx));
         }
-        variants.push(Variant { id, bindings });
+        let runtime_overrides = match item.get("runtime_overrides") {
+            None | Some(Value::Null) => None,
+            Some(Value::Object(_)) => item.get("runtime_overrides").cloned(),
+            Some(_) => {
+                return Err(anyhow!(
+                    "/variant_plan[{}].runtime_overrides must be an object",
+                    idx
+                ))
+            }
+        };
+        variants.push(Variant {
+            id,
+            bindings,
+            runtime_overrides,
+        });
     }
     Ok((variants, baseline))
+}
+
+fn merge_json_value(base: &mut Value, patch: &Value) {
+    match (base, patch) {
+        (Value::Object(base_map), Value::Object(patch_map)) => {
+            for (key, patch_value) in patch_map {
+                if let Some(base_value) = base_map.get_mut(key) {
+                    merge_json_value(base_value, patch_value);
+                } else {
+                    base_map.insert(key.clone(), patch_value.clone());
+                }
+            }
+        }
+        (base_slot, patch_value) => {
+            *base_slot = patch_value.clone();
+        }
+    }
+}
+
+fn resolve_runtime_for_variant(experiment: &Value, variant: &Variant) -> Result<Value> {
+    let mut resolved = experiment.clone();
+    let Some(runtime_overrides) = variant.runtime_overrides.as_ref() else {
+        return Ok(resolved);
+    };
+
+    let mut runtime = resolved
+        .pointer("/runtime")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    if !runtime.is_object() {
+        return Err(anyhow!("invalid /runtime: expected object"));
+    }
+
+    merge_json_value(&mut runtime, runtime_overrides);
+    set_json_pointer_value(&mut resolved, "/runtime", runtime)?;
+    Ok(resolved)
+}
+
+fn find_variant_by_id<'a>(variants: &'a [Variant], variant_id: &str) -> Result<&'a Variant> {
+    let trimmed = variant_id.trim();
+    if trimmed.is_empty() {
+        return variants
+            .first()
+            .ok_or_else(|| anyhow!("no variants available in experiment"));
+    }
+    variants
+        .iter()
+        .find(|variant| variant.id == trimmed)
+        .ok_or_else(|| anyhow!("variant '{}' not found in experiment", trimmed))
 }
 
 fn apply_experiment_overrides(
@@ -3885,18 +4685,11 @@ fn parse_task_boundary_ext(
     })
 }
 
-fn task_requires_explicit_workspace_materialization(task_payload: &Value) -> bool {
-    let task_id = task_payload
-        .get("id")
-        .and_then(|v| v.as_str())
-        .unwrap_or_default();
-    task_payload.get("swebench").is_some() || task_id.starts_with("swebench_")
-}
-
 fn validate_task_boundary_workspace_materialization(
     task_boundary: &TaskBoundaryMaterialization,
+    task_boundary_policy: &TaskBoundaryPolicy,
 ) -> Result<()> {
-    if !task_requires_explicit_workspace_materialization(&task_boundary.task_payload) {
+    if !task_boundary_policy.require_workspace_materialization {
         return Ok(());
     }
     if !task_boundary.workspace_files.is_empty() || !task_boundary.mount_references.is_empty() {
@@ -3908,7 +4701,7 @@ fn validate_task_boundary_workspace_materialization(
         .and_then(|v| v.as_str())
         .unwrap_or("<unknown_task>");
     Err(anyhow!(
-        "benchmark task '{}' is missing workspace materialization: provide task boundary workspace_files or mount_references",
+        "task '{}' is missing required workspace materialization: provide task boundary workspace_files or mount_references",
         task_id
     ))
 }
@@ -4008,7 +4801,10 @@ fn validate_workspace_relative_path(path: &str) -> Result<PathBuf> {
     }
     let p = Path::new(path);
     if p.is_absolute() {
-        return Err(anyhow!("path must be relative to /workspace"));
+        return Err(anyhow!(
+            "path must be relative to {}",
+            AGENTLAB_CONTRACT_WORKSPACE_DIR
+        ));
     }
     let mut normalized = PathBuf::new();
     for component in p.components() {
@@ -4030,8 +4826,13 @@ fn validate_workspace_relative_path(path: &str) -> Result<PathBuf> {
 }
 
 fn validate_container_workspace_path(path: &str) -> Result<()> {
-    if !(path == "/workspace" || path.starts_with("/workspace/")) {
-        return Err(anyhow!("mount_path must be under /workspace"));
+    if !(path == AGENTLAB_CONTRACT_WORKSPACE_DIR
+        || path.starts_with(&format!("{}/", AGENTLAB_CONTRACT_WORKSPACE_DIR)))
+    {
+        return Err(anyhow!(
+            "mount_path must be under {}",
+            AGENTLAB_CONTRACT_WORKSPACE_DIR
+        ));
     }
     let p = Path::new(path);
     if !p.is_absolute() {
@@ -4216,13 +5017,6 @@ struct DependencyFileStagingSpec {
     read_only: bool,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum AgentRuntimeMode {
-    LegacyAgentLoop,
-    KnownAgentRef,
-    CustomImage,
-}
-
 #[derive(Clone, Debug, Deserialize)]
 struct AgentRuntimeManifest {
     image: String,
@@ -4233,9 +5027,8 @@ struct AgentRuntimeManifest {
 
 #[derive(Clone)]
 struct AgentLoopConfig {
-    runtime_mode: AgentRuntimeMode,
+    adapter_ref: AgentAdapterRef,
     command_raw: Vec<String>,
-    resolve_command_from_project_root: bool,
     container_image: Option<String>,
     known_agent_id: Option<String>,
     known_agent_version: Option<String>,
@@ -4246,8 +5039,7 @@ struct AgentLoopConfig {
     env_from_host: Vec<String>,
     trajectory_path: Option<String>,
     causal_extraction: Option<String>,
-    control_path: String,
-    control_mode: HarnessControlMode,
+    default_timeout_ms: Option<u64>,
     tracing_mode: Option<String>,
     force_container: bool,
     dependency_file_staging: Vec<DependencyFileStagingSpec>,
@@ -4321,13 +5113,8 @@ fn parse_dependency_file_staging(
     json_value: &Value,
     exp_dir: &Path,
 ) -> Result<Vec<DependencyFileStagingSpec>> {
-    let assets_ptr = json_value.pointer("/runtime/dependencies/assets");
-    let staging_ptr = json_value.pointer("/runtime/dependencies/file_staging");
-    let (source_name, raw_items) = if assets_ptr.is_some() {
-        ("runtime.dependencies.assets", assets_ptr)
-    } else {
-        ("runtime.dependencies.file_staging", staging_ptr)
-    };
+    let source_name = "runtime.dependencies.file_staging";
+    let raw_items = json_value.pointer("/runtime/dependencies/file_staging");
 
     match raw_items {
         None => Ok(Vec::new()),
@@ -4340,25 +5127,16 @@ fn parse_dependency_file_staging(
                 let source_raw = obj
                     .get("source_from_host")
                     .and_then(|v| v.as_str())
-                    .ok_or_else(|| {
-                        anyhow!("{}[{}].source_from_host missing", source_name, idx)
-                    })?;
+                    .ok_or_else(|| anyhow!("{}[{}].source_from_host missing", source_name, idx))?;
                 let destination_path = obj
-                    .get("mount_path")
+                    .get("destination_path")
                     .and_then(|v| v.as_str())
-                    .or_else(|| obj.get("destination_path").and_then(|v| v.as_str()))
-                    .ok_or_else(|| {
-                        anyhow!(
-                            "{}[{}].mount_path (or destination_path) missing",
-                            source_name,
-                            idx
-                        )
-                    })?
+                    .ok_or_else(|| anyhow!("{}[{}].destination_path missing", source_name, idx))?
                     .trim()
                     .to_string();
                 if destination_path.is_empty() {
                     return Err(anyhow!(
-                        "{}[{}].mount_path (or destination_path) must not be empty",
+                        "{}[{}].destination_path must not be empty",
                         source_name,
                         idx
                     ));
@@ -4414,13 +5192,8 @@ fn load_known_agent_manifest(
             continue;
         }
         let raw = fs::read_to_string(path)?;
-        let manifest: AgentRuntimeManifest = serde_json::from_str(&raw).map_err(|err| {
-            anyhow!(
-                "invalid known agent manifest {}: {}",
-                path.display(),
-                err
-            )
-        })?;
+        let manifest: AgentRuntimeManifest = serde_json::from_str(&raw)
+            .map_err(|err| anyhow!("invalid known agent manifest {}: {}", path.display(), err))?;
         if manifest.image.trim().is_empty() {
             return Err(anyhow!(
                 "known agent manifest {} has empty image",
@@ -4433,7 +5206,11 @@ fn load_known_agent_manifest(
                 path.display()
             ));
         }
-        if manifest.entrypoint.iter().any(|part| part.trim().is_empty()) {
+        if manifest
+            .entrypoint
+            .iter()
+            .any(|part| part.trim().is_empty())
+        {
             return Err(anyhow!(
                 "known agent manifest {} has an entrypoint token that is empty",
                 path.display()
@@ -4455,12 +5232,15 @@ fn load_known_agent_manifest(
     ))
 }
 
-fn resolve_agent_loop(json_value: &Value, exp_dir: &Path) -> Result<AgentLoopConfig> {
+fn resolve_agent_runtime(json_value: &Value, exp_dir: &Path) -> Result<AgentLoopConfig> {
     if json_value.pointer("/runtime/harness").is_some() {
         return Err(anyhow!(
-            "runtime.harness is not supported; use runtime.agent or runtime.agent_loop"
+            "runtime.harness is not supported; use runtime.agent"
         ));
     }
+    let agent = json_value.pointer("/runtime/agent").ok_or_else(|| {
+        anyhow!("runtime.agent is required; runtime.agent_loop is removed in this runner version")
+    })?;
 
     let trajectory_path = json_value
         .pointer("/runtime/telemetry/trajectory_path")
@@ -4471,8 +5251,6 @@ fn resolve_agent_loop(json_value: &Value, exp_dir: &Path) -> Result<AgentLoopCon
         .pointer("/runtime/telemetry/causal_extraction")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
-    let control_path = DEFAULT_CONTAINER_CONTROL_PATH.to_string();
-    let control_mode = HarnessControlMode::File;
     let tracing_mode = None;
 
     let force_container = json_value
@@ -4491,174 +5269,228 @@ fn resolve_agent_loop(json_value: &Value, exp_dir: &Path) -> Result<AgentLoopCon
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
 
-    if let Some(agent) = json_value.pointer("/runtime/agent") {
-        let mode = agent
-            .pointer("/mode")
+    let mode = agent
+        .pointer("/mode")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow!("runtime.agent.mode missing"))?;
+    let integration_level = agent
+        .pointer("/integration_level")
+        .and_then(|v| v.as_str())
+        .unwrap_or("agent_loop")
+        .to_string();
+    let adapter_ref = AgentAdapterRef {
+        id: agent
+            .pointer("/adapter/id")
             .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow!("runtime.agent.mode missing"))?;
-        let override_args = parse_string_array_field(
-            agent.pointer("/overrides/args"),
-            "runtime.agent.overrides.args",
-        )?;
-        let override_env = parse_string_map_field(
-            agent.pointer("/overrides/env"),
-            "runtime.agent.overrides.env",
-        )?;
-        let env_from_host = parse_string_array_field(
-            agent.pointer("/overrides/env_from_host"),
-            "runtime.agent.overrides.env_from_host",
-        )?;
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| BUILTIN_COMMAND_ADAPTER_ID.to_string()),
+        version: agent
+            .pointer("/adapter/version")
+            .and_then(|v| v.as_str())
+            .map(|s| s.trim().to_string())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| BUILTIN_COMMAND_ADAPTER_VERSION.to_string()),
+    };
+    let launch_mode =
+        HarnessLaunchMode::parse(agent.pointer("/launch/mode").and_then(|v| v.as_str()))?;
+    let default_timeout_ms = agent
+        .pointer("/default_timeout_ms")
+        .and_then(|v| v.as_u64())
+        .filter(|v| *v > 0);
+    let override_args = parse_string_array_field(
+        agent.pointer("/overrides/args"),
+        "runtime.agent.overrides.args",
+    )?;
+    let override_env = parse_string_map_field(
+        agent.pointer("/overrides/env"),
+        "runtime.agent.overrides.env",
+    )?;
+    let env_from_host = parse_string_array_field(
+        agent.pointer("/overrides/env_from_host"),
+        "runtime.agent.overrides.env_from_host",
+    )?;
 
-        match mode {
-            "known_agent_ref" => {
-                let id = agent
-                    .pointer("/known_agent_ref/id")
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| anyhow!("runtime.agent.known_agent_ref.id missing"))?
-                    .trim()
-                    .to_string();
-                if id.is_empty() {
-                    return Err(anyhow!(
-                        "runtime.agent.known_agent_ref.id must not be empty"
-                    ));
-                }
-                let version = agent
-                    .pointer("/known_agent_ref/version")
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| anyhow!("runtime.agent.known_agent_ref.version missing"))?
-                    .trim()
-                    .to_string();
-                if version.is_empty() {
-                    return Err(anyhow!(
-                        "runtime.agent.known_agent_ref.version must not be empty"
-                    ));
-                }
-                let registry = agent
-                    .pointer("/known_agent_ref/registry")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.trim().to_string())
-                    .filter(|s| !s.is_empty());
-                let manifest =
-                    load_known_agent_manifest(exp_dir, &id, &version, registry.as_deref())?;
-                let mut command = manifest.entrypoint;
-                command.extend(override_args);
-                let mut env = manifest.default_env;
-                env.extend(override_env);
-                return Ok(AgentLoopConfig {
-                    runtime_mode: AgentRuntimeMode::KnownAgentRef,
-                    command_raw: command,
-                    resolve_command_from_project_root: false,
-                    container_image: Some(manifest.image),
-                    known_agent_id: Some(id),
-                    known_agent_version: Some(version),
-                    known_agent_registry: registry,
-                    integration_level: "agent_loop".to_string(),
-                    launch_mode: HarnessLaunchMode::File,
-                    env,
-                    env_from_host,
-                    trajectory_path,
-                    causal_extraction,
-                    control_path,
-                    control_mode,
-                    tracing_mode,
-                    force_container,
-                    dependency_file_staging,
-                    dependency_services,
-                });
-            }
-            "custom_image" => {
-                let mut entrypoint = parse_string_array_field(
-                    agent.pointer("/custom_image/entrypoint"),
-                    "runtime.agent.custom_image.entrypoint",
-                )?;
-                if entrypoint.is_empty() {
-                    return Err(anyhow!(
-                        "runtime.agent.custom_image.entrypoint is required for mode=custom_image"
-                    ));
-                }
-                entrypoint.extend(override_args);
-                let container_image = agent
-                    .pointer("/custom_image/image")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.trim().to_string())
-                    .filter(|s| !s.is_empty())
-                    .or(policy_image);
-                return Ok(AgentLoopConfig {
-                    runtime_mode: AgentRuntimeMode::CustomImage,
-                    command_raw: entrypoint,
-                    resolve_command_from_project_root: false,
-                    container_image,
-                    known_agent_id: None,
-                    known_agent_version: None,
-                    known_agent_registry: None,
-                    integration_level: "agent_loop".to_string(),
-                    launch_mode: HarnessLaunchMode::File,
-                    env: override_env,
-                    env_from_host,
-                    trajectory_path,
-                    causal_extraction,
-                    control_path,
-                    control_mode,
-                    tracing_mode,
-                    force_container,
-                    dependency_file_staging,
-                    dependency_services,
-                });
-            }
-            other => {
+    match mode {
+        "known_agent_ref" => {
+            let id = agent
+                .pointer("/known_agent_ref/id")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| anyhow!("runtime.agent.known_agent_ref.id missing"))?
+                .trim()
+                .to_string();
+            if id.is_empty() {
                 return Err(anyhow!(
-                    "unsupported runtime.agent.mode '{}'; expected known_agent_ref|custom_image",
-                    other
+                    "runtime.agent.known_agent_ref.id must not be empty"
                 ));
             }
+            let version = agent
+                .pointer("/known_agent_ref/version")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| anyhow!("runtime.agent.known_agent_ref.version missing"))?
+                .trim()
+                .to_string();
+            if version.is_empty() {
+                return Err(anyhow!(
+                    "runtime.agent.known_agent_ref.version must not be empty"
+                ));
+            }
+            let registry = agent
+                .pointer("/known_agent_ref/registry")
+                .and_then(|v| v.as_str())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty());
+            let manifest = load_known_agent_manifest(exp_dir, &id, &version, registry.as_deref())?;
+            let mut command = manifest.entrypoint;
+            command.extend(override_args);
+            let mut env = manifest.default_env;
+            env.extend(override_env);
+            Ok(AgentLoopConfig {
+                adapter_ref,
+                command_raw: command,
+                container_image: Some(manifest.image),
+                known_agent_id: Some(id),
+                known_agent_version: Some(version),
+                known_agent_registry: registry,
+                integration_level,
+                launch_mode,
+                env,
+                env_from_host,
+                trajectory_path,
+                causal_extraction,
+                default_timeout_ms,
+                tracing_mode,
+                force_container,
+                dependency_file_staging,
+                dependency_services,
+            })
         }
+        "custom_image" => {
+            let mut entrypoint = parse_string_array_field(
+                agent.pointer("/custom_image/entrypoint"),
+                "runtime.agent.custom_image.entrypoint",
+            )?;
+            if entrypoint.is_empty() {
+                return Err(anyhow!(
+                    "runtime.agent.custom_image.entrypoint is required for mode=custom_image"
+                ));
+            }
+            entrypoint.extend(override_args);
+            let container_image = agent
+                .pointer("/custom_image/image")
+                .and_then(|v| v.as_str())
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .or(policy_image);
+            Ok(AgentLoopConfig {
+                adapter_ref,
+                command_raw: entrypoint,
+                container_image,
+                known_agent_id: None,
+                known_agent_version: None,
+                known_agent_registry: None,
+                integration_level,
+                launch_mode,
+                env: override_env,
+                env_from_host,
+                trajectory_path,
+                causal_extraction,
+                default_timeout_ms,
+                tracing_mode,
+                force_container,
+                dependency_file_staging,
+                dependency_services,
+            })
+        }
+        other => Err(anyhow!(
+            "unsupported runtime.agent.mode '{}'; expected known_agent_ref|custom_image",
+            other
+        )),
     }
-
-    let agent_loop = json_value
-        .pointer("/runtime/agent_loop")
-        .ok_or_else(|| anyhow!("runtime.agent_loop missing"))?;
-    let command = parse_string_array_field(
-        agent_loop.pointer("/command"),
-        "runtime.agent_loop.command",
-    )?;
-    let env = parse_string_map_field(agent_loop.pointer("/env"), "runtime.agent_loop.env")?;
-    let env_from_host = parse_string_array_field(
-        agent_loop.pointer("/env_from_host"),
-        "runtime.agent_loop.env_from_host",
-    )?;
-
-    Ok(AgentLoopConfig {
-        runtime_mode: AgentRuntimeMode::LegacyAgentLoop,
-        command_raw: command,
-        resolve_command_from_project_root: true,
-        container_image: policy_image,
-        known_agent_id: None,
-        known_agent_version: None,
-        known_agent_registry: None,
-        integration_level: "agent_loop".to_string(),
-        launch_mode: HarnessLaunchMode::File,
-        env,
-        env_from_host,
-        trajectory_path,
-        causal_extraction,
-        control_path,
-        control_mode,
-        tracing_mode,
-        force_container,
-        dependency_file_staging,
-        dependency_services,
-    })
 }
 
-fn resolve_agent_loop_env(agent_loop: &AgentLoopConfig) -> Result<BTreeMap<String, String>> {
+fn resolve_agent_runtime_env(agent_loop: &AgentLoopConfig) -> Result<BTreeMap<String, String>> {
     let mut merged = agent_loop.env.clone();
     for key in &agent_loop.env_from_host {
         let value = std::env::var(key).map_err(|_| {
-            anyhow!("missing required host env var for runtime agent env_from_host: {}", key)
+            anyhow!(
+                "missing required host env var for runtime agent env_from_host: {}",
+                key
+            )
         })?;
         merged.insert(key.clone(), value);
     }
     Ok(merged)
+}
+
+#[derive(Clone)]
+struct VariantRuntimeProfile {
+    experiment: Value,
+    harness: AgentLoopConfig,
+    harness_env: BTreeMap<String, String>,
+    invocation_source: String,
+    invocation_default_timeout_ms: Option<u64>,
+    executor_kind: ExecutorKind,
+    container_mode: bool,
+    configured_network_mode: String,
+    effective_network_mode: String,
+}
+
+fn resolve_variant_runtime_profile(
+    experiment: &Value,
+    variant: &Variant,
+    project_root: &Path,
+    use_container: bool,
+    behavior: &RunBehavior,
+    execution: &RunExecutionOptions,
+) -> Result<VariantRuntimeProfile> {
+    let variant_experiment = resolve_runtime_for_variant(experiment, variant)?;
+    validate_required_fields(&variant_experiment)?;
+
+    let mut harness = resolve_agent_runtime(&variant_experiment, project_root)?;
+    let configured_network_mode = variant_experiment
+        .pointer("/runtime/policy/network/mode")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow!("missing /runtime/policy/network/mode"))?
+        .to_string();
+    let effective_network_mode = behavior
+        .network_mode_override
+        .as_deref()
+        .unwrap_or(configured_network_mode.as_str())
+        .to_string();
+    if behavior.require_network_none && effective_network_mode != "none" {
+        return Err(anyhow!(
+            "run-experiment requires network mode 'none' (variant '{}', effective mode: {})",
+            variant.id,
+            effective_network_mode
+        ));
+    }
+
+    harness.command_raw = resolve_agent_runtime_command(&harness.command_raw, project_root);
+    validate_agent_runtime_command(&harness.command_raw, project_root)?;
+    let invocation_default_timeout_ms = harness.default_timeout_ms;
+
+    let executor_kind = execution.executor.unwrap_or_else(|| {
+        if use_container || harness.force_container {
+            ExecutorKind::LocalDocker
+        } else {
+            ExecutorKind::LocalProcess
+        }
+    });
+    let container_mode = matches!(executor_kind, ExecutorKind::LocalDocker);
+    let harness_env = resolve_agent_runtime_env(&harness)?;
+
+    Ok(VariantRuntimeProfile {
+        experiment: variant_experiment,
+        harness,
+        harness_env,
+        invocation_source: "runtime_agent".to_string(),
+        invocation_default_timeout_ms,
+        executor_kind,
+        container_mode,
+        configured_network_mode,
+        effective_network_mode,
+    })
 }
 
 struct TrialPaths {
@@ -5174,83 +6006,196 @@ fn materialize_runner_entrypoint_shim(paths: &TrialPaths) -> Result<PathBuf> {
     Ok(paths.runtime.entrypoint_dir.clone())
 }
 
-fn run_agent_loop_local(
-    _agent_loop: &AgentLoopConfig,
-    agent_loop_env: &BTreeMap<String, String>,
-    paths: &TrialPaths,
-    input_path: &Path,
-    output_path: &Path,
-    _invocation_path: &Path,
-    _agentlabd_start_request_path: &Path,
-    _agentlabd_start_response_path: &Path,
-    control_transport: &HarnessControlTransport,
-    run_id: &str,
-    command: &[String],
-    runtime_env: &BTreeMap<String, String>,
-) -> Result<ProcessRunResult> {
-    let rendered = apply_agentlab_template_to_command(command, runtime_env);
+fn command_contract_capabilities() -> AgentAdapterCapabilities {
+    AgentAdapterCapabilities {
+        pause: true,
+        control_ack: true,
+        event_stream: true,
+        strict_replay: false,
+    }
+}
+
+fn command_contract_active_control(
+    request: &AdapterRunRequest<'_>,
+) -> Option<ActiveAdapterControl> {
+    Some(ActiveAdapterControl {
+        adapter_id: request.runtime.adapter_ref.id.clone(),
+        adapter_version: request.runtime.adapter_ref.version.clone(),
+        command_path: request
+            .trial_paths
+            .runtime
+            .control
+            .to_string_lossy()
+            .to_string(),
+        events_path: Some(request.io_paths.events_host.to_string_lossy().to_string()),
+    })
+}
+
+fn run_command_contract_trial(request: &AdapterRunRequest<'_>) -> Result<ProcessRunResult> {
+    write_adapter_continue_control(&request.trial_paths.runtime.control)?;
+    if !request.container_mode && request.setup_command.is_some() {
+        return Err(anyhow!(
+            "setup command is only supported for container runs"
+        ));
+    }
+    if request.container_mode {
+        run_builtin_adapter_container(request)
+    } else {
+        run_builtin_adapter_local(request)
+    }
+}
+
+fn pause_command_contract_trial(request: &AdapterPauseRequest<'_>) -> Result<AdapterPauseAck> {
+    let control_path = Path::new(&request.control.command_path);
+    let events_path =
+        request.control.events_path.as_deref().ok_or_else(|| {
+            anyhow!("pause_unsupported: active adapter control missing events path")
+        })?;
+    let events_path = Path::new(events_path);
+    let deadline = Instant::now() + request.timeout;
+
+    let seq_checkpoint = read_control_seq(control_path)? + 1;
+    let checkpoint_version = write_adapter_control_action(
+        control_path,
+        seq_checkpoint,
+        "checkpoint",
+        Some(request.label),
+        "lab_pause",
+    )?;
+    wait_for_adapter_control_ack(events_path, "checkpoint", &checkpoint_version, deadline)?;
+
+    let seq_stop = read_control_seq(control_path)? + 1;
+    let stop_version = write_adapter_control_action(
+        control_path,
+        seq_stop,
+        "stop",
+        Some(request.label),
+        "lab_pause",
+    )?;
+    wait_for_adapter_control_ack(events_path, "stop", &stop_version, deadline)?;
+
+    Ok(AdapterPauseAck {
+        checkpoint_acked: true,
+        stop_acked: true,
+    })
+}
+
+fn prebuilt_adapter_profile_value(flavor: PrebuiltAdapterFlavor) -> &'static str {
+    match flavor {
+        PrebuiltAdapterFlavor::CodexCli => "codex_cli",
+        PrebuiltAdapterFlavor::RexJesus => "rex_jesus",
+    }
+}
+
+impl AgentAdapter for BuiltinCommandAdapter {
+    fn capabilities(&self) -> AgentAdapterCapabilities {
+        command_contract_capabilities()
+    }
+
+    fn active_control(
+        &self,
+        request: &AdapterRunRequest<'_>,
+    ) -> Result<Option<ActiveAdapterControl>> {
+        Ok(command_contract_active_control(request))
+    }
+
+    fn run_trial(&self, request: &AdapterRunRequest<'_>) -> Result<ProcessRunResult> {
+        run_command_contract_trial(request)
+    }
+
+    fn pause_trial(&self, request: &AdapterPauseRequest<'_>) -> Result<AdapterPauseAck> {
+        pause_command_contract_trial(request)
+    }
+}
+
+impl AgentAdapter for PrebuiltCommandAdapter {
+    fn capabilities(&self) -> AgentAdapterCapabilities {
+        command_contract_capabilities()
+    }
+
+    fn active_control(
+        &self,
+        request: &AdapterRunRequest<'_>,
+    ) -> Result<Option<ActiveAdapterControl>> {
+        Ok(command_contract_active_control(request))
+    }
+
+    fn run_trial(&self, request: &AdapterRunRequest<'_>) -> Result<ProcessRunResult> {
+        let mut adapter_overrides = request.runtime_overrides_env.clone();
+        adapter_overrides.insert(
+            "AGENTLAB_PREBUILT_ADAPTER".to_string(),
+            prebuilt_adapter_profile_value(self.flavor).to_string(),
+        );
+        adapter_overrides.insert(
+            "AGENTLAB_PREBUILT_ADAPTER_ID".to_string(),
+            request.runtime.adapter_ref.id.clone(),
+        );
+        let prebuilt_request = AdapterRunRequest {
+            runtime_experiment: request.runtime_experiment,
+            runtime: request.runtime,
+            runtime_env: request.runtime_env,
+            runtime_overrides_env: &adapter_overrides,
+            container_mode: request.container_mode,
+            trial_paths: request.trial_paths,
+            dynamic_mounts: request.dynamic_mounts,
+            io_paths: request.io_paths,
+            network_mode: request.network_mode,
+            setup_command: request.setup_command,
+            run_id: request.run_id,
+        };
+        run_command_contract_trial(&prebuilt_request)
+    }
+
+    fn pause_trial(&self, request: &AdapterPauseRequest<'_>) -> Result<AdapterPauseAck> {
+        pause_command_contract_trial(request)
+    }
+}
+
+fn run_builtin_adapter_local(request: &AdapterRunRequest<'_>) -> Result<ProcessRunResult> {
+    let rendered =
+        apply_agentlab_template_to_command(&request.runtime.command_raw, request.runtime_env);
     if rendered.is_empty() {
-        return Err(anyhow!("resolved agent loop command is empty"));
+        return Err(anyhow!("resolved runtime.agent command is empty"));
     }
     let mut cmd = Command::new(&rendered[0]);
     cmd.args(&rendered[1..]);
-    cmd.current_dir(&paths.workspace);
-    for (key, value) in agent_loop_env {
+    cmd.current_dir(&request.trial_paths.workspace);
+    for (key, value) in request.runtime_overrides_env {
         cmd.env(key, value);
     }
-    for (key, value) in runtime_env {
+    for (key, value) in request.runtime_env {
         cmd.env(key, value);
     }
-    run_process_with_trial_io(
-        cmd,
-        control_transport,
-        run_id,
-        input_path,
-        output_path,
-        None,
-    )
+    run_adapter_process(cmd, &request.io_paths.output_host, None)
 }
 
-fn run_agent_loop_container(
-    json_value: &Value,
-    agent_loop: &AgentLoopConfig,
-    agent_loop_env: &BTreeMap<String, String>,
-    paths: &TrialPaths,
-    dynamic_mounts: &[ResolvedMountReference],
-    input_path: &Path,
-    output_path: &Path,
-    _invocation_path: &Path,
-    _agentlabd_start_request_path: &Path,
-    _agentlabd_start_response_path: &Path,
-    control_transport: &HarnessControlTransport,
-    command: &[String],
-    network_mode: &str,
-    setup_command: Option<&str>,
-    run_id: &str,
-    runtime_env: &BTreeMap<String, String>,
-) -> Result<ProcessRunResult> {
-    let image = agent_loop
+fn run_builtin_adapter_container(request: &AdapterRunRequest<'_>) -> Result<ProcessRunResult> {
+    let image = request
+        .runtime
         .container_image
         .as_deref()
         .or_else(|| {
-            json_value
+            request
+                .runtime_experiment
                 .pointer("/runtime/policy/sandbox/image")
                 .and_then(|v| v.as_str())
         })
         .ok_or_else(|| anyhow!("container image required for container mode"))?;
 
-    if network_mode == "allowlist_enforced" {
+    if request.network_mode == "allowlist_enforced" {
         return Err(anyhow!("allowlist_enforced not implemented in Rust runner"));
     }
-    let rendered = apply_agentlab_template_to_command(command, runtime_env);
+    let rendered =
+        apply_agentlab_template_to_command(&request.runtime.command_raw, request.runtime_env);
     if rendered.is_empty() {
-        return Err(anyhow!("resolved agent loop command is empty"));
+        return Err(anyhow!("resolved runtime.agent command is empty"));
     }
 
     let mut cmd = Command::new("docker");
     cmd.arg("run").arg("--rm");
 
-    if json_value
+    if request
+        .runtime_experiment
         .pointer("/runtime/policy/sandbox/root_read_only")
         .and_then(|v| v.as_bool())
         .unwrap_or(true)
@@ -5258,25 +6203,28 @@ fn run_agent_loop_container(
         cmd.arg("--read-only");
     }
 
-    let run_as_user = json_value
+    let run_as_user = request
+        .runtime_experiment
         .pointer("/runtime/policy/sandbox/run_as_user")
         .and_then(|v| v.as_str());
     if let Some(user) = run_as_user {
         cmd.args(["-u", user]);
     }
 
-    if network_mode == "none" {
+    if request.network_mode == "none" {
         cmd.arg("--network=none");
     }
 
-    if json_value
+    if request
+        .runtime_experiment
         .pointer("/runtime/policy/sandbox/hardening/no_new_privileges")
         .and_then(|v| v.as_bool())
         .unwrap_or(true)
     {
         cmd.args(["--security-opt", "no-new-privileges"]);
     }
-    if json_value
+    if request
+        .runtime_experiment
         .pointer("/runtime/policy/sandbox/hardening/drop_all_caps")
         .and_then(|v| v.as_bool())
         .unwrap_or(true)
@@ -5284,13 +6232,15 @@ fn run_agent_loop_container(
         cmd.args(["--cap-drop", "ALL"]);
     }
 
-    if let Some(cpu) = json_value
+    if let Some(cpu) = request
+        .runtime_experiment
         .pointer("/runtime/policy/sandbox/resources/cpu_count")
         .and_then(|v| v.as_u64())
     {
         cmd.arg("--cpus").arg(cpu.to_string());
     }
-    if let Some(mem) = json_value
+    if let Some(mem) = request
+        .runtime_experiment
         .pointer("/runtime/policy/sandbox/resources/memory_mb")
         .and_then(|v| v.as_u64())
     {
@@ -5299,31 +6249,49 @@ fn run_agent_loop_container(
 
     cmd.args([
         "-v",
-        &format!("{}:{}:ro", paths.in_dir.display(), AGENTLAB_CONTRACT_IN_DIR),
-    ]);
-    cmd.args([
-        "-v",
-        &format!("{}:{}", paths.out.display(), AGENTLAB_CONTRACT_OUT_DIR),
-    ]);
-    cmd.args([
-        "-v",
-        &format!("{}:{}", paths.state.display(), AGENTLAB_CONTRACT_STATE_DIR),
-    ]);
-    cmd.args([
-        "-v",
-        &format!("{}:{}", paths.deps.display(), AGENTLAB_CONTRACT_DEPS_DIR),
+        &format!(
+            "{}:{}:ro",
+            request.trial_paths.in_dir.display(),
+            AGENTLAB_CONTRACT_IN_DIR
+        ),
     ]);
     cmd.args([
         "-v",
         &format!(
             "{}:{}",
-            paths.workspace.display(),
+            request.trial_paths.out.display(),
+            AGENTLAB_CONTRACT_OUT_DIR
+        ),
+    ]);
+    cmd.args([
+        "-v",
+        &format!(
+            "{}:{}",
+            request.trial_paths.state.display(),
+            AGENTLAB_CONTRACT_STATE_DIR
+        ),
+    ]);
+    cmd.args([
+        "-v",
+        &format!(
+            "{}:{}",
+            request.trial_paths.deps.display(),
+            AGENTLAB_CONTRACT_DEPS_DIR
+        ),
+    ]);
+    cmd.args([
+        "-v",
+        &format!(
+            "{}:{}",
+            request.trial_paths.workspace.display(),
             AGENTLAB_CONTRACT_WORKSPACE_DIR
         ),
     ]);
-    cmd.args(["-v", &format!("{}:/workspace", paths.workspace.display())]);
-    cmd.args(["-v", &format!("{}:/dataset:ro", paths.dataset.display())]);
-    for mount in dynamic_mounts {
+    cmd.args([
+        "-v",
+        &format!("{}:/dataset:ro", request.trial_paths.dataset.display()),
+    ]);
+    for mount in request.dynamic_mounts {
         cmd.args([
             "-v",
             &format!("{}:{}:ro", mount.host_path.display(), mount.mount_path),
@@ -5332,13 +6300,13 @@ fn run_agent_loop_container(
     cmd.args(["--tmpfs", "/tmp:rw"]);
     cmd.args(["-w", AGENTLAB_CONTRACT_WORKSPACE_DIR]);
 
-    for (key, value) in agent_loop_env {
+    for (key, value) in request.runtime_overrides_env {
         cmd.arg("-e").arg(format!("{}={}", key, value));
     }
-    for (key, value) in runtime_env {
+    for (key, value) in request.runtime_env {
         cmd.arg("-e").arg(format!("{}={}", key, value));
     }
-    if let Some(setup) = setup_command {
+    if let Some(setup) = request.setup_command {
         cmd.arg(image);
         let wrapped = format!("{} && exec {}", setup, shell_join(&rendered));
         cmd.arg("/bin/sh");
@@ -5349,241 +6317,10 @@ fn run_agent_loop_container(
         cmd.args(rendered);
     }
 
-    run_process_with_trial_io(
-        cmd,
-        control_transport,
-        run_id,
-        input_path,
-        output_path,
-        None,
-    )
+    run_adapter_process(cmd, &request.io_paths.output_host, None)
 }
 
-fn command_output_stdout(output: &std::process::Output) -> String {
-    String::from_utf8_lossy(&output.stdout).trim().to_string()
-}
-
-fn command_output_stderr(output: &std::process::Output) -> String {
-    String::from_utf8_lossy(&output.stderr).trim().to_string()
-}
-
-fn inspect_image_labels(image: &str) -> Result<BTreeMap<String, String>> {
-    let output = Command::new("docker")
-        .args([
-            "image",
-            "inspect",
-            "--format",
-            "{{json .Config.Labels}}",
-            image,
-        ])
-        .output()?;
-    if !output.status.success() {
-        return Err(anyhow!(
-            "failed to inspect image labels for {}: {}",
-            image,
-            command_output_stderr(&output)
-        ));
-    }
-    let raw = command_output_stdout(&output);
-    if raw.is_empty() || raw == "null" || raw == "<no value>" {
-        return Ok(BTreeMap::new());
-    }
-    let labels: BTreeMap<String, String> = serde_json::from_str(&raw).map_err(|err| {
-        anyhow!(
-            "invalid label payload from docker image inspect for {}: {}",
-            image,
-            err
-        )
-    })?;
-    Ok(labels)
-}
-
-fn parse_harness_invocation_from_labels(
-    labels: &BTreeMap<String, String>,
-) -> Result<Option<HarnessInvocationMetadata>> {
-    for key in OCI_HARNESS_LABEL_KEYS {
-        if let Some(raw) = labels.get(*key) {
-            let metadata: HarnessInvocationMetadata = serde_json::from_str(raw).map_err(|err| {
-                anyhow!(
-                    "invalid {} label JSON for harness invocation metadata: {}",
-                    key,
-                    err
-                )
-            })?;
-            return Ok(Some(metadata));
-        }
-    }
-
-    for prefix in OCI_HARNESS_LABEL_PREFIXES {
-        let schema_key = format!("{}.schema_version", prefix);
-        let kind_key = format!("{}.kind", prefix);
-        let cmd_key = format!("{}.cmd", prefix);
-        let args_key = format!("{}.args", prefix);
-        let integration_key = format!("{}.integration_level", prefix);
-        let default_timeout_key = format!("{}.default_timeout_ms", prefix);
-
-        if !labels.contains_key(&schema_key)
-            && !labels.contains_key(&kind_key)
-            && !labels.contains_key(&cmd_key)
-            && !labels.contains_key(&args_key)
-            && !labels.contains_key(&integration_key)
-            && !labels.contains_key(&default_timeout_key)
-        {
-            continue;
-        }
-
-        let schema_version = labels
-            .get(&schema_key)
-            .cloned()
-            .ok_or_else(|| anyhow!("missing {} label", schema_key))?;
-        let kind = labels
-            .get(&kind_key)
-            .cloned()
-            .ok_or_else(|| anyhow!("missing {} label", kind_key))?;
-        let cmd = labels
-            .get(&cmd_key)
-            .cloned()
-            .ok_or_else(|| anyhow!("missing {} label", cmd_key))?;
-        let args = if let Some(raw_args) = labels.get(&args_key) {
-            serde_json::from_str::<Vec<String>>(raw_args).map_err(|err| {
-                anyhow!(
-                    "invalid {} label (expected JSON string[]): {}",
-                    args_key,
-                    err
-                )
-            })?
-        } else {
-            Vec::new()
-        };
-        let integration_level = labels.get(&integration_key).cloned();
-        let default_timeout_ms = if let Some(raw_timeout) = labels.get(&default_timeout_key) {
-            Some(raw_timeout.parse::<u64>().map_err(|err| {
-                anyhow!(
-                    "invalid {} label (expected u64 millis): {}",
-                    default_timeout_key,
-                    err
-                )
-            })?)
-        } else {
-            None
-        };
-        return Ok(Some(HarnessInvocationMetadata {
-            schema_version,
-            kind,
-            cmd,
-            args,
-            integration_level,
-            default_timeout_ms,
-        }));
-    }
-
-    Ok(None)
-}
-
-fn load_harness_invocation_from_image_file(
-    image: &str,
-) -> Result<Option<HarnessInvocationMetadata>> {
-    let output = Command::new("docker")
-        .args([
-            "run",
-            "--rm",
-            "--entrypoint",
-            "cat",
-            image,
-            "/agentlab/harness.json",
-        ])
-        .output()?;
-    if !output.status.success() {
-        let stderr = command_output_stderr(&output);
-        if stderr.contains("No such file")
-            || stderr.contains("cannot open")
-            || stderr.contains("not found")
-        {
-            return Ok(None);
-        }
-        return Err(anyhow!(
-            "failed to load /agentlab/harness.json from image {}: {}",
-            image,
-            stderr
-        ));
-    }
-    let raw = command_output_stdout(&output);
-    if raw.is_empty() {
-        return Ok(None);
-    }
-    let metadata: HarnessInvocationMetadata = serde_json::from_str(&raw).map_err(|err| {
-        anyhow!(
-            "invalid /agentlab/harness.json metadata in image {}: {}",
-            image,
-            err
-        )
-    })?;
-    Ok(Some(metadata))
-}
-
-fn validate_harness_invocation_metadata(metadata: &HarnessInvocationMetadata) -> Result<()> {
-    if metadata.schema_version.trim().is_empty() {
-        return Err(anyhow!(
-            "harness invocation metadata requires non-empty schema_version"
-        ));
-    }
-    if metadata.kind.trim() != "command" {
-        return Err(anyhow!(
-            "unsupported harness invocation kind '{}': only 'command' is supported",
-            metadata.kind
-        ));
-    }
-    if metadata.cmd.trim().is_empty() {
-        return Err(anyhow!(
-            "harness invocation metadata requires non-empty cmd"
-        ));
-    }
-    if metadata
-        .integration_level
-        .as_deref()
-        .map(|v| v.trim().is_empty())
-        .unwrap_or(false)
-    {
-        return Err(anyhow!(
-            "harness invocation metadata integration_level must not be empty"
-        ));
-    }
-    if metadata.default_timeout_ms == Some(0) {
-        return Err(anyhow!(
-            "harness invocation metadata default_timeout_ms must be > 0"
-        ));
-    }
-    Ok(())
-}
-
-fn resolve_harness_invocation(
-    _json_value: &Value,
-    harness: &AgentLoopConfig,
-    project_root: &Path,
-    _executor_kind: ExecutorKind,
-) -> Result<ResolvedHarnessInvocation> {
-    if harness.command_raw.is_empty() {
-        return Err(anyhow!(
-            "runtime agent entrypoint is required for execution"
-        ));
-    }
-    let command = if harness.resolve_command_from_project_root {
-        resolve_command_local(&harness.command_raw, project_root)
-    } else {
-        harness.command_raw.clone()
-    };
-    if harness.resolve_command_from_project_root {
-        validate_harness_command(&command, project_root)?;
-    }
-    Ok(ResolvedHarnessInvocation {
-        command,
-        source: HarnessInvocationSource::RuntimeSpec,
-        integration_level: None,
-        default_timeout_ms: None,
-    })
-}
-
-fn resolve_command_local(command: &[String], exp_dir: &Path) -> Vec<String> {
+fn resolve_agent_runtime_command(command: &[String], exp_dir: &Path) -> Vec<String> {
     let mut resolved = Vec::new();
     for part in command {
         let p = Path::new(part);
@@ -5635,7 +6372,7 @@ fn normalize_path(path: &Path) -> PathBuf {
     out
 }
 
-fn validate_harness_command(command: &[String], project_root: &Path) -> Result<()> {
+fn validate_agent_runtime_command(command: &[String], project_root: &Path) -> Result<()> {
     if command.is_empty() {
         return Ok(());
     }
@@ -5661,7 +6398,7 @@ fn validate_harness_command(command: &[String], project_root: &Path) -> Result<(
                 format!("candidates: {}", candidates.join(", "))
             };
             return Err(anyhow!(
-                "agent entrypoint file not found on host: {} (update runtime.agent or runtime.agent_loop command). {}",
+                "agent entrypoint file not found on host: {} (update runtime.agent command). {}",
                 p.display(),
                 hint
             ));
@@ -5670,11 +6407,8 @@ fn validate_harness_command(command: &[String], project_root: &Path) -> Result<(
     Ok(())
 }
 
-fn run_process_with_trial_io(
+fn run_adapter_process(
     mut cmd: Command,
-    control_transport: &HarnessControlTransport,
-    run_id: &str,
-    input_path: &Path,
     output_path: &Path,
     start_response_path: Option<&Path>,
 ) -> Result<ProcessRunResult> {
@@ -5693,41 +6427,15 @@ fn run_process_with_trial_io(
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
 
-    let output = if control_transport.mode != HarnessControlMode::File {
-        let mut child = cmd.spawn()?;
-        wait_for_control_transport(&control_transport.host_path, Duration::from_secs(20)).map_err(
-            |err| {
-                let _ = child.kill();
-                let _ = child.wait();
-                err
-            },
-        )?;
-        send_hti_request(
-            &control_transport.host_path,
-            run_id,
-            "start_run",
-            json!({
-                "input_ref": input_path.to_string_lossy().to_string(),
-                "payload": Value::Null
-            }),
-        )
-        .map_err(|err| {
+    let mut child = cmd.spawn()?;
+    if let Some(path) = start_response_path {
+        wait_for_file(path, Duration::from_secs(10)).map_err(|err| {
             let _ = child.kill();
             let _ = child.wait();
             err
         })?;
-        child.wait_with_output()?
-    } else {
-        let mut child = cmd.spawn()?;
-        if let Some(path) = start_response_path {
-            wait_for_file(path, Duration::from_secs(10)).map_err(|err| {
-                let _ = child.kill();
-                let _ = child.wait();
-                err
-            })?;
-        }
-        child.wait_with_output()?
-    };
+    }
+    let output = child.wait_with_output()?;
 
     Ok(ProcessRunResult {
         status: output
@@ -5784,26 +6492,11 @@ fn resolve_trial_io_host_path(
     if container_mode {
         return map_container_path_to_host(path, paths);
     }
-    if !path.starts_with('/') {
-        return Err(anyhow!(
-            "runtime io path must be absolute when using container mount contract: {}",
-            path
-        ));
-    }
-    if path.starts_with("/state")
-        || path.starts_with("/out")
-        || path.starts_with("/agentlab")
-        || path.starts_with("/harness")
-        || path.starts_with("/workspace")
-        || path.starts_with("/dataset")
-        || path.starts_with("/tmp")
-    {
-        return map_container_path_to_host(path, paths);
-    }
-    Err(anyhow!(
-        "unsupported runtime io path for non-container trials: {}",
-        path
-    ))
+    map_contract_path_to_host(
+        path,
+        &ContractPathHostRoots::from_trial_paths(paths),
+        ContractPathMode::RuntimeIo,
+    )
 }
 
 fn prepare_io_paths(
@@ -5843,7 +6536,7 @@ fn prepare_io_paths(
             DEFAULT_CONTAINER_RESULT_PATH.to_string(),
             DEFAULT_CONTAINER_TRAJECTORY_PATH.to_string(),
             DEFAULT_CONTAINER_TRIAL_INPUT_PATH.to_string(),
-            DEFAULT_CONTAINER_TRIAL_OUTPUT_PATH.to_string(),
+            DEFAULT_CONTAINER_RESULT_PATH.to_string(),
             DEFAULT_CONTAINER_EVENTS_PATH.to_string(),
             AGENTLAB_AGENTLABD_START_REQUEST_PATH.to_string(),
             AGENTLAB_AGENTLABD_START_RESPONSE_PATH.to_string(),
@@ -5924,12 +6617,18 @@ fn prepare_io_paths(
 
     let input_value: Value = serde_json::from_slice(input_bytes)?;
     let task_value = input_value.pointer("/task").cloned().unwrap_or(json!({}));
-    let bindings_value = input_value.pointer("/bindings").cloned().unwrap_or(json!({}));
+    let bindings_value = input_value
+        .pointer("/bindings")
+        .cloned()
+        .unwrap_or(json!({}));
     let dependencies_value = input_value
         .pointer("/dependencies")
         .cloned()
         .unwrap_or_else(|| json!({}));
-    let policy_value = input_value.pointer("/policy").cloned().unwrap_or_else(|| json!({}));
+    let policy_value = input_value
+        .pointer("/policy")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
 
     atomic_write_json_pretty(&task_host, &task_value)?;
     atomic_write_json_pretty(&bindings_host, &bindings_value)?;
@@ -5979,8 +6678,8 @@ fn prepare_io_paths(
     })
 }
 
-fn materialize_trial_output(trial_dir: &Path, output_path: &Path) -> Result<PathBuf> {
-    let canonical_output = trial_dir.join("result.json");
+fn materialize_trial_result(trial_dir: &Path, output_path: &Path) -> Result<PathBuf> {
+    let canonical_output = trial_dir.join(CANONICAL_TRIAL_RESULT_FILENAME);
     if output_path != canonical_output {
         if canonical_output.exists() {
             let _ = fs::remove_file(&canonical_output);
@@ -5992,189 +6691,15 @@ fn materialize_trial_output(trial_dir: &Path, output_path: &Path) -> Result<Path
             fs::copy(output_path, &canonical_output)?;
         }
     }
-    // Temporary compatibility mirror for downstream consumers still reading trial_output.json.
-    if canonical_output.exists() {
-        fs::copy(&canonical_output, trial_dir.join("trial_output.json"))?;
-    }
     Ok(canonical_output)
 }
 
-fn resolve_control_paths(
-    harness: &AgentLoopConfig,
-    paths: &TrialPaths,
-    container_mode: bool,
-) -> Result<HarnessControlTransport> {
-    if matches!(harness.control_mode, HarnessControlMode::Uds) && cfg!(not(unix)) {
-        return Err(anyhow!(
-            "uds control transport is only supported on unix platforms"
-        ));
-    }
-
-    match harness.control_mode {
-        HarnessControlMode::File => {
-            if container_mode {
-                let host_path = map_container_path_to_host(&harness.control_path, paths)?;
-                Ok(HarnessControlTransport {
-                    mode: HarnessControlMode::File,
-                    harness_path: harness.control_path.clone(),
-                    host_path,
-                    harness_mount_dir: None,
-                    host_mount_dir: None,
-                })
-            } else {
-                let host = resolve_trial_io_host_path(&harness.control_path, paths, false)?;
-                Ok(HarnessControlTransport {
-                    mode: HarnessControlMode::File,
-                    harness_path: host.to_string_lossy().to_string(),
-                    host_path: host,
-                    harness_mount_dir: None,
-                    host_mount_dir: None,
-                })
-            }
-        }
-        HarnessControlMode::Uds => {
-            let resolve_uds_path = |raw: &str| -> Result<String> {
-                let trimmed = raw.trim();
-                if !trimmed.starts_with('/') {
-                    return Err(anyhow!(
-                        "control socket path must be absolute for uds transport: {}",
-                        trimmed
-                    ));
-                }
-                Ok(trimmed.to_string())
-            };
-
-            if !container_mode {
-                let socket_path = resolve_uds_path(&harness.control_path)?;
-                let host_path = PathBuf::from(&socket_path);
-                return Ok(HarnessControlTransport {
-                    mode: HarnessControlMode::Uds,
-                    harness_path: host_path.to_string_lossy().to_string(),
-                    host_path,
-                    harness_mount_dir: None,
-                    host_mount_dir: None,
-                });
-            }
-            let socket_path = resolve_uds_path(&harness.control_path)?;
-            let socket_path = Path::new(&socket_path);
-            let harness_mount_dir = socket_path
-                .parent()
-                .and_then(|v| v.to_str())
-                .ok_or_else(|| {
-                    anyhow!(
-                        "control socket path must include a parent directory: {}",
-                        socket_path.display()
-                    )
-                })?
-                .to_string();
-            let socket_name = socket_path
-                .file_name()
-                .and_then(|v| v.to_str())
-                .ok_or_else(|| {
-                    anyhow!(
-                        "control socket path must include a socket file name: {}",
-                        socket_path.display()
-                    )
-                })?
-                .to_string();
-            let host_mount_dir = paths.state.join("agentlab_ipc");
-            ensure_dir(&host_mount_dir)?;
-            let host_path = host_mount_dir.join(&socket_name);
-            let harness_path = format!(
-                "{}/{}",
-                harness_mount_dir.trim_end_matches('/'),
-                socket_name
-            );
-
-            Ok(HarnessControlTransport {
-                mode: HarnessControlMode::Uds,
-                harness_path,
-                host_path,
-                harness_mount_dir: Some(harness_mount_dir),
-                host_mount_dir: Some(host_mount_dir),
-            })
-        }
-    }
-}
-
-fn wait_for_control_transport(path: &Path, timeout: Duration) -> Result<()> {
-    #[cfg(not(unix))]
-    {
-        let _ = path;
-        return Err(anyhow!(
-            "uds control transport is not supported on this platform at runtime"
-        ));
-    }
-
-    #[cfg(unix)]
-    {
-        let deadline = Instant::now() + timeout;
-        let mut last_err: Option<std::io::Error> = None;
-        while Instant::now() < deadline {
-            if path.exists() {
-                match UnixStream::connect(path) {
-                    Ok(_) => return Ok(()),
-                    Err(err) => last_err = Some(err),
-                }
-            }
-            thread::sleep(Duration::from_millis(50));
-        }
-
-        if let Some(err) = last_err {
-            return Err(anyhow!(
-                "control_transport_unavailable: path={}, timeout={:?}, error={}",
-                path.display(),
-                timeout,
-                err
-            ));
-        }
-        Err(anyhow!(
-            "control_transport_unavailable: path={}, timeout={:?}",
-            path.display(),
-            timeout
-        ))
-    }
-}
-
-fn hti_request(message_type: &str, request_id: &str, payload: Value) -> Value {
-    json!({
-        "request_id": request_id,
-        "type": message_type,
-        "timestamp": Utc::now().to_rfc3339(),
-        "payload": payload,
-    })
-}
-
-fn send_hti_request(
-    path: &Path,
-    request_id: &str,
-    message_type: &str,
-    payload: Value,
-) -> Result<()> {
-    let encoded = serde_json::to_string(&hti_request(message_type, request_id, payload))?;
-    #[cfg(unix)]
-    {
-        let mut stream = BufWriter::new(UnixStream::connect(path)?);
-        stream.write_all(encoded.as_bytes())?;
-        stream.write_all(b"\n")?;
-        stream.flush()?;
-    }
-    #[cfg(not(unix))]
-    {
-        let _ = (path, request_id, message_type, encoded);
-        return Err(anyhow!(
-            "uds control transport is not supported on this platform"
-        ));
-    }
+fn write_adapter_continue_control(path: &Path) -> Result<()> {
+    let _ = write_adapter_control_action(path, 0, "continue", None, "run_loop")?;
     Ok(())
 }
 
-fn write_control_file(path: &Path) -> Result<()> {
-    let _ = write_control_action(path, 0, "continue", None, "run_loop")?;
-    Ok(())
-}
-
-fn write_control_action(
+fn write_adapter_control_action(
     path: &Path,
     seq: u64,
     action: &str,
@@ -6288,7 +6813,7 @@ fn write_state_inventory(
                 "cases": []
             }
         },
-        "agent_loop_identity": {
+        "agent_runtime_identity": {
             "name": harness.command_raw.get(0).cloned().unwrap_or("unknown".to_string()),
             "exec_digest": exec_digest,
             "entry_command": harness.command_raw.clone(),
@@ -6330,7 +6855,7 @@ fn apply_materialization_policy(trial_dir: &Path, mode: MaterializationMode) -> 
                 remove_path_if_exists(&trial_dir.join(dir_name))?;
             }
             remove_path_if_exists(&trial_dir.join("trial_input.json"))?;
-            remove_path_if_exists(&trial_dir.join("trial_output.json"))?;
+            remove_path_if_exists(&trial_dir.join(CANONICAL_TRIAL_RESULT_FILENAME))?;
             remove_path_if_exists(&trial_dir.join("harness_manifest.json"))?;
             remove_path_if_exists(&trial_dir.join("trace_manifest.json"))?;
             if matches!(mode, MaterializationMode::None) {
@@ -6342,43 +6867,11 @@ fn apply_materialization_policy(trial_dir: &Path, mode: MaterializationMode) -> 
 }
 
 fn map_container_path_to_host(path: &str, paths: &TrialPaths) -> Result<PathBuf> {
-    let raw = path.trim();
-    if raw.is_empty() {
-        return Err(anyhow!("container path is empty"));
-    }
-    if !raw.starts_with('/') {
-        return Err(anyhow!("container path must be absolute: {}", raw));
-    }
-
-    let (base, rest) = if let Some(rest) = raw.strip_prefix(AGENTLAB_CONTRACT_IN_DIR) {
-        (paths.in_dir.as_path(), rest)
-    } else if let Some(rest) = raw.strip_prefix(AGENTLAB_CONTRACT_STATE_DIR) {
-        (paths.state.as_path(), rest)
-    } else if let Some(rest) = raw.strip_prefix(AGENTLAB_CONTRACT_OUT_DIR) {
-        (paths.out.as_path(), rest)
-    } else if let Some(rest) = raw.strip_prefix(AGENTLAB_CONTRACT_DEPS_DIR) {
-        (paths.deps.as_path(), rest)
-    } else if let Some(rest) = raw.strip_prefix(AGENTLAB_CONTRACT_WORKSPACE_DIR) {
-        (paths.workspace.as_path(), rest)
-    } else if let Some(rest) = raw.strip_prefix("/state") {
-        (paths.state.as_path(), rest)
-    } else if let Some(rest) = raw.strip_prefix("/out") {
-        (paths.out.as_path(), rest)
-    } else if let Some(rest) = raw.strip_prefix("/deps") {
-        (paths.deps.as_path(), rest)
-    } else if let Some(rest) = raw.strip_prefix("/harness") {
-        (paths.exp_dir.as_path(), rest)
-    } else if let Some(rest) = raw.strip_prefix("/workspace") {
-        (paths.workspace.as_path(), rest)
-    } else if let Some(rest) = raw.strip_prefix("/dataset") {
-        (paths.dataset.as_path(), rest)
-    } else if let Some(rest) = raw.strip_prefix("/tmp") {
-        (paths.tmp.as_path(), rest)
-    } else {
-        return Err(anyhow!("unsupported container mount path: {}", raw));
-    };
-
-    Ok(base.join(rest.trim_start_matches('/')))
+    map_contract_path_to_host(
+        path,
+        &ContractPathHostRoots::from_trial_paths(paths),
+        ContractPathMode::ContainerMount,
+    )
 }
 
 fn count_event_types(events_path: &Path) -> Result<BTreeMap<String, usize>> {
@@ -6515,53 +7008,88 @@ mod tests {
         ]
     }
 
+    #[test]
+    fn adapter_registry_supports_prebuilt_codex_and_rex_jesus() {
+        let codex = adapter_registry_entry(&AgentAdapterRef {
+            id: PREBUILT_CODEX_ADAPTER_ID.to_string(),
+            version: PREBUILT_AGENT_ADAPTER_VERSION.to_string(),
+        })
+        .expect("codex prebuilt adapter");
+        assert!(codex.capabilities().pause);
+
+        let rex = adapter_registry_entry(&AgentAdapterRef {
+            id: PREBUILT_REX_JESUS_ADAPTER_ID.to_string(),
+            version: PREBUILT_AGENT_ADAPTER_VERSION.to_string(),
+        })
+        .expect("rex prebuilt adapter");
+        assert!(rex.capabilities().pause);
+    }
+
+    #[test]
+    fn adapter_registry_error_lists_supported_adapters() {
+        let err = adapter_registry_entry(&AgentAdapterRef {
+            id: "unknown.adapter".to_string(),
+            version: "v0".to_string(),
+        })
+        .expect_err("unsupported adapter should fail");
+        let msg = err.to_string();
+        assert!(
+            msg.contains(&format!(
+                "{}@{}",
+                BUILTIN_COMMAND_ADAPTER_ID, BUILTIN_COMMAND_ADAPTER_VERSION
+            )),
+            "message should include builtin adapter: {}",
+            msg
+        );
+        assert!(
+            msg.contains(&format!(
+                "{}@{}",
+                PREBUILT_CODEX_ADAPTER_ID, PREBUILT_AGENT_ADAPTER_VERSION
+            )),
+            "message should include codex prebuilt adapter: {}",
+            msg
+        );
+        assert!(
+            msg.contains(&format!(
+                "{}@{}",
+                PREBUILT_REX_JESUS_ADAPTER_ID, PREBUILT_AGENT_ADAPTER_VERSION
+            )),
+            "message should include rex prebuilt adapter: {}",
+            msg
+        );
+    }
+
     fn write_resolved_experiment(
         run_dir: &Path,
         integration_level: &str,
         include_events_path: bool,
     ) {
-        let mut harness = serde_json::Map::new();
-        harness.insert(
-            "command".to_string(),
-            Value::Array(
-                harness_success_command()
-                    .into_iter()
-                    .map(Value::String)
-                    .collect(),
-            ),
-        );
-        harness.insert(
-            "integration_level".to_string(),
-            Value::String(integration_level.to_string()),
-        );
-        harness.insert(
-            "input_path".to_string(),
-            Value::String(AGENTLAB_TRIAL_INPUT_PATH.to_string()),
-        );
-        harness.insert(
-            "output_path".to_string(),
-            Value::String(AGENTLAB_TRIAL_OUTPUT_PATH.to_string()),
-        );
-        harness.insert(
-            "control_plane".to_string(),
-            json!({
-                "mode": "file",
-                "path": AGENTLAB_CONTROL_PATH
-            }),
-        );
-        if include_events_path {
-            harness.insert(
-                "events".to_string(),
-                json!({
-                    "path": AGENTLAB_TRIAL_EVENTS_PATH
-                }),
-            );
-        }
+        let _ = include_events_path;
 
         let resolved = json!({
+            "version": "0.3",
+            "experiment": { "id": "e", "name": "n", "workload_type": "agent_harness" },
+            "dataset": { "path": "tasks.jsonl" },
+            "design": { "sanitization_profile": "hermetic_functional", "replications": 1 },
+            "baseline": { "variant_id": "base", "bindings": {} },
             "runtime": {
-                "harness": Value::Object(harness),
-                "network": { "mode": "none" }
+                "agent": {
+                    "mode": "custom_image",
+                    "integration_level": integration_level,
+                    "adapter": {
+                        "id": BUILTIN_COMMAND_ADAPTER_ID,
+                        "version": BUILTIN_COMMAND_ADAPTER_VERSION
+                    },
+                    "custom_image": {
+                        "entrypoint": harness_success_command(),
+                        "image": "img"
+                    }
+                },
+                "policy": {
+                    "timeout_ms": 600000,
+                    "sandbox": { "mode": "local" },
+                    "network": { "mode": "none", "allowed_hosts": [] }
+                }
             }
         });
         atomic_write_json_pretty(&run_dir.join("resolved_experiment.json"), &resolved)
@@ -6594,7 +7122,7 @@ mod tests {
 
         let trial_input = json!({
             "schema_version": "agent_task_v1",
-            "ids": { "trial_id": trial_id },
+            "ids": { "trial_id": trial_id, "variant_id": "base", "task_id": "task_1", "repl_idx": 0 },
             "task": {
                 "id": "task_1"
             },
@@ -6620,8 +7148,11 @@ mod tests {
             "outcome": "success",
             "checkpoints": checkpoints
         });
-        atomic_write_json_pretty(&trial_dir.join("trial_output.json"), &trial_output)
-            .expect("trial output");
+        atomic_write_json_pretty(
+            &trial_dir.join(CANONICAL_TRIAL_RESULT_FILENAME),
+            &trial_output,
+        )
+        .expect("trial output");
 
         write_trial_state(
             &trial_dir,
@@ -6638,6 +7169,23 @@ mod tests {
         .expect("trial state");
 
         trial_dir
+    }
+
+    fn active_control_for_trial(trial_dir: &Path) -> ActiveAdapterControl {
+        let control_path = trial_dir.join("state").join("lab_control.json");
+        write_adapter_continue_control(&control_path).expect("control file");
+        ActiveAdapterControl {
+            adapter_id: BUILTIN_COMMAND_ADAPTER_ID.to_string(),
+            adapter_version: BUILTIN_COMMAND_ADAPTER_VERSION.to_string(),
+            command_path: control_path.to_string_lossy().to_string(),
+            events_path: Some(
+                trial_dir
+                    .join("state")
+                    .join("events.jsonl")
+                    .to_string_lossy()
+                    .to_string(),
+            ),
+        }
     }
 
     fn spawn_pause_ack_writer(
@@ -6700,6 +7248,232 @@ mod tests {
         })
     }
 
+    fn create_trial_paths_fixture(prefix: &str) -> (TempDirGuard, TrialPaths) {
+        let root = TempDirGuard::new(prefix);
+        let exp_dir = root.path.join("exp");
+        ensure_dir(&exp_dir).expect("exp dir");
+        fs::write(exp_dir.join("README.md"), "fixture").expect("exp fixture");
+        let dataset_src = root.path.join("tasks.jsonl");
+        fs::write(&dataset_src, "{\"id\":\"task_1\"}\n").expect("dataset");
+        let trial_dir = root.path.join("trial_1");
+        ensure_dir(&trial_dir).expect("trial");
+        let paths = TrialPaths::new(&trial_dir, &exp_dir, &dataset_src).expect("trial paths");
+        paths.prepare(true).expect("prepare");
+        (root, paths)
+    }
+
+    #[test]
+    fn contract_path_mapper_resolves_container_contract_paths() {
+        let (_root, paths) = create_trial_paths_fixture("agentlab_contract_mapper_container");
+        let cases = vec![
+            (
+                format!("{}/trial_input.json", AGENTLAB_CONTRACT_IN_DIR),
+                paths.in_dir.join("trial_input.json"),
+            ),
+            (
+                format!("{}/events.jsonl", AGENTLAB_CONTRACT_STATE_DIR),
+                paths.state.join("events.jsonl"),
+            ),
+            (
+                format!("{}/result.json", AGENTLAB_CONTRACT_OUT_DIR),
+                paths.out.join("result.json"),
+            ),
+        ];
+        for (raw, expected) in cases {
+            let resolved = map_container_path_to_host(&raw, &paths).expect("resolve path");
+            assert_eq!(resolved, expected, "path mismatch for {}", raw);
+        }
+
+        let err = map_container_path_to_host("/stateful/not_state", &paths).expect_err("reject");
+        assert!(
+            err.to_string().contains("unsupported container mount path"),
+            "unexpected error: {}",
+            err
+        );
+
+        let err = map_container_path_to_host("/state/events.jsonl", &paths).expect_err("reject");
+        assert!(
+            err.to_string().contains("unsupported container mount path"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn contract_path_mapper_enforces_mode_specific_paths() {
+        let (_root, paths) = create_trial_paths_fixture("agentlab_contract_mapper_modes");
+        let contract_deps = format!("{}/pkg.json", AGENTLAB_CONTRACT_DEPS_DIR);
+        let resolved =
+            resolve_trial_io_host_path(&contract_deps, &paths, false).expect("contract deps");
+        assert_eq!(resolved, paths.deps.join("pkg.json"));
+
+        let err = resolve_trial_io_host_path("/deps/pkg.json", &paths, false).expect_err("reject");
+        assert!(
+            err.to_string()
+                .contains("unsupported runtime io path for non-container trials"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn contract_path_mapper_resolves_event_paths_and_rejects_invalid_roots() {
+        let (_root, paths) = create_trial_paths_fixture("agentlab_contract_mapper_events");
+        let trial_dir = paths.in_dir.parent().expect("trial dir").to_path_buf();
+
+        let in_path = format!("{}/trial_input.json", AGENTLAB_CONTRACT_IN_DIR);
+        let resolved_in = resolve_event_path_for_trial(&in_path, &trial_dir).expect("in path");
+        assert_eq!(resolved_in, trial_dir.join("in").join("trial_input.json"));
+
+        let err = resolve_event_path_for_trial("/dataset/tasks.jsonl", &trial_dir)
+            .expect_err("reject legacy dataset path");
+        assert!(
+            err.to_string()
+                .contains("unsupported runtime event path for trial"),
+            "unexpected error: {}",
+            err
+        );
+
+        let err = resolve_event_path_for_trial("/harness/logs/events.jsonl", &trial_dir)
+            .expect_err("reject");
+        assert!(
+            err.to_string()
+                .contains("unsupported runtime event path for trial"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn run_session_state_roundtrip_normalizes_execution_options() {
+        let (_root, run_dir) = create_run_dir("agentlab_run_session_state", "run_1");
+        let behavior = RunBehavior {
+            setup_command: Some("echo setup".to_string()),
+            network_mode_override: Some("full".to_string()),
+            require_network_none: false,
+        };
+        let execution = RunExecutionOptions {
+            executor: Some(ExecutorKind::LocalProcess),
+            materialize: None,
+            remote_endpoint: None,
+            remote_token_env: Some("TOKEN".to_string()),
+        };
+        write_run_session_state(&run_dir, "run_1", &behavior, &execution).expect("write state");
+        let state = load_run_session_state(&run_dir).expect("load state");
+        assert_eq!(state.schema_version, "run_session_state_v1");
+        assert_eq!(state.run_id, "run_1");
+        assert_eq!(state.behavior.setup_command.as_deref(), Some("echo setup"));
+        assert_eq!(
+            state.behavior.network_mode_override.as_deref(),
+            Some("full")
+        );
+        assert_eq!(state.execution.executor, Some(ExecutorKind::LocalProcess));
+        assert_eq!(state.execution.materialize, Some(MaterializationMode::Full));
+        assert_eq!(state.execution.remote_token_env.as_deref(), Some("TOKEN"));
+    }
+
+    #[test]
+    fn continue_run_accepts_paused_and_interrupted_terminal_statuses() {
+        for status in ["paused", "interrupted"] {
+            let (_root, run_dir) = create_run_dir("agentlab_continue_statuses", "run_1");
+            write_run_control(&run_dir, "run_1", status, None, None).expect("run control");
+
+            let err =
+                continue_run(&run_dir).expect_err("continue should reach run session state load");
+            assert!(
+                err.to_string().contains("run_session_state.json not found"),
+                "status {} produced unexpected error: {}",
+                status,
+                err
+            );
+        }
+    }
+
+    #[test]
+    fn continue_run_uses_persisted_behavior() {
+        let (_root, run_dir) = create_run_dir("agentlab_continue_persisted_behavior", "run_1");
+        let dataset_path = run_dir.join("tasks.jsonl");
+        fs::write(&dataset_path, "{\"id\":\"task_1\"}\n").expect("dataset");
+        let resolved = json!({
+            "version": "0.3",
+            "experiment": { "id": "e", "name": "n", "workload_type": "agent_harness" },
+            "dataset": {
+                "path": "tasks.jsonl",
+                "provider": "local_jsonl",
+                "suite_id": "s",
+                "schema_version": "v1",
+                "split_id": "dev",
+                "limit": 1
+            },
+            "design": {
+                "sanitization_profile": "hermetic_functional",
+                "comparison": "paired",
+                "replications": 1,
+                "random_seed": 1,
+                "shuffle_tasks": false,
+                "max_concurrency": 1
+            },
+            "baseline": { "variant_id": "base", "bindings": {} },
+            "runtime": {
+                "agent": {
+                    "mode": "custom_image",
+                    "integration_level": "cli_basic",
+                    "adapter": {
+                        "id": BUILTIN_COMMAND_ADAPTER_ID,
+                        "version": BUILTIN_COMMAND_ADAPTER_VERSION
+                    },
+                    "custom_image": {
+                        "entrypoint": harness_success_command(),
+                        "image": "img"
+                    }
+                },
+                "policy": {
+                    "timeout_ms": 600000,
+                    "sandbox": { "mode": "local" },
+                    "network": { "mode": "full", "allowed_hosts": [] }
+                }
+            }
+        });
+        atomic_write_json_pretty(&run_dir.join("resolved_experiment.json"), &resolved)
+            .expect("resolved");
+        write_run_control(&run_dir, "run_1", "failed", None, None).expect("run control");
+        let schedule = build_trial_schedule(1, 1, 1, parse_policies(&resolved).scheduling, 1);
+        let schedule_progress = ScheduleProgress {
+            schema_version: "schedule_progress_v1".to_string(),
+            run_id: "run_1".to_string(),
+            total_slots: schedule.len(),
+            next_schedule_index: 0,
+            next_trial_index: 0,
+            schedule,
+            completed_slots: Vec::new(),
+            pruned_variants: Vec::new(),
+            consecutive_failures: BTreeMap::new(),
+            use_container: false,
+            updated_at: Utc::now().to_rfc3339(),
+        };
+        write_schedule_progress(&run_dir, &schedule_progress).expect("progress");
+        let behavior = RunBehavior {
+            setup_command: None,
+            network_mode_override: None,
+            require_network_none: true,
+        };
+        write_run_session_state(
+            &run_dir,
+            "run_1",
+            &behavior,
+            &RunExecutionOptions::default(),
+        )
+        .expect("run session");
+
+        let err = continue_run(&run_dir).expect_err("continue should honor persisted behavior");
+        assert!(
+            err.to_string()
+                .contains("run-experiment requires network mode 'none'"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
     #[test]
     fn resolve_script_path_supports_binary_first_commands() {
         let root = PathBuf::from("/tmp/agentlab_proj");
@@ -6721,72 +7495,39 @@ mod tests {
     }
 
     #[test]
-    fn resolve_command_local_resolves_first_token_when_path_like() {
+    fn resolve_agent_runtime_command_resolves_first_token_when_path_like() {
         let root = PathBuf::from("/tmp/agentlab_proj");
         let cmd = vec!["./harness".to_string(), "run".to_string()];
-        let resolved = resolve_command_local(&cmd, &root);
+        let resolved = resolve_agent_runtime_command(&cmd, &root);
         assert_eq!(resolved[0], root.join("harness").to_string_lossy());
         assert_eq!(resolved[1], "run");
     }
 
     #[test]
-    fn parse_harness_invocation_from_labels_supports_json_payload() {
-        let mut labels = BTreeMap::new();
-        labels.insert(
-            "io.agentlab.harness".to_string(),
-            r#"{"schema_version":"harness_invocation_v1","kind":"command","cmd":"node","args":["/app/harness.js","run"],"integration_level":"cli_events","default_timeout_ms":120000}"#.to_string(),
-        );
-        let metadata = parse_harness_invocation_from_labels(&labels)
-            .expect("parse labels")
-            .expect("metadata");
-        assert_eq!(metadata.cmd, "node");
-        assert_eq!(metadata.args, vec!["/app/harness.js", "run"]);
-        assert_eq!(metadata.integration_level.as_deref(), Some("cli_events"));
-        assert_eq!(metadata.default_timeout_ms, Some(120000));
-    }
-
-    #[test]
-    fn parse_harness_invocation_from_labels_supports_split_fields() {
-        let mut labels = BTreeMap::new();
-        labels.insert(
-            "io.agentlab.harness.schema_version".to_string(),
-            "harness_invocation_v1".to_string(),
-        );
-        labels.insert(
-            "io.agentlab.harness.kind".to_string(),
-            "command".to_string(),
-        );
-        labels.insert("io.agentlab.harness.cmd".to_string(), "python".to_string());
-        labels.insert(
-            "io.agentlab.harness.args".to_string(),
-            "[\"/opt/harness.py\",\"--run\"]".to_string(),
-        );
-        let metadata = parse_harness_invocation_from_labels(&labels)
-            .expect("parse labels")
-            .expect("metadata");
-        assert_eq!(metadata.cmd, "python");
-        assert_eq!(metadata.args, vec!["/opt/harness.py", "--run"]);
-    }
-
-    #[test]
-    fn resolve_harness_parses_launch_mode_stdio() {
+    fn resolve_agent_runtime_parses_launch_mode_stdio() {
         let root = TempDirGuard::new("agentlab_launch_mode_parse");
         let exp_dir = root.path.join("exp");
         ensure_dir(&exp_dir).expect("exp dir");
         let spec = json!({
             "runtime": {
-                "harness": {
-                    "mode": "cli",
-                    "command": ["sh", "-lc", "echo ok"],
+                "agent": {
+                    "mode": "custom_image",
+                    "custom_image": {
+                        "entrypoint": ["sh", "-lc", "echo ok"],
+                        "image": "img"
+                    },
                     "integration_level": "cli_basic",
-                    "launch": { "mode": "stdio" },
-                    "control_plane": { "mode": "file", "path": AGENTLAB_CONTROL_PATH }
+                    "launch": { "mode": "stdio" }
                 },
-                "sandbox": { "mode": "container" }
+                "policy": {
+                    "timeout_ms": 600000,
+                    "sandbox": { "mode": "container", "image": "img" },
+                    "network": { "mode": "none", "allowed_hosts": [] }
+                }
             }
         });
 
-        let harness = resolve_agent_loop(&spec, &exp_dir).expect("resolve harness");
+        let harness = resolve_agent_runtime(&spec, &exp_dir).expect("resolve harness");
         assert_eq!(harness.launch_mode, HarnessLaunchMode::Stdio);
     }
 
@@ -6812,7 +7553,7 @@ mod tests {
             result_path: AGENTLAB_RESULT_PATH.to_string(),
             trajectory_path: AGENTLAB_TRAJECTORY_PATH.to_string(),
             harness_input_path: AGENTLAB_TRIAL_INPUT_PATH.to_string(),
-            harness_output_path: AGENTLAB_TRIAL_OUTPUT_PATH.to_string(),
+            harness_output_path: AGENTLAB_RESULT_PATH.to_string(),
             harness_events_path: AGENTLAB_TRIAL_EVENTS_PATH.to_string(),
             harness_agentlabd_start_request_path: AGENTLAB_AGENTLABD_START_REQUEST_PATH.to_string(),
             harness_agentlabd_start_response_path: AGENTLAB_AGENTLABD_START_RESPONSE_PATH
@@ -6826,20 +7567,17 @@ mod tests {
                 "repl_idx": 0
             }
         });
-        let env =
-            build_runtime_contract_env("run_1", &input, &io, Some(12345));
+        let env = build_runtime_contract_env("run_1", &input, &io, Some(12345));
         assert_eq!(
             env.get(AGENTLAB_ENV_TASK_PATH).map(String::as_str),
             Some(AGENTLAB_TASK_PATH)
         );
         assert_eq!(
-            env.get(AGENTLAB_ENV_BINDINGS_PATH)
-                .map(String::as_str),
+            env.get(AGENTLAB_ENV_BINDINGS_PATH).map(String::as_str),
             Some(AGENTLAB_BINDINGS_PATH)
         );
         assert_eq!(
-            env.get(AGENTLAB_ENV_RESULT_PATH)
-                .map(String::as_str),
+            env.get(AGENTLAB_ENV_RESULT_PATH).map(String::as_str),
             Some(AGENTLAB_RESULT_PATH)
         );
     }
@@ -6851,15 +7589,21 @@ mod tests {
         ensure_dir(&exp_dir).expect("exp dir");
         let spec = json!({
             "runtime": {
-                "agent_loop": {
-                    "command": ["sh", "-lc", "echo ok"],
-                    "env": {"A":"B"}
+                "agent": {
+                    "mode": "custom_image",
+                    "custom_image": {
+                        "entrypoint": ["sh", "-lc", "echo ok"],
+                        "image": "img"
+                    },
+                    "overrides": {
+                        "env": {"A":"B"}
+                    }
                 },
                 "dependencies": {
                     "file_staging": [
                         {
                             "source_from_host": "./secrets/graphd.db",
-                            "destination_path": "/state/.graphd/graphd.db",
+                            "destination_path": format!("{}/.graphd/graphd.db", AGENTLAB_CONTRACT_STATE_DIR),
                             "required": true
                         }
                     ]
@@ -6872,14 +7616,17 @@ mod tests {
             }
         });
 
-        let harness = resolve_agent_loop(&spec, &exp_dir).expect("resolve harness");
+        let harness = resolve_agent_runtime(&spec, &exp_dir).expect("resolve harness");
         assert_eq!(harness.dependency_file_staging.len(), 1);
         let entry = &harness.dependency_file_staging[0];
         assert_eq!(
             entry.source_from_host,
             normalize_path(&exp_dir.join("secrets/graphd.db"))
         );
-        assert_eq!(entry.destination_path, "/state/.graphd/graphd.db");
+        assert_eq!(
+            entry.destination_path,
+            format!("{}/.graphd/graphd.db", AGENTLAB_CONTRACT_STATE_DIR)
+        );
         assert!(entry.required);
     }
 
@@ -6900,9 +7647,8 @@ mod tests {
         fs::write(&source_db, "db-bytes").expect("source db");
 
         let harness = AgentLoopConfig {
-            runtime_mode: AgentRuntimeMode::LegacyAgentLoop,
+            adapter_ref: AgentAdapterRef::default(),
             command_raw: vec![],
-            resolve_command_from_project_root: true,
             container_image: None,
             known_agent_id: None,
             known_agent_version: None,
@@ -6913,20 +7659,22 @@ mod tests {
             env_from_host: vec![],
             trajectory_path: None,
             causal_extraction: None,
-            control_path: "/state/lab_control.json".to_string(),
-            control_mode: HarnessControlMode::File,
+            default_timeout_ms: None,
             tracing_mode: None,
             force_container: true,
             dependency_file_staging: vec![
                 DependencyFileStagingSpec {
                     source_from_host: source_db.clone(),
-                    destination_path: "/state/.graphd/graphd.db".to_string(),
+                    destination_path: format!("{}/.graphd/graphd.db", AGENTLAB_CONTRACT_STATE_DIR),
                     required: true,
                     read_only: false,
                 },
                 DependencyFileStagingSpec {
                     source_from_host: root.path.join("missing-wal"),
-                    destination_path: "/state/.graphd/graphd.db-wal".to_string(),
+                    destination_path: format!(
+                        "{}/.graphd/graphd.db-wal",
+                        AGENTLAB_CONTRACT_STATE_DIR
+                    ),
                     required: false,
                     read_only: false,
                 },
@@ -6994,7 +7742,7 @@ mod tests {
     }
 
     #[test]
-    fn has_control_ack_matches_action_and_control_version() {
+    fn adapter_control_ack_received_matches_action_and_control_version() {
         let root = std::env::temp_dir().join(format!(
             "agentlab_ack_test_{}_{}",
             std::process::id(),
@@ -7005,13 +7753,13 @@ mod tests {
         let line = r#"{"event_type":"control_ack","seq":9,"step_index":2,"control_version":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","action_observed":"stop"}"#;
         atomic_write_bytes(&events_path, format!("{}\n", line).as_bytes()).expect("write events");
 
-        assert!(has_control_ack(
+        assert!(adapter_control_ack_received(
             &events_path,
             "stop",
             "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
         )
         .expect("parse ack"));
-        assert!(!has_control_ack(
+        assert!(!adapter_control_ack_received(
             &events_path,
             "checkpoint",
             "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
@@ -7034,11 +7782,12 @@ mod tests {
             "schema_version": "agent_result_v1",
             "outcome": "success",
             "checkpoints": [
-                {"path": "/state/ckpt_a", "logical_name": "a", "step": 1},
-                {"path": "/state/ckpt_b", "logical_name": "b", "step": 2}
+                {"path": format!("{}/ckpt_a", AGENTLAB_CONTRACT_STATE_DIR), "logical_name": "a", "step": 1},
+                {"path": format!("{}/ckpt_b", AGENTLAB_CONTRACT_STATE_DIR), "logical_name": "b", "step": 2}
             ]
         });
-        atomic_write_json_pretty(&trial_dir.join("trial_output.json"), &output).expect("write");
+        atomic_write_json_pretty(&trial_dir.join(CANONICAL_TRIAL_RESULT_FILENAME), &output)
+            .expect("write");
         let selector = resolve_resume_selector(&trial_dir, Some("a")).expect("selector");
         assert_eq!(selector, "checkpoint:a");
         let _ = fs::remove_dir_all(root);
@@ -7058,11 +7807,12 @@ mod tests {
             "schema_version": "agent_result_v1",
             "outcome": "success",
             "checkpoints": [
-                {"path": "/state/ckpt_a", "logical_name": "a", "step": 3},
-                {"path": "/state/ckpt_b", "logical_name": "b", "step": 5}
+                {"path": format!("{}/ckpt_a", AGENTLAB_CONTRACT_STATE_DIR), "logical_name": "a", "step": 3},
+                {"path": format!("{}/ckpt_b", AGENTLAB_CONTRACT_STATE_DIR), "logical_name": "b", "step": 5}
             ]
         });
-        atomic_write_json_pretty(&trial_dir.join("trial_output.json"), &output).expect("write");
+        atomic_write_json_pretty(&trial_dir.join(CANONICAL_TRIAL_RESULT_FILENAME), &output)
+            .expect("write");
         let selector = resolve_resume_selector(&trial_dir, None).expect("selector");
         assert_eq!(selector, "checkpoint:b");
         let _ = fs::remove_dir_all(root);
@@ -7077,10 +7827,11 @@ mod tests {
             "schema_version": "agent_result_v1",
             "outcome": "success",
             "checkpoints": [
-                {"path": "/state/ckpt_a", "logical_name": "a", "step": 1}
+                {"path": format!("{}/ckpt_a", AGENTLAB_CONTRACT_STATE_DIR), "logical_name": "a", "step": 1}
             ]
         });
-        atomic_write_json_pretty(&trial_dir.join("trial_output.json"), &output).expect("write");
+        atomic_write_json_pretty(&trial_dir.join(CANONICAL_TRIAL_RESULT_FILENAME), &output)
+            .expect("write");
         let err = resolve_resume_selector(&trial_dir, Some("missing")).expect_err("should fail");
         assert!(
             err.to_string().contains("resume_checkpoint_not_found"),
@@ -7109,7 +7860,7 @@ mod tests {
         ensure_dir(&trial_dir).expect("trial");
         let output = json!({
             "checkpoints": [
-                {"path": "/state/cp_missing", "logical_name": "cp1", "step": 3}
+                {"path": format!("{}/cp_missing", AGENTLAB_CONTRACT_STATE_DIR), "logical_name": "cp1", "step": 3}
             ]
         });
         let selector = parse_fork_selector("checkpoint:cp1").expect("selector");
@@ -7125,7 +7876,7 @@ mod tests {
         ensure_dir(&trial_dir).expect("trial");
         let output = json!({
             "checkpoints": [
-                {"path": "/state/cp_missing", "logical_name": "cp1", "step": 3}
+                {"path": format!("{}/cp_missing", AGENTLAB_CONTRACT_STATE_DIR), "logical_name": "cp1", "step": 3}
             ]
         });
         let selector = parse_fork_selector("checkpoint:cp1").expect("selector");
@@ -7145,7 +7896,7 @@ mod tests {
         seed_parent_trial(
             &run_dir,
             "trial_1",
-            json!([{"path": "/state/cp_missing", "logical_name": "cp1", "step": 1}]),
+            json!([{"path": format!("{}/cp_missing", AGENTLAB_CONTRACT_STATE_DIR), "logical_name": "cp1", "step": 1}]),
             "completed",
             None,
         );
@@ -7179,7 +7930,7 @@ mod tests {
         seed_parent_trial(
             &run_dir,
             "trial_1",
-            json!([{"path": "/state/cp1", "logical_name": "cp1", "step": 1}]),
+            json!([{"path": format!("{}/cp1", AGENTLAB_CONTRACT_STATE_DIR), "logical_name": "cp1", "step": 1}]),
             "completed",
             None,
         );
@@ -7208,7 +7959,7 @@ mod tests {
         seed_parent_trial(
             &run_dir,
             "trial_1",
-            json!([{"path": "/state/cp_missing", "logical_name": "cp1", "step": 1}]),
+            json!([{"path": format!("{}/cp_missing", AGENTLAB_CONTRACT_STATE_DIR), "logical_name": "cp1", "step": 1}]),
             "completed",
             None,
         );
@@ -7234,16 +7985,13 @@ mod tests {
         let (_root, run_dir) = create_run_dir("agentlab_pause_not_active", "run_1");
         write_resolved_experiment(&run_dir, "cli_events", true);
         let trial_dir = seed_parent_trial(&run_dir, "trial_1", json!([]), "running", None);
-        let control_path = trial_dir.join("state").join("lab_control.json");
-        let control_transport =
-            HarnessControlTransport::active(HarnessControlMode::File, &control_path);
-        write_control_file(&control_path).expect("control file");
+        let control = active_control_for_trial(&trial_dir);
         write_run_control(
             &run_dir,
             "run_1",
             "running",
             Some("trial_1"),
-            Some(&control_transport),
+            Some(&control),
         )
         .expect("run control");
 
@@ -7264,15 +8012,13 @@ mod tests {
         let trial_dir = seed_parent_trial(&run_dir, "trial_1", json!([]), "running", None);
         let control_path = trial_dir.join("state").join("lab_control.json");
         let events_path = trial_dir.join("state").join("events.jsonl");
-        let control_transport =
-            HarnessControlTransport::active(HarnessControlMode::File, &control_path);
-        write_control_file(&control_path).expect("control file");
+        let control = active_control_for_trial(&trial_dir);
         write_run_control(
             &run_dir,
             "run_1",
             "running",
             Some("trial_1"),
-            Some(&control_transport),
+            Some(&control),
         )
         .expect("run control");
 
@@ -7289,15 +8035,13 @@ mod tests {
         let trial_dir = seed_parent_trial(&run_dir, "trial_1", json!([]), "running", None);
         let control_path = trial_dir.join("state").join("lab_control.json");
         let events_path = trial_dir.join("state").join("events.jsonl");
-        let control_transport =
-            HarnessControlTransport::active(HarnessControlMode::File, &control_path);
-        write_control_file(&control_path).expect("control file");
+        let control = active_control_for_trial(&trial_dir);
         write_run_control(
             &run_dir,
             "run_1",
             "running",
             Some("trial_1"),
-            Some(&control_transport),
+            Some(&control),
         )
         .expect("run control");
 
@@ -7365,24 +8109,22 @@ mod tests {
         let trial_dir = seed_parent_trial(
             &run_dir,
             "trial_1",
-            json!([{"path": "/state/cp1", "logical_name": "cp1", "step": 1}]),
+            json!([{"path": format!("{}/cp1", AGENTLAB_CONTRACT_STATE_DIR), "logical_name": "cp1", "step": 1}]),
             "paused",
             Some("cp1"),
         );
         ensure_dir(&trial_dir.join("state").join("cp1")).expect("checkpoint path");
-        let control_path = trial_dir.join("state").join("lab_control.json");
-        let control_transport =
-            HarnessControlTransport::active(HarnessControlMode::File, &control_path);
+        let control = active_control_for_trial(&trial_dir);
         write_run_control(
             &run_dir,
             "run_1",
             "running",
             Some("trial_1"),
-            Some(&control_transport),
+            Some(&control),
         )
         .expect("run control");
 
-        let err = resume_run(&run_dir, None, None, &BTreeMap::new(), false)
+        let err = resume_trial(&run_dir, None, None, &BTreeMap::new(), false)
             .err()
             .expect("resume should fail for non-paused run");
         assert!(
@@ -7399,24 +8141,16 @@ mod tests {
         let trial_dir = seed_parent_trial(
             &run_dir,
             "trial_1",
-            json!([{"path": "/state/cp1", "logical_name": "cp1", "step": 1}]),
+            json!([{"path": format!("{}/cp1", AGENTLAB_CONTRACT_STATE_DIR), "logical_name": "cp1", "step": 1}]),
             "completed",
             None,
         );
         ensure_dir(&trial_dir.join("state").join("cp1")).expect("checkpoint path");
-        let control_path = trial_dir.join("state").join("lab_control.json");
-        let control_transport =
-            HarnessControlTransport::active(HarnessControlMode::File, &control_path);
-        write_run_control(
-            &run_dir,
-            "run_1",
-            "paused",
-            Some("trial_1"),
-            Some(&control_transport),
-        )
-        .expect("run control");
+        let control = active_control_for_trial(&trial_dir);
+        write_run_control(&run_dir, "run_1", "paused", Some("trial_1"), Some(&control))
+            .expect("run control");
 
-        let err = resume_run(&run_dir, None, None, &BTreeMap::new(), false)
+        let err = resume_trial(&run_dir, None, None, &BTreeMap::new(), false)
             .err()
             .expect("resume should fail when trial state is not paused");
         assert!(
@@ -7434,29 +8168,21 @@ mod tests {
             &run_dir,
             "trial_1",
             json!([
-                {"path": "/state/cp_old", "logical_name": "cp_old", "step": 1},
-                {"path": "/state/cp_resume", "logical_name": "cp_resume", "step": 2}
+                {"path": format!("{}/cp_old", AGENTLAB_CONTRACT_STATE_DIR), "logical_name": "cp_old", "step": 1},
+                {"path": format!("{}/cp_resume", AGENTLAB_CONTRACT_STATE_DIR), "logical_name": "cp_resume", "step": 2}
             ]),
             "paused",
             Some("cp_resume"),
         );
         ensure_dir(&trial_dir.join("state").join("cp_resume")).expect("checkpoint path");
-        let control_path = trial_dir.join("state").join("lab_control.json");
-        let control_transport =
-            HarnessControlTransport::active(HarnessControlMode::File, &control_path);
-        write_run_control(
-            &run_dir,
-            "run_1",
-            "paused",
-            Some("trial_1"),
-            Some(&control_transport),
-        )
-        .expect("run control");
+        let control = active_control_for_trial(&trial_dir);
+        write_run_control(&run_dir, "run_1", "paused", Some("trial_1"), Some(&control))
+            .expect("run control");
 
         let mut set_bindings = BTreeMap::new();
         set_bindings.insert("resume.override".to_string(), json!(42));
         let resumed =
-            resume_run(&run_dir, None, None, &set_bindings, false).expect("resume success");
+            resume_trial(&run_dir, None, None, &set_bindings, false).expect("resume success");
 
         assert_eq!(resumed.trial_id, "trial_1");
         assert_eq!(resumed.selector, "checkpoint:cp_resume");
@@ -7497,9 +8223,12 @@ mod tests {
             "design": { "sanitization_profile": "hermetic_functional", "comparison": "paired", "replications": 1, "random_seed": 1337, "shuffle_tasks": true, "max_concurrency": 1 },
             "baseline": { "variant_id": "base", "bindings": {} },
             "runtime": {
-                "harness": { "mode": "cli", "command": ["node", "h.js"], "integration_level": "cli_basic", "input_path": "/out/in.json", "output_path": "/out/out.json", "control_plane": { "mode": "file", "path": "/state/ctl.json" } },
-                "sandbox": { "mode": "local" },
-                "network": { "mode": "none", "allowed_hosts": [] }
+                "agent": { "mode": "custom_image", "custom_image": { "entrypoint": ["node", "h.js"] } },
+                "policy": {
+                    "timeout_ms": 600000,
+                    "sandbox": { "mode": "local" },
+                    "network": { "mode": "none", "allowed_hosts": [] }
+                }
             }
         });
         validate_required_fields(&spec).expect("valid spec should pass");
@@ -7513,7 +8242,10 @@ mod tests {
             "dataset": { "path": "tasks.jsonl" },
             "design": {},
             "baseline": {},
-            "runtime": { "harness": { "mode": "cli" }, "sandbox": { "mode": "local" }, "network": {} }
+            "runtime": {
+                "agent": {},
+                "policy": { "sandbox": { "mode": "local" }, "network": {} }
+            }
         });
         let err = validate_required_fields(&spec).expect_err("should fail");
         let msg = err.to_string();
@@ -7533,8 +8265,8 @@ mod tests {
             msg
         );
         assert!(
-            msg.contains("/runtime/harness/command"),
-            "missing command: {}",
+            msg.contains("/runtime/agent"),
+            "missing runtime.agent: {}",
             msg
         );
         assert!(
@@ -7558,9 +8290,12 @@ mod tests {
             "design": { "sanitization_profile": "hermetic_functional", "comparison": "paired", "replications": 1, "random_seed": 1337, "shuffle_tasks": true, "max_concurrency": 1 },
             "baseline": { "variant_id": "base", "bindings": {} },
             "runtime": {
-                "harness": { "mode": "cli", "command": ["node", "h.js"], "input_path": "/out/in.json", "output_path": "/out/out.json", "control_plane": { "mode": "file", "path": "/state/ctl.json" } },
-                "sandbox": { "mode": "local" },
-                "network": { "mode": "none", "allowed_hosts": [] }
+                "agent": { "mode": "custom_image", "custom_image": { "entrypoint": ["node", "h.js"] } },
+                "policy": {
+                    "timeout_ms": 600000,
+                    "sandbox": { "mode": "local" },
+                    "network": { "mode": "none", "allowed_hosts": [] }
+                }
             }
         });
         validate_required_fields(&spec).expect("missing integration_level should default");
@@ -7575,9 +8310,15 @@ mod tests {
             "design": { "sanitization_profile": "hermetic_functional", "comparison": "paired", "replications": 1, "random_seed": 1337, "shuffle_tasks": true, "max_concurrency": 1 },
             "baseline": { "variant_id": "base", "bindings": {} },
             "runtime": {
-                "harness": { "mode": "cli", "integration_level": "cli_basic" },
-                "sandbox": { "mode": "container" },
-                "network": { "mode": "none", "allowed_hosts": [] }
+                "agent": {
+                    "mode": "custom_image",
+                    "custom_image": { "entrypoint": ["node", "/app/h.js"] }
+                },
+                "policy": {
+                    "timeout_ms": 600000,
+                    "sandbox": { "mode": "container" },
+                    "network": { "mode": "none", "allowed_hosts": [] }
+                }
             }
         });
         let err = validate_required_fields(&spec).expect_err("should fail");
@@ -7587,8 +8328,8 @@ mod tests {
             err
         );
         assert!(
-            !err.to_string().contains("/runtime/harness/command"),
-            "container mode should not require runtime harness command: {}",
+            !err.to_string().contains("/runtime/agent/mode"),
+            "container mode runtime.agent mode should be present: {}",
             err
         );
     }
@@ -7654,6 +8395,164 @@ mod tests {
     }
 
     #[test]
+    fn resolve_variant_plan_parses_runtime_overrides() {
+        let spec = json!({
+            "baseline": {
+                "variant_id": "base",
+                "bindings": {},
+                "runtime_overrides": {
+                    "policy": {
+                        "timeout_ms": 123000
+                    }
+                }
+            },
+            "variant_plan": [
+                {
+                    "variant_id": "treatment",
+                    "bindings": {},
+                    "runtime_overrides": {
+                        "agent": {
+                            "custom_image": {
+                                "image": "example:variant"
+                            }
+                        }
+                    }
+                }
+            ]
+        });
+
+        let (variants, baseline_id) = resolve_variant_plan(&spec).expect("variant plan");
+        assert_eq!(baseline_id, "base");
+        assert_eq!(variants.len(), 2);
+        assert!(variants[0].runtime_overrides.is_some());
+        assert!(variants[1].runtime_overrides.is_some());
+    }
+
+    #[test]
+    fn resolve_variant_plan_rejects_invalid_runtime_overrides_shape() {
+        let spec = json!({
+            "baseline": {
+                "variant_id": "base",
+                "bindings": {},
+                "runtime_overrides": "bad"
+            }
+        });
+        let err = resolve_variant_plan(&spec).expect_err("baseline runtime_overrides should fail");
+        assert!(
+            err.to_string().contains("/baseline/runtime_overrides"),
+            "unexpected error: {}",
+            err
+        );
+
+        let spec = json!({
+            "baseline": { "variant_id": "base", "bindings": {} },
+            "variant_plan": [
+                {
+                    "variant_id": "treatment",
+                    "bindings": {},
+                    "runtime_overrides": "bad"
+                }
+            ]
+        });
+        let err = resolve_variant_plan(&spec).expect_err("variant runtime_overrides should fail");
+        assert!(
+            err.to_string()
+                .contains("/variant_plan[0].runtime_overrides"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn resolve_runtime_for_variant_merges_runtime_overrides() {
+        let base = json!({
+            "runtime": {
+                "agent": {
+                    "mode": "custom_image",
+                    "custom_image": {
+                        "image": "base:image",
+                        "entrypoint": ["echo", "base"]
+                    },
+                    "overrides": {
+                        "env": {
+                            "A": "1",
+                            "B": "2"
+                        }
+                    }
+                },
+                "policy": {
+                    "timeout_ms": 600000
+                }
+            }
+        });
+        let variant = Variant {
+            id: "treatment".to_string(),
+            bindings: json!({}),
+            runtime_overrides: Some(json!({
+                "agent": {
+                    "custom_image": {
+                        "image": "treatment:image"
+                    },
+                    "overrides": {
+                        "env": {
+                            "B": "override",
+                            "C": "3"
+                        }
+                    }
+                },
+                "policy": {
+                    "timeout_ms": 900000
+                }
+            })),
+        };
+
+        let merged = resolve_runtime_for_variant(&base, &variant).expect("merge");
+        assert_eq!(
+            merged
+                .pointer("/runtime/agent/custom_image/image")
+                .and_then(|v| v.as_str())
+                .unwrap_or(""),
+            "treatment:image"
+        );
+        assert_eq!(
+            merged
+                .pointer("/runtime/agent/custom_image/entrypoint")
+                .and_then(|v| v.as_array())
+                .map(|v| v.len())
+                .unwrap_or(0),
+            2
+        );
+        assert_eq!(
+            merged
+                .pointer("/runtime/agent/overrides/env/A")
+                .and_then(|v| v.as_str())
+                .unwrap_or(""),
+            "1"
+        );
+        assert_eq!(
+            merged
+                .pointer("/runtime/agent/overrides/env/B")
+                .and_then(|v| v.as_str())
+                .unwrap_or(""),
+            "override"
+        );
+        assert_eq!(
+            merged
+                .pointer("/runtime/agent/overrides/env/C")
+                .and_then(|v| v.as_str())
+                .unwrap_or(""),
+            "3"
+        );
+        assert_eq!(
+            merged
+                .pointer("/runtime/policy/timeout_ms")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0),
+            900000
+        );
+    }
+
+    #[test]
     fn validate_required_fields_requires_benchmark_adapter_command() {
         let spec = json!({
             "version": "0.3",
@@ -7665,9 +8564,12 @@ mod tests {
                 "policy": { "task_model": "independent" }
             },
             "runtime": {
-                "harness": { "mode": "cli", "command": ["node", "h.js"], "integration_level": "cli_basic", "input_path": "/out/in.json", "output_path": "/out/out.json", "control_plane": { "mode": "file", "path": "/state/ctl.json" } },
-                "sandbox": { "mode": "local" },
-                "network": { "mode": "none", "allowed_hosts": [] }
+                "agent": { "mode": "custom_image", "custom_image": { "entrypoint": ["node", "h.js"] } },
+                "policy": {
+                    "timeout_ms": 600000,
+                    "sandbox": { "mode": "local" },
+                    "network": { "mode": "none", "allowed_hosts": [] }
+                }
             }
         });
         let err = validate_required_fields(&spec).expect_err("should fail");
@@ -7762,7 +8664,7 @@ JSONL
             "mount_references": [
                 {
                     "dataset_pack_ref": format!("sha256:{}", "a".repeat(64)),
-                    "mount_path": "/workspace/dataset_pack",
+                    "mount_path": format!("{}/dataset_pack", AGENTLAB_CONTRACT_WORKSPACE_DIR),
                     "read_only": true
                 }
             ],
@@ -7804,6 +8706,51 @@ JSONL
         let err = parse_task_boundary_from_dataset_task(&task).expect_err("should fail");
         assert!(
             err.to_string().contains("unsupported key"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn parse_policies_reads_task_boundary_workspace_materialization_flag() {
+        let spec = json!({
+            "design": {
+                "policies": {
+                    "task_boundary": {
+                        "require_workspace_materialization": true
+                    }
+                }
+            }
+        });
+        let policy = parse_policies(&spec);
+        assert!(policy.task_boundary.require_workspace_materialization);
+    }
+
+    #[test]
+    fn task_boundary_workspace_materialization_uses_policy_not_benchmark_identity() {
+        let boundary = TaskBoundaryMaterialization {
+            task_payload: json!({
+                "id": "swebench_like_id",
+                "swebench": { "repo": "x/y" }
+            }),
+            workspace_files: Vec::new(),
+            mount_references: Vec::new(),
+            limits: TaskBoundaryLimits::default(),
+        };
+        let not_required = TaskBoundaryPolicy {
+            require_workspace_materialization: false,
+        };
+        validate_task_boundary_workspace_materialization(&boundary, &not_required)
+            .expect("should not require materialization when policy flag is false");
+
+        let required = TaskBoundaryPolicy {
+            require_workspace_materialization: true,
+        };
+        let err = validate_task_boundary_workspace_materialization(&boundary, &required)
+            .expect_err("policy-required materialization should fail when task boundary is empty");
+        assert!(
+            err.to_string()
+                .contains("missing required workspace materialization"),
             "unexpected error: {}",
             err
         );
@@ -7879,7 +8826,7 @@ JSONL
 
         let refs = vec![MountReferenceSpec {
             dataset_pack_ref: format!("sha256:{}", digest),
-            mount_path: "/workspace/dataset_pack".to_string(),
+            mount_path: format!("{}/dataset_pack", AGENTLAB_CONTRACT_WORKSPACE_DIR),
             read_only: true,
         }];
         let resolved = resolve_task_mounts(&root.path, &refs, true).expect("resolve mounts");
@@ -7915,8 +8862,12 @@ JSONL
         let json_value = json!({
             "design": { "sanitization_profile": "hermetic_functional" },
             "runtime": {
-                "agent_loop": {
-                    "command": ["sh", "-lc", "echo ok"]
+                "agent": {
+                    "mode": "custom_image",
+                    "custom_image": {
+                        "entrypoint": ["sh", "-lc", "echo ok"],
+                        "image": "img"
+                    }
                 },
                 "dependencies": { "services": [] },
                 "policy": {
@@ -7926,10 +8877,12 @@ JSONL
                 }
             }
         });
-        let agent_loop = resolve_agent_loop(&json_value, &exp_dir).expect("resolve agent loop");
+        let agent_loop =
+            resolve_agent_runtime(&json_value, &exp_dir).expect("resolve runtime agent");
         let variant = Variant {
             id: "baseline".to_string(),
             bindings: json!({ "model": "demo" }),
+            runtime_overrides: None,
         };
         let task_boundary = TaskBoundaryMaterialization {
             task_payload: json!({ "id": "task_1", "prompt": "x" }),
@@ -7941,7 +8894,7 @@ JSONL
             }],
             mount_references: vec![MountReferenceSpec {
                 dataset_pack_ref: format!("sha256:{}", "c".repeat(64)),
-                mount_path: "/workspace/dataset_pack".to_string(),
+                mount_path: format!("{}/dataset_pack", AGENTLAB_CONTRACT_WORKSPACE_DIR),
                 read_only: true,
             }],
             limits: TaskBoundaryLimits {

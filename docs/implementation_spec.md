@@ -1,5 +1,7 @@
 # Agent Lab v0.3 — Multi‑Phase Implementation Spec (Draft)
 
+Note (2026-02-20): This draft predates the adapter-runtime hard cutover. Current runner execution seam is `runtime.agent`, and canonical trial output is `result.json` (`agent_result_v1`).
+
 > This is the initial scaffold. Each phase will be expanded with concrete interfaces, data structures, and acceptance tests. Open questions are listed at the end of each phase.
 
 ## Assumptions (to confirm)
@@ -61,7 +63,7 @@ Derived guarantees (grades) must be computed from the integration level actually
 - Canonical JSON serialization (sorted keys, no whitespace) for digesting.
 - Event `payload_ref` always refers to already‑redacted payload.
 - `grades.json` must include `integration_level` and evidence sources (hooks/traces/sdk).
-- `trial_input.json` and `trial_output.json` are required for CLI harness mode.
+- `trial_input.json` and `result.json` are required for CLI runtime mode.
 - `network.mode`: `none | full | allowlist_enforced` and `network.enforcement` must be recorded in resolved spec and state inventory.
 - Hook schema requires a `step_semantics` string in `harness_manifest.json` and `step_index` on causal boundary events; `turn_count` is derived from `model_call_end` count.
  - `harness_manifest.json` minimal fields: `hooks_schema_version`, `step_semantics`, `integration_level`, `entry_command`, `exec_digest`, `trace_export` (mode/endpoint or manifest), optional `source_digest`.
@@ -87,9 +89,9 @@ Derived guarantees (grades) must be computed from the integration level actually
 ### Deliverables
 - **CLI Harness Executor**
   - `runtime.harness` schema: mode `cli`, command, input/output paths.
-  - Writes `trial_input.json` and validates `trial_output.json`.
+  - Writes `trial_input.json` and validates `result.json`.
   - `trial_input.json` minimal fields: run/trial/task ids, variant bindings, budgets/timeouts, paths, sanitization profile, expected integration_level.
-  - `trial_output.json` minimal fields: outcome (success/failure/missing), evaluator inputs or artifact refs, optional metrics, produced artifacts.
+  - `result.json` minimal fields: outcome (success/failure/missing), evaluator inputs or artifact refs, optional metrics, produced artifacts.
 - **Hook Collector + Validator**
   - Reads `/out/harness_events.jsonl` when integration_level >= `cli_events`.
   - Requires `harness_manifest.json` for `cli_events`, `otel`, and `sdk_*` modes (even if hooks absent).
@@ -247,7 +249,7 @@ Derived guarantees (grades) must be computed from the integration level actually
 
 ### Precision Substeps (Phase 3 Implementation)
 1. Load `resolved_experiment.json` and parse `analysis_plan` into a normalized internal model.
-2. Load per‑trial results from `trials/<trial_id>/metrics.json` (fallback: `trial_output.json`).
+2. Load per‑trial results from `trials/<trial_id>/metrics.json` (fallback: `result.json`).
 3. Build paired sets by `(task_id, repl_idx)` across baseline and each variant.
 4. For each metric, apply missingness policy (`paired_drop`, `paired_impute`, `treat_as_failure`).
 5. Compute effect sizes (risk_diff, median_diff, mean_diff) and paired bootstrap CIs.
@@ -352,7 +354,7 @@ Derived guarantees (grades) must be computed from the integration level actually
 - Phase 1 implemented:
   - Schema registry + Draft 2020‑12 validation: `src/agentlab_runner/schemas.py`.
   - Harness manifest loader/validator: `src/agentlab_runner/harness_manifest.py`.
-  - Harness CLI executor: `src/agentlab_runner/harness_executor.py` (writes `trial_input.json`, validates `trial_output.json`).
+  - Harness CLI executor: `src/agentlab_runner/harness_executor.py` (writes `trial_input.json`, validates `result.json`).
   - Hook collector + validator: `src/agentlab_runner/hook_collector.py` (seq monotonicity, step contract, control_ack, optional header match).
   - Control‑plane writer (sha256 of file contents): `src/agentlab_runner/control_plane.py`.
   - Trace manifest ingestion stub: `src/agentlab_runner/trace_ingest.py` (OTLP not implemented yet).

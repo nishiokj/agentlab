@@ -67,6 +67,13 @@
               "properties": {
                 "max_consecutive_failures": { "type": "integer", "minimum": 1 }
               }
+            },
+            "task_boundary": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "require_workspace_materialization": { "type": "boolean" }
+              }
             }
           },
           "required": ["scheduling", "comparison", "retry"]
@@ -134,6 +141,15 @@
           "required": ["mode"],
           "properties": {
             "mode": { "type": "string", "enum": ["known_agent_ref", "custom_image"] },
+            "adapter": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["id", "version"],
+              "properties": {
+                "id": { "type": "string", "minLength": 1 },
+                "version": { "type": "string", "minLength": 1 }
+              }
+            },
             "known_agent_ref": {
               "type": "object",
               "additionalProperties": false,

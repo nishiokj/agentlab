@@ -2,7 +2,7 @@ use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[derive(Parser)]
 #[command(name = "lab", version = "0.3.0", about = "AgentLab Rust CLI")]
@@ -125,6 +125,7 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+    #[command(about = "Resume a paused trial by forking from its checkpoint state")]
     Resume {
         #[arg(long)]
         run_dir: PathBuf,
@@ -139,10 +140,42 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+    #[command(about = "Continue a terminal run from the next schedule slot")]
+    Continue {
+        #[arg(long)]
+        run_dir: PathBuf,
+        #[arg(long)]
+        json: bool,
+    },
     Describe {
         experiment: PathBuf,
         #[arg(long)]
         overrides: Option<PathBuf>,
+        #[arg(long)]
+        json: bool,
+    },
+    Views {
+        run: String,
+        view: Option<String>,
+        #[arg(long)]
+        all: bool,
+        #[arg(long, default_value_t = 100)]
+        limit: usize,
+        #[arg(long)]
+        json: bool,
+    },
+    Query {
+        run: String,
+        sql: String,
+        #[arg(long)]
+        json: bool,
+    },
+    Trend {
+        experiment_id: String,
+        #[arg(long)]
+        task: Option<String>,
+        #[arg(long)]
+        variant: Option<String>,
         #[arg(long)]
         json: bool,
     },
@@ -410,7 +443,7 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
             json,
         } => {
             let set_bindings = parse_set_bindings(&set_values)?;
-            let result = lab_runner::resume_run(
+            let result = lab_runner::resume_trial(
                 &run_dir,
                 trial_id.as_deref(),
                 label.as_deref(),
@@ -431,6 +464,18 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
             println!("replay_grade: {}", result.fork.replay_grade);
             println!("harness_status: {}", result.fork.harness_status);
         }
+        Commands::Continue { run_dir, json } => {
+            let result = lab_runner::continue_run(&run_dir)?;
+            if json {
+                return Ok(Some(json!({
+                    "ok": true,
+                    "command": "continue",
+                    "run": run_result_to_json(&result),
+                })));
+            }
+            println!("run_id: {}", result.run_id);
+            println!("run_dir: {}", result.run_dir.display());
+        }
         Commands::Describe {
             experiment,
             overrides,
@@ -446,6 +491,130 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
                 })));
             }
             print_summary(&summary);
+        }
+        Commands::Views {
+            run,
+            view,
+            all,
+            limit,
+            json,
+        } => {
+            if all && view.is_some() {
+                return Err(anyhow::anyhow!(
+                    "--all cannot be combined with a specific view name"
+                ));
+            }
+            let run_dir = resolve_run_dir_arg(&run)?;
+            let view_set = lab_analysis::run_view_set(&run_dir)?.as_str().to_string();
+            let view_names = lab_analysis::list_views(&run_dir)?;
+
+            if all {
+                if json {
+                    let mut payload = serde_json::Map::new();
+                    for name in &view_names {
+                        let table = lab_analysis::query_view(&run_dir, name, limit)?;
+                        payload.insert(name.clone(), query_table_to_json(&table));
+                    }
+                    return Ok(Some(json!({
+                        "ok": true,
+                        "command": "views",
+                        "run_dir": run_dir.display().to_string(),
+                        "view_set": view_set,
+                        "views": Value::Object(payload),
+                    })));
+                }
+                println!("run_dir: {}", run_dir.display());
+                println!("view_set: {}", view_set);
+                for name in &view_names {
+                    println!("\n== {} ==", name);
+                    let table = lab_analysis::query_view(&run_dir, name, limit)?;
+                    print_query_table(&table);
+                }
+                return Ok(None);
+            }
+
+            if let Some(view_name) = view {
+                let normalized = normalize_view_name(&view_name);
+                let table = lab_analysis::query_view(&run_dir, &normalized, limit)?;
+                if json {
+                    return Ok(Some(json!({
+                        "ok": true,
+                        "command": "views",
+                        "run_dir": run_dir.display().to_string(),
+                        "view_set": view_set,
+                        "view": normalized,
+                        "result": query_table_to_json(&table),
+                    })));
+                }
+                println!("run_dir: {}", run_dir.display());
+                println!("view_set: {}", view_set);
+                println!("view: {}", normalized);
+                print_query_table(&table);
+                return Ok(None);
+            }
+
+            if json {
+                return Ok(Some(json!({
+                    "ok": true,
+                    "command": "views",
+                    "run_dir": run_dir.display().to_string(),
+                    "view_set": view_set,
+                    "available_views": view_names,
+                })));
+            }
+            println!("run_dir: {}", run_dir.display());
+            println!("view_set: {}", view_set);
+            for name in view_names {
+                println!("{}", name);
+            }
+        }
+        Commands::Query { run, sql, json } => {
+            let run_dir = resolve_run_dir_arg(&run)?;
+            let table = lab_analysis::query_run(&run_dir, &sql)?;
+            if json {
+                return Ok(Some(json!({
+                    "ok": true,
+                    "command": "query",
+                    "run_dir": run_dir.display().to_string(),
+                    "sql": sql,
+                    "result": query_table_to_json(&table),
+                })));
+            }
+            print_query_table(&table);
+        }
+        Commands::Trend {
+            experiment_id,
+            task,
+            variant,
+            json,
+        } => {
+            let project_root = resolve_project_root(std::env::current_dir()?.as_path());
+            let table = lab_analysis::query_trend(
+                &project_root,
+                &experiment_id,
+                task.as_deref(),
+                variant.as_deref(),
+            )?;
+            if json {
+                return Ok(Some(json!({
+                    "ok": true,
+                    "command": "trend",
+                    "project_root": project_root.display().to_string(),
+                    "experiment_id": experiment_id,
+                    "task": task,
+                    "variant": variant,
+                    "result": query_table_to_json(&table),
+                })));
+            }
+            println!("project_root: {}", project_root.display());
+            println!("experiment_id: {}", experiment_id);
+            if let Some(task_id) = task {
+                println!("task: {}", task_id);
+            }
+            if let Some(variant_id) = variant {
+                println!("variant: {}", variant_id);
+            }
+            print_query_table(&table);
         }
         Commands::KnobsInit {
             manifest,
@@ -577,6 +746,9 @@ variant_plan: []
 runtime:
   agent:
     mode: custom_image                 # REQUIRED: known_agent_ref | custom_image
+    adapter:
+      id: builtin.command_contract     # optional: builtin.command_contract | prebuilt.codex_cli | prebuilt.rex_jesus
+      version: v1                      # optional: defaults to v1
     known_agent_ref:
       id: ''                           # REQUIRED when mode=known_agent_ref
       version: ''                      # REQUIRED when mode=known_agent_ref
@@ -672,7 +844,11 @@ fn command_json_mode(command: &Commands) -> bool {
         | Commands::Fork { json, .. }
         | Commands::Pause { json, .. }
         | Commands::Resume { json, .. }
+        | Commands::Continue { json, .. }
         | Commands::Describe { json, .. }
+        | Commands::Views { json, .. }
+        | Commands::Query { json, .. }
+        | Commands::Trend { json, .. }
         | Commands::KnobsValidate { json, .. }
         | Commands::SchemaValidate { json, .. }
         | Commands::HooksValidate { json, .. }
@@ -805,6 +981,157 @@ fn print_summary(summary: &lab_runner::ExperimentSummary) {
     }
     if let Some(mode) = &summary.causal_extraction {
         println!("causal_extraction: {}", mode);
+    }
+}
+
+fn resolve_run_dir_arg(run: &str) -> Result<PathBuf> {
+    let raw = PathBuf::from(run);
+    if raw.exists() {
+        return raw
+            .canonicalize()
+            .map_err(|_| anyhow::anyhow!(format!("run path not found: {}", raw.display())));
+    }
+
+    let cwd = std::env::current_dir()?;
+    let from_cwd = cwd.join(".lab").join("runs").join(run);
+    if from_cwd.exists() {
+        return from_cwd
+            .canonicalize()
+            .map_err(|_| anyhow::anyhow!(format!("run path not found: {}", from_cwd.display())));
+    }
+
+    let project_root = resolve_project_root(cwd.as_path());
+    let from_project = project_root.join(".lab").join("runs").join(run);
+    if from_project.exists() {
+        return from_project.canonicalize().map_err(|_| {
+            anyhow::anyhow!(format!("run path not found: {}", from_project.display()))
+        });
+    }
+
+    Err(anyhow::anyhow!(format!(
+        "run '{}' not found (expected path or run id under .lab/runs)",
+        run
+    )))
+}
+
+fn resolve_project_root(start: &Path) -> PathBuf {
+    let mut cur = Some(start);
+    while let Some(path) = cur {
+        if path.join(".lab").exists() {
+            return path.to_path_buf();
+        }
+        cur = path.parent();
+    }
+    start.to_path_buf()
+}
+
+fn normalize_view_name(input: &str) -> String {
+    let normalized = input.trim().replace('-', "_");
+    match normalized.as_str() {
+        "paired_diffs" => "paired_outcomes".to_string(),
+        other => other.to_string(),
+    }
+}
+
+fn query_table_to_json(table: &lab_analysis::QueryTable) -> Value {
+    let mut objects = Vec::with_capacity(table.rows.len());
+    for row in &table.rows {
+        let mut obj = serde_json::Map::new();
+        for (idx, column) in table.columns.iter().enumerate() {
+            obj.insert(column.clone(), row.get(idx).cloned().unwrap_or(Value::Null));
+        }
+        objects.push(Value::Object(obj));
+    }
+    json!({
+        "columns": table.columns,
+        "rows": objects,
+        "row_count": table.rows.len()
+    })
+}
+
+fn print_query_table(table: &lab_analysis::QueryTable) {
+    if table.columns.is_empty() {
+        println!("(ok)");
+        return;
+    }
+
+    let rendered_rows: Vec<Vec<String>> = table
+        .rows
+        .iter()
+        .map(|row| row.iter().map(render_json_cell).collect::<Vec<String>>())
+        .collect();
+
+    let mut widths: Vec<usize> = table.columns.iter().map(|c| c.chars().count()).collect();
+    for row in &rendered_rows {
+        for (idx, cell) in row.iter().enumerate() {
+            if idx < widths.len() {
+                widths[idx] = widths[idx].max(cell.chars().count()).min(80);
+            }
+        }
+    }
+
+    let header = table
+        .columns
+        .iter()
+        .enumerate()
+        .map(|(idx, col)| pad_cell(col, widths[idx]))
+        .collect::<Vec<_>>()
+        .join(" | ");
+    println!("{}", header);
+    let separator = widths
+        .iter()
+        .map(|w| "-".repeat(*w))
+        .collect::<Vec<_>>()
+        .join("-+-");
+    println!("{}", separator);
+
+    for row in rendered_rows {
+        let line = row
+            .iter()
+            .enumerate()
+            .map(|(idx, cell)| {
+                if idx < widths.len() {
+                    pad_cell(&truncate_cell(cell, widths[idx]), widths[idx])
+                } else {
+                    cell.clone()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join(" | ");
+        println!("{}", line);
+    }
+    println!("({} rows)", table.rows.len());
+}
+
+fn render_json_cell(value: &Value) -> String {
+    match value {
+        Value::Null => "null".to_string(),
+        Value::Bool(v) => v.to_string(),
+        Value::Number(v) => v.to_string(),
+        Value::String(v) => v.clone(),
+        Value::Array(_) | Value::Object(_) => serde_json::to_string(value).unwrap_or_default(),
+    }
+}
+
+fn truncate_cell(value: &str, width: usize) -> String {
+    let value_len = value.chars().count();
+    if value_len <= width {
+        return value.to_string();
+    }
+    if width <= 1 {
+        return ".".to_string();
+    }
+    let mut out: String = value.chars().take(width - 1).collect();
+    out.push('.');
+    out
+}
+
+fn pad_cell(value: &str, width: usize) -> String {
+    let value_len = value.chars().count();
+    if value_len >= width {
+        value.to_string()
+    } else {
+        format!("{value}{:padding$}", "", padding = width - value_len)
     }
 }
 

@@ -67,6 +67,13 @@
               "properties": {
                 "max_consecutive_failures": { "type": "integer", "minimum": 1 }
               }
+            },
+            "task_boundary": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "require_workspace_materialization": { "type": "boolean" }
+              }
             }
           },
           "required": ["scheduling", "comparison", "retry"]
@@ -126,7 +133,7 @@
     "runtime": {
       "type": "object",
       "additionalProperties": true,
-      "required": ["agent_loop", "dependencies", "policy"],
+      "required": ["agent", "dependencies", "policy"],
       "allOf": [
         {
           "if": {
@@ -161,19 +168,61 @@
         }
       ],
       "properties": {
-        "agent_loop": {
+        "agent": {
           "type": "object",
           "additionalProperties": true,
-          "required": ["command"],
+          "required": ["mode"],
           "properties": {
-            "command": { "type": "array", "items": { "type": "string", "minLength": 1 }, "minItems": 1 },
-            "env": {
+            "mode": { "type": "string", "enum": ["known_agent_ref", "custom_image"] },
+            "adapter": {
               "type": "object",
-              "additionalProperties": { "type": "string" }
+              "additionalProperties": false,
+              "required": ["id", "version"],
+              "properties": {
+                "id": { "type": "string", "minLength": 1 },
+                "version": { "type": "string", "minLength": 1 }
+              }
             },
-            "env_from_host": {
-              "type": "array",
-              "items": { "type": "string", "minLength": 1 }
+            "known_agent_ref": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["id", "version"],
+              "properties": {
+                "id": { "type": "string", "minLength": 1 },
+                "version": { "type": "string", "minLength": 1 },
+                "registry": { "type": "string", "minLength": 1 }
+              }
+            },
+            "custom_image": {
+              "type": "object",
+              "additionalProperties": true,
+              "required": ["entrypoint"],
+              "properties": {
+                "image": { "type": "string", "minLength": 1 },
+                "entrypoint": {
+                  "type": "array",
+                  "items": { "type": "string", "minLength": 1 },
+                  "minItems": 1
+                }
+              }
+            },
+            "overrides": {
+              "type": "object",
+              "additionalProperties": true,
+              "properties": {
+                "args": {
+                  "type": "array",
+                  "items": { "type": "string", "minLength": 1 }
+                },
+                "env": {
+                  "type": "object",
+                  "additionalProperties": { "type": "string" }
+                },
+                "env_from_host": {
+                  "type": "array",
+                  "items": { "type": "string", "minLength": 1 }
+                }
+              }
             }
           }
         },
