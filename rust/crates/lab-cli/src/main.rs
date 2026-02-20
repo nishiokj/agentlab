@@ -724,7 +724,7 @@ version: '0.5'
 experiment:
   id: ''                              # REQUIRED
   name: ''                            # REQUIRED
-  workload_type: ''                   # REQUIRED: agent_loop | trainer
+  workload_type: ''                   # REQUIRED: agent_runtime | trainer
 dataset:
   path: ''                            # REQUIRED: path to tasks.jsonl
   provider: local_jsonl
@@ -746,6 +746,8 @@ variant_plan: []
 runtime:
   agent:
     mode: custom_image                 # REQUIRED: known_agent_ref | custom_image
+    command: []                        # optional: string|string[] command override (e.g. [\"rex\"] or [\"./agent.py\"])
+    aliases: {}                        # optional: alias -> command (e.g. { rex: [\"bun\", \"./bin/rex.js\"] })
     adapter:
       id: builtin.command_contract     # optional: builtin.command_contract | prebuilt.codex_cli | prebuilt.rex_jesus
       version: v1                      # optional: defaults to v1
@@ -755,13 +757,13 @@ runtime:
       registry: ''                     # optional
     custom_image:
       image: ''                        # REQUIRED when mode=custom_image and sandbox.mode=container
-      entrypoint: []                   # REQUIRED when mode=custom_image
+      entrypoint: []                   # REQUIRED when mode=custom_image unless runtime.agent.command is set
     overrides:
       args: []
       env: {}
       env_from_host: []
   dependencies:
-    assets: []
+    file_staging: []
     services: []
   policy:
     timeout_ms: 600000
@@ -951,7 +953,7 @@ fn summary_to_json(summary: &lab_runner::ExperimentSummary) -> Value {
         "replications": summary.replications,
         "variant_count": summary.variant_count,
         "total_trials": summary.total_trials,
-        "agent_loop": summary.agent_loop_command,
+        "agent_runtime": summary.agent_runtime_command,
         "image": summary.image,
         "network": summary.network_mode,
         "trajectory_path": summary.trajectory_path,
@@ -971,7 +973,7 @@ fn print_summary(summary: &lab_runner::ExperimentSummary) {
     println!("replications: {}", summary.replications);
     println!("variant_count: {}", summary.variant_count);
     println!("total_trials: {}", summary.total_trials);
-    println!("agent_loop: {:?}", summary.agent_loop_command);
+    println!("agent_runtime: {:?}", summary.agent_runtime_command);
     if let Some(image) = &summary.image {
         println!("image: {}", image);
     }

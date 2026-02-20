@@ -21,7 +21,7 @@ export interface ExperimentSummary {
   replications: number;
   variant_count: number;
   total_trials: number;
-  agent_loop: string[];
+  agent_runtime: string[];
   image?: string | null;
   network: string;
   trajectory_path?: string | null;

@@ -1,4 +1,5 @@
 use anyhow::{anyhow, Context, Result};
+#[cfg(feature = "duckdb_engine")]
 use duckdb::Connection;
 use include_dir::{include_dir, Dir};
 use lab_core::ensure_dir;
@@ -231,6 +232,14 @@ pub fn run_view_set(run_dir: &Path) -> Result<ViewSet> {
     Ok(context.view_set)
 }
 
+fn duckdb_disabled_error(op: &str) -> anyhow::Error {
+    anyhow!(
+        "DuckDB support is disabled in this build; '{}' is unavailable (enable feature 'duckdb_engine' on lab-analysis)",
+        op
+    )
+}
+
+#[cfg(feature = "duckdb_engine")]
 pub fn list_views(run_dir: &Path) -> Result<Vec<String>> {
     let context = load_run_context(run_dir)?;
     materialize_run_duckdb(&context)?;
@@ -251,6 +260,11 @@ pub fn list_views(run_dir: &Path) -> Result<Vec<String>> {
     Ok(out)
 }
 
+#[cfg(not(feature = "duckdb_engine"))]
+pub fn list_views(_run_dir: &Path) -> Result<Vec<String>> {
+    Err(duckdb_disabled_error("views"))
+}
+
 pub fn query_view(run_dir: &Path, view_name: &str, limit: usize) -> Result<QueryTable> {
     if !is_safe_identifier(view_name) {
         return Err(anyhow!(
@@ -267,6 +281,7 @@ pub fn query_view(run_dir: &Path, view_name: &str, limit: usize) -> Result<Query
     query_run(run_dir, &sql)
 }
 
+#[cfg(feature = "duckdb_engine")]
 pub fn query_run(run_dir: &Path, sql: &str) -> Result<QueryTable> {
     let normalized = validate_read_only_sql(sql)?;
     let context = load_run_context(run_dir)?;
@@ -275,6 +290,12 @@ pub fn query_run(run_dir: &Path, sql: &str) -> Result<QueryTable> {
     execute_select_query(&conn, &normalized)
 }
 
+#[cfg(not(feature = "duckdb_engine"))]
+pub fn query_run(_run_dir: &Path, _sql: &str) -> Result<QueryTable> {
+    Err(duckdb_disabled_error("query"))
+}
+
+#[cfg(feature = "duckdb_engine")]
 pub fn query_trend(
     project_root: &Path,
     experiment_id: &str,
@@ -317,6 +338,16 @@ pub fn query_trend(
         conditions.join(" AND ")
     );
     execute_select_query(&conn, &sql)
+}
+
+#[cfg(not(feature = "duckdb_engine"))]
+pub fn query_trend(
+    _project_root: &Path,
+    _experiment_id: &str,
+    _task_id: Option<&str>,
+    _variant_id: Option<&str>,
+) -> Result<QueryTable> {
+    Err(duckdb_disabled_error("trend"))
 }
 
 fn write_analysis_tables(
@@ -750,6 +781,7 @@ SELECT
     )
 }
 
+#[cfg(feature = "duckdb_engine")]
 fn materialize_run_duckdb(context: &RunAnalysisContext) -> Result<()> {
     ensure_dir(&context.analysis_dir)?;
     ensure_dir(&context.tables_dir)?;
@@ -765,6 +797,12 @@ fn materialize_run_duckdb(context: &RunAnalysisContext) -> Result<()> {
     Ok(())
 }
 
+#[cfg(not(feature = "duckdb_engine"))]
+fn materialize_run_duckdb(_context: &RunAnalysisContext) -> Result<()> {
+    Err(duckdb_disabled_error("run materialization"))
+}
+
+#[cfg(feature = "duckdb_engine")]
 fn open_run_connection(context: &RunAnalysisContext) -> Result<Connection> {
     let db_path = context.analysis_dir.join(ANALYSIS_DB_FILE);
     let conn = Connection::open(&db_path)
@@ -792,6 +830,7 @@ fn ensure_table_files(tables_dir: &Path) -> Result<()> {
     Ok(())
 }
 
+#[cfg(feature = "duckdb_engine")]
 fn load_json_extension(conn: &Connection) -> Result<()> {
     match conn.execute_batch("LOAD json;") {
         Ok(_) => Ok(()),
@@ -801,6 +840,7 @@ fn load_json_extension(conn: &Connection) -> Result<()> {
     }
 }
 
+#[cfg(feature = "duckdb_engine")]
 fn materialize_project_duckdb(project_root: &Path) -> Result<PathBuf> {
     let project_root = project_root
         .canonicalize()
@@ -920,6 +960,7 @@ ORDER BY t.run_id, t.variant_id, t.task_id;
     Ok(db_path)
 }
 
+#[cfg(feature = "duckdb_engine")]
 fn execute_select_query(conn: &Connection, sql: &str) -> Result<QueryTable> {
     let normalized = normalize_sql(sql)?;
     let column_probe_sql = format!("SELECT * FROM ({}) AS __q LIMIT 0", normalized);

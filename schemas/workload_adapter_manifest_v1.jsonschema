@@ -19,7 +19,7 @@
     "adapter_version": { "type": "string", "minLength": 1 },
     "workload_type": {
       "type": "string",
-      "enum": ["agent_loop", "trainer", "custom"]
+      "enum": ["agent_runtime", "trainer", "custom"]
     },
     "execution": {
       "type": "object",

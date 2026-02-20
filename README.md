@@ -106,6 +106,9 @@ variant_plan:
 runtime:
   agent:
     mode: custom_image # known_agent_ref | custom_image
+    command: ["rex", "run-agent-loop"] # optional: string|string[] command override
+    aliases: # optional: short aliases to avoid hardcoding image paths
+      rex: ["bun", "/opt/rex/packages/infra/harness-daemon/bin/rex.js"]
     adapter:
       id: prebuilt.rex_jesus # optional: builtin.command_contract | prebuilt.codex_cli | prebuilt.rex_jesus
       version: v1
@@ -237,7 +240,7 @@ Minimum inputs for a runnable experiment:
    - optional explicit adapter identity (`runtime.agent.adapter`).
 3. Baseline variant bindings (plus optional treatments).
 4. Policy (`timeout`, `network`, `sandbox`).
-5. Optional dependency assets/services for sqlite, AST indexes, or other local state.
+5. Optional staged dependency files/services for sqlite, AST indexes, or other local state.
 
 ## Runtime Source of Truth
 
@@ -259,6 +262,12 @@ Optional adapter identity:
    - `prebuilt.codex_cli@v1`
    - `prebuilt.rex_jesus@v1`
 
+Optional command overrides:
+
+1. `runtime.agent.command` can be a string (single token) or string array.
+2. For `mode: custom_image`, `runtime.agent.command` can replace `custom_image.entrypoint`.
+3. `runtime.agent.aliases` can map short names (for example `rex`) to full command token arrays.
+
 For reproducible frozen agents:
 
 1. Build agent image with runtime + code.
@@ -274,7 +283,8 @@ Resolution behavior:
 
 1. `dataset.path` resolves relative to the experiment file directory.
 2. `runtime.dependencies.file_staging[*].source_from_host` resolves relative to project root (parent of `.lab`) when relative.
-3. `runtime.agent` entrypoint tokens are treated as literal command tokens; runner does not rewrite them to host paths.
+3. In container execution, `runtime.agent.command` / `custom_image.entrypoint` tokens are treated as literal command tokens.
+4. In local-process execution, path-like tokens may be host-resolved for compatibility.
 
 ## CLI Quick Start
 

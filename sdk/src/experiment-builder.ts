@@ -402,7 +402,6 @@ export interface ExperimentSpec {
       overrides?: AgentRuntimeOverrides;
     };
     dependencies: {
-      assets?: DependencyAssetEntry[];
       file_staging?: DependencyFileStagingEntry[];
       services?: Array<{
         id: string;
@@ -506,7 +505,6 @@ export class ExperimentBuilder {
           },
         },
         dependencies: {
-          assets: [],
           file_staging: [],
           services: [],
         },
@@ -650,14 +648,7 @@ export class ExperimentBuilder {
   }
 
   dependencyAssets(entries: DependencyAssetEntry[]): this {
-    this.spec.runtime.dependencies.assets = entries.map((entry) => ({
-      id: entry.id,
-      source_from_host: entry.source_from_host,
-      mount_path: entry.mount_path,
-      read_only: entry.read_only ?? false,
-      required: entry.required ?? true,
-    }));
-    this.spec.runtime.dependencies.file_staging = this.spec.runtime.dependencies.assets.map((entry) => ({
+    this.spec.runtime.dependencies.file_staging = entries.map((entry) => ({
       source_from_host: entry.source_from_host,
       destination_path: entry.mount_path,
       required: entry.required ?? true,
@@ -671,12 +662,6 @@ export class ExperimentBuilder {
       destination_path: entry.destination_path,
       required: entry.required ?? true,
     }));
-    this.spec.runtime.dependencies.assets = entries.map((entry) => ({
-      source_from_host: entry.source_from_host,
-      mount_path: entry.destination_path,
-      read_only: false,
-      required: entry.required ?? true,
-    }));
     return this;
   }
 
@@ -685,16 +670,6 @@ export class ExperimentBuilder {
     mountPath: string,
     options?: { id?: string; readOnly?: boolean; required?: boolean },
   ): this {
-    if (!this.spec.runtime.dependencies.assets) {
-      this.spec.runtime.dependencies.assets = [];
-    }
-    this.spec.runtime.dependencies.assets.push({
-      id: options?.id,
-      source_from_host: sourceFromHost,
-      mount_path: mountPath,
-      read_only: options?.readOnly ?? false,
-      required: options?.required ?? true,
-    });
     if (!this.spec.runtime.dependencies.file_staging) {
       this.spec.runtime.dependencies.file_staging = [];
     }

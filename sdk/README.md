@@ -6,7 +6,7 @@ The SDK is runtime-agent-first:
 
 1. You declare `runtime.agent`, `runtime.dependencies`, and `runtime.policy`.
 2. Runner owns container/process execution, isolation, and causal artifact extraction.
-3. Your agent loop is just a command invoked once per trial.
+3. Your runtime command is invoked once per trial.
 
 ## Install
 
@@ -46,18 +46,15 @@ const builder = ExperimentBuilder.create('rex_ab', 'Rex Prompt A/B')
   .agentEnvFromHost(['OPENAI_API_KEY'])
 
   // Dependency boundary: stage host files into trial paths.
-  .dependencyAssets([
+  .dependencyFileStaging([
     {
-      id: 'sqlite-main',
       source_from_host: './deps/sqlite/main.db',
-      mount_path: '/agentlab/deps/sqlite/main.db',
-      read_only: true,
+      destination_path: '/agentlab/deps/sqlite/main.db',
       required: true,
     },
     {
-      id: 'ast-index',
       source_from_host: './deps/ast/index.tar.zst',
-      mount_path: '/agentlab/deps/ast/index.tar.zst',
+      destination_path: '/agentlab/deps/ast/index.tar.zst',
       required: false,
     },
   ])
@@ -97,7 +94,7 @@ console.log(run.run.run_id);
    - optional `runtime.agent.adapter` for explicit adapter identity.
 3. At least one baseline variant (`.baseline(...)`).
 4. Optional treatment variants (`.addVariant(...)`) and metrics (`.metric(...)`).
-5. Optional staged dependency assets (`.dependencyAssets(...)`).
+5. Optional staged dependency files (`.dependencyFileStaging(...)`).
 
 You do not provide a control-plane protocol, runner socket wiring, or runner state handling.
 
@@ -166,11 +163,6 @@ You can also set command/env through:
 7. `.usePrebuiltCodexAdapter(version?)`
 8. `.usePrebuiltRexJesusAdapter(version?)`
 
-Legacy aliases remain exported:
-
-1. `.agentLoopEnv(...)`
-2. `.agentLoopEnvFromHost(...)`
-
 ## Command Semantics
 
 1. Runner executes exactly one command per trial.
@@ -185,20 +177,14 @@ Practical implication: the command must be valid in the runtime environment you 
 
 Preferred API:
 
-1. `.dependencyAssets(entries)`
-2. `.stageDependencyAsset(sourceFromHost, mountPath, options?)`
+1. `.dependencyFileStaging(entries)`
+2. `.stageDependencyFile(sourceFromHost, destinationPath, options?)`
 
 Entry fields:
 
 1. `source_from_host`: host file path (supports `~`; relative paths resolve from project root, parent of `.lab`).
-2. `mount_path`: absolute path exposed in trial filesystem (usually under `/agentlab/deps/...`).
-3. `read_only` (optional): when true, runner marks copied file read-only in trial.
-4. `required` (optional, default true): if false, missing source is tolerated.
-
-Compatibility alias:
-
-1. `.dependencyFileStaging(...)`
-2. `.stageDependencyFile(...)`
+2. `destination_path`: absolute path exposed in trial filesystem (usually under `/agentlab/deps/...`).
+3. `required` (optional, default true): if false, missing source is tolerated.
 
 ## What Goes Into The Trial Container
 
@@ -206,7 +192,7 @@ For each trial, runner prepares and mounts:
 
 1. `/agentlab/in` (read-only): `task.json`, `bindings.json`, `dependencies.json`, `policy.json`
 2. `/agentlab/workspace` (read-write): workspace copy seeded from project root
-3. `/agentlab/deps` (read-write): staged dependency assets
+3. `/agentlab/deps` (read-write): staged dependency files
 4. `/agentlab/out` (read-write): `result.json`, optional `trajectory.jsonl`
 5. `/agentlab/state` (read-write): runner internal state and metadata
 6. `/dataset` (read-only): dataset copy for the trial
@@ -301,12 +287,8 @@ Canonical per-trial result is:
 
 1. `.lab/runs/<run_id>/trials/<trial_id>/result.json`
 
-Compatibility mirror (temporary):
-
-1. `.lab/runs/<run_id>/trials/<trial_id>/trial_output.json`
-
 ## Current Runtime Notes
 
 1. `networkMode('allowlist_enforced', ...)` is not yet implemented by the Rust container executor.
 2. Container reproducibility is strongest when image references are pinned by digest (`image@sha256:...`).
-3. Prefer `runtime.agent` APIs; `runtime.agent_loop` is legacy fallback behavior.
+3. `runtime.agent` is the runtime source of truth.
