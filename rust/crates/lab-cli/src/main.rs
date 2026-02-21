@@ -724,7 +724,7 @@ version: '0.5'
 experiment:
   id: ''                              # REQUIRED
   name: ''                            # REQUIRED
-  workload_type: ''                   # REQUIRED: agent_loop | trainer
+  workload_type: ''                   # REQUIRED: agent_runtime | trainer
 dataset:
   path: ''                            # REQUIRED: path to tasks.jsonl
   provider: local_jsonl
@@ -745,29 +745,18 @@ baseline:
 variant_plan: []
 runtime:
   agent:
-    mode: custom_image                 # REQUIRED: known_agent_ref | custom_image
-    adapter:
-      id: builtin.command_contract     # optional: builtin.command_contract | prebuilt.codex_cli | prebuilt.rex_jesus
-      version: v1                      # optional: defaults to v1
-    known_agent_ref:
-      id: ''                           # REQUIRED when mode=known_agent_ref
-      version: ''                      # REQUIRED when mode=known_agent_ref
-      registry: ''                     # optional
-    custom_image:
-      image: ''                        # REQUIRED when mode=custom_image and sandbox.mode=container
-      entrypoint: []                   # REQUIRED when mode=custom_image
-    overrides:
-      args: []
-      env: {}
-      env_from_host: []
+    command: []                        # REQUIRED: string|string[] command (e.g. [\"rex\"])
+    image: ''                          # REQUIRED when sandbox.mode=container (can be overridden per variant)
+    io:
+      input_arg: --input               # runner appends resolved task path
+      output_arg: --output             # runner appends resolved result path
   dependencies:
-    assets: []
+    file_staging: []
     services: []
   policy:
     timeout_ms: 600000
     sandbox:
       mode: local
-      image: ''                        # REQUIRED when mode=container
     network:
       mode: none
       allowed_hosts: []
@@ -951,7 +940,7 @@ fn summary_to_json(summary: &lab_runner::ExperimentSummary) -> Value {
         "replications": summary.replications,
         "variant_count": summary.variant_count,
         "total_trials": summary.total_trials,
-        "agent_loop": summary.agent_loop_command,
+        "agent_runtime": summary.agent_runtime_command,
         "image": summary.image,
         "network": summary.network_mode,
         "trajectory_path": summary.trajectory_path,
@@ -971,7 +960,7 @@ fn print_summary(summary: &lab_runner::ExperimentSummary) {
     println!("replications: {}", summary.replications);
     println!("variant_count: {}", summary.variant_count);
     println!("total_trials: {}", summary.total_trials);
-    println!("agent_loop: {:?}", summary.agent_loop_command);
+    println!("agent_runtime: {:?}", summary.agent_runtime_command);
     if let Some(image) = &summary.image {
         println!("image: {}", image);
     }
@@ -1181,17 +1170,17 @@ fn write_knob_files(
       "scientific_role": "invariant"
     },
     {
-      "id": "runtime.agent.custom_image.entrypoint",
-      "label": "Agent Entrypoint",
-      "json_pointer": "/runtime/agent/custom_image/entrypoint",
-      "type": "string",
+      "id": "runtime.agent.command",
+      "label": "Agent Command",
+      "json_pointer": "/runtime/agent/command",
+      "type": "json",
       "role": "agent",
       "scientific_role": "treatment"
     },
     {
-      "id": "runtime.policy.sandbox.image",
-      "label": "Sandbox Image",
-      "json_pointer": "/runtime/policy/sandbox/image",
+      "id": "runtime.agent.image",
+      "label": "Agent Image",
+      "json_pointer": "/runtime/agent/image",
       "type": "string",
       "role": "infra",
       "scientific_role": "treatment",

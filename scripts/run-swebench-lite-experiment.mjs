@@ -14,13 +14,14 @@ function loadJsonEnv(name, fallback) {
   }
 }
 
-function loadHarnessCommand() {
-  const fromJson = loadJsonEnv('AGENTLAB_HARNESS_CMD_JSON', null);
+function loadAgentRuntimeCommand() {
+  const fromJson = loadJsonEnv('AGENTLAB_AGENT_RUNTIME_CMD_JSON', null)
+    ?? loadJsonEnv('AGENTLAB_HARNESS_CMD_JSON', null);
   if (Array.isArray(fromJson) && fromJson.length > 0 && fromJson.every((v) => typeof v === 'string')) {
     return fromJson;
   }
 
-  const fromShell = process.env.AGENTLAB_HARNESS_CMD;
+  const fromShell = process.env.AGENTLAB_AGENT_RUNTIME_CMD || process.env.AGENTLAB_HARNESS_CMD;
   if (fromShell && fromShell.trim().length > 0) {
     // Keep parsing simple: use JSON env for quoted args.
     return fromShell.trim().split(/\s+/);
@@ -68,7 +69,7 @@ function ensureWorkloadType(yamlText) {
     return yamlText;
   }
 
-  lines.splice(expIdx + 1, 0, '  workload_type: agent_harness');
+  lines.splice(expIdx + 1, 0, '  workload_type: agent_runtime');
   return lines.join('\n');
 }
 
@@ -97,10 +98,6 @@ async function main() {
       replications: { type: 'string', default: process.env.AGENTLAB_REPLICATIONS || '1' },
       seed: { type: 'string', default: process.env.AGENTLAB_RANDOM_SEED || '42' },
       concurrency: { type: 'string', default: process.env.AGENTLAB_MAX_CONCURRENCY || '1' },
-      'integration-level': {
-        type: 'string',
-        default: process.env.AGENTLAB_INTEGRATION_LEVEL || 'cli_events',
-      },
       'container-image': {
         type: 'string',
         default: process.env.AGENTLAB_SANDBOX_IMAGE || 'python:3.11-slim',
@@ -132,8 +129,7 @@ async function main() {
     throw new Error('Dataset is empty.');
   }
 
-  const harnessCommand = loadHarnessCommand();
-  const integrationLevel = values['integration-level'];
+  const agentRuntimeCommand = loadAgentRuntimeCommand();
   const image = values['container-image'];
 
   const expDirAbs = dirname(expAbs);
@@ -149,10 +145,10 @@ async function main() {
   const { ExperimentBuilder, LabClient, Metric } = await loadSdk();
 
   const builder = ExperimentBuilder.create(
-    'swebench_lite_curated_actual_harness',
-    'SWE-bench Lite Curated (Actual Harness)',
+    'swebench_lite_curated_actual_agent_runtime',
+    'SWE-bench Lite Curated (Actual Agent Runtime)',
   )
-    .description('Strict containerized eval over curated SWE-bench Lite with the real harness.')
+    .description('Strict containerized eval over curated SWE-bench Lite with the real agent runtime.')
     .owner('jevinnishioka')
     .tags(['swebench-lite', 'curated', 'container', 'strict'])
     .datasetJsonl(datasetRelFromExp, {
@@ -160,7 +156,7 @@ async function main() {
       splitId: 'test',
       limit: safeLimit,
     })
-    .harnessCli(harnessCommand, { integrationLevel })
+    .agentLoop(agentRuntimeCommand)
     .sanitizationProfile('hermetic_functional')
     .replications(replications)
     .randomSeed(randomSeed)
@@ -193,7 +189,7 @@ async function main() {
   const yaml = ensureWorkloadType(builder.toYaml());
   writeFileSync(expAbs, yaml);
   console.log(`Wrote experiment config: ${values.experiment}`);
-  console.log(`Harness command: ${JSON.stringify(harnessCommand)}`);
+  console.log(`Agent runtime command: ${JSON.stringify(agentRuntimeCommand)}`);
   console.log(`Dataset tasks: ${datasetCount} (limit=${safeLimit})`);
   console.log(`Container image: ${image}`);
 

@@ -4,9 +4,13 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+default = []
+duckdb_engine = ["dep:duckdb"]
+
 [dependencies]
 anyhow.workspace = true
 serde_json.workspace = true
 include_dir.workspace = true
-duckdb.workspace = true
+duckdb = { workspace = true, optional = true }
 lab-core = { path = "../lab-core" }

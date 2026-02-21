@@ -141,6 +141,29 @@
           "required": ["mode"],
           "properties": {
             "mode": { "type": "string", "enum": ["known_agent_ref", "custom_image"] },
+            "command": {
+              "oneOf": [
+                { "type": "string", "minLength": 1 },
+                {
+                  "type": "array",
+                  "items": { "type": "string", "minLength": 1 },
+                  "minItems": 1
+                }
+              ]
+            },
+            "aliases": {
+              "type": "object",
+              "additionalProperties": {
+                "oneOf": [
+                  { "type": "string", "minLength": 1 },
+                  {
+                    "type": "array",
+                    "items": { "type": "string", "minLength": 1 },
+                    "minItems": 1
+                  }
+                ]
+              }
+            },
             "adapter": {
               "type": "object",
               "additionalProperties": false,
@@ -163,7 +186,6 @@
             "custom_image": {
               "type": "object",
               "additionalProperties": true,
-              "required": ["entrypoint"],
               "properties": {
                 "image": { "type": "string", "minLength": 1 },
                 "entrypoint": {

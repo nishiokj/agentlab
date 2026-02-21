@@ -35,7 +35,7 @@ In local (non-container) mode, the runtime command is executed with:
 
 ## How To Try
 
-1. Update `experiment.yaml` to use `runtime.agent` (`known_agent_ref` or `custom_image`) and optional `runtime.agent.adapter` (`builtin.command_contract`, `prebuilt.codex_cli`, `prebuilt.rex_jesus`).
+1. Update `experiment.yaml` to use lightweight `runtime.agent` fields only: `command` (string|string[]), `image` (for container mode), and optional `io.input_arg` / `io.output_arg` for your CLI flags.
 2. Implement your runtime command to read `trial_input.json` and write `result.json`.
 3. Run (Python): `lab run experiment.yaml`
 4. Run (Rust, containerized): `cargo run -p lab-cli -- run experiment.yaml --container`
