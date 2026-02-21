@@ -84,11 +84,29 @@ struct AgentAdapterCapabilities {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ActiveAdapterControl {
+    #[serde(
+        rename = "id",
+        alias = "adapter_id",
+        default = "default_active_adapter_id"
+    )]
     adapter_id: String,
+    #[serde(
+        rename = "version",
+        alias = "adapter_version",
+        default = "default_active_adapter_version"
+    )]
     adapter_version: String,
     command_path: String,
     #[serde(default)]
     events_path: Option<String>,
+}
+
+fn default_active_adapter_id() -> String {
+    BUILTIN_COMMAND_ADAPTER_ID.to_string()
+}
+
+fn default_active_adapter_version() -> String {
+    BUILTIN_COMMAND_ADAPTER_VERSION.to_string()
 }
 
 #[derive(Clone)]
@@ -208,6 +226,7 @@ impl AgentLaunchMode {
     }
 }
 
+#[derive(Debug)]
 pub struct RunResult {
     pub run_dir: PathBuf,
     pub run_id: String,
@@ -2247,77 +2266,59 @@ fn validate_required_fields(json_value: &Value) -> Result<()> {
             missing.push(*pointer);
         }
     }
-    let agent_mode = json_value
-        .pointer("/runtime/agent/mode")
-        .and_then(|v| v.as_str());
     if json_value.pointer("/runtime/agent").is_none() {
         missing.push("/runtime/agent");
     }
-    if agent_mode.is_none() {
-        missing.push("/runtime/agent/mode");
+    let has_command = match json_value.pointer("/runtime/agent/command") {
+        Some(Value::String(s)) => !s.trim().is_empty(),
+        Some(Value::Array(parts)) if !parts.is_empty() => parts
+            .iter()
+            .all(|part| part.as_str().map(|s| !s.trim().is_empty()).unwrap_or(false)),
+        _ => false,
+    };
+    if !has_command {
+        missing.push("/runtime/agent/command");
     }
-    match agent_mode {
-        Some("known_agent_ref") => {
-            let id = json_value
-                .pointer("/runtime/agent/known_agent_ref/id")
-                .and_then(|v| v.as_str())
-                .map(|v| v.trim().to_string())
-                .unwrap_or_default();
-            if id.is_empty() {
-                missing.push("/runtime/agent/known_agent_ref/id");
-            }
-            let version = json_value
-                .pointer("/runtime/agent/known_agent_ref/version")
-                .and_then(|v| v.as_str())
-                .map(|v| v.trim().to_string())
-                .unwrap_or_default();
-            if version.is_empty() {
-                missing.push("/runtime/agent/known_agent_ref/version");
-            }
-        }
-        Some("custom_image") => {
-            let has_command = match json_value.pointer("/runtime/agent/command") {
-                Some(Value::String(s)) => !s.trim().is_empty(),
-                Some(Value::Array(parts)) if !parts.is_empty() => parts
-                    .iter()
-                    .all(|part| part.as_str().map(|s| !s.trim().is_empty()).unwrap_or(false)),
-                _ => false,
-            };
-            let has_entrypoint = match json_value.pointer("/runtime/agent/custom_image/entrypoint")
-            {
-                Some(Value::Array(parts)) if !parts.is_empty() => parts
-                    .iter()
-                    .all(|part| part.as_str().map(|s| !s.trim().is_empty()).unwrap_or(false)),
-                _ => false,
-            };
-            if !has_command && !has_entrypoint {
-                missing.push("/runtime/agent/custom_image/entrypoint");
-            }
-        }
-        _ => {}
+
+    let mut invalid = Vec::new();
+    if json_value.pointer("/runtime/agent/mode").is_some() {
+        invalid
+            .push("/runtime/agent/mode (removed; use runtime.agent.command + runtime.agent.image)");
     }
+    if json_value
+        .pointer("/runtime/agent/known_agent_ref")
+        .is_some()
+    {
+        invalid.push(
+            "/runtime/agent/known_agent_ref (removed; ship built runtime in container image)",
+        );
+    }
+    if json_value.pointer("/runtime/agent/custom_image").is_some() {
+        invalid.push("/runtime/agent/custom_image (removed; use runtime.agent.image)");
+    }
+    if json_value.pointer("/runtime/agent/adapter").is_some() {
+        invalid.push("/runtime/agent/adapter (removed from user-facing spec)");
+    }
+    if json_value.pointer("/runtime/agent/aliases").is_some() {
+        invalid.push("/runtime/agent/aliases (removed from user-facing spec)");
+    }
+    if json_value.pointer("/runtime/agent/overrides").is_some() {
+        invalid.push("/runtime/agent/overrides (removed; package runtime concerns in the image)");
+    }
+
     let sandbox_mode = json_value
         .pointer("/runtime/policy/sandbox/mode")
         .and_then(|v| v.as_str())
         .unwrap_or("local");
     if sandbox_mode == "container" {
-        let policy_image = json_value
-            .pointer("/runtime/policy/sandbox/image")
+        let runtime_agent_image = json_value
+            .pointer("/runtime/agent/image")
             .and_then(|v| v.as_str())
             .map(|v| v.trim().to_string())
             .unwrap_or_default();
-        let custom_image = json_value
-            .pointer("/runtime/agent/custom_image/image")
-            .and_then(|v| v.as_str())
-            .map(|v| v.trim().to_string())
-            .unwrap_or_default();
-        let has_container_image = match agent_mode {
-            Some("known_agent_ref") => true,
-            Some("custom_image") => !custom_image.is_empty() || !policy_image.is_empty(),
-            _ => !policy_image.is_empty(),
-        };
+        let has_container_image = !runtime_agent_image.is_empty();
         if !has_container_image {
-            missing.push("/runtime/policy/sandbox/image");
+            missing.push("/runtime/agent/image");
         }
     }
     if json_value.pointer("/benchmark").is_some() {
@@ -2331,16 +2332,17 @@ fn validate_required_fields(json_value: &Value) -> Result<()> {
             missing.push("/benchmark/adapter/command");
         }
     }
-    if missing.is_empty() {
+    if missing.is_empty() && invalid.is_empty() {
         Ok(())
     } else {
+        let mut lines = missing
+            .iter()
+            .map(|p| format!("  - {}", p))
+            .collect::<Vec<_>>();
+        lines.extend(invalid.iter().map(|p| format!("  - {}", p)));
         Err(anyhow!(
             "experiment.yaml missing required fields:\n{}",
-            missing
-                .iter()
-                .map(|p| format!("  - {}", p))
-                .collect::<Vec<_>>()
-                .join("\n")
+            lines.join("\n")
         ))
     }
 }
@@ -4132,11 +4134,18 @@ fn resolve_variant_plan(json_value: &Value) -> Result<(Vec<Variant>, String)> {
     if !baseline_bindings.is_object() {
         return Err(anyhow!("invalid /baseline/bindings: expected object"));
     }
-    let baseline_runtime_overrides = match json_value.pointer("/baseline/runtime_overrides") {
+    let mut baseline_runtime_overrides = match json_value.pointer("/baseline/runtime_overrides") {
         None | Some(Value::Null) => None,
         Some(Value::Object(_)) => json_value.pointer("/baseline/runtime_overrides").cloned(),
         Some(_) => return Err(anyhow!("/baseline/runtime_overrides must be an object")),
     };
+    if let Some(image) =
+        parse_optional_nonempty_string(json_value.pointer("/baseline/image"), "/baseline/image")?
+    {
+        let mut overrides = baseline_runtime_overrides.unwrap_or_else(|| json!({}));
+        set_json_pointer_value(&mut overrides, "/agent/image", json!(image))?;
+        baseline_runtime_overrides = Some(overrides);
+    }
 
     let mut variants = Vec::new();
     variants.push(Variant {
@@ -4174,7 +4183,7 @@ fn resolve_variant_plan(json_value: &Value) -> Result<(Vec<Variant>, String)> {
         if !bindings.is_object() {
             return Err(anyhow!("/variant_plan[{}].bindings must be an object", idx));
         }
-        let runtime_overrides = match item.get("runtime_overrides") {
+        let mut runtime_overrides = match item.get("runtime_overrides") {
             None | Some(Value::Null) => None,
             Some(Value::Object(_)) => item.get("runtime_overrides").cloned(),
             Some(_) => {
@@ -4184,6 +4193,14 @@ fn resolve_variant_plan(json_value: &Value) -> Result<(Vec<Variant>, String)> {
                 ))
             }
         };
+        if let Some(image) = parse_optional_nonempty_string(
+            item.get("image"),
+            &format!("/variant_plan[{}].image", idx),
+        )? {
+            let mut overrides = runtime_overrides.unwrap_or_else(|| json!({}));
+            set_json_pointer_value(&mut overrides, "/agent/image", json!(image))?;
+            runtime_overrides = Some(overrides);
+        }
         variants.push(Variant {
             id,
             bindings,
@@ -5029,10 +5046,17 @@ struct AgentRuntimeManifest {
 }
 
 #[derive(Clone)]
+struct AgentRuntimeIoConfig {
+    input_arg: String,
+    output_arg: String,
+}
+
+#[derive(Clone)]
 struct AgentRuntimeConfig {
     adapter_ref: AgentAdapterRef,
     command_raw: Vec<String>,
     container_image: Option<String>,
+    io: AgentRuntimeIoConfig,
     integration_level: String,
     launch_mode: AgentLaunchMode,
     env: BTreeMap<String, String>,
@@ -5106,6 +5130,21 @@ fn parse_string_map_field(value: Option<&Value>, field: &str) -> Result<BTreeMap
             Ok(parsed)
         }
         Some(_) => Err(anyhow!("{} must be an object<string,string>", field)),
+    }
+}
+
+fn parse_optional_nonempty_string(value: Option<&Value>, field: &str) -> Result<Option<String>> {
+    match value {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(raw)) => {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(trimmed.to_string()))
+            }
+        }
+        Some(_) => Err(anyhow!("{} must be a string", field)),
     }
 }
 
@@ -5322,6 +5361,17 @@ fn resolve_agent_runtime(json_value: &Value, exp_dir: &Path) -> Result<AgentRunt
     let agent = json_value
         .pointer("/runtime/agent")
         .ok_or_else(|| anyhow!("runtime.agent is required"))?;
+    if agent.pointer("/mode").is_some()
+        || agent.pointer("/known_agent_ref").is_some()
+        || agent.pointer("/custom_image").is_some()
+        || agent.pointer("/adapter").is_some()
+        || agent.pointer("/aliases").is_some()
+        || agent.pointer("/overrides").is_some()
+    {
+        return Err(anyhow!(
+            "runtime.agent hard cut: use runtime.agent.command + runtime.agent.image (+ optional runtime.agent.io)"
+        ));
+    }
 
     let trajectory_path = json_value
         .pointer("/runtime/telemetry/trajectory_path")
@@ -5344,157 +5394,73 @@ fn resolve_agent_runtime(json_value: &Value, exp_dir: &Path) -> Result<AgentRunt
         .and_then(|v| v.as_array())
         .cloned()
         .unwrap_or_default();
-    let policy_image = json_value
-        .pointer("/runtime/policy/sandbox/image")
+    let runtime_agent_image = agent
+        .pointer("/image")
         .and_then(|v| v.as_str())
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
 
-    let mode = agent
-        .pointer("/mode")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| anyhow!("runtime.agent.mode missing"))?;
+    let command = parse_command_field(agent.pointer("/command"), "runtime.agent.command")?
+        .ok_or_else(|| anyhow!("runtime.agent.command is required"))?;
     let integration_level = agent
         .pointer("/integration_level")
         .and_then(|v| v.as_str())
         .unwrap_or("cli_basic")
         .to_string();
-    let adapter_ref = AgentAdapterRef {
-        id: agent
-            .pointer("/adapter/id")
-            .and_then(|v| v.as_str())
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| BUILTIN_COMMAND_ADAPTER_ID.to_string()),
-        version: agent
-            .pointer("/adapter/version")
-            .and_then(|v| v.as_str())
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
-            .unwrap_or_else(|| BUILTIN_COMMAND_ADAPTER_VERSION.to_string()),
-    };
+    let adapter_ref = AgentAdapterRef::default();
     let launch_mode =
         AgentLaunchMode::parse(agent.pointer("/launch/mode").and_then(|v| v.as_str()))?;
     let default_timeout_ms = agent
         .pointer("/default_timeout_ms")
         .and_then(|v| v.as_u64())
         .filter(|v| *v > 0);
-    let command_override = parse_command_field(agent.pointer("/command"), "runtime.agent.command")?;
-    let override_args = parse_string_array_field(
-        agent.pointer("/overrides/args"),
-        "runtime.agent.overrides.args",
-    )?;
-    let override_env = parse_string_map_field(
-        agent.pointer("/overrides/env"),
-        "runtime.agent.overrides.env",
-    )?;
+    let env = parse_string_map_field(agent.pointer("/env"), "runtime.agent.env")?;
     let env_from_host = parse_string_array_field(
-        agent.pointer("/overrides/env_from_host"),
-        "runtime.agent.overrides.env_from_host",
+        agent.pointer("/env_from_host"),
+        "runtime.agent.env_from_host",
     )?;
-    let mut command_aliases = default_command_aliases_for_adapter(&adapter_ref);
-    let user_aliases =
-        parse_command_aliases_field(agent.pointer("/aliases"), "runtime.agent.aliases")?;
-    for (alias, target) in user_aliases {
-        command_aliases.insert(alias, target);
+    let input_arg = agent
+        .pointer("/io/input_arg")
+        .and_then(|v| v.as_str())
+        .unwrap_or("--input")
+        .trim()
+        .to_string();
+    if input_arg.is_empty() {
+        return Err(anyhow!("runtime.agent.io.input_arg must not be empty"));
+    }
+    let output_arg = agent
+        .pointer("/io/output_arg")
+        .and_then(|v| v.as_str())
+        .unwrap_or("--output")
+        .trim()
+        .to_string();
+    if output_arg.is_empty() {
+        return Err(anyhow!("runtime.agent.io.output_arg must not be empty"));
     }
 
-    match mode {
-        "known_agent_ref" => {
-            let id = agent
-                .pointer("/known_agent_ref/id")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| anyhow!("runtime.agent.known_agent_ref.id missing"))?
-                .trim()
-                .to_string();
-            if id.is_empty() {
-                return Err(anyhow!(
-                    "runtime.agent.known_agent_ref.id must not be empty"
-                ));
-            }
-            let version = agent
-                .pointer("/known_agent_ref/version")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| anyhow!("runtime.agent.known_agent_ref.version missing"))?
-                .trim()
-                .to_string();
-            if version.is_empty() {
-                return Err(anyhow!(
-                    "runtime.agent.known_agent_ref.version must not be empty"
-                ));
-            }
-            let registry = agent
-                .pointer("/known_agent_ref/registry")
-                .and_then(|v| v.as_str())
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty());
-            let manifest = load_known_agent_manifest(exp_dir, &id, &version, registry.as_deref())?;
-            let mut command = command_override.clone().unwrap_or(manifest.entrypoint);
-            command.extend(override_args);
-            command = apply_command_aliases(command, &command_aliases);
-            let mut env = manifest.default_env;
-            env.extend(override_env);
-            Ok(AgentRuntimeConfig {
-                adapter_ref,
-                command_raw: command,
-                container_image: Some(manifest.image),
-                integration_level,
-                launch_mode,
-                env,
-                env_from_host,
-                trajectory_path,
-                causal_extraction,
-                default_timeout_ms,
-                tracing_mode,
-                force_container,
-                dependency_file_staging,
-                dependency_services,
-            })
-        }
-        "custom_image" => {
-            let mut command = if let Some(command) = command_override {
-                command
-            } else {
-                parse_string_array_field(
-                    agent.pointer("/custom_image/entrypoint"),
-                    "runtime.agent.custom_image.entrypoint",
-                )?
-            };
-            if command.is_empty() {
-                return Err(anyhow!(
-                    "runtime.agent.custom_image.entrypoint is required for mode=custom_image (or set runtime.agent.command)"
-                ));
-            }
-            command.extend(override_args);
-            command = apply_command_aliases(command, &command_aliases);
-            let container_image = agent
-                .pointer("/custom_image/image")
-                .and_then(|v| v.as_str())
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .or(policy_image);
-            Ok(AgentRuntimeConfig {
-                adapter_ref,
-                command_raw: command,
-                container_image,
-                integration_level,
-                launch_mode,
-                env: override_env,
-                env_from_host,
-                trajectory_path,
-                causal_extraction,
-                default_timeout_ms,
-                tracing_mode,
-                force_container,
-                dependency_file_staging,
-                dependency_services,
-            })
-        }
-        other => Err(anyhow!(
-            "unsupported runtime.agent.mode '{}'; expected known_agent_ref|custom_image",
-            other
-        )),
-    }
+    let container_image = runtime_agent_image;
+    let force_container = force_container || container_image.is_some();
+
+    Ok(AgentRuntimeConfig {
+        adapter_ref,
+        command_raw: command,
+        container_image,
+        io: AgentRuntimeIoConfig {
+            input_arg,
+            output_arg,
+        },
+        integration_level,
+        launch_mode,
+        env,
+        env_from_host,
+        trajectory_path,
+        causal_extraction,
+        default_timeout_ms,
+        tracing_mode,
+        force_container,
+        dependency_file_staging,
+        dependency_services,
+    })
 }
 
 fn resolve_agent_runtime_env(
@@ -6115,13 +6081,9 @@ impl AgentAdapter for PrebuiltCommandAdapter {
 }
 
 fn run_builtin_adapter_local(request: &AdapterRunRequest<'_>) -> Result<ProcessRunResult> {
-    let rendered =
-        apply_agentlab_template_to_command(&request.runtime.command_raw, request.runtime_env);
-    if rendered.is_empty() {
-        return Err(anyhow!("resolved runtime.agent command is empty"));
-    }
-    let mut cmd = Command::new(&rendered[0]);
-    cmd.args(&rendered[1..]);
+    let command = resolve_runtime_agent_command(request)?;
+    let mut cmd = Command::new(&command[0]);
+    cmd.args(&command[1..]);
     cmd.current_dir(&request.trial_paths.workspace);
     for (key, value) in request.runtime_overrides_env {
         cmd.env(key, value);
@@ -6137,22 +6099,12 @@ fn run_builtin_adapter_container(request: &AdapterRunRequest<'_>) -> Result<Proc
         .runtime
         .container_image
         .as_deref()
-        .or_else(|| {
-            request
-                .runtime_experiment
-                .pointer("/runtime/policy/sandbox/image")
-                .and_then(|v| v.as_str())
-        })
         .ok_or_else(|| anyhow!("container image required for container mode"))?;
 
     if request.network_mode == "allowlist_enforced" {
         return Err(anyhow!("allowlist_enforced not implemented in Rust runner"));
     }
-    let rendered =
-        apply_agentlab_template_to_command(&request.runtime.command_raw, request.runtime_env);
-    if rendered.is_empty() {
-        return Err(anyhow!("resolved runtime.agent command is empty"));
-    }
+    let command = resolve_runtime_agent_command(request)?;
 
     let mut cmd = Command::new("docker");
     cmd.arg("run").arg("--rm");
@@ -6271,16 +6223,52 @@ fn run_builtin_adapter_container(request: &AdapterRunRequest<'_>) -> Result<Proc
     }
     if let Some(setup) = request.setup_command {
         cmd.arg(image);
-        let wrapped = format!("{} && exec {}", setup, shell_join(&rendered));
+        let wrapped = format!("{} && exec {}", setup, shell_join(&command));
         cmd.arg("/bin/sh");
         cmd.arg("-lc");
         cmd.arg(wrapped);
     } else {
         cmd.arg(image);
-        cmd.args(rendered);
+        cmd.args(command);
     }
 
     run_adapter_process(cmd, &request.io_paths.output_host, None)
+}
+
+fn append_runtime_io_arg(command: &mut Vec<String>, arg_spec: &str, path: &str) -> Result<()> {
+    let trimmed = arg_spec.trim();
+    if trimmed.is_empty() {
+        return Err(anyhow!("runtime.agent.io argument spec must not be empty"));
+    }
+    if trimmed.contains("{path}") {
+        command.push(trimmed.replace("{path}", path));
+    } else if trimmed.ends_with('=') {
+        command.push(format!("{}{}", trimmed, path));
+    } else {
+        command.push(trimmed.to_string());
+        command.push(path.to_string());
+    }
+    Ok(())
+}
+
+fn resolve_runtime_agent_command(request: &AdapterRunRequest<'_>) -> Result<Vec<String>> {
+    let rendered =
+        apply_agentlab_template_to_command(&request.runtime.command_raw, request.runtime_env);
+    if rendered.is_empty() {
+        return Err(anyhow!("resolved runtime.agent command is empty"));
+    }
+    let mut command = rendered;
+    append_runtime_io_arg(
+        &mut command,
+        &request.runtime.io.input_arg,
+        &request.io_paths.task_path,
+    )?;
+    append_runtime_io_arg(
+        &mut command,
+        &request.runtime.io.output_arg,
+        &request.io_paths.result_path,
+    )?;
+    Ok(command)
 }
 
 fn resolve_agent_runtime_command(
@@ -6984,11 +6972,13 @@ mod tests {
 
     #[test]
     fn adapter_registry_error_lists_supported_adapters() {
-        let err = adapter_registry_entry(&AgentAdapterRef {
+        let err = match adapter_registry_entry(&AgentAdapterRef {
             id: "unknown.adapter".to_string(),
             version: "v0".to_string(),
-        })
-        .expect_err("unsupported adapter should fail");
+        }) {
+            Ok(_) => panic!("unsupported adapter should fail"),
+            Err(err) => err,
+        };
         let msg = err.to_string();
         assert!(
             msg.contains(&format!(
@@ -7031,16 +7021,10 @@ mod tests {
             "baseline": { "variant_id": "base", "bindings": {} },
             "runtime": {
                 "agent": {
-                    "mode": "custom_image",
+                    "command": harness_success_command(),
+                    "image": "img",
                     "integration_level": integration_level,
-                    "adapter": {
-                        "id": BUILTIN_COMMAND_ADAPTER_ID,
-                        "version": BUILTIN_COMMAND_ADAPTER_VERSION
-                    },
-                    "custom_image": {
-                        "entrypoint": harness_success_command(),
-                        "image": "img"
-                    }
+                    "io": { "input_arg": "--input", "output_arg": "--output" }
                 },
                 "policy": {
                     "timeout_ms": 600000,
@@ -7373,16 +7357,10 @@ mod tests {
             "baseline": { "variant_id": "base", "bindings": {} },
             "runtime": {
                 "agent": {
-                    "mode": "custom_image",
+                    "command": harness_success_command(),
+                    "image": "img",
                     "integration_level": "cli_basic",
-                    "adapter": {
-                        "id": BUILTIN_COMMAND_ADAPTER_ID,
-                        "version": BUILTIN_COMMAND_ADAPTER_VERSION
-                    },
-                    "custom_image": {
-                        "entrypoint": harness_success_command(),
-                        "image": "img"
-                    }
+                    "io": { "input_arg": "--input", "output_arg": "--output" }
                 },
                 "policy": {
                     "timeout_ms": 600000,
@@ -7476,11 +7454,8 @@ mod tests {
         let spec = json!({
             "runtime": {
                 "agent": {
-                    "mode": "custom_image",
-                    "custom_image": {
-                        "entrypoint": ["sh", "-lc", "echo ok"],
-                        "image": "img"
-                    },
+                    "command": ["sh", "-lc", "echo ok"],
+                    "image": "img",
                     "integration_level": "cli_basic",
                     "launch": { "mode": "stdio" }
                 },
@@ -7504,15 +7479,8 @@ mod tests {
         let spec = json!({
             "runtime": {
                 "agent": {
-                    "mode": "custom_image",
                     "command": "rex",
-                    "custom_image": {
-                        "image": "img",
-                        "entrypoint": ["should", "not", "be", "used"]
-                    },
-                    "overrides": {
-                        "args": ["run-agent-loop"]
-                    }
+                    "image": "img"
                 },
                 "policy": {
                     "timeout_ms": 600000,
@@ -7523,26 +7491,22 @@ mod tests {
         });
 
         let agent_runtime = resolve_agent_runtime(&spec, &exp_dir).expect("resolve runtime");
-        assert_eq!(agent_runtime.command_raw, vec!["rex", "run-agent-loop"]);
+        assert_eq!(agent_runtime.command_raw, vec!["rex"]);
     }
 
     #[test]
-    fn resolve_agent_runtime_applies_user_aliases() {
+    fn resolve_agent_runtime_rejects_legacy_aliases() {
         let root = TempDirGuard::new("agentlab_command_aliases");
         let exp_dir = root.path.join("exp");
         ensure_dir(&exp_dir).expect("exp dir");
         let spec = json!({
             "runtime": {
                 "agent": {
-                    "mode": "custom_image",
                     "command": ["rex", "run-agent-loop"],
                     "aliases": {
                         "rex": ["bun", "./scripts/rex.js"]
                     },
-                    "custom_image": {
-                        "image": "img",
-                        "entrypoint": ["ignored"]
-                    }
+                    "image": "img"
                 },
                 "policy": {
                     "timeout_ms": 600000,
@@ -7552,10 +7516,14 @@ mod tests {
             }
         });
 
-        let agent_runtime = resolve_agent_runtime(&spec, &exp_dir).expect("resolve runtime");
-        assert_eq!(
-            agent_runtime.command_raw,
-            vec!["bun", "./scripts/rex.js", "run-agent-loop"]
+        let err = match resolve_agent_runtime(&spec, &exp_dir) {
+            Ok(_) => panic!("legacy aliases should fail"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains("hard cut"),
+            "unexpected error: {}",
+            err
         );
     }
 
@@ -7602,14 +7570,9 @@ mod tests {
         let spec = json!({
             "runtime": {
                 "agent": {
-                    "mode": "custom_image",
-                    "custom_image": {
-                        "entrypoint": ["sh", "-lc", "echo ok"],
-                        "image": "img"
-                    },
-                    "overrides": {
-                        "env": {"A":"B"}
-                    }
+                    "command": ["sh", "-lc", "echo ok"],
+                    "image": "img",
+                    "env": {"A":"B"}
                 },
                 "dependencies": {
                     "file_staging": [
@@ -7662,6 +7625,10 @@ mod tests {
             adapter_ref: AgentAdapterRef::default(),
             command_raw: vec![],
             container_image: None,
+            io: AgentRuntimeIoConfig {
+                input_arg: "--input".to_string(),
+                output_arg: "--output".to_string(),
+            },
             integration_level: "cli_basic".to_string(),
             launch_mode: AgentLaunchMode::File,
             env: BTreeMap::new(),
@@ -8232,7 +8199,7 @@ mod tests {
             "design": { "sanitization_profile": "hermetic_functional", "comparison": "paired", "replications": 1, "random_seed": 1337, "shuffle_tasks": true, "max_concurrency": 1 },
             "baseline": { "variant_id": "base", "bindings": {} },
             "runtime": {
-                "agent": { "mode": "custom_image", "custom_image": { "entrypoint": ["node", "h.js"] } },
+                "agent": { "command": ["node", "h.js"] },
                 "policy": {
                     "timeout_ms": 600000,
                     "sandbox": { "mode": "local" },
@@ -8299,7 +8266,7 @@ mod tests {
             "design": { "sanitization_profile": "hermetic_functional", "comparison": "paired", "replications": 1, "random_seed": 1337, "shuffle_tasks": true, "max_concurrency": 1 },
             "baseline": { "variant_id": "base", "bindings": {} },
             "runtime": {
-                "agent": { "mode": "custom_image", "custom_image": { "entrypoint": ["node", "h.js"] } },
+                "agent": { "command": ["node", "h.js"] },
                 "policy": {
                     "timeout_ms": 600000,
                     "sandbox": { "mode": "local" },
@@ -8320,8 +8287,7 @@ mod tests {
             "baseline": { "variant_id": "base", "bindings": {} },
             "runtime": {
                 "agent": {
-                    "mode": "custom_image",
-                    "custom_image": { "entrypoint": ["node", "/app/h.js"] }
+                    "command": ["node", "/app/h.js"]
                 },
                 "policy": {
                     "timeout_ms": 600000,
@@ -8332,13 +8298,8 @@ mod tests {
         });
         let err = validate_required_fields(&spec).expect_err("should fail");
         assert!(
-            err.to_string().contains("/runtime/policy/sandbox/image"),
+            err.to_string().contains("/runtime/agent/image"),
             "missing sandbox image: {}",
-            err
-        );
-        assert!(
-            !err.to_string().contains("/runtime/agent/mode"),
-            "container mode runtime.agent mode should be present: {}",
             err
         );
     }
@@ -8872,11 +8833,8 @@ JSONL
             "design": { "sanitization_profile": "hermetic_functional" },
             "runtime": {
                 "agent": {
-                    "mode": "custom_image",
-                    "custom_image": {
-                        "entrypoint": ["sh", "-lc", "echo ok"],
-                        "image": "img"
-                    }
+                    "command": ["sh", "-lc", "echo ok"],
+                    "image": "img"
                 },
                 "dependencies": { "services": [] },
                 "policy": {

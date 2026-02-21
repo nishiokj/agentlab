@@ -745,23 +745,11 @@ baseline:
 variant_plan: []
 runtime:
   agent:
-    mode: custom_image                 # REQUIRED: known_agent_ref | custom_image
-    command: []                        # optional: string|string[] command override (e.g. [\"rex\"] or [\"./agent.py\"])
-    aliases: {}                        # optional: alias -> command (e.g. { rex: [\"bun\", \"./bin/rex.js\"] })
-    adapter:
-      id: builtin.command_contract     # optional: builtin.command_contract | prebuilt.codex_cli | prebuilt.rex_jesus
-      version: v1                      # optional: defaults to v1
-    known_agent_ref:
-      id: ''                           # REQUIRED when mode=known_agent_ref
-      version: ''                      # REQUIRED when mode=known_agent_ref
-      registry: ''                     # optional
-    custom_image:
-      image: ''                        # REQUIRED when mode=custom_image and sandbox.mode=container
-      entrypoint: []                   # REQUIRED when mode=custom_image unless runtime.agent.command is set
-    overrides:
-      args: []
-      env: {}
-      env_from_host: []
+    command: []                        # REQUIRED: string|string[] command (e.g. [\"rex\"])
+    image: ''                          # REQUIRED when sandbox.mode=container (can be overridden per variant)
+    io:
+      input_arg: --input               # runner appends resolved task path
+      output_arg: --output             # runner appends resolved result path
   dependencies:
     file_staging: []
     services: []
@@ -769,7 +757,6 @@ runtime:
     timeout_ms: 600000
     sandbox:
       mode: local
-      image: ''                        # REQUIRED when mode=container
     network:
       mode: none
       allowed_hosts: []
@@ -1183,17 +1170,17 @@ fn write_knob_files(
       "scientific_role": "invariant"
     },
     {
-      "id": "runtime.agent.custom_image.entrypoint",
-      "label": "Agent Entrypoint",
-      "json_pointer": "/runtime/agent/custom_image/entrypoint",
-      "type": "string",
+      "id": "runtime.agent.command",
+      "label": "Agent Command",
+      "json_pointer": "/runtime/agent/command",
+      "type": "json",
       "role": "agent",
       "scientific_role": "treatment"
     },
     {
-      "id": "runtime.policy.sandbox.image",
-      "label": "Sandbox Image",
-      "json_pointer": "/runtime/policy/sandbox/image",
+      "id": "runtime.agent.image",
+      "label": "Agent Image",
+      "json_pointer": "/runtime/agent/image",
       "type": "string",
       "role": "infra",
       "scientific_role": "treatment",

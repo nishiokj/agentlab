@@ -95,30 +95,23 @@ design:
 
 baseline:
   variant_id: control
+  image: ghcr.io/org/agent-runtime-control@sha256:...
   bindings:
     model: gpt-4o-mini
 
 variant_plan:
   - variant_id: treatment
+    image: ghcr.io/org/agent-runtime-treatment@sha256:...
     bindings:
       model: gpt-4.1
 
 runtime:
   agent:
-    mode: custom_image # known_agent_ref | custom_image
-    command: ["rex", "run-agent-loop"] # optional: string|string[] command override
-    aliases: # optional: short aliases to avoid hardcoding image paths
-      rex: ["bun", "/opt/rex/packages/infra/harness-daemon/bin/rex.js"]
-    adapter:
-      id: prebuilt.rex_jesus # optional: builtin.command_contract | prebuilt.codex_cli | prebuilt.rex_jesus
-      version: v1
-    custom_image:
-      image: ghcr.io/org/agent-runtime@sha256:...
-      entrypoint: ["python", "-m", "my_agent.run_trial"]
-    overrides:
-      env:
-        AGENT_NAME: baseline
-      env_from_host: ["OPENAI_API_KEY"]
+    command: ["rex"] # required: single runtime command
+    image: ghcr.io/org/agent-runtime@sha256:... # required for container mode; variant image can override
+    io: # optional: defaults shown
+      input_arg: --input
+      output_arg: --output
 
   dependencies:
     file_staging:
@@ -234,45 +227,30 @@ with open(os.environ["AGENTLAB_RESULT_PATH"], "w", encoding="utf-8") as f:
 Minimum inputs for a runnable experiment:
 
 1. Dataset rows (`dataset.path`).
-2. Agent runtime (`runtime.agent`):
-   - `known_agent_ref`, or
-   - `custom_image`.
-   - optional explicit adapter identity (`runtime.agent.adapter`).
-3. Baseline variant bindings (plus optional treatments).
-4. Policy (`timeout`, `network`, `sandbox`).
-5. Optional staged dependency files/services for sqlite, AST indexes, or other local state.
+2. Agent runtime (`runtime.agent.command` and optional `runtime.agent.io` flags).
+3. Container image (`runtime.agent.image` for baseline/default, optionally overridden per variant via `baseline.image` and `variant_plan[].image`).
+4. Baseline variant bindings (plus optional treatments).
+5. Policy (`timeout`, `network`, `sandbox`).
+6. Optional staged dependency files/services for sqlite, AST indexes, or other local state.
 
 ## Runtime Source of Truth
 
-`runtime.agent` answers where the runtime actually lives:
+`runtime.agent` is intentionally small:
 
-1. `mode: known_agent_ref`
-   - Runner resolves `.lab/agents/<registry>/<id>/<version>.json` (or `.lab/agents/<id>/<version>.json`).
-   - Manifest provides immutable runtime image + entrypoint.
-2. `mode: custom_image`
-   - Experiment directly declares image + entrypoint.
+1. `runtime.agent.command` is the only runtime command the runner invokes.
+2. `runtime.agent.image` is the default container image.
+3. `baseline.image` and `variant_plan[].image` can override image per variant.
+4. `runtime.agent.io.input_arg` / `output_arg` define how runner-appended file paths are passed to your command.
 
 The command is executed by runner inside that runtime context. It is not a host-side path lookup API.
 
-Optional adapter identity:
-
-1. `runtime.agent.adapter.id` + `runtime.agent.adapter.version`
-2. Built-in ids:
-   - `builtin.command_contract@v1`
-   - `prebuilt.codex_cli@v1`
-   - `prebuilt.rex_jesus@v1`
-
-Optional command overrides:
-
-1. `runtime.agent.command` can be a string (single token) or string array.
-2. For `mode: custom_image`, `runtime.agent.command` can replace `custom_image.entrypoint`.
-3. `runtime.agent.aliases` can map short names (for example `rex`) to full command token arrays.
+Runner automatically appends the resolved trial input/output paths to your command using these IO arg settings.
 
 For reproducible frozen agents:
 
 1. Build agent image with runtime + code.
 2. Pin image by digest (`image@sha256:...`).
-3. Use `known_agent_ref` manifest or `custom_image` to point at that digest.
+3. Set `runtime.agent.image` to that digest and optionally override per variant.
 4. Stage large mutable inputs (sqlite/db/index files) via `runtime.dependencies.file_staging`.
 
 ## Path and CWD Semantics
@@ -283,7 +261,7 @@ Resolution behavior:
 
 1. `dataset.path` resolves relative to the experiment file directory.
 2. `runtime.dependencies.file_staging[*].source_from_host` resolves relative to project root (parent of `.lab`) when relative.
-3. In container execution, `runtime.agent.command` / `custom_image.entrypoint` tokens are treated as literal command tokens.
+3. In container execution, `runtime.agent.command` tokens are treated as literal command tokens.
 4. In local-process execution, path-like tokens may be host-resolved for compatibility.
 
 ## CLI Quick Start
@@ -374,6 +352,6 @@ See full details in:
 ## Notes
 
 1. If your agent needs sqlite indices, AST stores, or similar assets, use `runtime.dependencies.file_staging` + `runtime.dependencies.services`.
-2. For reproducibility in container mode, pin `runtime.policy.sandbox.image` by digest (`image@sha256:...`).
-3. `runtime.agent.mode: known_agent_ref` resolves from `.lab/agents/<registry>/<id>/<version>.json` (or `.lab/agents/<id>/<version>.json` without registry).
+2. For reproducibility in container mode, pin `runtime.agent.image` (and per-variant `baseline.image` / `variant_plan[].image`) by digest (`image@sha256:...`).
+3. Keep runtime YAML minimal: command + image + policy; package dependencies/env/runtime setup inside the image.
 4. Keep agent runtime implementations stateless across trials; each trial should be self-sufficient and isolated.
