@@ -29,6 +29,13 @@ pub const AGENTLAB_AGENTLABD_START_REQUEST_PATH: &str =
     "/agentlab/state/agentlabd_start_trial.request.json";
 pub const AGENTLAB_AGENTLABD_START_RESPONSE_PATH: &str =
     "/agentlab/state/agentlabd_start_trial.response.json";
+pub const HARNESS_IN_DIR: &str = "/in";
+pub const HARNESS_OUT_DIR: &str = "/out";
+pub const HARNESS_TASK_PATH: &str = "/in/task.json";
+pub const HARNESS_RESULT_PATH: &str = "/out/result.json";
+pub const CLEAN_IN_TASK: &str = HARNESS_TASK_PATH;
+pub const CLEAN_OUT_DIR: &str = HARNESS_OUT_DIR;
+pub const CLEAN_OUT_RESULT: &str = HARNESS_RESULT_PATH;
 
 pub const AGENTLAB_ENV_TRIAL_INPUT: &str = "AGENTLAB_TRIAL_INPUT";
 pub const AGENTLAB_ENV_TRIAL_OUTPUT: &str = "AGENTLAB_TRIAL_OUTPUT";

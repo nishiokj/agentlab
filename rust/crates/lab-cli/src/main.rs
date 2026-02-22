@@ -1,8 +1,10 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
 use serde_json::{json, Value};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
+use std::io::Write;
 use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 #[derive(Parser)]
 #[command(name = "lab", version = "0.3.0", about = "AgentLab Rust CLI")]
@@ -52,6 +54,20 @@ impl From<MaterializeArg> for lab_runner::MaterializationMode {
             MaterializeArg::Full => lab_runner::MaterializationMode::Full,
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum InitProfileArg {
+    #[value(name = "agent-eval")]
+    AgentEval,
+    #[value(name = "ab-test")]
+    AbTest,
+    #[value(name = "sweep")]
+    Sweep,
+    #[value(name = "regression")]
+    Regression,
+    #[value(name = "local-dev")]
+    LocalDev,
 }
 
 #[derive(Subcommand)]
@@ -147,6 +163,12 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+    #[command(about = "Kill a running or paused experiment immediately")]
+    Kill {
+        run: String,
+        #[arg(long)]
+        json: bool,
+    },
     Describe {
         experiment: PathBuf,
         #[arg(long)]
@@ -163,12 +185,28 @@ enum Commands {
         limit: usize,
         #[arg(long)]
         json: bool,
+        #[arg(long)]
+        csv: bool,
     },
     Query {
         run: String,
         sql: String,
         #[arg(long)]
         json: bool,
+        #[arg(long)]
+        csv: bool,
+    },
+    #[command(about = "Live per-task scoreboard grouped by variant")]
+    Scoreboard {
+        run: String,
+        #[arg(long, default_value_t = 2)]
+        interval_seconds: u64,
+        #[arg(long, default_value_t = 8)]
+        metric_limit: usize,
+        #[arg(long)]
+        once: bool,
+        #[arg(long)]
+        no_clear: bool,
     },
     Trend {
         experiment_id: String,
@@ -178,6 +216,14 @@ enum Commands {
         variant: Option<String>,
         #[arg(long)]
         json: bool,
+        #[arg(long)]
+        csv: bool,
+    },
+    Runs {
+        #[arg(long)]
+        json: bool,
+        #[arg(long)]
+        csv: bool,
     },
     KnobsInit {
         #[arg(long, default_value = ".lab/knobs/manifest.json")]
@@ -224,6 +270,8 @@ enum Commands {
         in_place: bool,
         #[arg(long)]
         force: bool,
+        #[arg(long, value_enum)]
+        profile: Option<InitProfileArg>,
     },
     Clean {
         #[arg(long)]
@@ -280,6 +328,7 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
                 execution.clone(),
             )?;
             if json {
+                let post_run = try_post_run_stats_json(&result.run_dir);
                 return Ok(Some(json!({
                     "ok": true,
                     "command": "run",
@@ -290,12 +339,14 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
                     "executor": execution.executor.map(|e| e.as_str()),
                     "materialize": execution.materialize.map(|m| m.as_str()),
                     "remote_endpoint": execution.remote_endpoint,
-                    "remote_token_env": execution.remote_token_env
+                    "remote_token_env": execution.remote_token_env,
+                    "post_run_stats": post_run
                 })));
             }
             print_summary(&summary);
             println!("run_id: {}", result.run_id);
             println!("run_dir: {}", result.run_dir.display());
+            try_print_post_run_stats(&result.run_dir, &result.run_id);
         }
         Commands::RunDev {
             experiment,
@@ -312,6 +363,7 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
                 overrides.as_deref(),
             )?;
             if json {
+                let post_run = try_post_run_stats_json(&result.run_dir);
                 return Ok(Some(json!({
                     "ok": true,
                     "command": "run-dev",
@@ -319,7 +371,8 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
                     "run": run_result_to_json(&result),
                     "artifacts": run_artifacts_to_json(&result),
                     "dev_setup": setup_for_json,
-                    "dev_network_mode": "full"
+                    "dev_network_mode": "full",
+                    "post_run_stats": post_run
                 })));
             }
             print_summary(&summary);
@@ -331,6 +384,7 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
             println!("dev_network_mode: full");
             println!("run_id: {}", result.run_id);
             println!("run_dir: {}", result.run_dir.display());
+            try_print_post_run_stats(&result.run_dir, &result.run_id);
         }
         Commands::RunExperiment {
             experiment,
@@ -344,18 +398,21 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
                 overrides.as_deref(),
             )?;
             if json {
+                let post_run = try_post_run_stats_json(&result.run_dir);
                 return Ok(Some(json!({
                     "ok": true,
                     "command": "run-experiment",
                     "summary": summary_to_json(&summary),
                     "run": run_result_to_json(&result),
-                    "experiment_network_requirement": "none"
+                    "experiment_network_requirement": "none",
+                    "post_run_stats": post_run
                 })));
             }
             print_summary(&summary);
             println!("experiment_network_requirement: none");
             println!("run_id: {}", result.run_id);
             println!("run_dir: {}", result.run_dir.display());
+            try_print_post_run_stats(&result.run_dir, &result.run_id);
         }
         Commands::Replay {
             run_dir,
@@ -476,6 +533,28 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
             println!("run_id: {}", result.run_id);
             println!("run_dir: {}", result.run_dir.display());
         }
+        Commands::Kill { run, json } => {
+            let run_dir = resolve_run_dir_arg(&run)?;
+            let result = lab_runner::kill_run(&run_dir)?;
+            if json {
+                return Ok(Some(json!({
+                    "ok": true,
+                    "command": "kill",
+                    "run_id": result.run_id,
+                    "run_dir": result.run_dir.display().to_string(),
+                    "previous_status": result.previous_status,
+                    "killed_trials": result.killed_trials,
+                })));
+            }
+            println!("killed: {}", result.run_id);
+            println!("run_dir: {}", result.run_dir.display());
+            println!("previous_status: {}", result.previous_status);
+            if result.killed_trials.is_empty() {
+                println!("killed_trials: (none active)");
+            } else {
+                println!("killed_trials: {}", result.killed_trials.join(", "));
+            }
+        }
         Commands::Describe {
             experiment,
             overrides,
@@ -498,7 +577,11 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
             all,
             limit,
             json,
+            csv,
         } => {
+            if json && csv {
+                return Err(anyhow::anyhow!("--json and --csv are mutually exclusive"));
+            }
             if all && view.is_some() {
                 return Err(anyhow::anyhow!(
                     "--all cannot be combined with a specific view name"
@@ -523,6 +606,13 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
                         "views": Value::Object(payload),
                     })));
                 }
+                if csv {
+                    for name in &view_names {
+                        let table = lab_analysis::query_view(&run_dir, name, limit)?;
+                        print_query_table_csv(&table);
+                    }
+                    return Ok(None);
+                }
                 println!("run_dir: {}", run_dir.display());
                 println!("view_set: {}", view_set);
                 for name in &view_names {
@@ -546,6 +636,10 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
                         "result": query_table_to_json(&table),
                     })));
                 }
+                if csv {
+                    print_query_table_csv(&table);
+                    return Ok(None);
+                }
                 println!("run_dir: {}", run_dir.display());
                 println!("view_set: {}", view_set);
                 println!("view: {}", normalized);
@@ -553,6 +647,14 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
                 return Ok(None);
             }
 
+            // View listing (no specific view selected)
+            let listing_table = lab_analysis::QueryTable {
+                columns: vec!["view_name".to_string()],
+                rows: view_names
+                    .iter()
+                    .map(|n| vec![Value::String(n.clone())])
+                    .collect(),
+            };
             if json {
                 return Ok(Some(json!({
                     "ok": true,
@@ -562,13 +664,25 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
                     "available_views": view_names,
                 })));
             }
+            if csv {
+                print_query_table_csv(&listing_table);
+                return Ok(None);
+            }
             println!("run_dir: {}", run_dir.display());
             println!("view_set: {}", view_set);
             for name in view_names {
                 println!("{}", name);
             }
         }
-        Commands::Query { run, sql, json } => {
+        Commands::Query {
+            run,
+            sql,
+            json,
+            csv,
+        } => {
+            if json && csv {
+                return Err(anyhow::anyhow!("--json and --csv are mutually exclusive"));
+            }
             let run_dir = resolve_run_dir_arg(&run)?;
             let table = lab_analysis::query_run(&run_dir, &sql)?;
             if json {
@@ -580,14 +694,53 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
                     "result": query_table_to_json(&table),
                 })));
             }
+            if csv {
+                print_query_table_csv(&table);
+                return Ok(None);
+            }
             print_query_table(&table);
+        }
+        Commands::Scoreboard {
+            run,
+            interval_seconds,
+            metric_limit,
+            once,
+            no_clear,
+        } => {
+            let run_dir = resolve_run_dir_arg(&run)?;
+            let sleep_interval = Duration::from_secs(interval_seconds.max(1));
+            loop {
+                let table = build_live_scoreboard_table(&run_dir, metric_limit)?;
+                if !no_clear {
+                    print!("\x1B[2J\x1B[H");
+                    let _ = std::io::stdout().flush();
+                }
+                println!("run_dir: {}", run_dir.display());
+                println!("status: {}", read_run_status(&run_dir));
+                println!("updated_unix_s: {}", unix_now_seconds());
+                println!(
+                    "refresh_interval_seconds: {} (Ctrl-C to stop)",
+                    sleep_interval.as_secs()
+                );
+                println!();
+                print_scoreboard_grouped_by_variant(&table);
+
+                if once {
+                    break;
+                }
+                std::thread::sleep(sleep_interval);
+            }
         }
         Commands::Trend {
             experiment_id,
             task,
             variant,
             json,
+            csv,
         } => {
+            if json && csv {
+                return Err(anyhow::anyhow!("--json and --csv are mutually exclusive"));
+            }
             let project_root = resolve_project_root(std::env::current_dir()?.as_path());
             let table = lab_analysis::query_trend(
                 &project_root,
@@ -606,6 +759,10 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
                     "result": query_table_to_json(&table),
                 })));
             }
+            if csv {
+                print_query_table_csv(&table);
+                return Ok(None);
+            }
             println!("project_root: {}", project_root.display());
             println!("experiment_id: {}", experiment_id);
             if let Some(task_id) = task {
@@ -613,6 +770,26 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
             }
             if let Some(variant_id) = variant {
                 println!("variant: {}", variant_id);
+            }
+            print_query_table(&table);
+        }
+        Commands::Runs { json, csv } => {
+            if json && csv {
+                return Err(anyhow::anyhow!("--json and --csv are mutually exclusive"));
+            }
+            let project_root = resolve_project_root(std::env::current_dir()?.as_path());
+            let table = build_runs_table(&project_root)?;
+            if json {
+                return Ok(Some(json!({
+                    "ok": true,
+                    "command": "runs",
+                    "project_root": project_root.display().to_string(),
+                    "result": query_table_to_json(&table),
+                })));
+            }
+            if csv {
+                print_query_table_csv(&table);
+                return Ok(None);
             }
             print_query_table(&table);
         }
@@ -700,7 +877,22 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
             }
             println!("bundle: {}", out_path.display());
         }
-        Commands::Init { in_place, force } => {
+        Commands::Init {
+            in_place,
+            force,
+            profile,
+        } => {
+            let Some(profile) = profile else {
+                println!("available profiles:");
+                println!("  - agent-eval  : single-variant agent evaluation in container mode");
+                println!("  - ab-test     : baseline vs treatment paired comparison");
+                println!("  - sweep       : independent parameter sweep over variant_plan");
+                println!("  - regression  : fixed-suite pass-rate tracking over time");
+                println!("  - local-dev   : fast local iteration (single worker)");
+                println!("usage: lab init --profile <name>");
+                return Ok(None);
+            };
+
             let cwd = std::env::current_dir()?;
             let root = cwd;
             let lab_dir = root.join(".lab");
@@ -719,60 +911,13 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
                 )));
             }
 
-            let exp_yaml = "\
-version: '0.5'
-experiment:
-  id: ''                              # REQUIRED
-  name: ''                            # REQUIRED
-  workload_type: ''                   # REQUIRED: agent_runtime | trainer
-dataset:
-  path: ''                            # REQUIRED: path to tasks.jsonl
-  provider: local_jsonl
-  suite_id: ''                        # REQUIRED
-  schema_version: task_jsonl_v1
-  split_id: ''                        # REQUIRED
-  limit: 0                            # REQUIRED: set > 0
-design:
-  sanitization_profile: ''            # REQUIRED: e.g. hermetic_functional
-  comparison: paired
-  replications: 0                     # REQUIRED: set > 0
-  random_seed: 0                      # REQUIRED
-  shuffle_tasks: true
-  max_concurrency: 1
-baseline:
-  variant_id: ''                      # REQUIRED
-  bindings: {}
-variant_plan: []
-runtime:
-  agent:
-    command: []                        # REQUIRED: string|string[] command (e.g. [\"rex\"])
-    image: ''                          # REQUIRED when sandbox.mode=container (can be overridden per variant)
-    io:
-      input_arg: --input               # runner appends resolved task path
-      output_arg: --output             # runner appends resolved result path
-  dependencies:
-    file_staging: []
-    services: []
-  policy:
-    timeout_ms: 600000
-    sandbox:
-      mode: local
-    network:
-      mode: none
-      allowed_hosts: []
-  telemetry:
-    trajectory_path: /agentlab/out/trajectory.jsonl
-    causal_extraction: event_envelope_v1
-validity:
-  fail_on_state_leak: true
-  fail_on_profile_invariant_violation: true
-";
+            let exp_yaml = init_profile_template(profile);
             std::fs::write(&exp_path, exp_yaml)?;
 
             let exp_show = exp_path.strip_prefix(&root).unwrap_or(&exp_path).display();
             println!("wrote: {}", exp_show);
             println!(
-                "next: edit {} \u{2014} fill in all fields marked REQUIRED",
+                "next: edit {} (fill in dataset path + runtime command/image)",
                 exp_show
             );
             println!("next: lab describe {}", exp_show);
@@ -802,6 +947,147 @@ validity:
         }
     }
     Ok(None)
+}
+
+fn init_profile_template(profile: InitProfileArg) -> &'static str {
+    match profile {
+        InitProfileArg::AgentEval => {
+            "version: \"1.0\"
+experiment:
+  id: my_eval
+  name: My Agent Evaluation
+  profile: agent-eval
+dataset:
+  path: tasks.jsonl
+  limit: 50
+design:
+  comparison: paired
+  replications: 3
+  seed: 42
+baseline:
+  variant_id: control
+variant_plan: []
+runtime:
+  image: my-harness:latest
+  command: [python, harness.py]
+  timeout_ms: 300000
+  network: none
+  resources:
+    cpus: 2
+    memory_mb: 2048
+"
+        }
+        InitProfileArg::AbTest => {
+            "version: \"1.0\"
+experiment:
+  id: my_ab_test
+  name: Baseline vs Treatment
+  profile: ab-test
+dataset:
+  path: tasks.jsonl
+  limit: 100
+design:
+  comparison: paired
+  replications: 5
+  seed: 42
+baseline:
+  variant_id: control
+variant_plan:
+  - variant_id: treatment
+    args: [--model, claude-4]
+runtime:
+  image: my-harness:latest
+  command: [python, harness.py]
+  timeout_ms: 300000
+  network: none
+  resources:
+    cpus: 2
+    memory_mb: 2048
+"
+        }
+        InitProfileArg::Sweep => {
+            "version: \"1.0\"
+experiment:
+  id: my_sweep
+  name: Parameter Sweep
+  profile: sweep
+dataset:
+  path: tasks.jsonl
+  limit: 100
+design:
+  comparison: unpaired
+  replications: 1
+  seed: 42
+baseline:
+  variant_id: control
+variant_plan:
+  - variant_id: t07
+    args: [--temperature, \"0.7\"]
+  - variant_id: t09
+    args: [--temperature, \"0.9\"]
+runtime:
+  image: my-harness:latest
+  command: [python, harness.py]
+  timeout_ms: 300000
+  network: none
+  resources:
+    cpus: 2
+    memory_mb: 2048
+"
+        }
+        InitProfileArg::Regression => {
+            "version: \"1.0\"
+experiment:
+  id: my_regression
+  name: Regression Tracking
+  profile: regression
+dataset:
+  path: tasks.jsonl
+  limit: 50
+design:
+  comparison: paired
+  replications: 3
+  seed: 42
+baseline:
+  variant_id: control
+variant_plan: []
+runtime:
+  image: my-harness:latest
+  command: [python, harness.py]
+  timeout_ms: 300000
+  network: none
+  resources:
+    cpus: 2
+    memory_mb: 2048
+"
+        }
+        InitProfileArg::LocalDev => {
+            "version: \"1.0\"
+experiment:
+  id: my_local_dev
+  name: Local Development
+  profile: local-dev
+dataset:
+  path: tasks.jsonl
+  limit: 10
+design:
+  comparison: paired
+  replications: 1
+  seed: 42
+baseline:
+  variant_id: control
+variant_plan: []
+runtime:
+  image: my-harness:latest
+  command: [python, harness.py]
+  timeout_ms: 120000
+  network: full
+  resources:
+    cpus: 1
+    memory_mb: 1024
+"
+        }
+    }
 }
 
 fn emit_json(value: &Value) {
@@ -834,10 +1120,12 @@ fn command_json_mode(command: &Commands) -> bool {
         | Commands::Pause { json, .. }
         | Commands::Resume { json, .. }
         | Commands::Continue { json, .. }
+        | Commands::Kill { json, .. }
         | Commands::Describe { json, .. }
         | Commands::Views { json, .. }
         | Commands::Query { json, .. }
         | Commands::Trend { json, .. }
+        | Commands::Runs { json, .. }
         | Commands::KnobsValidate { json, .. }
         | Commands::SchemaValidate { json, .. }
         | Commands::HooksValidate { json, .. }
@@ -1014,6 +1302,413 @@ fn resolve_project_root(start: &Path) -> PathBuf {
     start.to_path_buf()
 }
 
+fn build_live_scoreboard_table(
+    run_dir: &Path,
+    metric_limit: usize,
+) -> Result<lab_analysis::QueryTable> {
+    let limit = metric_limit.max(1).min(32);
+    let metric_names = fetch_scoreboard_metric_names(run_dir, limit)?;
+    let sql = build_scoreboard_sql(&metric_names);
+    lab_analysis::query_run(run_dir, &sql)
+}
+
+fn fetch_scoreboard_metric_names(run_dir: &Path, metric_limit: usize) -> Result<Vec<String>> {
+    let sql = format!(
+        "SELECT metric_name
+         FROM metrics_long
+         WHERE metric_name <> 'status_code'
+         GROUP BY metric_name
+         ORDER BY metric_name
+         LIMIT {}",
+        metric_limit
+    );
+    let table = lab_analysis::query_run(run_dir, &sql)?;
+    let mut out = Vec::new();
+    for row in table.rows {
+        if let Some(name) = row.first().and_then(Value::as_str) {
+            if !name.trim().is_empty() {
+                out.push(name.to_string());
+            }
+        }
+    }
+    Ok(out)
+}
+
+fn build_scoreboard_sql(metric_names: &[String]) -> String {
+    let mut columns = Vec::new();
+    for metric_name in metric_names {
+        let alias = format!("{}_mean", sanitize_scoreboard_alias(metric_name));
+        columns.push(format!(
+            "(SELECT round(m.mean_metric, 4)
+             FROM metric_agg m
+             WHERE m.variant_id = b.variant_id
+               AND m.task_id = b.task_id
+               AND m.metric_name = {}) AS {}",
+            sql_string_literal(metric_name),
+            sql_identifier(&alias)
+        ));
+    }
+    let dynamic_cols = if columns.is_empty() {
+        String::new()
+    } else {
+        format!(",\n    {}", columns.join(",\n    "))
+    };
+    format!(
+        "WITH base AS (
+            SELECT
+                variant_id,
+                task_id,
+                count(*) AS n_trials,
+                round(avg(CASE WHEN outcome = 'success' THEN 1.0 ELSE 0.0 END), 4) AS success_rate,
+                round(avg(try_cast(primary_metric_value AS DOUBLE)), 4) AS primary_metric_mean
+            FROM trials
+            GROUP BY variant_id, task_id
+        ),
+        metric_agg AS (
+            SELECT
+                variant_id,
+                task_id,
+                metric_name,
+                avg(try_cast(metric_value AS DOUBLE)) AS mean_metric
+            FROM metrics_long
+            GROUP BY variant_id, task_id, metric_name
+        )
+        SELECT
+            b.variant_id,
+            b.task_id,
+            b.n_trials,
+            b.success_rate,
+            b.primary_metric_mean{}
+        FROM base b
+        ORDER BY b.variant_id, b.task_id",
+        dynamic_cols
+    )
+}
+
+fn sanitize_scoreboard_alias(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for ch in value.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '_' {
+            out.push(ch.to_ascii_lowercase());
+        } else {
+            out.push('_');
+        }
+    }
+    out.trim_matches('_').to_string()
+}
+
+fn sql_string_literal(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "''"))
+}
+
+fn sql_identifier(value: &str) -> String {
+    format!("\"{}\"", value.replace('"', "\"\""))
+}
+
+fn terminal_width() -> usize {
+    #[cfg(unix)]
+    {
+        use std::mem::MaybeUninit;
+        let mut ws = MaybeUninit::<libc::winsize>::uninit();
+        let ret = unsafe { libc::ioctl(libc::STDOUT_FILENO, libc::TIOCGWINSZ, ws.as_mut_ptr()) };
+        if ret == 0 {
+            let ws = unsafe { ws.assume_init() };
+            if ws.ws_col > 0 {
+                return ws.ws_col as usize;
+            }
+        }
+    }
+    120
+}
+
+fn print_scoreboard_grouped_by_variant(table: &lab_analysis::QueryTable) {
+    let term_w = terminal_width();
+
+    let Some(variant_col_idx) = table.columns.iter().position(|c| c == "variant_id") else {
+        print_scoreboard_table(table, term_w);
+        return;
+    };
+
+    let mut per_variant: BTreeMap<String, Vec<Vec<Value>>> = BTreeMap::new();
+    for row in &table.rows {
+        let variant = row
+            .get(variant_col_idx)
+            .and_then(Value::as_str)
+            .unwrap_or("unknown")
+            .to_string();
+        let mut compact_row = Vec::with_capacity(row.len().saturating_sub(1));
+        for (idx, cell) in row.iter().enumerate() {
+            if idx != variant_col_idx {
+                compact_row.push(cell.clone());
+            }
+        }
+        per_variant.entry(variant).or_default().push(compact_row);
+    }
+
+    let mut columns = Vec::with_capacity(table.columns.len().saturating_sub(1));
+    for (idx, col) in table.columns.iter().enumerate() {
+        if idx != variant_col_idx {
+            columns.push(col.clone());
+        }
+    }
+
+    if per_variant.is_empty() {
+        print_scoreboard_table(
+            &lab_analysis::QueryTable {
+                columns,
+                rows: Vec::new(),
+            },
+            term_w,
+        );
+        return;
+    }
+
+    for (variant, rows) in per_variant {
+        println!("== variant: {} ==", variant);
+        print_scoreboard_table(
+            &lab_analysis::QueryTable {
+                columns: columns.clone(),
+                rows,
+            },
+            term_w,
+        );
+        println!();
+    }
+}
+
+/// Width-aware table printer for the scoreboard.
+///
+/// Strategy when the table exceeds terminal width:
+/// 1. Switch from ` | ` separators to `  ` (saves 1 char per column boundary).
+/// 2. Cap every column to a max width derived from available space.
+/// 3. If still too wide, drop rightmost metric columns until it fits.
+fn print_scoreboard_table(table: &lab_analysis::QueryTable, term_width: usize) {
+    if table.columns.is_empty() {
+        println!("(ok)");
+        return;
+    }
+
+    let rendered_rows: Vec<Vec<String>> = table
+        .rows
+        .iter()
+        .map(|row| row.iter().map(render_json_cell).collect::<Vec<String>>())
+        .collect();
+
+    let numeric_cols: Vec<bool> = (0..table.columns.len())
+        .map(|col_idx| {
+            let mut has_number = false;
+            for row in &table.rows {
+                match row.get(col_idx) {
+                    Some(Value::Number(_)) => has_number = true,
+                    Some(Value::Null) => {}
+                    _ => return false,
+                }
+            }
+            has_number
+        })
+        .collect();
+
+    // Natural (uncapped) widths per column.
+    let mut natural_widths: Vec<usize> = table.columns.iter().map(|c| c.chars().count()).collect();
+    for row in &rendered_rows {
+        for (idx, cell) in row.iter().enumerate() {
+            if idx < natural_widths.len() {
+                natural_widths[idx] = natural_widths[idx].max(cell.chars().count());
+            }
+        }
+    }
+
+    // Determine how many columns we can actually show.
+    // We protect the first few "core" columns (task_id, n_trials, success_rate, primary_metric_mean)
+    // and drop metric columns from the right when space is tight.
+    let core_count = table
+        .columns
+        .iter()
+        .position(|c| c.ends_with("_mean") && c != "primary_metric_mean")
+        .unwrap_or(table.columns.len());
+
+    let (visible_count, sep, widths) =
+        fit_columns_to_width(&natural_widths, core_count, term_width);
+
+    // Render header
+    let header: String = table.columns[..visible_count]
+        .iter()
+        .enumerate()
+        .map(|(idx, col)| {
+            pad_cell(
+                &truncate_cell(col, widths[idx]),
+                widths[idx],
+                numeric_cols.get(idx).copied().unwrap_or(false),
+            )
+        })
+        .collect::<Vec<_>>()
+        .join(sep);
+    println!("{}", header);
+
+    // Separator line
+    let dash_join = if sep == " | " { "-+-" } else { "--" };
+    let separator: String = widths[..visible_count]
+        .iter()
+        .map(|w| "-".repeat(*w))
+        .collect::<Vec<_>>()
+        .join(dash_join);
+    println!("{}", separator);
+
+    // Rows
+    for row in &rendered_rows {
+        let line: String = row[..visible_count.min(row.len())]
+            .iter()
+            .enumerate()
+            .map(|(idx, cell)| {
+                let ra = numeric_cols.get(idx).copied().unwrap_or(false);
+                pad_cell(&truncate_cell(cell, widths[idx]), widths[idx], ra)
+            })
+            .collect::<Vec<_>>()
+            .join(sep);
+        println!("{}", line);
+    }
+
+    if visible_count < table.columns.len() {
+        println!(
+            "({} rows, {} cols hidden — widen terminal or use --metric-limit)",
+            table.rows.len(),
+            table.columns.len() - visible_count
+        );
+    } else {
+        println!("({} rows)", table.rows.len());
+    }
+}
+
+/// Pick separator style, cap column widths, and optionally drop trailing columns to fit `term_width`.
+/// Returns (visible_column_count, separator_str, capped_widths).
+fn fit_columns_to_width(
+    natural_widths: &[usize],
+    core_count: usize,
+    term_width: usize,
+) -> (usize, &'static str, Vec<usize>) {
+    let n = natural_widths.len();
+    if n == 0 {
+        return (0, " | ", Vec::new());
+    }
+
+    // Try wide separators first (" | " = 3 chars), then compact ("  " = 2 chars).
+    for sep in [" | ", "  "] {
+        let sep_w = sep.len();
+        // Try showing all columns, then progressively drop from the right (but never below core_count).
+        let min_visible = core_count.min(n);
+        for visible in (min_visible..=n).rev() {
+            let sep_total = if visible > 1 {
+                (visible - 1) * sep_w
+            } else {
+                0
+            };
+            let avail_for_cols = term_width.saturating_sub(sep_total);
+            if avail_for_cols < visible {
+                continue; // not even 1 char per column
+            }
+            let widths = cap_widths(&natural_widths[..visible], avail_for_cols);
+            let total: usize = widths.iter().sum::<usize>() + sep_total;
+            if total <= term_width {
+                return (visible, sep, widths);
+            }
+        }
+    }
+
+    // Absolute fallback: show core columns, compact sep, hard-capped.
+    let visible = core_count.min(n).max(1);
+    let sep = "  ";
+    let sep_total = if visible > 1 { (visible - 1) * 2 } else { 0 };
+    let avail = term_width.saturating_sub(sep_total);
+    let widths = cap_widths(&natural_widths[..visible], avail);
+    (visible, sep, widths)
+}
+
+/// Distribute `budget` characters across columns, shrinking the widest ones first.
+/// Minimum 4 chars per column.
+fn cap_widths(natural: &[usize], budget: usize) -> Vec<usize> {
+    let n = natural.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    let total: usize = natural.iter().sum();
+    if total <= budget {
+        return natural.to_vec();
+    }
+    // Uniform cap: iteratively lower the ceiling until total fits.
+    let min_w = 4_usize;
+    // Binary search for the right cap.
+    let mut lo = min_w;
+    let mut hi = *natural.iter().max().unwrap_or(&budget);
+    while lo < hi {
+        let mid = (lo + hi + 1) / 2;
+        let used: usize = natural.iter().map(|&w| w.min(mid)).sum();
+        if used <= budget {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    natural.iter().map(|&w| w.min(lo).max(min_w)).collect()
+}
+
+fn read_run_status(run_dir: &Path) -> String {
+    let path = run_dir.join("runtime").join("run_control.json");
+    if !path.exists() {
+        return "unknown".to_string();
+    }
+    let raw = match std::fs::read_to_string(&path) {
+        Ok(v) => v,
+        Err(_) => return "unknown".to_string(),
+    };
+    let parsed: Value = match serde_json::from_str(&raw) {
+        Ok(v) => v,
+        Err(_) => return "unknown".to_string(),
+    };
+    let status = parsed
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown")
+        .to_string();
+    let active_trials = match parsed.get("active_trials").and_then(Value::as_object) {
+        Some(active_trials) => active_trials,
+        None => return status,
+    };
+    if active_trials.is_empty() {
+        return status;
+    }
+    let mut workers = BTreeSet::new();
+    for entry in active_trials.values() {
+        if let Some(worker_id) = entry.get("worker_id").and_then(Value::as_str) {
+            workers.insert(worker_id.to_string());
+        }
+    }
+    if workers.is_empty() {
+        return format!("{} (active_trials={})", status, active_trials.len());
+    }
+    if workers.len() <= 3 {
+        let worker_list = workers.into_iter().collect::<Vec<_>>().join(",");
+        return format!(
+            "{} (active_trials={}, workers={})",
+            status,
+            active_trials.len(),
+            worker_list
+        );
+    }
+    format!(
+        "{} (active_trials={}, workers={} total)",
+        status,
+        active_trials.len(),
+        workers.len()
+    )
+}
+
+fn unix_now_seconds() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
 fn normalize_view_name(input: &str) -> String {
     let normalized = input.trim().replace('-', "_");
     match normalized.as_str() {
@@ -1050,6 +1745,20 @@ fn print_query_table(table: &lab_analysis::QueryTable) {
         .map(|row| row.iter().map(render_json_cell).collect::<Vec<String>>())
         .collect();
 
+    let numeric_cols: Vec<bool> = (0..table.columns.len())
+        .map(|col_idx| {
+            let mut has_number = false;
+            for row in &table.rows {
+                match row.get(col_idx) {
+                    Some(Value::Number(_)) => has_number = true,
+                    Some(Value::Null) => {}
+                    _ => return false,
+                }
+            }
+            has_number
+        })
+        .collect();
+
     let mut widths: Vec<usize> = table.columns.iter().map(|c| c.chars().count()).collect();
     for row in &rendered_rows {
         for (idx, cell) in row.iter().enumerate() {
@@ -1063,7 +1772,13 @@ fn print_query_table(table: &lab_analysis::QueryTable) {
         .columns
         .iter()
         .enumerate()
-        .map(|(idx, col)| pad_cell(col, widths[idx]))
+        .map(|(idx, col)| {
+            pad_cell(
+                col,
+                widths[idx],
+                numeric_cols.get(idx).copied().unwrap_or(false),
+            )
+        })
         .collect::<Vec<_>>()
         .join(" | ");
     println!("{}", header);
@@ -1079,8 +1794,9 @@ fn print_query_table(table: &lab_analysis::QueryTable) {
             .iter()
             .enumerate()
             .map(|(idx, cell)| {
+                let ra = numeric_cols.get(idx).copied().unwrap_or(false);
                 if idx < widths.len() {
-                    pad_cell(&truncate_cell(cell, widths[idx]), widths[idx])
+                    pad_cell(&truncate_cell(cell, widths[idx]), widths[idx], ra)
                 } else {
                     cell.clone()
                 }
@@ -1090,6 +1806,32 @@ fn print_query_table(table: &lab_analysis::QueryTable) {
         println!("{}", line);
     }
     println!("({} rows)", table.rows.len());
+}
+
+fn csv_escape(value: &str) -> String {
+    if value.contains(',') || value.contains('"') || value.contains('\n') || value.contains('\r') {
+        format!("\"{}\"", value.replace('"', "\"\""))
+    } else {
+        value.to_string()
+    }
+}
+
+fn print_query_table_csv(table: &lab_analysis::QueryTable) {
+    let header = table
+        .columns
+        .iter()
+        .map(|c| csv_escape(c))
+        .collect::<Vec<_>>()
+        .join(",");
+    println!("{}", header);
+    for row in &table.rows {
+        let line = row
+            .iter()
+            .map(|v| csv_escape(&render_json_cell(v)))
+            .collect::<Vec<_>>()
+            .join(",");
+        println!("{}", line);
+    }
 }
 
 fn render_json_cell(value: &Value) -> String {
@@ -1115,13 +1857,192 @@ fn truncate_cell(value: &str, width: usize) -> String {
     out
 }
 
-fn pad_cell(value: &str, width: usize) -> String {
+fn pad_cell(value: &str, width: usize, right_align: bool) -> String {
     let value_len = value.chars().count();
     if value_len >= width {
         value.to_string()
+    } else if right_align {
+        format!("{:padding$}{value}", "", padding = width - value_len)
     } else {
         format!("{value}{:padding$}", "", padding = width - value_len)
     }
+}
+
+fn try_print_post_run_stats(run_dir: &Path, run_id: &str) {
+    let Some((view_set, table)) = try_load_headline(run_dir) else {
+        return;
+    };
+    println!();
+    println!("--- post-run stats ({}) ---", view_set.as_str());
+    print_query_table(&table);
+    println!();
+    println!("next steps:");
+    println!("  lab views {}", run_id);
+    println!("  lab views {} --all", run_id);
+    println!("  lab query {} \"SELECT * FROM trials\"", run_id);
+}
+
+fn try_post_run_stats_json(run_dir: &Path) -> Value {
+    let Some((view_set, table)) = try_load_headline(run_dir) else {
+        return Value::Null;
+    };
+    json!({
+        "view_set": view_set.as_str(),
+        "headline": query_table_to_json(&table),
+    })
+}
+
+fn try_load_headline(run_dir: &Path) -> Option<(lab_analysis::ViewSet, lab_analysis::QueryTable)> {
+    let view_set = lab_analysis::run_view_set(run_dir).ok()?;
+    let headline = view_set.headline_view()?;
+    let table = lab_analysis::query_view(run_dir, headline, 20).ok()?;
+    Some((view_set, table))
+}
+
+fn build_runs_table(project_root: &Path) -> Result<lab_analysis::QueryTable> {
+    let runs_dir = project_root.join(".lab").join("runs");
+    if !runs_dir.exists() {
+        return Ok(lab_analysis::QueryTable {
+            columns: vec![
+                "run_id".into(),
+                "experiment".into(),
+                "created_at".into(),
+                "variants".into(),
+                "pass_rate".into(),
+            ],
+            rows: vec![],
+        });
+    }
+
+    struct RunRow {
+        run_id: String,
+        experiment: String,
+        created_at: String,
+        variants: usize,
+        pass_rate: Option<f64>,
+    }
+
+    let mut entries: Vec<RunRow> = Vec::new();
+    for entry in std::fs::read_dir(&runs_dir)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        let run_path = entry.path();
+
+        // manifest.json → run_id, created_at
+        let manifest_path = run_path.join("manifest.json");
+        let (run_id, created_at) = if manifest_path.exists() {
+            let raw = std::fs::read_to_string(&manifest_path).unwrap_or_default();
+            let val: Value = serde_json::from_str(&raw).unwrap_or(json!({}));
+            (
+                val.get("run_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                val.get("created_at")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+            )
+        } else {
+            let dirname = entry.file_name().to_string_lossy().to_string();
+            (dirname, String::new())
+        };
+
+        // resolved_experiment.json → experiment id
+        let resolved_path = run_path.join("resolved_experiment.json");
+        let experiment = if resolved_path.exists() {
+            let raw = std::fs::read_to_string(&resolved_path).unwrap_or_default();
+            let val: Value = serde_json::from_str(&raw).unwrap_or(json!({}));
+            val.pointer("/experiment/id")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string()
+        } else {
+            String::new()
+        };
+
+        // Canonical: facts/trials.jsonl (variant_summary is query-time derived).
+        let trials_facts_path = run_path.join("facts").join("trials.jsonl");
+        let (variants, pass_rate) = if trials_facts_path.exists() {
+            let raw = std::fs::read_to_string(&trials_facts_path).unwrap_or_default();
+            let mut baseline_id = String::new();
+            let mut variant_ids: BTreeSet<String> = BTreeSet::new();
+            let mut baseline_total = 0usize;
+            let mut baseline_successes = 0usize;
+            for line in raw.lines().filter(|line| !line.trim().is_empty()) {
+                let row: Value = serde_json::from_str(line).unwrap_or(json!({}));
+                let variant_id = row
+                    .get("variant_id")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                if variant_id.is_empty() {
+                    continue;
+                }
+                variant_ids.insert(variant_id.clone());
+                if baseline_id.is_empty() {
+                    baseline_id = row
+                        .get("baseline_id")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string();
+                }
+                if !baseline_id.is_empty() && variant_id == baseline_id {
+                    baseline_total += 1;
+                    if row.get("outcome").and_then(Value::as_str) == Some("success") {
+                        baseline_successes += 1;
+                    }
+                }
+            }
+            let pr = if baseline_total > 0 {
+                Some(baseline_successes as f64 / baseline_total as f64)
+            } else {
+                None
+            };
+            (variant_ids.len(), pr)
+        } else {
+            (0, None)
+        };
+
+        entries.push(RunRow {
+            run_id,
+            experiment,
+            created_at,
+            variants,
+            pass_rate,
+        });
+    }
+
+    entries.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+
+    let rows: Vec<Vec<Value>> = entries
+        .into_iter()
+        .map(|e| {
+            vec![
+                Value::String(e.run_id),
+                Value::String(e.experiment),
+                Value::String(e.created_at),
+                json!(e.variants),
+                match e.pass_rate {
+                    Some(pr) => json!((pr * 10000.0).round() / 10000.0),
+                    None => Value::Null,
+                },
+            ]
+        })
+        .collect();
+
+    Ok(lab_analysis::QueryTable {
+        columns: vec![
+            "run_id".into(),
+            "experiment".into(),
+            "created_at".into(),
+            "variants".into(),
+            "pass_rate".into(),
+        ],
+        rows,
+    })
 }
 
 fn write_knob_files(
@@ -1214,4 +2135,66 @@ fn write_knob_files(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp_dir(label: &str) -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        std::env::temp_dir().join(format!(
+            "agentlab_cli_{}_{}_{}",
+            label,
+            std::process::id(),
+            nanos
+        ))
+    }
+
+    #[test]
+    fn read_run_status_renders_multiflight_active_trials() {
+        let run_dir = temp_dir("run_status");
+        let runtime_dir = run_dir.join("runtime");
+        std::fs::create_dir_all(&runtime_dir).expect("runtime dir");
+        let control = json!({
+            "schema_version": "run_control_v2",
+            "run_id": "run_1",
+            "status": "running",
+            "active_trials": {
+                "trial_1": {
+                    "trial_id": "trial_1",
+                    "worker_id": "worker_2",
+                    "schedule_idx": 1,
+                    "variant_id": "base",
+                    "started_at": "2026-02-22T00:00:00Z",
+                    "control": null
+                },
+                "trial_2": {
+                    "trial_id": "trial_2",
+                    "worker_id": "worker_1",
+                    "schedule_idx": 2,
+                    "variant_id": "candidate",
+                    "started_at": "2026-02-22T00:00:01Z",
+                    "control": null
+                }
+            },
+            "updated_at": "2026-02-22T00:00:02Z"
+        });
+        std::fs::write(
+            runtime_dir.join("run_control.json"),
+            serde_json::to_vec_pretty(&control).expect("serialize control"),
+        )
+        .expect("write control");
+
+        let status = read_run_status(&run_dir);
+        assert_eq!(
+            status,
+            "running (active_trials=2, workers=worker_1,worker_2)"
+        );
+
+        let _ = std::fs::remove_dir_all(&run_dir);
+    }
 }

@@ -1,0 +1,3 @@
+[env]
+# Work around Apple clang 17 treating this legacy DuckDB template pattern as an error.
+CXXFLAGS = { value = "-Wno-missing-template-arg-list-after-template-kw", force = false }

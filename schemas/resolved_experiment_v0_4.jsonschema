@@ -68,6 +68,14 @@
                 "max_consecutive_failures": { "type": "integer", "minimum": 1 }
               }
             },
+            "concurrency": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "max_in_flight_per_variant": { "type": "integer", "minimum": 1 },
+                "require_chain_lease": { "type": "boolean" }
+              }
+            },
             "task_boundary": {
               "type": "object",
               "additionalProperties": false,

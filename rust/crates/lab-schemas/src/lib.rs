@@ -26,7 +26,7 @@ pub fn load_schema(name: &str) -> Result<Value> {
 
     // Dev fallback: allow newly added schema files before this crate is rebuilt.
     let fs_path = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../../../schemas")
+        .join("../../../schemas")
         .join(name);
     if fs_path.exists() {
         let data = fs::read_to_string(fs_path)?;
