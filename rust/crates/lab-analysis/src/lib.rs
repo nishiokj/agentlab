@@ -1,24 +1,33 @@
 use anyhow::{anyhow, Context, Result};
 #[cfg(feature = "duckdb_engine")]
 use duckdb::Connection;
+#[cfg(feature = "duckdb_engine")]
 use include_dir::{include_dir, Dir};
+#[cfg(feature = "duckdb_engine")]
 use lab_core::ensure_dir;
-use serde_json::{json, Value};
-use std::collections::{BTreeMap, BTreeSet};
+use serde_json::Value;
+use std::collections::BTreeSet;
 use std::fs;
-use std::io::Write;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+#[cfg(feature = "duckdb_engine")]
+use std::path::PathBuf;
 
+#[cfg(feature = "duckdb_engine")]
 static VIEW_BUNDLES: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/views");
 
-const TABLE_TRIALS: &str = "trials.jsonl";
-const TABLE_METRICS_LONG: &str = "metrics_long.jsonl";
-const TABLE_EVENT_COUNTS_BY_TRIAL: &str = "event_counts_by_trial.jsonl";
-const TABLE_EVENT_COUNTS_BY_VARIANT: &str = "event_counts_by_variant.jsonl";
-const TABLE_VARIANT_SUMMARY: &str = "variant_summary.jsonl";
-const TABLE_BINDINGS_LONG: &str = "bindings_long.jsonl";
+const FACTS_DIR: &str = "facts";
+#[cfg(feature = "duckdb_engine")]
+const FACTS_TRIALS_FILE: &str = "trials.jsonl";
+#[cfg(feature = "duckdb_engine")]
+const FACTS_METRICS_LONG_FILE: &str = "metrics_long.jsonl";
+#[cfg(feature = "duckdb_engine")]
+const FACTS_EVENTS_FILE: &str = "events.jsonl";
+#[cfg(feature = "duckdb_engine")]
+const FACTS_VARIANT_SNAPSHOTS_FILE: &str = "variant_snapshots.jsonl";
 
+#[cfg(feature = "duckdb_engine")]
 const ANALYSIS_DB_FILE: &str = "agentlab.duckdb";
+#[cfg(feature = "duckdb_engine")]
 const LOAD_SQL_FILE: &str = "load_duckdb.sql";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -41,6 +50,17 @@ impl ViewSet {
         }
     }
 
+    pub fn headline_view(self) -> Option<&'static str> {
+        match self {
+            Self::AbTest => Some("win_loss_tie"),
+            Self::MultiVariant => Some("variant_ranking"),
+            Self::ParameterSweep => Some("best_config"),
+            Self::Regression => Some("pass_rate_trend"),
+            Self::CoreOnly => None,
+        }
+    }
+
+    #[cfg(feature = "duckdb_engine")]
     fn bundle_file(self) -> Option<&'static str> {
         match self {
             Self::CoreOnly => None,
@@ -61,10 +81,15 @@ struct ExperimentDesign {
 
 #[derive(Debug, Clone)]
 struct RunAnalysisContext {
+    #[cfg(feature = "duckdb_engine")]
     run_dir: PathBuf,
+    #[cfg(feature = "duckdb_engine")]
     analysis_dir: PathBuf,
-    tables_dir: PathBuf,
+    #[cfg(feature = "duckdb_engine")]
+    facts_dir: PathBuf,
+    #[cfg(feature = "duckdb_engine")]
     comparison_policy: String,
+    #[cfg(feature = "duckdb_engine")]
     scheduling_policy: String,
     view_set: ViewSet,
 }
@@ -75,163 +100,12 @@ pub struct QueryTable {
     pub rows: Vec<Vec<Value>>,
 }
 
-pub fn summarize_trial(
-    run_id: &str,
-    trial_output: &Value,
-    trial_id: &str,
-    workload_type: &str,
-    variant_id: &str,
-    task_idx: usize,
-    task_id: &str,
-    repl: usize,
-    bindings: &Value,
-    status: String,
-    container_mode: bool,
-    integration_level: &str,
-    network_mode_requested: &str,
-    network_mode_effective: &str,
-) -> Value {
-    let outcome = trial_output
-        .get("outcome")
-        .and_then(|v| v.as_str())
-        .unwrap_or("error");
-    let (primary_metric_name, primary_metric_value) =
-        if let Some(obj) = trial_output.get("objective").and_then(|v| v.as_object()) {
-            let name = obj
-                .get("name")
-                .and_then(|v| v.as_str())
-                .unwrap_or("primary_metric")
-                .to_string();
-            let value = obj.get("value").cloned().unwrap_or(json!(null));
-            (name, value)
-        } else {
-            let fallback = if outcome == "success" { 1.0 } else { 0.0 };
-            ("success".to_string(), json!(fallback))
-        };
-    let mut metrics = trial_output.get("metrics").cloned().unwrap_or(json!({}));
-    if let Some(obj) = metrics.as_object_mut() {
-        obj.insert("status_code".to_string(), json!(status));
-    }
-    json!({
-        "run_id": run_id,
-        "trial_id": trial_id,
-        "workload_type": workload_type,
-        "variant_id": variant_id,
-        "task_index": task_idx,
-        "task_id": task_id,
-        "repl_idx": repl,
-        "outcome": outcome,
-        "success": outcome == "success",
-        "container_mode": container_mode,
-        "integration_level": integration_level,
-        "network_mode_requested": network_mode_requested,
-        "network_mode_effective": network_mode_effective,
-        "primary_metric_name": primary_metric_name,
-        "primary_metric_value": primary_metric_value,
-        "metrics": metrics,
-        "bindings": bindings,
-    })
-}
-
-pub fn write_analysis(
-    analysis_dir: &Path,
-    summaries: &[Value],
-    baseline_id: &str,
-    event_counts: &BTreeMap<String, BTreeMap<String, usize>>,
-    trial_event_counts: &BTreeMap<String, BTreeMap<String, usize>>,
-) -> Result<()> {
-    let mut outcomes: BTreeMap<String, Vec<&Value>> = BTreeMap::new();
-    for s in summaries {
-        let vid = s
-            .get("variant_id")
-            .and_then(|v| v.as_str())
-            .unwrap_or("base");
-        outcomes.entry(vid.to_string()).or_default().push(s);
-    }
-
-    let mut summary_map = BTreeMap::new();
-    for (variant, rows) in &outcomes {
-        let total = rows.len() as f64;
-        let successes = rows
-            .iter()
-            .filter(|r| r.get("outcome").and_then(|v| v.as_str()) == Some("success"))
-            .count() as f64;
-        let success_rate = if total > 0.0 { successes / total } else { 0.0 };
-        let primary_metric_name = rows
-            .iter()
-            .find_map(|r| r.get("primary_metric_name").and_then(|v| v.as_str()))
-            .unwrap_or("success");
-        let mut pm_sum = 0.0f64;
-        let mut pm_n = 0usize;
-        for r in rows {
-            if let Some(v) = r.get("primary_metric_value").and_then(|v| v.as_f64()) {
-                pm_sum += v;
-                pm_n += 1;
-            }
-        }
-        let primary_metric_mean = if pm_n > 0 { pm_sum / pm_n as f64 } else { 0.0 };
-        summary_map.insert(
-            variant.clone(),
-            json!({
-                "total": total,
-                "success_rate": success_rate,
-                "primary_metric_name": primary_metric_name,
-                "primary_metric_mean": primary_metric_mean,
-                "event_counts": event_counts.get(variant).cloned().unwrap_or_default()
-            }),
-        );
-    }
-
-    let summary = json!({
-        "schema_version": "analysis_summary_v1",
-        "baseline_id": baseline_id,
-        "variants": summary_map,
-    });
-    fs::write(
-        analysis_dir.join("summary.json"),
-        serde_json::to_vec_pretty(&summary)?,
-    )?;
-
-    let mut comparisons = Vec::new();
-    for (variant, data) in &summary_map {
-        if variant == baseline_id {
-            continue;
-        }
-        let base = summary_map.get(baseline_id).cloned().unwrap_or(json!({}));
-        comparisons.push(json!({
-            "baseline": baseline_id,
-            "variant": variant,
-            "baseline_success_rate": base.get("success_rate").cloned().unwrap_or(json!(0.0)),
-            "variant_success_rate": data.get("success_rate").cloned().unwrap_or(json!(0.0)),
-        }));
-    }
-
-    let comparisons_json = json!({
-        "schema_version": "analysis_comparisons_v1",
-        "comparisons": comparisons
-    });
-    fs::write(
-        analysis_dir.join("comparisons.json"),
-        serde_json::to_vec_pretty(&comparisons_json)?,
-    )?;
-
-    write_analysis_tables(
-        analysis_dir,
-        summaries,
-        baseline_id,
-        &summary_map,
-        event_counts,
-        trial_event_counts,
-    )?;
-
-    Ok(())
-}
-
 pub fn run_view_set(run_dir: &Path) -> Result<ViewSet> {
     let context = load_run_context(run_dir)?;
     Ok(context.view_set)
 }
 
+#[cfg(not(feature = "duckdb_engine"))]
 fn duckdb_disabled_error(op: &str) -> anyhow::Error {
     anyhow!(
         "DuckDB support is disabled in this build; '{}' is unavailable (enable feature 'duckdb_engine' on lab-analysis)",
@@ -246,10 +120,10 @@ pub fn list_views(run_dir: &Path) -> Result<Vec<String>> {
     let conn = open_run_connection(&context)?;
     let table = execute_select_query(
         &conn,
-        "SELECT table_name
-         FROM information_schema.views
-         WHERE table_schema = 'main'
-         ORDER BY table_name",
+        "SELECT view_name AS table_name
+         FROM duckdb_views()
+         WHERE schema_name = 'main'
+         ORDER BY view_name",
     )?;
     let mut out = Vec::new();
     for row in table.rows {
@@ -350,202 +224,15 @@ pub fn query_trend(
     Err(duckdb_disabled_error("trend"))
 }
 
-fn write_analysis_tables(
-    analysis_dir: &Path,
-    summaries: &[Value],
-    baseline_id: &str,
-    summary_map: &BTreeMap<String, Value>,
-    event_counts: &BTreeMap<String, BTreeMap<String, usize>>,
-    trial_event_counts: &BTreeMap<String, BTreeMap<String, usize>>,
-) -> Result<()> {
-    let tables_dir = analysis_dir.join("tables");
-    ensure_dir(&tables_dir)?;
-
-    let mut trials = fs::File::create(tables_dir.join(TABLE_TRIALS))?;
-    let mut metrics_long = fs::File::create(tables_dir.join(TABLE_METRICS_LONG))?;
-    let mut events_by_trial = fs::File::create(tables_dir.join(TABLE_EVENT_COUNTS_BY_TRIAL))?;
-    let mut events_by_variant = fs::File::create(tables_dir.join(TABLE_EVENT_COUNTS_BY_VARIANT))?;
-    let mut variant_summary = fs::File::create(tables_dir.join(TABLE_VARIANT_SUMMARY))?;
-    let mut bindings_long = fs::File::create(tables_dir.join(TABLE_BINDINGS_LONG))?;
-
-    let mut variant_bindings: BTreeMap<String, Value> = BTreeMap::new();
-    for s in summaries {
-        if let (Some(variant_id), Some(bindings)) = (
-            s.get("variant_id").and_then(Value::as_str),
-            s.get("bindings"),
-        ) {
-            variant_bindings
-                .entry(variant_id.to_string())
-                .or_insert_with(|| bindings.clone());
-        }
-    }
-
-    for s in summaries {
-        let trial_id = s
-            .get("trial_id")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_string();
-        let hook_counts = trial_event_counts
-            .get(&trial_id)
-            .cloned()
-            .unwrap_or_default();
-        let hook_total: usize = hook_counts.values().sum();
-        let mut trial_row = s.clone();
-        if let Some(obj) = trial_row.as_object_mut() {
-            obj.insert("baseline_id".to_string(), json!(baseline_id));
-            obj.insert("hook_events_total".to_string(), json!(hook_total));
-            obj.insert("has_hook_events".to_string(), json!(hook_total > 0));
-        }
-        serde_json::to_writer(&mut trials, &trial_row)?;
-        writeln!(&mut trials)?;
-
-        if let Some(metrics) = s.get("metrics").and_then(Value::as_object) {
-            for (metric_name, metric_value) in metrics {
-                let row = json!({
-                    "run_id": s.get("run_id").cloned().unwrap_or(json!(null)),
-                    "trial_id": s.get("trial_id").cloned().unwrap_or(json!(null)),
-                    "variant_id": s.get("variant_id").cloned().unwrap_or(json!(null)),
-                    "task_id": s.get("task_id").cloned().unwrap_or(json!(null)),
-                    "repl_idx": s.get("repl_idx").cloned().unwrap_or(json!(null)),
-                    "outcome": s.get("outcome").cloned().unwrap_or(json!(null)),
-                    "metric_name": metric_name,
-                    "metric_value": metric_value,
-                });
-                serde_json::to_writer(&mut metrics_long, &row)?;
-                writeln!(&mut metrics_long)?;
-            }
-        }
-        if let (Some(name), Some(value)) = (
-            s.get("primary_metric_name").and_then(Value::as_str),
-            s.get("primary_metric_value"),
-        ) {
-            let row = json!({
-                "run_id": s.get("run_id").cloned().unwrap_or(json!(null)),
-                "trial_id": s.get("trial_id").cloned().unwrap_or(json!(null)),
-                "variant_id": s.get("variant_id").cloned().unwrap_or(json!(null)),
-                "task_id": s.get("task_id").cloned().unwrap_or(json!(null)),
-                "repl_idx": s.get("repl_idx").cloned().unwrap_or(json!(null)),
-                "outcome": s.get("outcome").cloned().unwrap_or(json!(null)),
-                "metric_name": name,
-                "metric_value": value,
-                "metric_source": "primary"
-            });
-            serde_json::to_writer(&mut metrics_long, &row)?;
-            writeln!(&mut metrics_long)?;
-        }
-
-        if let Some(bindings) = s.get("bindings").and_then(Value::as_object) {
-            for (binding_name, binding_value) in bindings {
-                let row = json!({
-                    "run_id": s.get("run_id").cloned().unwrap_or(json!(null)),
-                    "trial_id": s.get("trial_id").cloned().unwrap_or(json!(null)),
-                    "variant_id": s.get("variant_id").cloned().unwrap_or(json!(null)),
-                    "task_id": s.get("task_id").cloned().unwrap_or(json!(null)),
-                    "repl_idx": s.get("repl_idx").cloned().unwrap_or(json!(null)),
-                    "binding_name": binding_name,
-                    "binding_value": binding_value,
-                    "binding_value_text": binding_value_to_text(binding_value),
-                });
-                serde_json::to_writer(&mut bindings_long, &row)?;
-                writeln!(&mut bindings_long)?;
-            }
-        }
-    }
-
-    for (trial_id, counts) in trial_event_counts {
-        for (event_type, count) in counts {
-            let row = json!({
-                "trial_id": trial_id,
-                "event_type": event_type,
-                "count": count
-            });
-            serde_json::to_writer(&mut events_by_trial, &row)?;
-            writeln!(&mut events_by_trial)?;
-        }
-    }
-
-    for (variant_id, counts) in event_counts {
-        for (event_type, count) in counts {
-            let row = json!({
-                "variant_id": variant_id,
-                "event_type": event_type,
-                "count": count
-            });
-            serde_json::to_writer(&mut events_by_variant, &row)?;
-            writeln!(&mut events_by_variant)?;
-        }
-    }
-
-    for (variant_id, data) in summary_map {
-        let row = json!({
-            "baseline_id": baseline_id,
-            "variant_id": variant_id,
-            "total": data.get("total").cloned().unwrap_or(json!(0)),
-            "success_rate": data.get("success_rate").cloned().unwrap_or(json!(0.0)),
-            "primary_metric_name": data.get("primary_metric_name").cloned().unwrap_or(json!("success")),
-            "primary_metric_mean": data.get("primary_metric_mean").cloned().unwrap_or(json!(0.0)),
-            "event_counts": data.get("event_counts").cloned().unwrap_or(json!({})),
-            "bindings": variant_bindings.get(variant_id).cloned().unwrap_or(json!({})),
-        });
-        serde_json::to_writer(&mut variant_summary, &row)?;
-        writeln!(&mut variant_summary)?;
-    }
-
-    let context =
-        load_run_context_from_analysis_dir(analysis_dir).unwrap_or_else(|_| RunAnalysisContext {
-            run_dir: analysis_dir.to_path_buf(),
-            analysis_dir: analysis_dir.to_path_buf(),
-            tables_dir: analysis_dir.join("tables"),
-            comparison_policy: "unknown".to_string(),
-            scheduling_policy: "unknown".to_string(),
-            view_set: ViewSet::CoreOnly,
-        });
-
-    let bundle_sql = load_view_bundle_sql(context.view_set)?;
-    let load_sql = build_load_sql_relative(&context, bundle_sql.as_deref());
-    fs::write(tables_dir.join(LOAD_SQL_FILE), load_sql)?;
-    fs::write(
-        analysis_dir.join("duckdb_view_context.json"),
-        serde_json::to_vec_pretty(&json!({
-            "schema_version": "duckdb_view_context_v1",
-            "view_set": context.view_set.as_str(),
-            "comparison_policy": context.comparison_policy,
-            "scheduling_policy": context.scheduling_policy
-        }))?,
-    )?;
-
-    if let Err(err) = materialize_run_duckdb(&context) {
-        let warning = format!(
-            "DuckDB materialization skipped for run analysis in {}: {}",
-            analysis_dir.display(),
-            err
-        );
-        fs::write(
-            analysis_dir.join("duckdb_materialization_error.txt"),
-            warning,
-        )?;
-    } else {
-        let warning_path = analysis_dir.join("duckdb_materialization_error.txt");
-        if warning_path.exists() {
-            let _ = fs::remove_file(warning_path);
-        }
-    }
-
-    Ok(())
-}
-
 fn load_run_context(run_dir: &Path) -> Result<RunAnalysisContext> {
     let canonical = run_dir
         .canonicalize()
         .map_err(|_| anyhow!("run directory not found: {}", run_dir.display()))?;
+    #[cfg(feature = "duckdb_engine")]
     let analysis_dir = canonical.join("analysis");
-    let tables_dir = analysis_dir.join("tables");
-    if !tables_dir.exists() {
-        return Err(anyhow!(
-            "analysis tables not found: {}",
-            tables_dir.display()
-        ));
+    let facts_dir = canonical.join(FACTS_DIR);
+    if !facts_dir.exists() {
+        return Err(anyhow!("run facts not found: {}", facts_dir.display()));
     }
     let resolved = read_resolved_experiment(&canonical)?;
     let design = resolved
@@ -554,23 +241,18 @@ fn load_run_context(run_dir: &Path) -> Result<RunAnalysisContext> {
         .unwrap_or_else(default_experiment_design);
     let view_set = view_set_for_design(&design);
     Ok(RunAnalysisContext {
+        #[cfg(feature = "duckdb_engine")]
         run_dir: canonical,
+        #[cfg(feature = "duckdb_engine")]
         analysis_dir,
-        tables_dir,
+        #[cfg(feature = "duckdb_engine")]
+        facts_dir,
+        #[cfg(feature = "duckdb_engine")]
         comparison_policy: design.comparison,
+        #[cfg(feature = "duckdb_engine")]
         scheduling_policy: design.scheduling,
         view_set,
     })
-}
-
-fn load_run_context_from_analysis_dir(analysis_dir: &Path) -> Result<RunAnalysisContext> {
-    let run_dir = analysis_dir.parent().ok_or_else(|| {
-        anyhow!(
-            "analysis directory has no parent: {}",
-            analysis_dir.display()
-        )
-    })?;
-    load_run_context(run_dir)
 }
 
 fn read_resolved_experiment(run_dir: &Path) -> Result<Option<Value>> {
@@ -668,6 +350,7 @@ fn view_set_for_design(design: &ExperimentDesign) -> ViewSet {
     }
 }
 
+#[cfg(feature = "duckdb_engine")]
 fn load_view_bundle_sql(view_set: ViewSet) -> Result<Option<String>> {
     let Some(file_name) = view_set.bundle_file() else {
         return Ok(None);
@@ -681,32 +364,22 @@ fn load_view_bundle_sql(view_set: ViewSet) -> Result<Option<String>> {
     Ok(Some(content.to_string()))
 }
 
+#[cfg(feature = "duckdb_engine")]
 fn build_load_sql_relative(context: &RunAnalysisContext, bundle_sql: Option<&str>) -> String {
-    let metadata_sql = build_metadata_view_sql(context);
     let mut sql = String::from(
         "-- Run from analysis directory:
--- duckdb .lab/runs/<run_id>/analysis/agentlab.duckdb < tables/load_duckdb.sql
+-- duckdb .lab/runs/<run_id>/analysis/agentlab.duckdb < load_duckdb.sql
+
 LOAD json;
-
-CREATE OR REPLACE VIEW trials AS
-SELECT * FROM read_json_auto('tables/trials.jsonl', format='newline_delimited', union_by_name=true);
-
-CREATE OR REPLACE VIEW metrics_long AS
-SELECT * FROM read_json_auto('tables/metrics_long.jsonl', format='newline_delimited', union_by_name=true);
-
-CREATE OR REPLACE VIEW event_counts_by_trial AS
-SELECT * FROM read_json_auto('tables/event_counts_by_trial.jsonl', format='newline_delimited', union_by_name=true);
-
-CREATE OR REPLACE VIEW event_counts_by_variant AS
-SELECT * FROM read_json_auto('tables/event_counts_by_variant.jsonl', format='newline_delimited', union_by_name=true);
-
-CREATE OR REPLACE VIEW variant_summary AS
-SELECT * FROM read_json_auto('tables/variant_summary.jsonl', format='newline_delimited', union_by_name=true);
-
-CREATE OR REPLACE VIEW bindings_long AS
-SELECT * FROM read_json_auto('tables/bindings_long.jsonl', format='newline_delimited', union_by_name=true);
 ",
     );
+    sql.push_str(&build_fact_views_sql(
+        &sql_literal("../facts/trials.jsonl"),
+        &sql_literal("../facts/metrics_long.jsonl"),
+        &sql_literal("../facts/events.jsonl"),
+        &sql_literal("../facts/variant_snapshots.jsonl"),
+    ));
+    let metadata_sql = build_metadata_view_sql(context);
     sql.push_str(&metadata_sql);
     sql.push('\n');
     if let Some(bundle) = bundle_sql {
@@ -719,35 +392,19 @@ SELECT * FROM read_json_auto('tables/bindings_long.jsonl', format='newline_delim
     sql
 }
 
+#[cfg(feature = "duckdb_engine")]
 fn build_load_sql_absolute(context: &RunAnalysisContext, bundle_sql: Option<&str>) -> String {
-    let trials_path = context.tables_dir.join(TABLE_TRIALS);
-    let metrics_path = context.tables_dir.join(TABLE_METRICS_LONG);
-    let events_trial_path = context.tables_dir.join(TABLE_EVENT_COUNTS_BY_TRIAL);
-    let events_variant_path = context.tables_dir.join(TABLE_EVENT_COUNTS_BY_VARIANT);
-    let variant_summary_path = context.tables_dir.join(TABLE_VARIANT_SUMMARY);
-    let bindings_long_path = context.tables_dir.join(TABLE_BINDINGS_LONG);
-    let mut sql = format!(
-        "LOAD json;
-CREATE OR REPLACE VIEW trials AS
-SELECT * FROM read_json_auto({}, format='newline_delimited', union_by_name=true);
-CREATE OR REPLACE VIEW metrics_long AS
-SELECT * FROM read_json_auto({}, format='newline_delimited', union_by_name=true);
-CREATE OR REPLACE VIEW event_counts_by_trial AS
-SELECT * FROM read_json_auto({}, format='newline_delimited', union_by_name=true);
-CREATE OR REPLACE VIEW event_counts_by_variant AS
-SELECT * FROM read_json_auto({}, format='newline_delimited', union_by_name=true);
-CREATE OR REPLACE VIEW variant_summary AS
-SELECT * FROM read_json_auto({}, format='newline_delimited', union_by_name=true);
-CREATE OR REPLACE VIEW bindings_long AS
-SELECT * FROM read_json_auto({}, format='newline_delimited', union_by_name=true);
-",
-        sql_literal_path(&trials_path),
-        sql_literal_path(&metrics_path),
-        sql_literal_path(&events_trial_path),
-        sql_literal_path(&events_variant_path),
-        sql_literal_path(&variant_summary_path),
-        sql_literal_path(&bindings_long_path),
-    );
+    let trials_path = context.facts_dir.join(FACTS_TRIALS_FILE);
+    let metrics_path = context.facts_dir.join(FACTS_METRICS_LONG_FILE);
+    let events_path = context.facts_dir.join(FACTS_EVENTS_FILE);
+    let variant_snapshots_path = context.facts_dir.join(FACTS_VARIANT_SNAPSHOTS_FILE);
+    let mut sql = String::from("LOAD json;\n");
+    sql.push_str(&build_fact_views_sql(
+        &sql_literal_path(&trials_path),
+        &sql_literal_path(&metrics_path),
+        &sql_literal_path(&events_path),
+        &sql_literal_path(&variant_snapshots_path),
+    ));
     sql.push_str(&build_metadata_view_sql(context));
     sql.push('\n');
     if let Some(bundle) = bundle_sql {
@@ -759,6 +416,7 @@ SELECT * FROM read_json_auto({}, format='newline_delimited', union_by_name=true)
     sql
 }
 
+#[cfg(feature = "duckdb_engine")]
 fn build_metadata_view_sql(context: &RunAnalysisContext) -> String {
     format!(
         "CREATE OR REPLACE VIEW analysis_metadata AS
@@ -782,24 +440,167 @@ SELECT
 }
 
 #[cfg(feature = "duckdb_engine")]
+fn build_fact_views_sql(
+    trials_path: &str,
+    metrics_long_path: &str,
+    events_path: &str,
+    variant_snapshots_path: &str,
+) -> String {
+    format!(
+        "CREATE OR REPLACE VIEW trials AS
+WITH raw AS (
+    SELECT to_json(r) AS row_json
+    FROM read_json_auto({}, format='newline_delimited', union_by_name=true) AS r
+)
+SELECT
+    json_extract_string(row_json, '$.run_id') AS run_id,
+    json_extract_string(row_json, '$.trial_id') AS trial_id,
+    json_extract_string(row_json, '$.variant_id') AS variant_id,
+    json_extract_string(row_json, '$.baseline_id') AS baseline_id,
+    json_extract_string(row_json, '$.task_id') AS task_id,
+    try_cast(json_extract(row_json, '$.repl_idx') AS BIGINT) AS repl_idx,
+    json_extract_string(row_json, '$.outcome') AS outcome,
+    json_extract_string(row_json, '$.primary_metric_name') AS primary_metric_name,
+    json_extract_string(row_json, '$.primary_metric_value') AS primary_metric_value,
+    json_extract(row_json, '$.bindings') AS bindings
+FROM raw;
+
+CREATE OR REPLACE VIEW metrics_long AS
+WITH raw AS (
+    SELECT to_json(r) AS row_json
+    FROM read_json_auto({}, format='newline_delimited', union_by_name=true) AS r
+)
+SELECT
+    json_extract_string(row_json, '$.run_id') AS run_id,
+    json_extract_string(row_json, '$.trial_id') AS trial_id,
+    json_extract_string(row_json, '$.variant_id') AS variant_id,
+    json_extract_string(row_json, '$.task_id') AS task_id,
+    json_extract_string(row_json, '$.metric_name') AS metric_name,
+    json_extract_string(row_json, '$.metric_value') AS metric_value
+FROM raw;
+
+CREATE OR REPLACE VIEW events AS
+WITH raw AS (
+    SELECT to_json(r) AS row_json
+    FROM read_json_auto({}, format='newline_delimited', union_by_name=true) AS r
+)
+SELECT
+    json_extract_string(row_json, '$.run_id') AS run_id,
+    json_extract_string(row_json, '$.trial_id') AS trial_id,
+    json_extract_string(row_json, '$.variant_id') AS variant_id,
+    json_extract_string(row_json, '$.event_type') AS event_type
+FROM raw;
+
+CREATE OR REPLACE VIEW variant_snapshots AS
+WITH raw AS (
+    SELECT to_json(r) AS row_json
+    FROM read_json_auto({}, format='newline_delimited', union_by_name=true) AS r
+)
+SELECT
+    json_extract_string(row_json, '$.run_id') AS run_id,
+    json_extract_string(row_json, '$.trial_id') AS trial_id,
+    json_extract_string(row_json, '$.variant_id') AS variant_id,
+    json_extract_string(row_json, '$.task_id') AS task_id,
+    try_cast(json_extract(row_json, '$.repl_idx') AS BIGINT) AS repl_idx,
+    json_extract_string(row_json, '$.binding_name') AS binding_name,
+    json_extract(row_json, '$.binding_value') AS binding_value,
+    json_extract_string(row_json, '$.binding_value_text') AS binding_value_text
+FROM raw;
+
+CREATE OR REPLACE VIEW bindings_long AS
+SELECT
+    run_id,
+    trial_id,
+    variant_id,
+    task_id,
+    repl_idx,
+    binding_name,
+    binding_value,
+    binding_value_text
+FROM variant_snapshots;
+
+CREATE OR REPLACE VIEW event_counts_by_trial AS
+SELECT
+    run_id,
+    trial_id,
+    variant_id,
+    event_type,
+    count(*) AS count
+FROM events
+GROUP BY run_id, trial_id, variant_id, event_type;
+
+CREATE OR REPLACE VIEW event_counts_by_variant AS
+SELECT
+    run_id,
+    variant_id,
+    event_type,
+    count(*) AS count
+FROM events
+GROUP BY run_id, variant_id, event_type;
+
+CREATE OR REPLACE VIEW variant_summary AS
+SELECT
+    min(baseline_id) AS baseline_id,
+    variant_id,
+    count(*)::DOUBLE AS total,
+    avg(CASE WHEN outcome = 'success' THEN 1.0 ELSE 0.0 END) AS success_rate,
+    first(primary_metric_name) AS primary_metric_name,
+    avg(try_cast(primary_metric_value AS DOUBLE)) AS primary_metric_mean,
+    NULL AS event_counts,
+    first(bindings) AS bindings
+FROM trials
+GROUP BY variant_id;
+
+CREATE OR REPLACE VIEW task_variant_matrix AS
+SELECT
+    task_id,
+    variant_id,
+    round(avg(CASE WHEN outcome = 'success' THEN 1.0 ELSE 0.0 END), 4) AS pass_rate,
+    count(*) AS n_trials
+FROM trials
+GROUP BY task_id, variant_id
+ORDER BY task_id, variant_id;
+
+CREATE OR REPLACE VIEW run_progress AS
+SELECT
+    run_id,
+    count(*) AS completed_trials,
+    count(DISTINCT variant_id) AS variants_seen,
+    count(DISTINCT task_id) AS tasks_seen,
+    round(avg(CASE WHEN outcome = 'success' THEN 1.0 ELSE 0.0 END), 4) AS pass_rate
+FROM trials
+GROUP BY run_id
+ORDER BY run_id;
+",
+        trials_path, metrics_long_path, events_path, variant_snapshots_path
+    )
+}
+
+#[cfg(feature = "duckdb_engine")]
 fn materialize_run_duckdb(context: &RunAnalysisContext) -> Result<()> {
     ensure_dir(&context.analysis_dir)?;
-    ensure_dir(&context.tables_dir)?;
-    ensure_table_files(&context.tables_dir)?;
+    ensure_dir(&context.facts_dir)?;
+    ensure_fact_files(&context.facts_dir)?;
+    fs::write(
+        context.analysis_dir.join("duckdb_view_context.json"),
+        serde_json::to_vec_pretty(&serde_json::json!({
+            "schema_version": "duckdb_view_context_v1",
+            "view_set": context.view_set.as_str(),
+            "comparison_policy": context.comparison_policy,
+            "scheduling_policy": context.scheduling_policy
+        }))?,
+    )?;
     let db_path = context.analysis_dir.join(ANALYSIS_DB_FILE);
     let conn = Connection::open(&db_path)
         .with_context(|| format!("failed to open DuckDB {}", db_path.display()))?;
     load_json_extension(&conn)?;
     let bundle_sql = load_view_bundle_sql(context.view_set)?;
+    let relative_sql = build_load_sql_relative(context, bundle_sql.as_deref());
+    fs::write(context.analysis_dir.join(LOAD_SQL_FILE), relative_sql)?;
     let sql = build_load_sql_absolute(context, bundle_sql.as_deref());
     conn.execute_batch(&sql)
         .with_context(|| format!("failed to materialize run DuckDB for {}", db_path.display()))?;
     Ok(())
-}
-
-#[cfg(not(feature = "duckdb_engine"))]
-fn materialize_run_duckdb(_context: &RunAnalysisContext) -> Result<()> {
-    Err(duckdb_disabled_error("run materialization"))
 }
 
 #[cfg(feature = "duckdb_engine")]
@@ -811,17 +612,16 @@ fn open_run_connection(context: &RunAnalysisContext) -> Result<Connection> {
     Ok(conn)
 }
 
-fn ensure_table_files(tables_dir: &Path) -> Result<()> {
+#[cfg(feature = "duckdb_engine")]
+fn ensure_fact_files(facts_dir: &Path) -> Result<()> {
     let files = [
-        TABLE_TRIALS,
-        TABLE_METRICS_LONG,
-        TABLE_EVENT_COUNTS_BY_TRIAL,
-        TABLE_EVENT_COUNTS_BY_VARIANT,
-        TABLE_VARIANT_SUMMARY,
-        TABLE_BINDINGS_LONG,
+        FACTS_TRIALS_FILE,
+        FACTS_METRICS_LONG_FILE,
+        FACTS_EVENTS_FILE,
+        FACTS_VARIANT_SNAPSHOTS_FILE,
     ];
     for file in files {
-        let path = tables_dir.join(file);
+        let path = facts_dir.join(file);
         if !path.exists() {
             fs::write(&path, b"")
                 .with_context(|| format!("failed to initialize {}", path.display()))?;
@@ -832,12 +632,13 @@ fn ensure_table_files(tables_dir: &Path) -> Result<()> {
 
 #[cfg(feature = "duckdb_engine")]
 fn load_json_extension(conn: &Connection) -> Result<()> {
-    match conn.execute_batch("LOAD json;") {
-        Ok(_) => Ok(()),
-        Err(_) => conn
-            .execute_batch("INSTALL json; LOAD json;")
-            .context("failed to load DuckDB json extension"),
+    if conn.execute_batch("LOAD json;").is_ok() {
+        return Ok(());
     }
+    if conn.execute_batch("INSTALL json; LOAD json;").is_ok() {
+        return Ok(());
+    }
+    Ok(())
 }
 
 #[cfg(feature = "duckdb_engine")]
@@ -864,7 +665,7 @@ fn materialize_project_duckdb(project_root: &Path) -> Result<PathBuf> {
             }
             let run_id = entry.file_name().to_string_lossy().to_string();
             let run_path = entry.path();
-            let trials_path = run_path.join("analysis").join("tables").join(TABLE_TRIALS);
+            let trials_path = run_path.join(FACTS_DIR).join(FACTS_TRIALS_FILE);
             if trials_path.exists() {
                 trial_sources.push(trials_path);
             }
@@ -963,16 +764,6 @@ ORDER BY t.run_id, t.variant_id, t.task_id;
 #[cfg(feature = "duckdb_engine")]
 fn execute_select_query(conn: &Connection, sql: &str) -> Result<QueryTable> {
     let normalized = normalize_sql(sql)?;
-    let column_probe_sql = format!("SELECT * FROM ({}) AS __q LIMIT 0", normalized);
-    let mut column_stmt = conn
-        .prepare(&column_probe_sql)
-        .with_context(|| format!("failed to inspect query columns: {}", normalized))?;
-    let columns = column_stmt
-        .column_names()
-        .iter()
-        .map(|name| name.to_string())
-        .collect::<Vec<_>>();
-    drop(column_stmt);
 
     let row_json_sql = format!(
         "SELECT to_json(__q) AS row_json FROM ({}) AS __q",
@@ -985,13 +776,28 @@ fn execute_select_query(conn: &Connection, sql: &str) -> Result<QueryTable> {
         .query([])
         .with_context(|| format!("failed to execute query: {}", normalized))?;
 
-    let mut out_rows: Vec<Vec<Value>> = Vec::new();
+    let mut columns: Vec<String> = Vec::new();
+    let mut seen_columns: BTreeSet<String> = BTreeSet::new();
+    let mut parsed_rows: Vec<Value> = Vec::new();
+
     while let Some(row) = rows.next()? {
         let raw: Option<String> = row.get(0)?;
         let parsed = match raw {
             Some(text) => serde_json::from_str::<Value>(&text).unwrap_or(Value::String(text)),
             None => Value::Null,
         };
+        if let Some(obj) = parsed.as_object() {
+            for key in obj.keys() {
+                if seen_columns.insert(key.clone()) {
+                    columns.push(key.clone());
+                }
+            }
+        }
+        parsed_rows.push(parsed);
+    }
+
+    let mut out_rows: Vec<Vec<Value>> = Vec::new();
+    for parsed in parsed_rows {
         if let Some(obj) = parsed.as_object() {
             let mut out = Vec::with_capacity(columns.len());
             for column in &columns {
@@ -1011,6 +817,7 @@ fn execute_select_query(conn: &Connection, sql: &str) -> Result<QueryTable> {
     })
 }
 
+#[cfg(any(feature = "duckdb_engine", test))]
 fn validate_read_only_sql(sql: &str) -> Result<String> {
     let normalized = normalize_sql(sql)?;
     let lower = normalized.to_ascii_lowercase();
@@ -1040,6 +847,7 @@ fn validate_read_only_sql(sql: &str) -> Result<String> {
     Ok(normalized)
 }
 
+#[cfg(any(feature = "duckdb_engine", test))]
 fn normalize_sql(sql: &str) -> Result<String> {
     let mut normalized = sql.trim();
     while normalized.ends_with(';') {
@@ -1071,20 +879,12 @@ fn quote_identifier(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
 }
 
-fn binding_value_to_text(value: &Value) -> String {
-    match value {
-        Value::Null => "null".to_string(),
-        Value::Bool(v) => v.to_string(),
-        Value::Number(v) => v.to_string(),
-        Value::String(v) => v.clone(),
-        Value::Array(_) | Value::Object(_) => serde_json::to_string(value).unwrap_or_default(),
-    }
-}
-
+#[cfg(feature = "duckdb_engine")]
 fn sql_literal(value: &str) -> String {
     format!("'{}'", value.replace('\'', "''"))
 }
 
+#[cfg(feature = "duckdb_engine")]
 fn sql_literal_path(path: &Path) -> String {
     sql_literal(&path.to_string_lossy())
 }
@@ -1092,6 +892,7 @@ fn sql_literal_path(path: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     #[test]
     fn picks_ab_test_for_two_variant_paired_interleaved() {

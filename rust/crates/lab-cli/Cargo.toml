@@ -13,3 +13,4 @@ lab-hooks = { path = "../lab-hooks" }
 lab-runner = { path = "../lab-runner" }
 lab-provenance = { path = "../lab-provenance" }
 lab-analysis = { path = "../lab-analysis" }
+libc = "0.2"

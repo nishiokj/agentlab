@@ -1,0 +1,30 @@
+{
+  "schema_version": "p2e_determinism_fixture_v1",
+  "arrivals": [
+    {
+      "tick": 0,
+      "schedule_idx": 2,
+      "trial_id": "trial_2",
+      "classification": "arrive_2"
+    },
+    {
+      "tick": 0,
+      "schedule_idx": 0,
+      "trial_id": "trial_0",
+      "classification": "arrive_0"
+    },
+    {
+      "tick": 1,
+      "schedule_idx": 3,
+      "trial_id": "trial_3",
+      "classification": "arrive_3"
+    },
+    {
+      "tick": 1,
+      "schedule_idx": 1,
+      "trial_id": "trial_1",
+      "classification": "arrive_1"
+    }
+  ],
+  "expected_commit_schedule_idx": [0, 1, 2, 3]
+}

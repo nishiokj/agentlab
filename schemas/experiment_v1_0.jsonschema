@@ -1,0 +1,110 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://agentlab.dev/schemas/experiment_v1_0.jsonschema",
+  "title": "AgentLab Experiment v1.0",
+  "type": "object",
+  "required": ["version", "experiment", "dataset", "design", "baseline", "runtime"],
+  "properties": {
+    "version": {
+      "const": "1.0"
+    },
+    "experiment": {
+      "type": "object",
+      "required": ["id", "name"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "name": { "type": "string", "minLength": 1 },
+        "profile": { "type": "string" }
+      },
+      "additionalProperties": true
+    },
+    "dataset": {
+      "type": "object",
+      "required": ["path"],
+      "properties": {
+        "path": { "type": "string", "minLength": 1 },
+        "limit": { "type": "integer", "minimum": 1 }
+      },
+      "additionalProperties": false
+    },
+    "design": {
+      "type": "object",
+      "required": ["replications"],
+      "properties": {
+        "comparison": {
+          "type": "string",
+          "enum": ["paired", "unpaired", "none"]
+        },
+        "replications": { "type": "integer", "minimum": 1 },
+        "seed": { "type": "integer" }
+      },
+      "additionalProperties": false
+    },
+    "baseline": {
+      "type": "object",
+      "required": ["variant_id"],
+      "properties": {
+        "variant_id": { "type": "string", "minLength": 1 },
+        "args": {
+          "type": "array",
+          "items": { "type": "string" }
+        },
+        "env": {
+          "type": "object",
+          "additionalProperties": { "type": "string" }
+        },
+        "image": { "type": "string" }
+      },
+      "additionalProperties": false
+    },
+    "variant_plan": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["variant_id"],
+        "properties": {
+          "variant_id": { "type": "string", "minLength": 1 },
+          "args": {
+            "type": "array",
+            "items": { "type": "string" }
+          },
+          "image": { "type": "string" },
+          "env": {
+            "type": "object",
+            "additionalProperties": { "type": "string" }
+          }
+        },
+        "additionalProperties": false
+      }
+    },
+    "runtime": {
+      "type": "object",
+      "required": ["image", "command"],
+      "properties": {
+        "image": { "type": "string", "minLength": 1 },
+        "command": {
+          "oneOf": [
+            { "type": "string", "minLength": 1 },
+            {
+              "type": "array",
+              "minItems": 1,
+              "items": { "type": "string", "minLength": 1 }
+            }
+          ]
+        },
+        "timeout_ms": { "type": "integer", "minimum": 1 },
+        "network": { "type": "string", "enum": ["none", "full"] },
+        "resources": {
+          "type": "object",
+          "properties": {
+            "cpus": { "type": "integer", "minimum": 1 },
+            "memory_mb": { "type": "integer", "minimum": 1 }
+          },
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    }
+  },
+  "additionalProperties": false
+}

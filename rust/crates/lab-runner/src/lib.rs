@@ -2,7 +2,6 @@ use anyhow::{anyhow, Result};
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine as _;
 use chrono::Utc;
-use lab_analysis::{summarize_trial, write_analysis};
 use lab_core::{
     canonical_json_digest, ensure_dir, runner_runtime_host_paths, sha256_bytes, sha256_file,
     ArtifactStore, RunnerRuntimeHostPaths, AGENTLAB_AGENTLABD_START_REQUEST_PATH,
@@ -13,15 +12,19 @@ use lab_core::{
     AGENTLAB_ENV_REPL_IDX, AGENTLAB_ENV_RESULT_PATH, AGENTLAB_ENV_RUN_ID, AGENTLAB_ENV_TASK_ID,
     AGENTLAB_ENV_TASK_PATH, AGENTLAB_ENV_TIMEOUT_MS, AGENTLAB_ENV_TRAJECTORY_PATH,
     AGENTLAB_ENV_TRIAL_ID, AGENTLAB_ENV_VARIANT_ID, AGENTLAB_POLICY_PATH, AGENTLAB_RESULT_PATH,
-    AGENTLAB_TASK_PATH, AGENTLAB_TRAJECTORY_PATH, AGENTLAB_TRIAL_INPUT_PATH,
+    AGENTLAB_TASK_PATH, AGENTLAB_TRAJECTORY_PATH, AGENTLAB_TRIAL_INPUT_PATH, HARNESS_IN_DIR,
+    HARNESS_OUT_DIR, HARNESS_RESULT_PATH, HARNESS_TASK_PATH,
 };
 use lab_hooks::{load_manifest, validate_hooks};
 use lab_provenance::{default_attestation, write_attestation};
 use lab_schemas::compile_schema;
+use reqwest::blocking::Client as HttpClient;
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use serde_json::Value;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::env;
 use std::fs;
 use std::io::Write;
 #[cfg(unix)]
@@ -30,8 +33,15 @@ use std::os::unix::fs::symlink;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
+
+mod sink;
+use sink::{
+    EventRow, JsonlRunSink, MetricRow, RunManifestRecord, RunSink, TrialRecord, VariantSnapshotRow,
+};
 
 const DEFAULT_CONTAINER_TASK_PATH: &str = AGENTLAB_TASK_PATH;
 const DEFAULT_CONTAINER_BINDINGS_PATH: &str = AGENTLAB_BINDINGS_PATH;
@@ -41,6 +51,35 @@ const DEFAULT_CONTAINER_RESULT_PATH: &str = AGENTLAB_RESULT_PATH;
 const DEFAULT_CONTAINER_TRAJECTORY_PATH: &str = AGENTLAB_TRAJECTORY_PATH;
 const DEFAULT_CONTAINER_TRIAL_INPUT_PATH: &str = AGENTLAB_TRIAL_INPUT_PATH;
 const DEFAULT_CONTAINER_CONTROL_PATH: &str = AGENTLAB_CONTROL_PATH;
+const DEFAULT_CLEAN_TASK_PATH: &str = HARNESS_TASK_PATH;
+const DEFAULT_CLEAN_RESULT_PATH: &str = HARNESS_RESULT_PATH;
+const AGENTLAB_ENV_TASK_IMAGE: &str = "AGENTLAB_TASK_IMAGE";
+const AGENTLAB_LOCAL_WORKER_MAX_IN_FLIGHT_ENV: &str = "AGENTLAB_LOCAL_WORKER_MAX_IN_FLIGHT";
+const AGENTLAB_REMOTE_PROTOCOL_RETRY_MAX_ATTEMPTS_ENV: &str =
+    "AGENTLAB_REMOTE_PROTOCOL_RETRY_MAX_ATTEMPTS";
+const AGENTLAB_REMOTE_PROTOCOL_RETRY_BASE_BACKOFF_MS_ENV: &str =
+    "AGENTLAB_REMOTE_PROTOCOL_RETRY_BASE_BACKOFF_MS";
+const AGENTLAB_REMOTE_PROTOCOL_CONNECT_TIMEOUT_MS_ENV: &str =
+    "AGENTLAB_REMOTE_PROTOCOL_CONNECT_TIMEOUT_MS";
+const AGENTLAB_REMOTE_PROTOCOL_SUBMIT_TIMEOUT_MS_ENV: &str =
+    "AGENTLAB_REMOTE_PROTOCOL_SUBMIT_TIMEOUT_MS";
+const AGENTLAB_REMOTE_PROTOCOL_POLL_TIMEOUT_GRACE_MS_ENV: &str =
+    "AGENTLAB_REMOTE_PROTOCOL_POLL_TIMEOUT_GRACE_MS";
+const AGENTLAB_REMOTE_PROTOCOL_PAUSE_TIMEOUT_MS_ENV: &str =
+    "AGENTLAB_REMOTE_PROTOCOL_PAUSE_TIMEOUT_MS";
+const AGENTLAB_REMOTE_PROTOCOL_STOP_TIMEOUT_MS_ENV: &str =
+    "AGENTLAB_REMOTE_PROTOCOL_STOP_TIMEOUT_MS";
+const LOCAL_WORKER_CAPACITY_ERROR_PREFIX: &str = "local worker backend at capacity:";
+const LOCAL_WORKER_MAX_COMPLETIONS_PER_POLL: usize = 256;
+const REMOTE_PROTOCOL_RETRY_MAX_ATTEMPTS_DEFAULT: usize = 3;
+const REMOTE_PROTOCOL_RETRY_BASE_BACKOFF_MS_DEFAULT: u64 = 20;
+const REMOTE_PROTOCOL_CONNECT_TIMEOUT_MS_DEFAULT: u64 = 5_000;
+const REMOTE_PROTOCOL_SUBMIT_TIMEOUT_MS_DEFAULT: u64 = 30_000;
+const REMOTE_PROTOCOL_POLL_TIMEOUT_GRACE_MS_DEFAULT: u64 = 1_000;
+const REMOTE_PROTOCOL_PAUSE_TIMEOUT_MS_DEFAULT: u64 = 30_000;
+const REMOTE_PROTOCOL_STOP_TIMEOUT_MS_DEFAULT: u64 = 30_000;
+const REMOTE_BACKEND_QUARANTINED_PREFIX: &str = "remote worker backend quarantined:";
+const REMOTE_COMPLETION_SEQ_FALLBACK: u64 = 0;
 const CANONICAL_TRIAL_RESULT_FILENAME: &str = "result.json";
 const WORKSPACE_EVIDENCE_EXCLUDE_PREFIXES: &[&str] = &[
     "logs",
@@ -113,6 +152,7 @@ fn default_active_adapter_version() -> String {
 struct AdapterRunRequest<'a> {
     runtime_experiment: &'a Value,
     runtime: &'a AgentRuntimeConfig,
+    variant_args: &'a [String],
     runtime_env: &'a BTreeMap<String, String>,
     runtime_overrides_env: &'a BTreeMap<String, String>,
     container_mode: bool,
@@ -137,15 +177,1393 @@ struct AdapterPauseAck {
     stop_acked: bool,
 }
 
+// ---------------------------------------------------------------------------
+// Worker execution boundary contracts (P1: contract freeze)
+// ---------------------------------------------------------------------------
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+struct TrialDispatch {
+    run_id: String,
+    trial_id: String,
+    schedule_idx: usize,
+    slot: TrialSlot,
+    variant_id: String,
+    task_id: String,
+    repl_idx: usize,
+    runtime_profile: Value,
+    task_payload: Value,
+    effective_policy: Value,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct WorkerTicket {
+    worker_id: String,
+    ticket_id: String,
+    trial_id: String,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+struct TrialCompletion {
+    ticket: WorkerTicket,
+    schedule_idx: usize,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    completion_seq: Option<u64>,
+    terminal_status: String,
+    classification: String,
+    artifacts: Value,
+    metrics: Value,
+    runtime_summary: Value,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct WorkerPauseAck {
+    worker_id: String,
+    trial_id: String,
+    label: String,
+    accepted: bool,
+}
+
+#[allow(dead_code)]
+trait WorkerBackend: Send + Sync {
+    fn submit(&self, dispatch: TrialDispatch) -> Result<WorkerTicket>;
+    fn poll_completions(&self, timeout: Duration) -> Result<Vec<TrialCompletion>>;
+    fn request_pause(&self, worker_id: &str, label: &str) -> Result<WorkerPauseAck>;
+    fn request_stop(&self, worker_id: &str, reason: &str) -> Result<()>;
+}
+
+#[allow(dead_code)]
+type LocalTrialExecutor = dyn Fn(TrialDispatch) -> Result<TrialCompletion> + Send + Sync + 'static;
+
+#[allow(dead_code)]
+#[derive(Clone)]
+struct LocalThreadWorkerBackend {
+    inner: Arc<LocalThreadWorkerBackendInner>,
+}
+
+struct LocalThreadWorkerBackendInner {
+    max_in_flight: usize,
+    capacity_warning: Option<String>,
+    max_completions_per_poll: usize,
+    executor: Arc<LocalTrialExecutor>,
+    next_ticket_seq: AtomicU64,
+    next_worker_seq: AtomicU64,
+    completions_tx: mpsc::Sender<TrialCompletion>,
+    completions_rx: Mutex<mpsc::Receiver<TrialCompletion>>,
+    state: Mutex<LocalThreadWorkerState>,
+}
+
+#[derive(Default)]
+struct LocalThreadWorkerState {
+    in_flight_by_ticket: HashMap<String, WorkerTicket>,
+}
+
+fn parse_local_worker_capacity_ceiling_from_env() -> Result<Option<usize>> {
+    match env::var(AGENTLAB_LOCAL_WORKER_MAX_IN_FLIGHT_ENV) {
+        Ok(raw) => {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                return Ok(None);
+            }
+            let parsed = trimmed.parse::<usize>().map_err(|_| {
+                anyhow!(
+                    "{} must be a positive integer when set (got: {})",
+                    AGENTLAB_LOCAL_WORKER_MAX_IN_FLIGHT_ENV,
+                    raw
+                )
+            })?;
+            if parsed == 0 {
+                return Err(anyhow!(
+                    "{} must be > 0 when set",
+                    AGENTLAB_LOCAL_WORKER_MAX_IN_FLIGHT_ENV
+                ));
+            }
+            Ok(Some(parsed))
+        }
+        Err(env::VarError::NotPresent) => Ok(None),
+        Err(err) => Err(anyhow!(
+            "failed reading {}: {}",
+            AGENTLAB_LOCAL_WORKER_MAX_IN_FLIGHT_ENV,
+            err
+        )),
+    }
+}
+
+fn resolve_local_worker_max_in_flight(
+    requested_max_in_flight: usize,
+    configured_ceiling: Option<usize>,
+) -> (usize, Option<String>) {
+    let effective_max_in_flight = configured_ceiling
+        .map(|ceiling| requested_max_in_flight.min(ceiling))
+        .unwrap_or(requested_max_in_flight)
+        .max(1);
+    if effective_max_in_flight < requested_max_in_flight {
+        let warning = format!(
+            "local worker backend capacity ceiling applied: requested_max_in_flight={} effective_max_in_flight={} env_var={}",
+            requested_max_in_flight,
+            effective_max_in_flight,
+            AGENTLAB_LOCAL_WORKER_MAX_IN_FLIGHT_ENV
+        );
+        return (effective_max_in_flight, Some(warning));
+    }
+    (effective_max_in_flight, None)
+}
+
+fn parse_optional_positive_usize_env(name: &str) -> Result<Option<usize>> {
+    match env::var(name) {
+        Ok(raw) => {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                return Ok(None);
+            }
+            let parsed = trimmed.parse::<usize>().map_err(|_| {
+                anyhow!("{} must be a positive integer when set (got: {})", name, raw)
+            })?;
+            if parsed == 0 {
+                return Err(anyhow!("{} must be > 0 when set", name));
+            }
+            Ok(Some(parsed))
+        }
+        Err(env::VarError::NotPresent) => Ok(None),
+        Err(err) => Err(anyhow!("failed reading {}: {}", name, err)),
+    }
+}
+
+fn parse_optional_positive_u64_env(name: &str) -> Result<Option<u64>> {
+    match env::var(name) {
+        Ok(raw) => {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                return Ok(None);
+            }
+            let parsed = trimmed.parse::<u64>().map_err(|_| {
+                anyhow!("{} must be a positive integer when set (got: {})", name, raw)
+            })?;
+            if parsed == 0 {
+                return Err(anyhow!("{} must be > 0 when set", name));
+            }
+            Ok(Some(parsed))
+        }
+        Err(env::VarError::NotPresent) => Ok(None),
+        Err(err) => Err(anyhow!("failed reading {}: {}", name, err)),
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RemoteRetrySettings {
+    max_attempts: usize,
+    base_backoff_ms: u64,
+}
+
+impl Default for RemoteRetrySettings {
+    fn default() -> Self {
+        Self {
+            max_attempts: REMOTE_PROTOCOL_RETRY_MAX_ATTEMPTS_DEFAULT,
+            base_backoff_ms: REMOTE_PROTOCOL_RETRY_BASE_BACKOFF_MS_DEFAULT,
+        }
+    }
+}
+
+fn resolve_remote_retry_settings_from_env() -> Result<RemoteRetrySettings> {
+    let mut settings = RemoteRetrySettings::default();
+    if let Some(max_attempts) =
+        parse_optional_positive_usize_env(AGENTLAB_REMOTE_PROTOCOL_RETRY_MAX_ATTEMPTS_ENV)?
+    {
+        settings.max_attempts = max_attempts;
+    }
+    if let Some(base_backoff_ms) =
+        parse_optional_positive_u64_env(AGENTLAB_REMOTE_PROTOCOL_RETRY_BASE_BACKOFF_MS_ENV)?
+    {
+        settings.base_backoff_ms = base_backoff_ms;
+    }
+    Ok(settings)
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RemoteProtocolTimeoutSettings {
+    connect_timeout_ms: u64,
+    submit_timeout_ms: u64,
+    poll_timeout_grace_ms: u64,
+    pause_timeout_ms: u64,
+    stop_timeout_ms: u64,
+}
+
+impl Default for RemoteProtocolTimeoutSettings {
+    fn default() -> Self {
+        Self {
+            connect_timeout_ms: REMOTE_PROTOCOL_CONNECT_TIMEOUT_MS_DEFAULT,
+            submit_timeout_ms: REMOTE_PROTOCOL_SUBMIT_TIMEOUT_MS_DEFAULT,
+            poll_timeout_grace_ms: REMOTE_PROTOCOL_POLL_TIMEOUT_GRACE_MS_DEFAULT,
+            pause_timeout_ms: REMOTE_PROTOCOL_PAUSE_TIMEOUT_MS_DEFAULT,
+            stop_timeout_ms: REMOTE_PROTOCOL_STOP_TIMEOUT_MS_DEFAULT,
+        }
+    }
+}
+
+fn resolve_remote_protocol_timeout_settings_from_env() -> Result<RemoteProtocolTimeoutSettings> {
+    let mut settings = RemoteProtocolTimeoutSettings::default();
+    if let Some(connect_timeout_ms) =
+        parse_optional_positive_u64_env(AGENTLAB_REMOTE_PROTOCOL_CONNECT_TIMEOUT_MS_ENV)?
+    {
+        settings.connect_timeout_ms = connect_timeout_ms;
+    }
+    if let Some(submit_timeout_ms) =
+        parse_optional_positive_u64_env(AGENTLAB_REMOTE_PROTOCOL_SUBMIT_TIMEOUT_MS_ENV)?
+    {
+        settings.submit_timeout_ms = submit_timeout_ms;
+    }
+    if let Some(poll_timeout_grace_ms) =
+        parse_optional_positive_u64_env(AGENTLAB_REMOTE_PROTOCOL_POLL_TIMEOUT_GRACE_MS_ENV)?
+    {
+        settings.poll_timeout_grace_ms = poll_timeout_grace_ms;
+    }
+    if let Some(pause_timeout_ms) =
+        parse_optional_positive_u64_env(AGENTLAB_REMOTE_PROTOCOL_PAUSE_TIMEOUT_MS_ENV)?
+    {
+        settings.pause_timeout_ms = pause_timeout_ms;
+    }
+    if let Some(stop_timeout_ms) =
+        parse_optional_positive_u64_env(AGENTLAB_REMOTE_PROTOCOL_STOP_TIMEOUT_MS_ENV)?
+    {
+        settings.stop_timeout_ms = stop_timeout_ms;
+    }
+    Ok(settings)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RemoteProtocolErrorKind {
+    Retryable,
+    Fatal,
+}
+
+#[derive(Debug)]
+struct RemoteProtocolError {
+    kind: RemoteProtocolErrorKind,
+    message: String,
+}
+
+impl RemoteProtocolError {
+    fn retryable(message: impl Into<String>) -> Self {
+        Self {
+            kind: RemoteProtocolErrorKind::Retryable,
+            message: message.into(),
+        }
+    }
+
+    fn fatal(message: impl Into<String>) -> Self {
+        Self {
+            kind: RemoteProtocolErrorKind::Fatal,
+            message: message.into(),
+        }
+    }
+
+    fn is_retryable(&self) -> bool {
+        self.kind == RemoteProtocolErrorKind::Retryable
+    }
+}
+
+impl std::fmt::Display for RemoteProtocolError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.message)
+    }
+}
+
+impl std::error::Error for RemoteProtocolError {}
+
+fn is_retryable_remote_http_status(status: u16) -> bool {
+    matches!(status, 408 | 425 | 429 | 500 | 502 | 503 | 504)
+}
+
+fn truncate_remote_error_body(raw: &str) -> String {
+    const MAX_ERROR_BODY_CHARS: usize = 512;
+    let normalized = raw.replace('\n', " ");
+    if normalized.chars().count() <= MAX_ERROR_BODY_CHARS {
+        return normalized;
+    }
+    normalized.chars().take(MAX_ERROR_BODY_CHARS).collect()
+}
+
+#[allow(dead_code)]
+impl LocalThreadWorkerBackend {
+    fn new(max_in_flight: usize, executor: Arc<LocalTrialExecutor>) -> Result<Self> {
+        let configured_ceiling = parse_local_worker_capacity_ceiling_from_env()?;
+        Self::new_with_ceiling(max_in_flight, executor, configured_ceiling)
+    }
+
+    fn new_with_ceiling(
+        max_in_flight: usize,
+        executor: Arc<LocalTrialExecutor>,
+        configured_ceiling: Option<usize>,
+    ) -> Result<Self> {
+        if max_in_flight == 0 {
+            return Err(anyhow!("local worker backend requires max_in_flight > 0"));
+        }
+        let (effective_max_in_flight, capacity_warning) =
+            resolve_local_worker_max_in_flight(max_in_flight, configured_ceiling);
+        let (tx, rx) = mpsc::channel();
+        Ok(Self {
+            inner: Arc::new(LocalThreadWorkerBackendInner {
+                max_in_flight: effective_max_in_flight,
+                capacity_warning,
+                max_completions_per_poll: LOCAL_WORKER_MAX_COMPLETIONS_PER_POLL,
+                executor,
+                next_ticket_seq: AtomicU64::new(1),
+                next_worker_seq: AtomicU64::new(1),
+                completions_tx: tx,
+                completions_rx: Mutex::new(rx),
+                state: Mutex::new(LocalThreadWorkerState::default()),
+            }),
+        })
+    }
+
+    fn next_ticket(&self, trial_id: &str) -> WorkerTicket {
+        let ticket_seq = self.inner.next_ticket_seq.fetch_add(1, Ordering::Relaxed);
+        let worker_seq = self.inner.next_worker_seq.fetch_add(1, Ordering::Relaxed);
+        WorkerTicket {
+            worker_id: format!("local.worker.{}", worker_seq),
+            ticket_id: format!("local.ticket.{}", ticket_seq),
+            trial_id: trial_id.to_string(),
+        }
+    }
+
+    fn normalize_completion(
+        dispatch: &TrialDispatch,
+        ticket: &WorkerTicket,
+        mut completion: TrialCompletion,
+    ) -> TrialCompletion {
+        completion.ticket = ticket.clone();
+        completion.schedule_idx = dispatch.schedule_idx;
+        completion
+    }
+
+    fn worker_error_completion(
+        dispatch: &TrialDispatch,
+        ticket: &WorkerTicket,
+        err: &anyhow::Error,
+    ) -> TrialCompletion {
+        TrialCompletion {
+            ticket: ticket.clone(),
+            schedule_idx: dispatch.schedule_idx,
+            completion_seq: None,
+            terminal_status: "failed".to_string(),
+            classification: "local_worker_error".to_string(),
+            artifacts: json!({
+                "error": err.to_string(),
+            }),
+            metrics: json!({}),
+            runtime_summary: json!({}),
+        }
+    }
+
+    fn consume_completion(&self, completion: TrialCompletion) -> Result<TrialCompletion> {
+        let mut state = self
+            .inner
+            .state
+            .lock()
+            .map_err(|_| anyhow!("local worker backend state lock poisoned"))?;
+        if state
+            .in_flight_by_ticket
+            .remove(completion.ticket.ticket_id.as_str())
+            .is_none()
+        {
+            return Err(anyhow!(
+                "local worker backend protocol fault: completion for unknown ticket {}",
+                completion.ticket.ticket_id
+            ));
+        }
+        Ok(completion)
+    }
+
+    fn effective_max_in_flight(&self) -> usize {
+        self.inner.max_in_flight
+    }
+
+    fn capacity_warning(&self) -> Option<&str> {
+        self.inner.capacity_warning.as_deref()
+    }
+}
+
+impl WorkerBackend for LocalThreadWorkerBackend {
+    fn submit(&self, dispatch: TrialDispatch) -> Result<WorkerTicket> {
+        let ticket = self.next_ticket(&dispatch.trial_id);
+        {
+            let mut state = self
+                .inner
+                .state
+                .lock()
+                .map_err(|_| anyhow!("local worker backend state lock poisoned"))?;
+            if state.in_flight_by_ticket.len() >= self.inner.max_in_flight {
+                return Err(anyhow!(
+                    "{} in_flight={} max_in_flight={}",
+                    LOCAL_WORKER_CAPACITY_ERROR_PREFIX,
+                    state.in_flight_by_ticket.len(),
+                    self.inner.max_in_flight
+                ));
+            }
+            state
+                .in_flight_by_ticket
+                .insert(ticket.ticket_id.clone(), ticket.clone());
+        }
+
+        let dispatch_for_worker = dispatch.clone();
+        let ticket_for_worker = ticket.clone();
+        let executor = self.inner.executor.clone();
+        let completions_tx = self.inner.completions_tx.clone();
+        thread::Builder::new()
+            .name(format!("agentlab-{}", ticket_for_worker.ticket_id))
+            .spawn(move || {
+                let completion = match executor(dispatch_for_worker.clone()) {
+                    Ok(completion) => LocalThreadWorkerBackend::normalize_completion(
+                        &dispatch_for_worker,
+                        &ticket_for_worker,
+                        completion,
+                    ),
+                    Err(err) => LocalThreadWorkerBackend::worker_error_completion(
+                        &dispatch_for_worker,
+                        &ticket_for_worker,
+                        &err,
+                    ),
+                };
+                let _ = completions_tx.send(completion);
+            })
+            .map_err(|e| anyhow!("failed to spawn local worker thread: {}", e))?;
+
+        Ok(ticket)
+    }
+
+    fn poll_completions(&self, timeout: Duration) -> Result<Vec<TrialCompletion>> {
+        let mut raw: Vec<TrialCompletion> = Vec::new();
+        let max_per_poll = self.inner.max_completions_per_poll.max(1);
+        {
+            let rx = self
+                .inner
+                .completions_rx
+                .lock()
+                .map_err(|_| anyhow!("local worker backend completion lock poisoned"))?;
+            match rx.recv_timeout(timeout) {
+                Ok(completion) => raw.push(completion),
+                Err(mpsc::RecvTimeoutError::Timeout) => return Ok(Vec::new()),
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    return Err(anyhow!(
+                        "local worker backend completion channel disconnected"
+                    ));
+                }
+            }
+            while raw.len() < max_per_poll {
+                match rx.try_recv() {
+                    Ok(completion) => raw.push(completion),
+                    Err(mpsc::TryRecvError::Empty) => break,
+                    Err(mpsc::TryRecvError::Disconnected) => break,
+                }
+            }
+        }
+        let mut completions = Vec::with_capacity(raw.len());
+        for completion in raw {
+            completions.push(self.consume_completion(completion)?);
+        }
+        Ok(completions)
+    }
+
+    fn request_pause(&self, worker_id: &str, label: &str) -> Result<WorkerPauseAck> {
+        let state = self
+            .inner
+            .state
+            .lock()
+            .map_err(|_| anyhow!("local worker backend state lock poisoned"))?;
+        let ticket = state
+            .in_flight_by_ticket
+            .values()
+            .find(|ticket| ticket.worker_id == worker_id)
+            .ok_or_else(|| {
+                anyhow!(
+                    "local worker backend pause failed: unknown active worker {}",
+                    worker_id
+                )
+            })?;
+        Ok(WorkerPauseAck {
+            worker_id: worker_id.to_string(),
+            trial_id: ticket.trial_id.clone(),
+            label: label.to_string(),
+            accepted: true,
+        })
+    }
+
+    fn request_stop(&self, worker_id: &str, reason: &str) -> Result<()> {
+        let state = self
+            .inner
+            .state
+            .lock()
+            .map_err(|_| anyhow!("local worker backend state lock poisoned"))?;
+        let _ = state
+            .in_flight_by_ticket
+            .values()
+            .find(|ticket| ticket.worker_id == worker_id)
+            .ok_or_else(|| {
+                anyhow!(
+                    "local worker backend stop failed: unknown active worker {} (reason: {})",
+                    worker_id,
+                    reason
+                )
+            })?;
+        Ok(())
+    }
+}
+
+const REMOTE_SUBMIT_SCHEMA_V1: &str = "remote_worker_submit_v1";
+const REMOTE_POLL_SCHEMA_V1: &str = "remote_worker_poll_v1";
+const REMOTE_PAUSE_SCHEMA_V1: &str = "remote_worker_pause_v1";
+const REMOTE_STOP_SCHEMA_V1: &str = "remote_worker_stop_v1";
+const REMOTE_SUBMIT_PATH_V1: &str = "v1/worker/submit";
+const REMOTE_POLL_PATH_V1: &str = "v1/worker/poll";
+const REMOTE_PAUSE_PATH_V1: &str = "v1/worker/pause";
+const REMOTE_STOP_PATH_V1: &str = "v1/worker/stop";
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+struct RemoteSubmitRequest {
+    schema_version: String,
+    dispatch: TrialDispatch,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+struct RemoteSubmitResponse {
+    schema_version: String,
+    ticket: WorkerTicket,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct RemotePollRequest {
+    schema_version: String,
+    timeout_ms: u64,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+struct RemotePollResponse {
+    schema_version: String,
+    completions: Vec<TrialCompletion>,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct RemotePauseRequest {
+    schema_version: String,
+    worker_id: String,
+    label: String,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct RemotePauseResponse {
+    schema_version: String,
+    ack: WorkerPauseAck,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct RemoteStopRequest {
+    schema_version: String,
+    worker_id: String,
+    reason: String,
+}
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct RemoteStopResponse {
+    schema_version: String,
+    accepted: bool,
+}
+
+#[allow(dead_code)]
+trait RemoteWorkerProtocol: Send + Sync {
+    fn submit(&self, request: RemoteSubmitRequest) -> Result<RemoteSubmitResponse>;
+    fn poll(&self, request: RemotePollRequest) -> Result<RemotePollResponse>;
+    fn pause(&self, request: RemotePauseRequest) -> Result<RemotePauseResponse>;
+    fn stop(&self, request: RemoteStopRequest) -> Result<RemoteStopResponse>;
+}
+
+#[derive(Clone)]
+struct HttpRemoteWorkerProtocol {
+    endpoint: String,
+    bearer_token: Option<String>,
+    client: HttpClient,
+    timeouts: RemoteProtocolTimeoutSettings,
+}
+
+impl HttpRemoteWorkerProtocol {
+    fn new(endpoint: &str, bearer_token: Option<String>) -> Result<Self> {
+        let endpoint = endpoint.trim().to_string();
+        if endpoint.is_empty() {
+            return Err(anyhow!("remote worker endpoint must not be empty"));
+        }
+        let timeouts = resolve_remote_protocol_timeout_settings_from_env()?;
+        let client = HttpClient::builder()
+            .connect_timeout(Duration::from_millis(timeouts.connect_timeout_ms))
+            .build()?;
+        Ok(Self {
+            endpoint,
+            bearer_token,
+            client,
+            timeouts,
+        })
+    }
+
+    fn url_for_path(&self, path: &str) -> String {
+        format!(
+            "{}/{}",
+            self.endpoint.trim_end_matches('/'),
+            path.trim_start_matches('/')
+        )
+    }
+
+    fn post_json<Req, Resp>(
+        &self,
+        path: &str,
+        request: &Req,
+        timeout: Option<Duration>,
+    ) -> Result<Resp>
+    where
+        Req: Serialize + ?Sized,
+        Resp: DeserializeOwned,
+    {
+        let url = self.url_for_path(path);
+        let mut builder = self.client.post(&url);
+        if let Some(token) = self.bearer_token.as_ref() {
+            builder = builder.bearer_auth(token);
+        }
+        if let Some(timeout) = timeout {
+            builder = builder.timeout(timeout);
+        }
+        let response = builder.json(request).send().map_err(|err| {
+            let detail = format!("remote worker http POST {} transport error: {}", url, err);
+            let classified = if err.is_timeout() || err.is_connect() || err.is_request() {
+                RemoteProtocolError::retryable(detail)
+            } else {
+                RemoteProtocolError::fatal(detail)
+            };
+            anyhow!(classified)
+        })?;
+        let status = response.status();
+        if !status.is_success() {
+            let code = status.as_u16();
+            let body = response
+                .text()
+                .map(|value| truncate_remote_error_body(&value))
+                .unwrap_or_else(|_| "<response body unavailable>".to_string());
+            let detail = format!(
+                "remote worker http POST {} failed: status={} body={}",
+                url, code, body
+            );
+            let classified = if is_retryable_remote_http_status(code) {
+                RemoteProtocolError::retryable(detail)
+            } else {
+                RemoteProtocolError::fatal(detail)
+            };
+            return Err(anyhow!(classified));
+        }
+        response.json::<Resp>().map_err(|err| {
+            let detail = format!(
+                "remote worker http POST {} returned invalid JSON payload: {}",
+                url, err
+            );
+            anyhow!(RemoteProtocolError::fatal(detail))
+        })
+    }
+}
+
+impl RemoteWorkerProtocol for HttpRemoteWorkerProtocol {
+    fn submit(&self, request: RemoteSubmitRequest) -> Result<RemoteSubmitResponse> {
+        self.post_json(
+            REMOTE_SUBMIT_PATH_V1,
+            &request,
+            Some(Duration::from_millis(self.timeouts.submit_timeout_ms)),
+        )
+    }
+
+    fn poll(&self, request: RemotePollRequest) -> Result<RemotePollResponse> {
+        let timeout = Duration::from_millis(
+            request
+                .timeout_ms
+                .saturating_add(self.timeouts.poll_timeout_grace_ms),
+        );
+        self.post_json(REMOTE_POLL_PATH_V1, &request, Some(timeout))
+    }
+
+    fn pause(&self, request: RemotePauseRequest) -> Result<RemotePauseResponse> {
+        self.post_json(
+            REMOTE_PAUSE_PATH_V1,
+            &request,
+            Some(Duration::from_millis(self.timeouts.pause_timeout_ms)),
+        )
+    }
+
+    fn stop(&self, request: RemoteStopRequest) -> Result<RemoteStopResponse> {
+        self.post_json(
+            REMOTE_STOP_PATH_V1,
+            &request,
+            Some(Duration::from_millis(self.timeouts.stop_timeout_ms)),
+        )
+    }
+}
+
+#[allow(dead_code)]
+#[derive(Clone)]
+struct RemoteWorkerBackend {
+    protocol: Arc<dyn RemoteWorkerProtocol>,
+    state: Arc<Mutex<RemoteWorkerBackendState>>,
+    retry_settings: RemoteRetrySettings,
+}
+
+#[derive(Default)]
+struct RemoteWorkerBackendState {
+    submitted_tickets: HashMap<String, RemoteSubmissionRecord>,
+    active_tickets_by_worker: HashMap<String, HashSet<String>>,
+    completion_key_by_ticket: HashMap<String, RemoteCompletionDedupKey>,
+    quarantined_reason: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct RemoteSubmissionRecord {
+    run_id: String,
+    trial_id: String,
+    schedule_idx: usize,
+    worker_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct RemoteCompletionDedupKey {
+    run_id: String,
+    schedule_idx: usize,
+    trial_id: String,
+    worker_id: String,
+    completion_seq: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RemoteCompletionValidation {
+    Deliver,
+    Duplicate,
+}
+
+#[allow(dead_code)]
+impl RemoteWorkerBackend {
+    fn new(protocol: Arc<dyn RemoteWorkerProtocol>) -> Result<Self> {
+        Ok(Self {
+            protocol,
+            state: Arc::new(Mutex::new(RemoteWorkerBackendState::default())),
+            retry_settings: resolve_remote_retry_settings_from_env()?,
+        })
+    }
+
+    fn ensure_available(&self) -> Result<()> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow!("remote worker backend state lock poisoned"))?;
+        if let Some(reason) = state.quarantined_reason.as_deref() {
+            return Err(anyhow!("{} {}", REMOTE_BACKEND_QUARANTINED_PREFIX, reason));
+        }
+        Ok(())
+    }
+
+    fn quarantined_error(reason: &str) -> anyhow::Error {
+        anyhow!("{} {}", REMOTE_BACKEND_QUARANTINED_PREFIX, reason)
+    }
+
+    fn protocol_fault(&self, detail: impl AsRef<str>) -> anyhow::Error {
+        let reason = format!("remote worker backend protocol fault: {}", detail.as_ref());
+        match self.state.lock() {
+            Ok(mut state) => {
+                if state.quarantined_reason.is_none() {
+                    state.quarantined_reason = Some(reason);
+                }
+                let quarantined_reason = state
+                    .quarantined_reason
+                    .as_deref()
+                    .unwrap_or("protocol fault");
+                Self::quarantined_error(quarantined_reason)
+            }
+            Err(_) => Self::quarantined_error("state lock poisoned while setting quarantine"),
+        }
+    }
+
+    fn remove_active_submission_for_ticket(
+        state: &mut RemoteWorkerBackendState,
+        ticket_id: &str,
+    ) -> Option<RemoteSubmissionRecord> {
+        let submission = state.submitted_tickets.remove(ticket_id)?;
+        if let Some(ticket_ids) = state
+            .active_tickets_by_worker
+            .get_mut(submission.worker_id.as_str())
+        {
+            ticket_ids.remove(ticket_id);
+            if ticket_ids.is_empty() {
+                state
+                    .active_tickets_by_worker
+                    .remove(submission.worker_id.as_str());
+            }
+        }
+        Some(submission)
+    }
+
+    fn active_submissions_for_worker(
+        &self,
+        worker_id: &str,
+        op_name: &str,
+    ) -> Result<Vec<RemoteSubmissionRecord>> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow!("remote worker backend state lock poisoned"))?;
+        if let Some(reason) = state.quarantined_reason.as_deref() {
+            return Err(Self::quarantined_error(reason));
+        }
+
+        let Some(ticket_ids) = state
+            .active_tickets_by_worker
+            .get(worker_id)
+            .cloned()
+        else {
+            return Err(anyhow!(
+                "remote worker backend {} failed: unknown active worker {}",
+                op_name,
+                worker_id
+            ));
+        };
+
+        let mut active_submissions = Vec::new();
+        let mut stale_ticket_ids = Vec::new();
+        for ticket_id in ticket_ids {
+            if let Some(submission) = state.submitted_tickets.get(ticket_id.as_str()).cloned() {
+                active_submissions.push(submission);
+            } else {
+                stale_ticket_ids.push(ticket_id);
+            }
+        }
+
+        if !stale_ticket_ids.is_empty() {
+            if let Some(active_tickets) = state.active_tickets_by_worker.get_mut(worker_id) {
+                for stale_ticket_id in stale_ticket_ids {
+                    active_tickets.remove(stale_ticket_id.as_str());
+                }
+                if active_tickets.is_empty() {
+                    state.active_tickets_by_worker.remove(worker_id);
+                }
+            }
+        }
+
+        if active_submissions.is_empty() {
+            return Err(anyhow!(
+                "remote worker backend {} failed: unknown active worker {}",
+                op_name,
+                worker_id
+            ));
+        }
+
+        Ok(active_submissions)
+    }
+
+    fn remember_submission(&self, dispatch: &TrialDispatch, ticket: &WorkerTicket) -> Result<()> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow!("remote worker backend state lock poisoned"))?;
+        if let Some(reason) = state.quarantined_reason.as_deref() {
+            return Err(Self::quarantined_error(reason));
+        }
+        if ticket.ticket_id.trim().is_empty() {
+            drop(state);
+            return Err(self.protocol_fault("submit returned empty ticket_id"));
+        }
+        if ticket.worker_id.trim().is_empty() {
+            drop(state);
+            return Err(self.protocol_fault(format!(
+                "submit returned empty worker_id for ticket {}",
+                ticket.ticket_id
+            )));
+        }
+        if state
+            .submitted_tickets
+            .contains_key(ticket.ticket_id.as_str())
+            || state
+                .completion_key_by_ticket
+                .contains_key(ticket.ticket_id.as_str())
+        {
+            drop(state);
+            return Err(self.protocol_fault(format!("duplicate ticket_id {}", ticket.ticket_id)));
+        }
+        state.submitted_tickets.insert(
+            ticket.ticket_id.clone(),
+            RemoteSubmissionRecord {
+                run_id: dispatch.run_id.clone(),
+                trial_id: dispatch.trial_id.clone(),
+                schedule_idx: dispatch.schedule_idx,
+                worker_id: ticket.worker_id.clone(),
+            },
+        );
+        state
+            .active_tickets_by_worker
+            .entry(ticket.worker_id.clone())
+            .or_default()
+            .insert(ticket.ticket_id.clone());
+        Ok(())
+    }
+
+    fn completion_seq_for_dedupe(completion: &TrialCompletion) -> u64 {
+        completion
+            .completion_seq
+            .unwrap_or(REMOTE_COMPLETION_SEQ_FALLBACK)
+    }
+
+    fn completion_key(
+        submission: &RemoteSubmissionRecord,
+        completion_seq: u64,
+    ) -> RemoteCompletionDedupKey {
+        RemoteCompletionDedupKey {
+            run_id: submission.run_id.clone(),
+            schedule_idx: submission.schedule_idx,
+            trial_id: submission.trial_id.clone(),
+            worker_id: submission.worker_id.clone(),
+            completion_seq,
+        }
+    }
+
+    fn validate_and_consume_completion(
+        &self,
+        completion: &TrialCompletion,
+    ) -> Result<RemoteCompletionValidation> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow!("remote worker backend state lock poisoned"))?;
+        if let Some(reason) = state.quarantined_reason.as_deref() {
+            return Err(Self::quarantined_error(reason));
+        }
+
+        let completion_seq = Self::completion_seq_for_dedupe(completion);
+        let ticket_id = completion.ticket.ticket_id.as_str();
+
+        if let Some(submission) = state.submitted_tickets.get(ticket_id).cloned() {
+            if completion.ticket.worker_id != submission.worker_id {
+                drop(state);
+                return Err(self.protocol_fault(format!(
+                    "completion worker_id {} did not match submitted worker_id {} for ticket {}",
+                    completion.ticket.worker_id, submission.worker_id, completion.ticket.ticket_id
+                )));
+            }
+            if completion.ticket.trial_id != submission.trial_id {
+                drop(state);
+                return Err(self.protocol_fault(format!(
+                    "completion trial_id {} did not match submitted trial_id {} for ticket {}",
+                    completion.ticket.trial_id, submission.trial_id, completion.ticket.ticket_id
+                )));
+            }
+            if completion.schedule_idx != submission.schedule_idx {
+                drop(state);
+                return Err(self.protocol_fault(format!(
+                    "completion schedule_idx {} did not match submitted schedule_idx {} for ticket {}",
+                    completion.schedule_idx, submission.schedule_idx, completion.ticket.ticket_id
+                )));
+            }
+            Self::remove_active_submission_for_ticket(&mut state, ticket_id);
+            state.completion_key_by_ticket.insert(
+                completion.ticket.ticket_id.clone(),
+                Self::completion_key(&submission, completion_seq),
+            );
+            return Ok(RemoteCompletionValidation::Deliver);
+        }
+
+        if let Some(existing) = state.completion_key_by_ticket.get(ticket_id).cloned() {
+            let duplicate = completion.ticket.trial_id == existing.trial_id
+                && completion.ticket.worker_id == existing.worker_id
+                && completion.schedule_idx == existing.schedule_idx
+                && completion_seq == existing.completion_seq;
+            if duplicate {
+                return Ok(RemoteCompletionValidation::Duplicate);
+            }
+            drop(state);
+            return Err(self.protocol_fault(format!(
+                "conflicting duplicate completion for ticket {} (expected trial_id={}, worker_id={}, schedule_idx={}, completion_seq={}, got trial_id={}, worker_id={}, schedule_idx={}, completion_seq={})",
+                completion.ticket.ticket_id,
+                existing.trial_id,
+                existing.worker_id,
+                existing.schedule_idx,
+                existing.completion_seq,
+                completion.ticket.trial_id,
+                completion.ticket.worker_id,
+                completion.schedule_idx,
+                completion_seq
+            )));
+        }
+
+        drop(state);
+        Err(self.protocol_fault(format!(
+            "completion for unknown ticket {}",
+            completion.ticket.ticket_id
+        )))
+    }
+
+    fn is_retryable_protocol_error(err: &anyhow::Error) -> bool {
+        for cause in err.chain() {
+            if let Some(protocol_error) = cause.downcast_ref::<RemoteProtocolError>() {
+                return protocol_error.is_retryable();
+            }
+        }
+        let message = err.to_string().to_ascii_lowercase();
+        if message.contains("timeout")
+            || message.contains("timed out")
+            || message.contains("connection reset")
+            || message.contains("connection refused")
+            || message.contains("connection aborted")
+            || message.contains("connection closed")
+            || message.contains("temporarily unavailable")
+            || message.contains("broken pipe")
+        {
+            return true;
+        }
+        message.contains(" 429 ")
+            || message.contains("status=429")
+            || message.contains("status 429")
+            || message.contains(" 408 ")
+            || message.contains("status=408")
+            || message.contains("status 408")
+            || message.contains(" 500 ")
+            || message.contains("status=500")
+            || message.contains("status 500")
+            || message.contains(" 502 ")
+            || message.contains("status=502")
+            || message.contains("status 502")
+            || message.contains(" 503 ")
+            || message.contains("status=503")
+            || message.contains("status 503")
+            || message.contains(" 504 ")
+            || message.contains("status=504")
+            || message.contains("status 504")
+    }
+
+    fn retry_backoff_delay(&self, attempt: usize) -> Duration {
+        let shift = attempt.saturating_sub(1).min(8) as u32;
+        let multiplier = 1u64 << shift;
+        Duration::from_millis(self.retry_settings.base_backoff_ms.saturating_mul(multiplier))
+    }
+
+    fn call_protocol_with_retry<T>(
+        &self,
+        op_name: &str,
+        mut op: impl FnMut() -> Result<T>,
+    ) -> Result<T> {
+        let attempts = self.retry_settings.max_attempts.max(1);
+        for attempt in 1..=attempts {
+            match op() {
+                Ok(value) => return Ok(value),
+                Err(err) => {
+                    let retryable = Self::is_retryable_protocol_error(&err);
+                    if retryable && attempt < attempts {
+                        thread::sleep(self.retry_backoff_delay(attempt));
+                        continue;
+                    }
+                    if retryable {
+                        return Err(anyhow!(
+                            "remote worker backend {} request failed after {} attempts: {}",
+                            op_name,
+                            attempt,
+                            err
+                        ));
+                    }
+                    return Err(err);
+                }
+            }
+        }
+        unreachable!("attempt loop always returns");
+    }
+}
+
+impl WorkerBackend for RemoteWorkerBackend {
+    fn submit(&self, dispatch: TrialDispatch) -> Result<WorkerTicket> {
+        self.ensure_available()?;
+        let request = RemoteSubmitRequest {
+            schema_version: REMOTE_SUBMIT_SCHEMA_V1.to_string(),
+            dispatch: dispatch.clone(),
+        };
+        let response =
+            self.call_protocol_with_retry("submit", || self.protocol.submit(request.clone()))?;
+        if response.schema_version != REMOTE_SUBMIT_SCHEMA_V1 {
+            return Err(self.protocol_fault(format!(
+                "submit schema_version {} did not match {}",
+                response.schema_version, REMOTE_SUBMIT_SCHEMA_V1
+            )));
+        }
+        if response.ticket.trial_id != dispatch.trial_id {
+            return Err(self.protocol_fault(format!(
+                "returned ticket trial_id {} did not match dispatch trial_id {}",
+                response.ticket.trial_id, dispatch.trial_id
+            )));
+        }
+        self.remember_submission(&dispatch, &response.ticket)?;
+        Ok(response.ticket)
+    }
+
+    fn poll_completions(&self, timeout: Duration) -> Result<Vec<TrialCompletion>> {
+        self.ensure_available()?;
+        let timeout_ms = timeout.as_millis().min(u128::from(u64::MAX)) as u64;
+        let request = RemotePollRequest {
+            schema_version: REMOTE_POLL_SCHEMA_V1.to_string(),
+            timeout_ms,
+        };
+        let response =
+            self.call_protocol_with_retry("poll", || self.protocol.poll(request.clone()))?;
+        if response.schema_version != REMOTE_POLL_SCHEMA_V1 {
+            return Err(self.protocol_fault(format!(
+                "poll schema_version {} did not match {}",
+                response.schema_version, REMOTE_POLL_SCHEMA_V1
+            )));
+        }
+        let mut accepted = Vec::with_capacity(response.completions.len());
+        for completion in response.completions {
+            match self.validate_and_consume_completion(&completion)? {
+                RemoteCompletionValidation::Deliver => accepted.push(completion),
+                RemoteCompletionValidation::Duplicate => {}
+            }
+        }
+        Ok(accepted)
+    }
+
+    fn request_pause(&self, worker_id: &str, label: &str) -> Result<WorkerPauseAck> {
+        self.ensure_available()?;
+        let active_submissions = self.active_submissions_for_worker(worker_id, "pause")?;
+        let request = RemotePauseRequest {
+            schema_version: REMOTE_PAUSE_SCHEMA_V1.to_string(),
+            worker_id: worker_id.to_string(),
+            label: label.to_string(),
+        };
+        let response =
+            self.call_protocol_with_retry("pause", || self.protocol.pause(request.clone()))?;
+        if response.schema_version != REMOTE_PAUSE_SCHEMA_V1 {
+            return Err(self.protocol_fault(format!(
+                "pause schema_version {} did not match {}",
+                response.schema_version, REMOTE_PAUSE_SCHEMA_V1
+            )));
+        }
+        if response.ack.worker_id != worker_id {
+            return Err(self.protocol_fault(format!(
+                "pause ack worker_id {} did not match request worker_id {}",
+                response.ack.worker_id, worker_id
+            )));
+        }
+        if response.ack.label != label {
+            return Err(self.protocol_fault(format!(
+                "pause ack label {} did not match request label {}",
+                response.ack.label, label
+            )));
+        }
+        if !response.ack.accepted {
+            return Err(anyhow!(
+                "remote worker backend pause rejected for worker {}",
+                worker_id
+            ));
+        }
+        let expected_trials: HashSet<String> = active_submissions
+            .iter()
+            .map(|entry| entry.trial_id.clone())
+            .collect();
+        if !expected_trials.contains(response.ack.trial_id.as_str()) {
+            let mut expected_trials_sorted: Vec<String> = expected_trials.into_iter().collect();
+            expected_trials_sorted.sort();
+            return Err(self.protocol_fault(format!(
+                "pause ack trial_id {} did not match active trial(s) [{}] for worker {}",
+                response.ack.trial_id,
+                expected_trials_sorted.join(","),
+                worker_id
+            )));
+        }
+        Ok(response.ack)
+    }
+
+    fn request_stop(&self, worker_id: &str, reason: &str) -> Result<()> {
+        self.ensure_available()?;
+        let _active_submissions = self.active_submissions_for_worker(worker_id, "stop")?;
+        let request = RemoteStopRequest {
+            schema_version: REMOTE_STOP_SCHEMA_V1.to_string(),
+            worker_id: worker_id.to_string(),
+            reason: reason.to_string(),
+        };
+        let response =
+            self.call_protocol_with_retry("stop", || self.protocol.stop(request.clone()))?;
+        if response.schema_version != REMOTE_STOP_SCHEMA_V1 {
+            return Err(self.protocol_fault(format!(
+                "stop schema_version {} did not match {}",
+                response.schema_version, REMOTE_STOP_SCHEMA_V1
+            )));
+        }
+        if !response.accepted {
+            return Err(anyhow!(
+                "remote worker backend stop rejected for worker {}",
+                worker_id
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Default)]
+struct FakeRemoteWorkerHarness {
+    state: Arc<Mutex<FakeRemoteWorkerState>>,
+}
+
+#[derive(Default)]
+struct FakeRemoteWorkerState {
+    ticket_seq: u64,
+    worker_by_ticket: HashMap<String, String>,
+    trial_by_worker: HashMap<String, String>,
+    submit_requests: Vec<RemoteSubmitRequest>,
+    poll_requests: Vec<RemotePollRequest>,
+    pause_requests: Vec<RemotePauseRequest>,
+    stop_requests: Vec<RemoteStopRequest>,
+    queued_completions: VecDeque<TrialCompletion>,
+}
+
+#[allow(dead_code)]
+impl FakeRemoteWorkerHarness {
+    fn new() -> Self {
+        Self::default()
+    }
+
+    fn enqueue_completion(&self, completion: TrialCompletion) -> Result<()> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow!("fake remote harness state lock poisoned"))?;
+        state.queued_completions.push_back(completion);
+        Ok(())
+    }
+
+    fn submit_requests(&self) -> Result<Vec<RemoteSubmitRequest>> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow!("fake remote harness state lock poisoned"))?;
+        Ok(state.submit_requests.clone())
+    }
+
+    fn poll_requests(&self) -> Result<Vec<RemotePollRequest>> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow!("fake remote harness state lock poisoned"))?;
+        Ok(state.poll_requests.clone())
+    }
+
+    fn pause_requests(&self) -> Result<Vec<RemotePauseRequest>> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow!("fake remote harness state lock poisoned"))?;
+        Ok(state.pause_requests.clone())
+    }
+
+    fn stop_requests(&self) -> Result<Vec<RemoteStopRequest>> {
+        let state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow!("fake remote harness state lock poisoned"))?;
+        Ok(state.stop_requests.clone())
+    }
+}
+
+impl RemoteWorkerProtocol for FakeRemoteWorkerHarness {
+    fn submit(&self, request: RemoteSubmitRequest) -> Result<RemoteSubmitResponse> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow!("fake remote harness state lock poisoned"))?;
+        state.ticket_seq += 1;
+        state.submit_requests.push(request.clone());
+        let worker_id = format!("fake.remote.worker.{}", state.ticket_seq);
+        let ticket_id = format!("fake.remote.ticket.{}", state.ticket_seq);
+        state
+            .worker_by_ticket
+            .insert(ticket_id.clone(), worker_id.clone());
+        state
+            .trial_by_worker
+            .insert(worker_id.clone(), request.dispatch.trial_id.clone());
+        Ok(RemoteSubmitResponse {
+            schema_version: REMOTE_SUBMIT_SCHEMA_V1.to_string(),
+            ticket: WorkerTicket {
+                worker_id,
+                ticket_id,
+                trial_id: request.dispatch.trial_id,
+            },
+        })
+    }
+
+    fn poll(&self, request: RemotePollRequest) -> Result<RemotePollResponse> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow!("fake remote harness state lock poisoned"))?;
+        state.poll_requests.push(request);
+        let mut completions = Vec::new();
+        while let Some(completion) = state.queued_completions.pop_front() {
+            completions.push(completion);
+        }
+        Ok(RemotePollResponse {
+            schema_version: REMOTE_POLL_SCHEMA_V1.to_string(),
+            completions,
+        })
+    }
+
+    fn pause(&self, request: RemotePauseRequest) -> Result<RemotePauseResponse> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow!("fake remote harness state lock poisoned"))?;
+        state.pause_requests.push(request.clone());
+        let trial_id = state
+            .trial_by_worker
+            .get(request.worker_id.as_str())
+            .cloned()
+            .unwrap_or_else(|| "unknown_trial".to_string());
+        let accepted = state
+            .trial_by_worker
+            .contains_key(request.worker_id.as_str());
+        Ok(RemotePauseResponse {
+            schema_version: REMOTE_PAUSE_SCHEMA_V1.to_string(),
+            ack: WorkerPauseAck {
+                worker_id: request.worker_id,
+                trial_id,
+                label: request.label,
+                accepted,
+            },
+        })
+    }
+
+    fn stop(&self, request: RemoteStopRequest) -> Result<RemoteStopResponse> {
+        let mut state = self
+            .state
+            .lock()
+            .map_err(|_| anyhow!("fake remote harness state lock poisoned"))?;
+        state.stop_requests.push(request.clone());
+        let accepted = state
+            .trial_by_worker
+            .remove(request.worker_id.as_str())
+            .is_some();
+        Ok(RemoteStopResponse {
+            schema_version: REMOTE_STOP_SCHEMA_V1.to_string(),
+            accepted,
+        })
+    }
+}
+
 trait AgentAdapter {
     fn capabilities(&self) -> AgentAdapterCapabilities;
 
     fn run_trial(&self, request: &AdapterRunRequest<'_>) -> Result<ProcessRunResult>;
-
-    fn active_control(
-        &self,
-        request: &AdapterRunRequest<'_>,
-    ) -> Result<Option<ActiveAdapterControl>>;
 
     fn pause_trial(&self, request: &AdapterPauseRequest<'_>) -> Result<AdapterPauseAck>;
 }
@@ -259,6 +1677,13 @@ pub struct PauseResult {
     pub label: String,
     pub checkpoint_acked: bool,
     pub stop_acked: bool,
+}
+
+pub struct KillResult {
+    pub run_id: String,
+    pub run_dir: PathBuf,
+    pub previous_status: String,
+    pub killed_trials: Vec<String>,
 }
 
 pub struct ResumeResult {
@@ -426,6 +1851,22 @@ fn normalize_execution_options(execution: &RunExecutionOptions) -> RunExecutionO
     }
 }
 
+fn resolve_remote_bearer_token(token_env: Option<&str>) -> Result<Option<String>> {
+    let name = token_env
+        .map(str::trim)
+        .filter(|value| !value.is_empty() && !value.eq_ignore_ascii_case("unset"));
+    let Some(name) = name else {
+        return Ok(None);
+    };
+    let value = std::env::var(name).map_err(|_| {
+        anyhow!(
+            "remote executor token env var '{}' is not set in current process environment",
+            name
+        )
+    })?;
+    Ok(Some(value))
+}
+
 fn atomic_write_bytes(path: &Path, bytes: &[u8]) -> Result<()> {
     if let Some(parent) = path.parent() {
         ensure_dir(parent)?;
@@ -489,28 +1930,170 @@ fn load_run_session_state(run_dir: &Path) -> Result<RunSessionState> {
     Ok(serde_json::from_slice(&bytes)?)
 }
 
-fn write_run_control(
-    run_dir: &Path,
-    run_id: &str,
-    status: &str,
-    active_trial_id: Option<&str>,
-    active_control: Option<&ActiveAdapterControl>,
-) -> Result<()> {
-    let active_adapter = active_control.map(|control| {
-        json!({
+const RUN_CONTROL_UNKNOWN_WORKER_ID: &str = "worker.unknown";
+
+#[derive(Debug, Clone)]
+struct RunControlActiveTrial {
+    trial_id: String,
+    worker_id: String,
+    schedule_idx: Option<usize>,
+    variant_id: Option<String>,
+    started_at: Option<String>,
+    control: Option<ActiveAdapterControl>,
+}
+
+#[derive(Debug, Clone)]
+struct RunControlPauseMetadata {
+    label: String,
+    requested_at: String,
+    requested_by: Option<String>,
+}
+
+fn active_adapter_payload_value(active_control: Option<&ActiveAdapterControl>) -> Value {
+    match active_control {
+        Some(control) => json!({
             "id": control.adapter_id,
             "version": control.adapter_version,
             "command_path": control.command_path,
             "events_path": control.events_path,
+        }),
+        None => Value::Null,
+    }
+}
+
+fn run_control_active_trials_payload(
+    active_trials: &[RunControlActiveTrial],
+    updated_at: &str,
+) -> serde_json::Map<String, Value> {
+    let mut payload = serde_json::Map::new();
+    for active in active_trials {
+        payload.insert(
+            active.trial_id.clone(),
+            json!({
+                "trial_id": active.trial_id,
+                "worker_id": active.worker_id,
+                "schedule_idx": active.schedule_idx,
+                "variant_id": active.variant_id,
+                "started_at": active.started_at.as_deref().unwrap_or(updated_at),
+                "control": active_adapter_payload_value(active.control.as_ref()),
+            }),
+        );
+    }
+    payload
+}
+
+fn run_control_active_trial_ids(run_control: &Value) -> Vec<String> {
+    let mut ids: Vec<String> = Vec::new();
+    if let Some(active_trials) = run_control
+        .pointer("/active_trials")
+        .and_then(|v| v.as_object())
+    {
+        for (trial_id, entry) in active_trials {
+            let candidate = entry
+                .pointer("/trial_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or(trial_id);
+            if !ids.iter().any(|existing| existing == candidate) {
+                ids.push(candidate.to_string());
+            }
+        }
+    }
+    ids
+}
+
+fn run_control_active_adapter_for_trial(run_control: &Value, trial_id: &str) -> Option<Value> {
+    let active_trials = run_control
+        .pointer("/active_trials")
+        .and_then(|v| v.as_object())?;
+    let entry = active_trials.iter().find_map(|(key, value)| {
+        let candidate = value
+            .pointer("/trial_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or(key.as_str());
+        if candidate == trial_id {
+            Some(value)
+        } else {
+            None
+        }
+    })?;
+    let control = entry.pointer("/control")?;
+    if control.is_null() {
+        None
+    } else {
+        Some(control.clone())
+    }
+}
+
+fn run_control_active_trials(run_control: &Value) -> Vec<RunControlActiveTrial> {
+    let mut active = Vec::new();
+    if let Some(entries) = run_control
+        .pointer("/active_trials")
+        .and_then(|v| v.as_object())
+    {
+        for (trial_id_key, entry) in entries {
+            let trial_id = entry
+                .pointer("/trial_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or(trial_id_key)
+                .to_string();
+            let worker_id = entry
+                .pointer("/worker_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or(RUN_CONTROL_UNKNOWN_WORKER_ID)
+                .to_string();
+            let schedule_idx = entry
+                .pointer("/schedule_idx")
+                .and_then(|v| v.as_u64())
+                .map(|v| v as usize);
+            let variant_id = entry
+                .pointer("/variant_id")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            let started_at = entry
+                .pointer("/started_at")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            let control = entry
+                .pointer("/control")
+                .cloned()
+                .and_then(|value| if value.is_null() { None } else { Some(value) })
+                .and_then(|value| serde_json::from_value::<ActiveAdapterControl>(value).ok());
+            active.push(RunControlActiveTrial {
+                trial_id,
+                worker_id,
+                schedule_idx,
+                variant_id,
+                started_at,
+                control,
+            });
+        }
+    }
+    active
+}
+
+fn write_run_control_v2(
+    run_dir: &Path,
+    run_id: &str,
+    status: &str,
+    active_trials: &[RunControlActiveTrial],
+    pause: Option<&RunControlPauseMetadata>,
+) -> Result<()> {
+    let updated_at = Utc::now().to_rfc3339();
+    let active_trials_payload = run_control_active_trials_payload(active_trials, &updated_at);
+    let pause_value = pause.map_or(Value::Null, |metadata| {
+        json!({
+            "label": metadata.label,
+            "requested_at": metadata.requested_at,
+            "requested_by": metadata.requested_by,
         })
     });
     let payload = json!({
-        "schema_version": "run_control_v1",
+        "schema_version": "run_control_v2",
         "run_id": run_id,
         "status": status,
-        "active_trial_id": active_trial_id,
-        "active_adapter": active_adapter,
-        "updated_at": Utc::now().to_rfc3339(),
+        "active_trials": active_trials_payload,
+        "pause": pause_value,
+        "updated_at": updated_at,
     });
     atomic_write_json_pretty(&run_control_path(run_dir), &payload)
 }
@@ -551,7 +2134,7 @@ impl RunControlGuard {
     }
 
     fn complete(&mut self, status: &str) -> Result<()> {
-        write_run_control(&self.run_dir, &self.run_id, status, None, None)?;
+        write_run_control_v2(&self.run_dir, &self.run_id, status, &[], None)?;
         self.done = true;
         Ok(())
     }
@@ -560,7 +2143,7 @@ impl RunControlGuard {
 impl Drop for RunControlGuard {
     fn drop(&mut self) {
         if !self.done {
-            let _ = write_run_control(&self.run_dir, &self.run_id, "failed", None, None);
+            let _ = write_run_control_v2(&self.run_dir, &self.run_id, "failed", &[], None);
         }
     }
 }
@@ -742,157 +2325,6 @@ fn find_project_root_from_run_dir(run_dir: &Path) -> Result<PathBuf> {
     Ok(root.to_path_buf())
 }
 
-/// Walk all `{run_dir}/trials/trial_*/` directories, read result.json +
-/// trial_metadata.json, and produce a summary for each via `summarize_trial`.
-fn rebuild_all_trial_summaries(
-    run_dir: &Path,
-    run_id: &str,
-    workload_type: &str,
-    variants: &[Variant],
-) -> Result<(
-    Vec<Value>,
-    BTreeMap<String, BTreeMap<String, usize>>,
-    BTreeMap<String, BTreeMap<String, usize>>,
-)> {
-    let trials_dir = run_dir.join("trials");
-    let mut trial_summaries = Vec::new();
-    let mut event_counts: BTreeMap<String, BTreeMap<String, usize>> = BTreeMap::new();
-    let mut trial_event_counts: BTreeMap<String, BTreeMap<String, usize>> = BTreeMap::new();
-
-    if !trials_dir.exists() {
-        return Ok((trial_summaries, event_counts, trial_event_counts));
-    }
-
-    let mut entries: Vec<_> = fs::read_dir(&trials_dir)?
-        .filter_map(|e| e.ok())
-        .filter(|e| {
-            e.file_name()
-                .to_str()
-                .is_some_and(|n| n.starts_with("trial_"))
-        })
-        .collect();
-    entries.sort_by_key(|e| e.file_name());
-
-    for entry in entries {
-        let trial_dir = entry.path();
-        let trial_id = entry.file_name().to_str().unwrap_or("unknown").to_string();
-
-        let metadata_path = trial_dir.join("trial_metadata.json");
-        let output_path = trial_dir.join(CANONICAL_TRIAL_RESULT_FILENAME);
-        let state_path = trial_dir.join("trial_state.json");
-
-        if !metadata_path.exists() {
-            continue;
-        }
-
-        let metadata: Value = serde_json::from_slice(&fs::read(&metadata_path)?)?;
-        let trial_output: Value = if output_path.exists() {
-            serde_json::from_slice(&fs::read(&output_path)?)?
-        } else {
-            json!({"schema_version": "agent_result_v1", "outcome": "error"})
-        };
-
-        let variant_id = metadata
-            .pointer("/ids/variant_id")
-            .and_then(|v| v.as_str())
-            .unwrap_or("unknown");
-        let task_id = metadata
-            .pointer("/ids/task_id")
-            .and_then(|v| v.as_str())
-            .unwrap_or("unknown");
-        let task_idx = metadata
-            .pointer("/ids/task_index")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0) as usize;
-        let repl = metadata
-            .pointer("/ids/repl_idx")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(0) as usize;
-
-        let bindings = variants
-            .iter()
-            .find(|v| v.id == variant_id)
-            .map(|v| v.bindings.clone())
-            .unwrap_or(json!({}));
-
-        let status = if state_path.exists() {
-            let state: Value = serde_json::from_slice(&fs::read(&state_path)?)?;
-            let trial_status = state
-                .get("status")
-                .and_then(|v| v.as_str())
-                .unwrap_or("failed");
-            if trial_status == "completed" {
-                "0".to_string()
-            } else {
-                "1".to_string()
-            }
-        } else {
-            "1".to_string()
-        };
-
-        let container_mode = metadata
-            .pointer("/runtime/container_mode")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
-        let integration_level = metadata
-            .pointer("/runtime/integration_level")
-            .and_then(|v| v.as_str())
-            .unwrap_or("cli_basic");
-        let network_requested = metadata
-            .pointer("/runtime/network_mode_requested")
-            .and_then(|v| v.as_str())
-            .unwrap_or("unknown");
-        let network_effective = metadata
-            .pointer("/runtime/network_mode_effective")
-            .and_then(|v| v.as_str())
-            .unwrap_or("unknown");
-
-        let summary = summarize_trial(
-            run_id,
-            &trial_output,
-            &trial_id,
-            workload_type,
-            variant_id,
-            task_idx,
-            task_id,
-            repl,
-            &bindings,
-            status,
-            container_mode,
-            integration_level,
-            network_requested,
-            network_effective,
-        );
-        trial_summaries.push(summary);
-
-        // Rebuild event counts from events files
-        let events_path = trial_dir.join("out").join("events.jsonl");
-        let state_events = trial_dir.join("state").join("events.jsonl");
-        let events_file = if events_path.exists() {
-            Some(events_path)
-        } else if state_events.exists() {
-            Some(state_events)
-        } else {
-            None
-        };
-        if let Some(path) = events_file {
-            if let Ok(counts) = count_event_types(&path) {
-                let trial_map = trial_event_counts.entry(trial_id.clone()).or_default();
-                for (k, v) in counts.into_iter() {
-                    *trial_map.entry(k.clone()).or_default() += v;
-                    *event_counts
-                        .entry(variant_id.to_string())
-                        .or_default()
-                        .entry(k)
-                        .or_default() += v;
-                }
-            }
-        }
-    }
-
-    Ok((trial_summaries, event_counts, trial_event_counts))
-}
-
 /// Continue a previously interrupted run from where it stopped.
 ///
 /// Loads persisted run session + `schedule_progress.json`, validates the run is
@@ -912,6 +2344,7 @@ pub fn continue_run(run_dir: &Path) -> Result<RunResult> {
         .get("status")
         .and_then(|v| v.as_str())
         .unwrap_or("unknown");
+    let recovered_active_trials = run_control_active_trials(&control);
     match run_status {
         "failed" | "paused" | "interrupted" => {}
         "completed" => return Err(anyhow!("run already completed — nothing to continue")),
@@ -958,16 +2391,13 @@ pub fn continue_run(run_dir: &Path) -> Result<RunResult> {
     let resolved_path = run_dir.join("resolved_experiment.json");
     let json_value: Value = serde_json::from_slice(&fs::read(&resolved_path)?)?;
     let policy_config = parse_policies(&json_value);
+    let max_concurrency = experiment_max_concurrency(&json_value);
     let project_root = find_project_root_from_run_dir(&run_dir)?;
     let project_root = project_root
         .canonicalize()
         .unwrap_or_else(|_| project_root.clone());
 
-    let workload_type = json_value
-        .pointer("/experiment/workload_type")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| anyhow!("missing /experiment/workload_type in resolved experiment"))?
-        .to_string();
+    let workload_type = experiment_workload_type(&json_value)?;
 
     // 4. Reject non-IsolatePerTrial state policies
     if !matches!(policy_config.state, StatePolicy::IsolatePerTrial) {
@@ -979,7 +2409,8 @@ pub fn continue_run(run_dir: &Path) -> Result<RunResult> {
     }
 
     // 5. Reconstruct schedule and verify it matches
-    let (variants, baseline_id) = resolve_variant_plan(&json_value)?;
+    let (variants, baseline_id) = load_run_variants(&run_dir, &json_value)?;
+    write_resolved_variants(&run_dir, &baseline_id, &variants)?;
     let exp_dir = resolved_path
         .parent()
         .unwrap_or(Path::new("."))
@@ -990,10 +2421,7 @@ pub fn continue_run(run_dir: &Path) -> Result<RunResult> {
         .pointer("/design/replications")
         .and_then(|v| v.as_u64())
         .ok_or_else(|| anyhow!("missing /design/replications"))? as usize;
-    let random_seed = json_value
-        .pointer("/design/random_seed")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(1);
+    let random_seed = experiment_random_seed(&json_value);
 
     let reconstructed_schedule = build_trial_schedule(
         variants.len(),
@@ -1013,11 +2441,12 @@ pub fn continue_run(run_dir: &Path) -> Result<RunResult> {
     }
 
     let schedule = reconstructed_schedule;
+    write_resolved_schedule(&run_dir, &schedule)?;
     let use_container = progress.use_container;
     let materialize_mode = execution.materialize.unwrap_or(MaterializationMode::Full);
 
     // 6. Mark run as running again
-    write_run_control(&run_dir, &run_id, "running", None, None)?;
+    write_run_control_v2(&run_dir, &run_id, "running", &[], None)?;
     let mut run_guard = RunControlGuard::new(&run_dir, &run_id);
 
     // 7. Reconstruct variant runtime profiles
@@ -1042,28 +2471,38 @@ pub fn continue_run(run_dir: &Path) -> Result<RunResult> {
 
     let benchmark_config = parse_benchmark_config(&json_value);
 
-    // 8. Restore loop accumulators from progress
+    // 8. Restore scheduler state from progress
     let mut consecutive_failures: BTreeMap<usize, usize> = progress.consecutive_failures.clone();
     let mut pruned_variants: HashSet<usize> = progress.pruned_variants.iter().copied().collect();
-    let mut chain_states: BTreeMap<String, ChainRuntimeState> = BTreeMap::new();
 
     let trials_dir = run_dir.join("trials");
     ensure_dir(&trials_dir)?;
-    let analysis_dir = run_dir.join("analysis");
-    ensure_dir(&analysis_dir)?;
     let evidence_dir = run_dir.join("evidence");
     ensure_dir(&evidence_dir)?;
     let evidence_records_path = evidence_dir.join("evidence_records.jsonl");
     let task_chain_states_path = evidence_dir.join("task_chain_states.jsonl");
-    let artifact_store = ArtifactStore::new(run_dir.join("artifacts"));
-
-    // Accumulators for new trials only (old summaries rebuilt at the end)
-    let mut trial_summaries = Vec::new();
-    let mut event_counts: BTreeMap<String, BTreeMap<String, usize>> = BTreeMap::new();
-    let mut trial_event_counts: BTreeMap<String, BTreeMap<String, usize>> = BTreeMap::new();
+    let mut run_sink = JsonlRunSink::new(&run_dir)?;
+    let facts_run_manifest_path = run_dir.join("facts").join("run_manifest.json");
+    if !facts_run_manifest_path.exists() {
+        run_sink.write_run_manifest(&RunManifestRecord {
+            schema_version: "run_manifest_v1".to_string(),
+            run_id: run_id.clone(),
+            created_at: Utc::now().to_rfc3339(),
+            workload_type: workload_type.clone(),
+            baseline_id: baseline_id.clone(),
+            variant_ids: variants.iter().map(|variant| variant.id.clone()).collect(),
+        })?;
+    }
 
     let mut schedule_progress = progress.clone();
-    let mut trial_index: usize = schedule_progress.next_trial_index;
+    let recovered_max_trial_index = recovered_active_trials
+        .iter()
+        .filter_map(|active| trial_index_from_trial_id(&active.trial_id))
+        .max()
+        .unwrap_or(0);
+    let mut trial_index: usize = schedule_progress
+        .next_trial_index
+        .max(recovered_max_trial_index);
 
     execute_schedule_engine(
         ScheduleEngineMode::ContinueRun,
@@ -1085,27 +2524,23 @@ pub fn continue_run(run_dir: &Path) -> Result<RunResult> {
         &evidence_dir,
         &evidence_records_path,
         &task_chain_states_path,
-        &artifact_store,
         &mut schedule_progress,
         &mut trial_index,
         &mut consecutive_failures,
         &mut pruned_variants,
-        &mut chain_states,
-        &mut trial_summaries,
-        &mut event_counts,
-        &mut trial_event_counts,
+        &recovered_active_trials,
+        &baseline_id,
+        &mut run_sink,
+        max_concurrency,
+        execution.remote_endpoint.as_deref(),
+        execution.remote_token_env.as_deref(),
     )?;
-
-    // 10. Rebuild ALL trial summaries (old + new) and re-run analysis
-    let (all_trial_summaries, all_event_counts, all_trial_event_counts) =
-        rebuild_all_trial_summaries(&run_dir, &run_id, &workload_type, &variants)?;
+    run_sink.flush()?;
 
     validate_jsonl_against_schema("evidence_record_v1.jsonschema", &evidence_records_path)?;
     validate_jsonl_against_schema("task_chain_state_v1.jsonschema", &task_chain_states_path)?;
-
-    let mut all_trial_summaries = all_trial_summaries;
     if let Some(adapter) = benchmark_config.adapter.as_ref() {
-        let scores_path = process_benchmark_outputs(
+        let _scores_path = process_benchmark_outputs(
             &project_root,
             &run_dir,
             &run_id,
@@ -1113,16 +2548,7 @@ pub fn continue_run(run_dir: &Path) -> Result<RunResult> {
             &evidence_records_path,
             &task_chain_states_path,
         )?;
-        apply_score_records_to_trial_summaries(&mut all_trial_summaries, &scores_path)?;
     }
-
-    write_analysis(
-        &analysis_dir,
-        &all_trial_summaries,
-        &baseline_id,
-        &all_event_counts,
-        &all_trial_event_counts,
-    )?;
 
     let resolved_digest = canonical_json_digest(&json_value);
     let grades = json!({
@@ -1187,7 +2613,7 @@ pub fn replay_trial(run_dir: &Path, trial_id: &str, strict: bool) -> Result<Repl
         ));
     }
     let mut input: Value = serde_json::from_slice(&fs::read(&parent_input_path)?)?;
-    let (variants, _) = resolve_variant_plan(&json_value)?;
+    let (variants, _) = load_run_variants(&run_dir, &json_value)?;
     let variant_id = input
         .pointer("/ids/variant_id")
         .and_then(|v| v.as_str())
@@ -1206,6 +2632,7 @@ pub fn replay_trial(run_dir: &Path, trial_id: &str, strict: bool) -> Result<Repl
         &RunBehavior::default(),
         &RunExecutionOptions::default(),
     )?;
+    let variant_args = runtime_profile.variant_args.clone();
     let agent_runtime = runtime_profile.agent_runtime;
     let agent_runtime_env = runtime_profile.agent_runtime_env;
     let container_mode = runtime_profile.container_mode;
@@ -1266,12 +2693,21 @@ pub fn replay_trial(run_dir: &Path, trial_id: &str, strict: bool) -> Result<Repl
     let canonical_input = replay_trial_dir.join("trial_input.json");
     atomic_write_bytes(&canonical_input, &input_bytes)?;
 
-    let io_paths = prepare_io_paths(&trial_paths, container_mode, &input_bytes)?;
+    let io_paths = prepare_io_paths(
+        &trial_paths,
+        container_mode,
+        &input_bytes,
+        is_clean_contract_experiment(&runtime_experiment),
+    )?;
     let runtime_env = build_runtime_contract_env(
         &run_id,
         &input,
         &io_paths,
         resolve_trial_timeout_ms(&input, invocation_default_timeout_ms),
+        runtime_experiment
+            .pointer("/version")
+            .and_then(|v| v.as_str())
+            == Some("1.0"),
     );
     let dynamic_mounts = resolve_task_mounts(
         &project_root,
@@ -1282,6 +2718,7 @@ pub fn replay_trial(run_dir: &Path, trial_id: &str, strict: bool) -> Result<Repl
     let run_request = AdapterRunRequest {
         runtime_experiment: &runtime_experiment,
         runtime: &agent_runtime,
+        variant_args: &variant_args,
         runtime_env: &runtime_env,
         runtime_overrides_env: &agent_runtime_env,
         container_mode,
@@ -1423,7 +2860,7 @@ fn fork_trial_inner(
         .to_string();
 
     let mut input: Value = serde_json::from_slice(&fs::read(&parent_input_path)?)?;
-    let (variants, _) = resolve_variant_plan(&json_value)?;
+    let (variants, _) = load_run_variants(&run_dir, &json_value)?;
     let variant_id = input
         .pointer("/ids/variant_id")
         .and_then(|v| v.as_str())
@@ -1442,6 +2879,7 @@ fn fork_trial_inner(
         &RunBehavior::default(),
         &RunExecutionOptions::default(),
     )?;
+    let variant_args = runtime_profile.variant_args.clone();
     let agent_runtime = runtime_profile.agent_runtime;
     let agent_runtime_env = runtime_profile.agent_runtime_env;
     let container_mode = runtime_profile.container_mode;
@@ -1534,12 +2972,21 @@ fn fork_trial_inner(
     let canonical_input = fork_trial_dir.join("trial_input.json");
     atomic_write_bytes(&canonical_input, &input_bytes)?;
 
-    let io_paths = prepare_io_paths(&trial_paths, container_mode, &input_bytes)?;
+    let io_paths = prepare_io_paths(
+        &trial_paths,
+        container_mode,
+        &input_bytes,
+        is_clean_contract_experiment(&runtime_experiment),
+    )?;
     let runtime_env = build_runtime_contract_env(
         &run_id,
         &input,
         &io_paths,
         resolve_trial_timeout_ms(&input, invocation_default_timeout_ms),
+        runtime_experiment
+            .pointer("/version")
+            .and_then(|v| v.as_str())
+            == Some("1.0"),
     );
     let dynamic_mounts = resolve_task_mounts(
         &project_root,
@@ -1550,6 +2997,7 @@ fn fork_trial_inner(
     let run_request = AdapterRunRequest {
         runtime_experiment: &runtime_experiment,
         runtime: &agent_runtime,
+        variant_args: &variant_args,
         runtime_env: &runtime_env,
         runtime_overrides_env: &agent_runtime_env,
         container_mode,
@@ -1641,109 +3089,280 @@ pub fn pause_run(
         .and_then(|v| v.as_str())
         .unwrap_or("run")
         .to_string();
-    let active_trial = run_control
-        .pointer("/active_trial_id")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string());
-    let target_trial = if let Some(id) = trial_id {
-        if let Some(active) = active_trial.as_ref() {
-            if active != id {
-                return Err(anyhow!(
-                    "pause_target_not_active: active trial is {}, requested {}",
-                    active,
-                    id
-                ));
-            }
+    let active_trial_ids = run_control_active_trial_ids(&run_control);
+    let target_trials: Vec<String> = if let Some(id) = trial_id {
+        if !active_trial_ids.iter().any(|active| active == id) {
+            let active_label = if active_trial_ids.is_empty() {
+                "<none>".to_string()
+            } else {
+                active_trial_ids.join(",")
+            };
+            return Err(anyhow!(
+                "pause_target_not_active: active trial(s) are {}, requested {}",
+                active_label,
+                id
+            ));
         }
-        id.to_string()
+        vec![id.to_string()]
     } else {
-        active_trial.ok_or_else(|| anyhow!("pause_no_active_trial"))?
+        if active_trial_ids.is_empty() {
+            return Err(anyhow!("pause_no_active_trial"));
+        }
+        active_trial_ids.clone()
     };
-    let active_adapter_value = run_control
-        .pointer("/active_adapter")
-        .cloned()
-        .ok_or_else(|| anyhow!("pause_missing_active_adapter"))?;
-    let active_control: ActiveAdapterControl = serde_json::from_value(active_adapter_value)?;
 
-    let trial_dir = run_dir.join("trials").join(&target_trial);
-    if !trial_dir.exists() {
-        return Err(anyhow!("pause_trial_not_found: {}", target_trial));
-    }
     let resolved = load_json_file(&run_dir.join("resolved_experiment.json"))?;
-    let trial_input = load_json_file(&trial_dir.join("trial_input.json"))?;
     let project_root = find_project_root(&run_dir)
         .canonicalize()
         .unwrap_or_else(|_| find_project_root(&run_dir));
-    let (variants, _) = resolve_variant_plan(&resolved)?;
-    let variant_id = trial_input
-        .pointer("/ids/variant_id")
-        .and_then(|v| v.as_str())
-        .or_else(|| {
-            resolved
-                .pointer("/baseline/variant_id")
-                .and_then(|v| v.as_str())
-        })
-        .unwrap_or("");
-    let variant = find_variant_by_id(&variants, variant_id)?;
-    let runtime_profile = resolve_variant_runtime_profile(
-        &resolved,
-        variant,
-        &project_root,
-        false,
-        &RunBehavior::default(),
-        &RunExecutionOptions::default(),
-    )?;
-    let adapter = adapter_registry_entry(&runtime_profile.agent_runtime.adapter_ref)?;
-    let capabilities = adapter.capabilities();
-    if !capabilities.pause {
-        return Err(anyhow!(
-            "pause_unsupported_capability: adapter '{}@{}' does not support pause",
-            runtime_profile.agent_runtime.adapter_ref.id,
-            runtime_profile.agent_runtime.adapter_ref.version
-        ));
-    }
-    if runtime_profile.agent_runtime.adapter_ref.id != active_control.adapter_id
-        || runtime_profile.agent_runtime.adapter_ref.version != active_control.adapter_version
-    {
-        return Err(anyhow!(
-            "pause_adapter_mismatch: active run control is '{}@{}' but trial runtime resolved '{}@{}'",
-            active_control.adapter_id,
-            active_control.adapter_version,
-            runtime_profile.agent_runtime.adapter_ref.id,
-            runtime_profile.agent_runtime.adapter_ref.version
-        ));
-    }
+    let (variants, _) = load_run_variants(&run_dir, &resolved)?;
 
     let pause_label = label.unwrap_or("pause").to_string();
     let timeout = Duration::from_secs(timeout_seconds.max(1));
-    let pause_ack = adapter.pause_trial(&AdapterPauseRequest {
-        control: &active_control,
-        label: &pause_label,
-        timeout,
-    })?;
+    let active_by_id: HashMap<String, RunControlActiveTrial> =
+        run_control_active_trials(&run_control)
+            .into_iter()
+            .map(|entry| (entry.trial_id.clone(), entry))
+            .collect();
+    let mut paused_active_trials: Vec<RunControlActiveTrial> = Vec::new();
+    let mut failures: Vec<String> = Vec::new();
+    let mut checkpoint_acked_all = true;
+    let mut stop_acked_all = true;
 
-    write_trial_state(
-        &trial_dir,
-        &target_trial,
-        "paused",
-        Some(&pause_label),
-        Some(&pause_label),
-        Some("paused_by_user"),
-    )?;
-    write_run_control(
+    for target_trial in &target_trials {
+        let active_adapter_value =
+            match run_control_active_adapter_for_trial(&run_control, target_trial) {
+                Some(value) => value,
+                None => {
+                    failures.push(format!("{}: pause_missing_active_adapter", target_trial));
+                    continue;
+                }
+            };
+        let active_control: ActiveAdapterControl =
+            match serde_json::from_value(active_adapter_value) {
+                Ok(control) => control,
+                Err(err) => {
+                    failures.push(format!(
+                        "{}: invalid active adapter control ({})",
+                        target_trial, err
+                    ));
+                    continue;
+                }
+            };
+
+        let trial_dir = run_dir.join("trials").join(target_trial);
+        if !trial_dir.exists() {
+            failures.push(format!("{}: pause_trial_not_found", target_trial));
+            continue;
+        }
+        let trial_input = match load_json_file(&trial_dir.join("trial_input.json")) {
+            Ok(value) => value,
+            Err(err) => {
+                failures.push(format!(
+                    "{}: failed to read trial_input.json ({})",
+                    target_trial, err
+                ));
+                continue;
+            }
+        };
+        let variant_id = trial_input
+            .pointer("/ids/variant_id")
+            .and_then(|v| v.as_str())
+            .or_else(|| {
+                resolved
+                    .pointer("/baseline/variant_id")
+                    .and_then(|v| v.as_str())
+            })
+            .unwrap_or("");
+        let variant = match find_variant_by_id(&variants, variant_id) {
+            Ok(variant) => variant,
+            Err(err) => {
+                failures.push(format!("{}: {}", target_trial, err));
+                continue;
+            }
+        };
+        let runtime_profile = match resolve_variant_runtime_profile(
+            &resolved,
+            variant,
+            &project_root,
+            false,
+            &RunBehavior::default(),
+            &RunExecutionOptions::default(),
+        ) {
+            Ok(profile) => profile,
+            Err(err) => {
+                failures.push(format!("{}: {}", target_trial, err));
+                continue;
+            }
+        };
+        let adapter = match adapter_registry_entry(&runtime_profile.agent_runtime.adapter_ref) {
+            Ok(adapter) => adapter,
+            Err(err) => {
+                failures.push(format!("{}: {}", target_trial, err));
+                continue;
+            }
+        };
+        let capabilities = adapter.capabilities();
+        if !capabilities.pause {
+            failures.push(format!(
+                "{}: pause_unsupported_capability for adapter '{}@{}'",
+                target_trial,
+                runtime_profile.agent_runtime.adapter_ref.id,
+                runtime_profile.agent_runtime.adapter_ref.version
+            ));
+            continue;
+        }
+        if runtime_profile.agent_runtime.adapter_ref.id != active_control.adapter_id
+            || runtime_profile.agent_runtime.adapter_ref.version != active_control.adapter_version
+        {
+            failures.push(format!(
+                "{}: pause_adapter_mismatch active='{}@{}' resolved='{}@{}'",
+                target_trial,
+                active_control.adapter_id,
+                active_control.adapter_version,
+                runtime_profile.agent_runtime.adapter_ref.id,
+                runtime_profile.agent_runtime.adapter_ref.version
+            ));
+            continue;
+        }
+
+        let pause_ack = match adapter.pause_trial(&AdapterPauseRequest {
+            control: &active_control,
+            label: &pause_label,
+            timeout,
+        }) {
+            Ok(ack) => ack,
+            Err(err) => {
+                failures.push(format!("{}: pause request failed ({})", target_trial, err));
+                continue;
+            }
+        };
+        checkpoint_acked_all &= pause_ack.checkpoint_acked;
+        stop_acked_all &= pause_ack.stop_acked;
+        if let Err(err) = write_trial_state(
+            &trial_dir,
+            target_trial,
+            "paused",
+            Some(&pause_label),
+            Some(&pause_label),
+            Some("paused_by_user"),
+        ) {
+            failures.push(format!(
+                "{}: failed to write trial_state ({})",
+                target_trial, err
+            ));
+            continue;
+        }
+
+        if let Some(mut active) = active_by_id.get(target_trial).cloned() {
+            active.control = Some(active_control.clone());
+            paused_active_trials.push(active);
+        } else {
+            failures.push(format!(
+                "{}: pause_missing_active_trial_metadata",
+                target_trial
+            ));
+        }
+    }
+
+    let pause_meta = RunControlPauseMetadata {
+        label: pause_label.clone(),
+        requested_at: Utc::now().to_rfc3339(),
+        requested_by: Some("user".to_string()),
+    };
+    if failures.is_empty() {
+        write_run_control_v2(
+            &run_dir,
+            &run_id,
+            "paused",
+            &paused_active_trials,
+            Some(&pause_meta),
+        )?;
+        let result_trial = if target_trials.len() == 1 {
+            target_trials[0].clone()
+        } else {
+            "multi".to_string()
+        };
+        return Ok(PauseResult {
+            run_id,
+            trial_id: result_trial,
+            label: pause_label,
+            checkpoint_acked: checkpoint_acked_all,
+            stop_acked: stop_acked_all,
+        });
+    }
+
+    let mut survivor_active_trials = run_control_active_trials(&run_control);
+    let paused_trial_ids: HashSet<String> = paused_active_trials
+        .iter()
+        .map(|active| active.trial_id.clone())
+        .collect();
+    survivor_active_trials.retain(|active| !paused_trial_ids.contains(&active.trial_id));
+    write_run_control_v2(
         &run_dir,
         &run_id,
-        "paused",
-        Some(&target_trial),
-        Some(&active_control),
+        "interrupted",
+        &survivor_active_trials,
+        Some(&pause_meta),
     )?;
+    Err(anyhow!(
+        "pause_partial_failure: paused {} of {} targeted trial(s); failures: {}",
+        paused_active_trials.len(),
+        target_trials.len(),
+        failures.join(" | ")
+    ))
+}
 
-    Ok(PauseResult {
+pub fn kill_run(run_dir: &Path) -> Result<KillResult> {
+    let _op_lock = acquire_run_operation_lock(run_dir)?;
+    let run_dir = run_dir
+        .canonicalize()
+        .map_err(|_| anyhow!("run_dir not found: {}", run_dir.display()))?;
+    let run_control = load_json_file(&run_control_path(&run_dir))?;
+    let status = run_control
+        .pointer("/status")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown")
+        .to_string();
+
+    match status.as_str() {
+        "completed" | "failed" | "killed" => {
+            return Err(anyhow!(
+                "kill_terminal_status: run is already '{}', nothing to kill",
+                status
+            ));
+        }
+        _ => {}
+    }
+
+    let run_id = run_control
+        .pointer("/run_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("run")
+        .to_string();
+
+    let active_trial_ids = run_control_active_trial_ids(&run_control);
+    for trial_id in &active_trial_ids {
+        let trial_dir = run_dir.join("trials").join(trial_id);
+        if trial_dir.exists() {
+            let _ = write_trial_state(
+                &trial_dir,
+                trial_id,
+                "killed",
+                None,
+                None,
+                Some("killed_by_user"),
+            );
+        }
+    }
+
+    write_run_control_v2(&run_dir, &run_id, "killed", &[], None)?;
+
+    Ok(KillResult {
         run_id,
-        trial_id: target_trial,
-        label: pause_label,
-        checkpoint_acked: pause_ack.checkpoint_acked,
-        stop_acked: pause_ack.stop_acked,
+        run_dir: run_dir.to_path_buf(),
+        previous_status: status,
+        killed_trials: active_trial_ids,
     })
 }
 
@@ -1767,14 +3386,27 @@ pub fn resume_trial(
         return Err(anyhow!("resume_non_paused: run status is {}", status));
     }
 
-    let active_trial = run_control
-        .pointer("/active_trial_id")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string());
+    let active_trial_ids = run_control_active_trial_ids(&run_control);
     let target_trial = if let Some(id) = trial_id {
+        if !active_trial_ids.is_empty() && !active_trial_ids.iter().any(|active| active == id) {
+            return Err(anyhow!(
+                "resume_target_not_active: active trial(s) are {}, requested {}",
+                active_trial_ids.join(","),
+                id
+            ));
+        }
         id.to_string()
     } else {
-        active_trial.ok_or_else(|| anyhow!("resume_no_active_trial"))?
+        if active_trial_ids.is_empty() {
+            return Err(anyhow!("resume_no_active_trial"));
+        }
+        if active_trial_ids.len() > 1 {
+            return Err(anyhow!(
+                "resume_multiple_active_trials: {} active trials require --trial-id",
+                active_trial_ids.len()
+            ));
+        }
+        active_trial_ids[0].clone()
     };
     let trial_dir = run_dir.join("trials").join(&target_trial);
     if !trial_dir.exists() {
@@ -2240,7 +3872,120 @@ fn apply_binding_overrides(
     Ok(())
 }
 
+fn experiment_version_string(json_value: &Value) -> Option<String> {
+    match json_value.pointer("/version") {
+        Some(Value::String(raw)) => Some(raw.trim().to_string()),
+        Some(Value::Number(raw)) => Some(raw.to_string()),
+        _ => None,
+    }
+}
+
+fn is_clean_contract_experiment(json_value: &Value) -> bool {
+    experiment_version_string(json_value).as_deref() == Some("1.0")
+}
+
+fn experiment_workload_type(json_value: &Value) -> Result<String> {
+    if let Some(value) = json_value
+        .pointer("/experiment/workload_type")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+    {
+        return Ok(value.to_string());
+    }
+    if is_clean_contract_experiment(json_value) {
+        return Ok("agent_runtime".to_string());
+    }
+    Err(anyhow!("missing /experiment/workload_type"))
+}
+
+fn experiment_random_seed(json_value: &Value) -> u64 {
+    if is_clean_contract_experiment(json_value) {
+        return json_value
+            .pointer("/design/seed")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(1);
+    }
+    json_value
+        .pointer("/design/random_seed")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(1)
+}
+
+fn experiment_max_concurrency(json_value: &Value) -> usize {
+    let raw = json_value
+        .pointer("/design/max_concurrency")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(1);
+    (raw.max(1)).min(usize::MAX as u64) as usize
+}
+
+fn configured_network_mode(json_value: &Value) -> Result<String> {
+    if is_clean_contract_experiment(json_value) {
+        return Ok(json_value
+            .pointer("/runtime/network")
+            .and_then(|v| v.as_str())
+            .unwrap_or("none")
+            .to_string());
+    }
+    json_value
+        .pointer("/runtime/policy/network/mode")
+        .and_then(|v| v.as_str())
+        .map(|v| v.to_string())
+        .ok_or_else(|| anyhow!("missing /runtime/policy/network/mode"))
+}
+
 fn validate_required_fields(json_value: &Value) -> Result<()> {
+    if is_clean_contract_experiment(json_value) {
+        let required_v1: &[&str] = &[
+            "/experiment/id",
+            "/experiment/name",
+            "/dataset/path",
+            "/design/replications",
+            "/baseline/variant_id",
+            "/runtime/image",
+            "/runtime/command",
+        ];
+        let mut missing = Vec::new();
+        for pointer in required_v1 {
+            let value = json_value.pointer(pointer);
+            let is_missing = match value {
+                None => true,
+                Some(Value::String(s)) => s.trim().is_empty(),
+                Some(Value::Array(items)) if *pointer == "/runtime/command" => items.is_empty(),
+                Some(Value::Number(n)) if *pointer == "/design/replications" => {
+                    n.as_u64() == Some(0)
+                }
+                _ => false,
+            };
+            if is_missing {
+                missing.push(*pointer);
+            }
+        }
+
+        let has_command = match json_value.pointer("/runtime/command") {
+            Some(Value::String(s)) => !s.trim().is_empty(),
+            Some(Value::Array(parts)) if !parts.is_empty() => parts
+                .iter()
+                .all(|part| part.as_str().map(|s| !s.trim().is_empty()).unwrap_or(false)),
+            _ => false,
+        };
+        if !has_command {
+            missing.push("/runtime/command");
+        }
+        if missing.is_empty() {
+            return Ok(());
+        }
+        let lines = missing
+            .iter()
+            .map(|p| format!("  - {}", p))
+            .collect::<Vec<_>>();
+        return Err(anyhow!(
+            "experiment.yaml missing required fields:\n{}",
+            lines.join("\n")
+        ));
+    }
+
     let required: &[&str] = &[
         "/experiment/workload_type",
         "/design/sanitization_profile",
@@ -2347,56 +4092,217 @@ fn validate_required_fields(json_value: &Value) -> Result<()> {
     }
 }
 
+fn stage_benchmark_trial_preflight(
+    benchmark_config: &BenchmarkConfig,
+    trial_dir: &Path,
+    run_id: &str,
+    trial_id: &str,
+    schedule_idx: usize,
+    variant_id: &str,
+    task_payload: &Value,
+    trial_input_path: &Path,
+) -> Result<()> {
+    if benchmark_config.adapter.is_none() {
+        return Ok(());
+    }
+
+    let task_id = task_payload
+        .get("id")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .ok_or_else(|| anyhow!("benchmark preflight: task payload missing non-empty id"))?;
+    let task_image = task_payload
+        .get("image")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(ToString::to_string);
+    if task_payload.get("image").is_some() && task_image.is_none() {
+        return Err(anyhow!(
+            "benchmark preflight: task image must be a non-empty string when provided"
+        ));
+    }
+    let grading_enabled = task_payload
+        .pointer("/grading/enabled")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+
+    let frozen_dir = trial_dir
+        .join("artifacts")
+        .join("benchmark_frozen_agent_input");
+    ensure_dir(&frozen_dir)?;
+    let frozen_input_path = frozen_dir.join("trial_input.json");
+    fs::copy(trial_input_path, &frozen_input_path)?;
+    let frozen_input_digest = sha256_file(&frozen_input_path)?;
+
+    let preflight = json!({
+        "schema_version": "benchmark_trial_preflight_v1",
+        "run_id": run_id,
+        "trial_id": trial_id,
+        "schedule_idx": schedule_idx,
+        "variant_id": variant_id,
+        "task_id": task_id,
+        "task_image": task_image,
+        "grading": {
+            "enabled": grading_enabled,
+        },
+        "frozen_agent_artifacts": {
+            "trial_input_path": frozen_input_path,
+            "trial_input_digest": frozen_input_digest,
+        },
+        "checked_at": Utc::now().to_rfc3339(),
+    });
+    atomic_write_json_pretty(&trial_dir.join("benchmark_preflight.json"), &preflight)
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ScheduleEngineMode {
     FreshRun,
     ContinueRun,
 }
 
-fn execute_schedule_engine(
-    mode: ScheduleEngineMode,
-    run_dir: &Path,
-    run_id: &str,
-    workload_type: &str,
-    project_root: &Path,
-    dataset_path: &Path,
-    variants: &[Variant],
-    tasks: &[Value],
-    schedule: &[TrialSlot],
-    policy_config: &PolicyConfig,
-    benchmark_config: &BenchmarkConfig,
-    variant_runtime_profiles: &[VariantRuntimeProfile],
-    behavior: &RunBehavior,
-    materialize_mode: MaterializationMode,
-    task_boundary_policy: &TaskBoundaryPolicy,
-    trials_dir: &Path,
-    evidence_dir: &Path,
-    evidence_records_path: &Path,
-    task_chain_states_path: &Path,
-    artifact_store: &ArtifactStore,
-    schedule_progress: &mut ScheduleProgress,
-    trial_index: &mut usize,
-    consecutive_failures: &mut BTreeMap<usize, usize>,
-    pruned_variants: &mut HashSet<usize>,
-    chain_states: &mut BTreeMap<String, ChainRuntimeState>,
-    trial_summaries: &mut Vec<Value>,
-    event_counts: &mut BTreeMap<String, BTreeMap<String, usize>>,
-    trial_event_counts: &mut BTreeMap<String, BTreeMap<String, usize>>,
-) -> Result<()> {
-    for schedule_idx in schedule_progress.next_schedule_index..schedule.len() {
-        let slot = &schedule[schedule_idx];
-        if pruned_variants.contains(&slot.variant_idx) {
-            schedule_progress.completed_slots.push(SlotCompletion {
-                schedule_index: schedule_idx,
-                trial_id: String::new(),
-                status: "skipped_pruned".to_string(),
-            });
-            schedule_progress.next_schedule_index = schedule_idx + 1;
-            schedule_progress.updated_at = Utc::now().to_rfc3339();
-            write_schedule_progress(run_dir, schedule_progress)?;
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct TrialExecutionResult {
+    trial_id: String,
+    slot_status: String,
+    #[serde(default)]
+    variant_idx: Option<usize>,
+    #[serde(default)]
+    deferred_trial_records: Vec<TrialRecord>,
+    #[serde(default)]
+    deferred_metric_rows: Vec<MetricRow>,
+    #[serde(default)]
+    deferred_event_rows: Vec<EventRow>,
+    #[serde(default)]
+    deferred_variant_snapshot_rows: Vec<VariantSnapshotRow>,
+    #[serde(default)]
+    deferred_evidence_records: Vec<Value>,
+    #[serde(default)]
+    deferred_chain_state_records: Vec<Value>,
+    #[serde(default)]
+    failure_classification: Option<String>,
+}
+
+impl TrialExecutionResult {
+    fn minimal(trial_id: String, slot_status: &str, variant_idx: Option<usize>) -> Self {
+        Self {
+            trial_id,
+            slot_status: slot_status.to_string(),
+            variant_idx,
+            deferred_trial_records: Vec::new(),
+            deferred_metric_rows: Vec::new(),
+            deferred_event_rows: Vec::new(),
+            deferred_variant_snapshot_rows: Vec::new(),
+            deferred_evidence_records: Vec::new(),
+            deferred_chain_state_records: Vec::new(),
+            failure_classification: None,
+        }
+    }
+
+    fn worker_lost(
+        trial_id: String,
+        variant_idx: Option<usize>,
+        classification: Option<String>,
+    ) -> Self {
+        let mut result = Self::minimal(trial_id, "failed", variant_idx);
+        result.failure_classification = classification;
+        result
+    }
+}
+
+#[derive(Default)]
+struct BufferedRunSink {
+    trial_records: Vec<TrialRecord>,
+    metric_rows: Vec<MetricRow>,
+    event_rows: Vec<EventRow>,
+    variant_snapshot_rows: Vec<VariantSnapshotRow>,
+}
+
+impl RunSink for BufferedRunSink {
+    fn write_run_manifest(&mut self, _run: &RunManifestRecord) -> Result<()> {
+        Ok(())
+    }
+
+    fn append_trial_record(&mut self, row: &TrialRecord) -> Result<()> {
+        self.trial_records.push(row.clone());
+        Ok(())
+    }
+
+    fn append_metric_rows(&mut self, rows: &[MetricRow]) -> Result<()> {
+        self.metric_rows.extend(rows.iter().cloned());
+        Ok(())
+    }
+
+    fn append_event_rows(&mut self, rows: &[EventRow]) -> Result<()> {
+        self.event_rows.extend(rows.iter().cloned());
+        Ok(())
+    }
+
+    fn append_variant_snapshot(&mut self, rows: &[VariantSnapshotRow]) -> Result<()> {
+        self.variant_snapshot_rows.extend(rows.iter().cloned());
+        Ok(())
+    }
+
+    fn flush(&mut self) -> Result<()> {
+        Ok(())
+    }
+}
+
+fn load_jsonl_value_rows(path: &Path) -> Result<Vec<Value>> {
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let raw = fs::read_to_string(path)?;
+    let mut rows = Vec::new();
+    for line in raw.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
             continue;
         }
+        rows.push(serde_json::from_str::<Value>(trimmed)?);
+    }
+    Ok(rows)
+}
 
+fn trial_index_from_trial_id(trial_id: &str) -> Option<usize> {
+    trial_id
+        .strip_prefix("trial_")
+        .and_then(|suffix| suffix.parse::<usize>().ok())
+        .filter(|idx| *idx > 0)
+}
+
+struct TrialExecutor;
+
+impl TrialExecutor {
+    #[allow(clippy::too_many_arguments)]
+    fn execute_slot(
+        mode: ScheduleEngineMode,
+        run_dir: &Path,
+        run_id: &str,
+        workload_type: &str,
+        project_root: &Path,
+        dataset_path: &Path,
+        variants: &[Variant],
+        tasks: &[Value],
+        schedule_idx: usize,
+        slot: &TrialSlot,
+        policy_config: &PolicyConfig,
+        benchmark_config: &BenchmarkConfig,
+        variant_runtime_profiles: &[VariantRuntimeProfile],
+        behavior: &RunBehavior,
+        materialize_mode: MaterializationMode,
+        task_boundary_policy: &TaskBoundaryPolicy,
+        trials_dir: &Path,
+        evidence_dir: &Path,
+        evidence_records_path: &Path,
+        task_chain_states_path: &Path,
+        artifact_store: &ArtifactStore,
+        trial_index: &mut usize,
+        chain_states: &mut BTreeMap<String, ChainRuntimeState>,
+        baseline_id: &str,
+        run_sink: &mut dyn RunSink,
+    ) -> Result<TrialExecutionResult> {
         let variant = &variants[slot.variant_idx];
         let variant_runtime = &variant_runtime_profiles[slot.variant_idx];
         let agent_runtime = &variant_runtime.agent_runtime;
@@ -2475,9 +4381,11 @@ fn execute_schedule_engine(
         let input_bytes = serde_json::to_vec_pretty(&input)?;
         let canonical_input_path = trial_dir.join("trial_input.json");
         atomic_write_bytes(&canonical_input_path, &input_bytes)?;
+        let variant_digest = variant_digest(variant)?;
 
         let trial_metadata = json!({
             "schema_version": "trial_metadata_v1",
+            "variant_digest": variant_digest,
             "ids": {
                 "run_id": run_id,
                 "trial_id": trial_id.as_str(),
@@ -2530,37 +4438,34 @@ fn execute_schedule_engine(
             }
         });
         atomic_write_json_pretty(&trial_dir.join("trial_metadata.json"), &trial_metadata)?;
+        stage_benchmark_trial_preflight(
+            benchmark_config,
+            &trial_dir,
+            run_id,
+            &trial_id,
+            schedule_idx,
+            &variant.id,
+            &task_boundary.task_payload,
+            &canonical_input_path,
+        )?;
 
-        let io_paths = prepare_io_paths(&trial_paths, container_mode, &input_bytes)?;
+        let io_paths = prepare_io_paths(
+            &trial_paths,
+            container_mode,
+            &input_bytes,
+            is_clean_contract_experiment(trial_experiment),
+        )?;
         let runtime_env = build_runtime_contract_env(
             run_id,
             &input,
             &io_paths,
             resolve_trial_timeout_ms(&input, invocation_default_timeout_ms),
+            trial_experiment
+                .pointer("/version")
+                .and_then(|v| v.as_str())
+                == Some("1.0"),
         );
         let adapter = adapter_registry_entry(&agent_runtime.adapter_ref)?;
-        let control_run_request = AdapterRunRequest {
-            runtime_experiment: trial_experiment,
-            runtime: agent_runtime,
-            runtime_env: &runtime_env,
-            runtime_overrides_env: agent_runtime_env,
-            container_mode,
-            trial_paths: &trial_paths,
-            dynamic_mounts: &dynamic_mounts,
-            io_paths: &io_paths,
-            network_mode: effective_network_mode,
-            setup_command: None,
-            run_id,
-        };
-        let active_control = adapter.active_control(&control_run_request)?;
-        write_run_control(
-            run_dir,
-            run_id,
-            "running",
-            Some(&trial_id),
-            active_control.as_ref(),
-        )?;
-
         let trial_evidence_dir = trial_dir.join("evidence");
         ensure_dir(&trial_evidence_dir)?;
         let chains_dir = evidence_dir.join("chains").join(&chain_fs_key);
@@ -2633,6 +4538,7 @@ fn execute_schedule_engine(
             let run_request = AdapterRunRequest {
                 runtime_experiment: trial_experiment,
                 runtime: agent_runtime,
+                variant_args: &variant_runtime.variant_args,
                 runtime_env: &runtime_env,
                 runtime_overrides_env: agent_runtime_env,
                 container_mode: matches!(executor_kind, ExecutorKind::LocalDocker),
@@ -2888,24 +4794,6 @@ fn execute_schedule_engine(
         });
         append_jsonl(task_chain_states_path, &chain_state_record)?;
 
-        let summary = summarize_trial(
-            run_id,
-            &trial_output,
-            &trial_id,
-            workload_type,
-            &variant.id,
-            task_idx,
-            &task_id,
-            repl,
-            &variant.bindings,
-            status.clone(),
-            container_mode,
-            &agent_runtime.integration_level,
-            configured_network_mode,
-            effective_network_mode,
-        );
-        trial_summaries.push(summary);
-
         write_state_inventory(
             &trial_dir,
             trial_experiment,
@@ -2922,44 +4810,101 @@ fn execute_schedule_engine(
             let manifest = load_manifest(&manifest_path)?;
             let schema = compile_schema("hook_events_v1.jsonschema")?;
             let _ = validate_hooks(&manifest, &io_paths.events_host, &schema);
-            let counts = count_event_types(&io_paths.events_host)?;
-            let trial_map = trial_event_counts.entry(trial_id.clone()).or_default();
-            for (k, v) in counts.into_iter() {
-                *trial_map.entry(k.clone()).or_default() += v;
-                *event_counts
-                    .entry(variant.id.clone())
-                    .or_default()
-                    .entry(k)
-                    .or_default() += v;
-            }
         }
 
         let outcome = trial_output
             .get("outcome")
             .and_then(|v| v.as_str())
-            .unwrap_or("error");
-        if status == "0" && outcome != "error" {
+            .unwrap_or("error")
+            .to_string();
+        let mut metrics = trial_output.get("metrics").cloned().unwrap_or(json!({}));
+        if let Some(obj) = metrics.as_object_mut() {
+            obj.insert("status_code".to_string(), json!(status.clone()));
+        }
+        let (primary_metric_name, primary_metric_value) =
+            if let Some(obj) = trial_output.get("objective").and_then(|v| v.as_object()) {
+                let name = obj
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("primary_metric")
+                    .to_string();
+                let value = obj.get("value").cloned().unwrap_or(json!(null));
+                (name, value)
+            } else {
+                let fallback = if outcome == "success" { 1.0 } else { 0.0 };
+                ("success".to_string(), json!(fallback))
+            };
+        let bindings = variant_bindings_for_summary(variant);
+        let event_rows = if io_paths.events_host.exists() {
+            load_event_rows(
+                &io_paths.events_host,
+                run_id,
+                &trial_id,
+                &variant.id,
+                &task_id,
+                repl,
+            )?
+        } else {
+            Vec::new()
+        };
+        let metric_rows = build_metric_rows(
+            run_id,
+            &trial_id,
+            &variant.id,
+            &task_id,
+            repl,
+            &outcome,
+            &metrics,
+            &primary_metric_name,
+            &primary_metric_value,
+        );
+        let variant_snapshot_rows = build_variant_snapshot_rows(
+            run_id,
+            &trial_id,
+            &variant.id,
+            baseline_id,
+            &task_id,
+            repl,
+            &bindings,
+        );
+        run_sink.append_trial_record(&TrialRecord {
+            run_id: run_id.to_string(),
+            trial_id: trial_id.clone(),
+            baseline_id: baseline_id.to_string(),
+            workload_type: workload_type.to_string(),
+            variant_id: variant.id.clone(),
+            task_index: task_idx,
+            task_id: task_id.clone(),
+            repl_idx: repl,
+            outcome: outcome.clone(),
+            success: outcome == "success",
+            status_code: status.clone(),
+            container_mode,
+            integration_level: agent_runtime.integration_level.clone(),
+            network_mode_requested: configured_network_mode.to_string(),
+            network_mode_effective: effective_network_mode.to_string(),
+            primary_metric_name: primary_metric_name.clone(),
+            primary_metric_value: primary_metric_value.clone(),
+            metrics: metrics.clone(),
+            bindings: bindings.clone(),
+            hook_events_total: event_rows.len(),
+            has_hook_events: !event_rows.is_empty(),
+        })?;
+        run_sink.append_metric_rows(&metric_rows)?;
+        run_sink.append_event_rows(&event_rows)?;
+        run_sink.append_variant_snapshot(&variant_snapshot_rows)?;
+
+        let failure_classification = if status == "0" && outcome != "error" {
             trial_guard.complete("completed", None)?;
-            *consecutive_failures.entry(slot.variant_idx).or_default() = 0;
+            None
         } else if status != "0" {
             trial_guard.complete("failed", Some("agent_exit_nonzero"))?;
-            *consecutive_failures.entry(slot.variant_idx).or_default() += 1;
+            Some("agent_exit_nonzero".to_string())
         } else {
             trial_guard.complete("failed", Some("result_error"))?;
-            *consecutive_failures.entry(slot.variant_idx).or_default() += 1;
-        }
+            Some("result_error".to_string())
+        };
 
-        if let Some(max_failures) = policy_config.pruning_max_consecutive_failures {
-            let count = consecutive_failures
-                .get(&slot.variant_idx)
-                .copied()
-                .unwrap_or(0);
-            if count >= max_failures {
-                pruned_variants.insert(slot.variant_idx);
-            }
-        }
-
-        write_run_control(run_dir, run_id, "running", None, None)?;
         apply_materialization_policy(&trial_dir, materialize_mode)?;
 
         let slot_status = if status == "0" && outcome != "error" {
@@ -2967,20 +4912,772 @@ fn execute_schedule_engine(
         } else {
             "failed"
         };
+        let mut result =
+            TrialExecutionResult::minimal(trial_id, slot_status, Some(slot.variant_idx));
+        result.failure_classification = failure_classification;
+        Ok(result)
+    }
+}
+
+struct RunCoordinator;
+
+impl RunCoordinator {
+    fn commit_skipped_pruned_slot(
+        run_dir: &Path,
+        schedule_progress: &mut ScheduleProgress,
+        schedule_idx: usize,
+        run_sink: &mut dyn RunSink,
+    ) -> Result<()> {
         schedule_progress.completed_slots.push(SlotCompletion {
             schedule_index: schedule_idx,
-            trial_id: trial_id.clone(),
-            status: slot_status.to_string(),
+            trial_id: String::new(),
+            status: "skipped_pruned".to_string(),
         });
         schedule_progress.next_schedule_index = schedule_idx + 1;
-        schedule_progress.next_trial_index = *trial_index;
+        schedule_progress.updated_at = Utc::now().to_rfc3339();
+        write_schedule_progress(run_dir, schedule_progress)?;
+        run_sink.flush()
+    }
+
+    fn commit_trial_slot(
+        run_dir: &Path,
+        policy_config: &PolicyConfig,
+        evidence_records_path: &Path,
+        task_chain_states_path: &Path,
+        schedule_progress: &mut ScheduleProgress,
+        schedule_idx: usize,
+        trial_index: usize,
+        pruned_variants: &mut HashSet<usize>,
+        consecutive_failures: &mut BTreeMap<usize, usize>,
+        trial_result: &TrialExecutionResult,
+        run_sink: &mut dyn RunSink,
+    ) -> Result<()> {
+        for record in &trial_result.deferred_evidence_records {
+            append_jsonl(evidence_records_path, record)?;
+        }
+        for record in &trial_result.deferred_chain_state_records {
+            append_jsonl(task_chain_states_path, record)?;
+        }
+        for row in &trial_result.deferred_trial_records {
+            run_sink.append_trial_record(row)?;
+        }
+        run_sink.append_metric_rows(&trial_result.deferred_metric_rows)?;
+        run_sink.append_event_rows(&trial_result.deferred_event_rows)?;
+        run_sink.append_variant_snapshot(&trial_result.deferred_variant_snapshot_rows)?;
+
+        if let Some(variant_idx) = trial_result.variant_idx {
+            if trial_result.slot_status == "completed" {
+                consecutive_failures.insert(variant_idx, 0);
+            } else {
+                *consecutive_failures.entry(variant_idx).or_default() += 1;
+            }
+            if let Some(max_failures) = policy_config.pruning_max_consecutive_failures {
+                let count = consecutive_failures.get(&variant_idx).copied().unwrap_or(0);
+                if count >= max_failures {
+                    pruned_variants.insert(variant_idx);
+                }
+            }
+        }
+
+        schedule_progress.completed_slots.push(SlotCompletion {
+            schedule_index: schedule_idx,
+            trial_id: trial_result.trial_id.clone(),
+            status: trial_result.slot_status.clone(),
+        });
+        schedule_progress.next_schedule_index = schedule_idx + 1;
+        schedule_progress.next_trial_index = trial_index;
         schedule_progress.pruned_variants = pruned_variants.iter().copied().collect();
         schedule_progress.consecutive_failures = consecutive_failures.clone();
         schedule_progress.updated_at = Utc::now().to_rfc3339();
         write_schedule_progress(run_dir, schedule_progress)?;
+        run_sink.flush()
+    }
+}
+
+#[derive(Debug, Clone)]
+enum PendingSlotCommit {
+    SkippedPruned,
+    Trial(TrialExecutionResult),
+}
+
+struct DeterministicCommitter {
+    next_commit_idx: usize,
+    committed_keys: HashSet<String>,
+    pending_by_schedule: BTreeMap<usize, PendingSlotCommit>,
+}
+
+impl DeterministicCommitter {
+    fn from_progress(progress: &ScheduleProgress) -> Self {
+        let mut committed_keys = HashSet::new();
+        for slot in &progress.completed_slots {
+            committed_keys.insert(Self::commit_key_for_slot_completion(slot));
+        }
+        Self {
+            next_commit_idx: progress.next_schedule_index,
+            committed_keys,
+            pending_by_schedule: BTreeMap::new(),
+        }
     }
 
+    fn commit_key_for_slot_completion(slot: &SlotCompletion) -> String {
+        format!("{}:{}:{}", slot.schedule_index, slot.trial_id, slot.status)
+    }
+
+    fn commit_key_for_pending(schedule_idx: usize, pending: &PendingSlotCommit) -> String {
+        match pending {
+            PendingSlotCommit::SkippedPruned => {
+                format!("{}::skipped_pruned", schedule_idx)
+            }
+            PendingSlotCommit::Trial(result) => {
+                format!(
+                    "{}:{}:{}",
+                    schedule_idx, result.trial_id, result.slot_status
+                )
+            }
+        }
+    }
+
+    fn enqueue_skipped(&mut self, schedule_idx: usize) -> Result<bool> {
+        self.enqueue(schedule_idx, PendingSlotCommit::SkippedPruned)
+    }
+
+    fn enqueue_trial(&mut self, schedule_idx: usize, result: TrialExecutionResult) -> Result<bool> {
+        self.enqueue(schedule_idx, PendingSlotCommit::Trial(result))
+    }
+
+    fn enqueue(&mut self, schedule_idx: usize, pending: PendingSlotCommit) -> Result<bool> {
+        let pending_key = Self::commit_key_for_pending(schedule_idx, &pending);
+        if self.committed_keys.contains(&pending_key) {
+            return Ok(false);
+        }
+        if schedule_idx < self.next_commit_idx {
+            return Err(anyhow!(
+                "deterministic committer protocol fault: stale completion schedule_idx {} already committed through {}",
+                schedule_idx,
+                self.next_commit_idx.saturating_sub(1)
+            ));
+        }
+        if let Some(existing) = self.pending_by_schedule.get(&schedule_idx) {
+            let existing_key = Self::commit_key_for_pending(schedule_idx, existing);
+            if existing_key == pending_key {
+                return Ok(false);
+            }
+            return Err(anyhow!(
+                "deterministic committer protocol fault: conflicting pending completion for schedule_idx {}",
+                schedule_idx
+            ));
+        }
+        self.pending_by_schedule.insert(schedule_idx, pending);
+        Ok(true)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn drain_ready(
+        &mut self,
+        run_dir: &Path,
+        policy_config: &PolicyConfig,
+        evidence_records_path: &Path,
+        task_chain_states_path: &Path,
+        schedule_progress: &mut ScheduleProgress,
+        trial_index: usize,
+        pruned_variants: &mut HashSet<usize>,
+        consecutive_failures: &mut BTreeMap<usize, usize>,
+        run_sink: &mut dyn RunSink,
+    ) -> Result<usize> {
+        let mut committed = 0_usize;
+        while let Some(pending) = self.pending_by_schedule.remove(&self.next_commit_idx) {
+            let schedule_idx = self.next_commit_idx;
+            let commit_key = Self::commit_key_for_pending(schedule_idx, &pending);
+            match pending {
+                PendingSlotCommit::SkippedPruned => {
+                    RunCoordinator::commit_skipped_pruned_slot(
+                        run_dir,
+                        schedule_progress,
+                        schedule_idx,
+                        run_sink,
+                    )?;
+                }
+                PendingSlotCommit::Trial(result) => {
+                    RunCoordinator::commit_trial_slot(
+                        run_dir,
+                        policy_config,
+                        evidence_records_path,
+                        task_chain_states_path,
+                        schedule_progress,
+                        schedule_idx,
+                        trial_index,
+                        pruned_variants,
+                        consecutive_failures,
+                        &result,
+                        run_sink,
+                    )?;
+                }
+            }
+            self.committed_keys.insert(commit_key);
+            self.next_commit_idx = schedule_progress.next_schedule_index;
+            committed += 1;
+        }
+        Ok(committed)
+    }
+}
+
+#[derive(Clone)]
+struct ParallelWorkerExecutionContext {
+    mode: ScheduleEngineMode,
+    run_dir: PathBuf,
+    run_id: String,
+    workload_type: String,
+    project_root: PathBuf,
+    dataset_path: PathBuf,
+    variants: Vec<Variant>,
+    tasks: Vec<Value>,
+    policy_config: PolicyConfig,
+    benchmark_config: BenchmarkConfig,
+    variant_runtime_profiles: Vec<VariantRuntimeProfile>,
+    behavior: RunBehavior,
+    materialize_mode: MaterializationMode,
+    task_boundary_policy: TaskBoundaryPolicy,
+    trials_dir: PathBuf,
+    evidence_dir: PathBuf,
+    baseline_id: String,
+}
+
+#[derive(Debug, Clone)]
+struct InFlightDispatch {
+    schedule_idx: usize,
+    trial_id: String,
+    variant_idx: usize,
+    variant_id: String,
+    worker_id: String,
+    started_at: String,
+}
+
+fn in_flight_active_trials(
+    in_flight: &HashMap<String, InFlightDispatch>,
+) -> Vec<RunControlActiveTrial> {
+    let mut active: Vec<RunControlActiveTrial> = in_flight
+        .values()
+        .map(|item| RunControlActiveTrial {
+            trial_id: item.trial_id.clone(),
+            worker_id: item.worker_id.clone(),
+            schedule_idx: Some(item.schedule_idx),
+            variant_id: Some(item.variant_id.clone()),
+            started_at: Some(item.started_at.clone()),
+            control: None,
+        })
+        .collect();
+    active.sort_by_key(|entry| entry.schedule_idx.unwrap_or(usize::MAX));
+    active
+}
+
+fn decode_parallel_completion_result(
+    completion: &TrialCompletion,
+    in_flight: &InFlightDispatch,
+) -> Result<TrialExecutionResult> {
+    if completion.classification == "trial_execution_result" {
+        let mut result: TrialExecutionResult = serde_json::from_value(completion.artifacts.clone())
+            .map_err(|err| {
+                anyhow!(
+                    "parallel worker completion decode failed for ticket {}: {}",
+                    completion.ticket.ticket_id,
+                    err
+                )
+            })?;
+        if result.trial_id != in_flight.trial_id {
+            return Err(anyhow!(
+                "parallel worker completion trial_id mismatch: expected {}, got {}",
+                in_flight.trial_id,
+                result.trial_id
+            ));
+        }
+        if result.variant_idx.is_none() {
+            result.variant_idx = Some(in_flight.variant_idx);
+        }
+        return Ok(result);
+    }
+    Ok(TrialExecutionResult::worker_lost(
+        in_flight.trial_id.clone(),
+        Some(in_flight.variant_idx),
+        Some(completion.classification.clone()),
+    ))
+}
+
+fn is_worker_backend_capacity_error(err: &anyhow::Error) -> bool {
+    let message = err.to_string();
+    message.starts_with(LOCAL_WORKER_CAPACITY_ERROR_PREFIX) || message.contains("at capacity")
+}
+
+fn submit_dispatch_with_backpressure(
+    backend: &dyn WorkerBackend,
+    dispatch: TrialDispatch,
+) -> Result<Option<WorkerTicket>> {
+    match backend.submit(dispatch) {
+        Ok(ticket) => Ok(Some(ticket)),
+        Err(err) if is_worker_backend_capacity_error(&err) => Ok(None),
+        Err(err) => Err(err),
+    }
+}
+
+fn execute_parallel_worker_trial(
+    context: &ParallelWorkerExecutionContext,
+    dispatch: TrialDispatch,
+) -> Result<TrialCompletion> {
+    let payload_dir = context
+        .run_dir
+        .join("runtime")
+        .join("worker_payload")
+        .join(&dispatch.trial_id);
+    if payload_dir.exists() {
+        fs::remove_dir_all(&payload_dir)?;
+    }
+    ensure_dir(&payload_dir)?;
+    let payload_evidence = payload_dir.join("evidence_records.jsonl");
+    let payload_chain = payload_dir.join("task_chain_states.jsonl");
+
+    let mut local_trial_index = trial_index_from_trial_id(&dispatch.trial_id)
+        .unwrap_or(dispatch.schedule_idx + 1)
+        .saturating_sub(1);
+    let mut local_chain_states: BTreeMap<String, ChainRuntimeState> = BTreeMap::new();
+    let mut buffered_sink = BufferedRunSink::default();
+    let artifact_store = ArtifactStore::new(context.run_dir.join("artifacts"));
+
+    let mut trial_result = TrialExecutor::execute_slot(
+        context.mode,
+        &context.run_dir,
+        &context.run_id,
+        &context.workload_type,
+        &context.project_root,
+        &context.dataset_path,
+        &context.variants,
+        &context.tasks,
+        dispatch.schedule_idx,
+        &dispatch.slot,
+        &context.policy_config,
+        &context.benchmark_config,
+        &context.variant_runtime_profiles,
+        &context.behavior,
+        context.materialize_mode,
+        &context.task_boundary_policy,
+        &context.trials_dir,
+        &context.evidence_dir,
+        &payload_evidence,
+        &payload_chain,
+        &artifact_store,
+        &mut local_trial_index,
+        &mut local_chain_states,
+        &context.baseline_id,
+        &mut buffered_sink,
+    )?;
+    trial_result.variant_idx = Some(dispatch.slot.variant_idx);
+    trial_result.deferred_trial_records = buffered_sink.trial_records;
+    trial_result.deferred_metric_rows = buffered_sink.metric_rows;
+    trial_result.deferred_event_rows = buffered_sink.event_rows;
+    trial_result.deferred_variant_snapshot_rows = buffered_sink.variant_snapshot_rows;
+    trial_result.deferred_evidence_records = load_jsonl_value_rows(&payload_evidence)?;
+    trial_result.deferred_chain_state_records = load_jsonl_value_rows(&payload_chain)?;
+
+    let _ = fs::remove_dir_all(&payload_dir);
+
+    Ok(TrialCompletion {
+        ticket: WorkerTicket {
+            worker_id: String::new(),
+            ticket_id: String::new(),
+            trial_id: dispatch.trial_id.clone(),
+        },
+        schedule_idx: dispatch.schedule_idx,
+        completion_seq: None,
+        terminal_status: trial_result.slot_status.clone(),
+        classification: "trial_execution_result".to_string(),
+        artifacts: serde_json::to_value(trial_result)?,
+        metrics: json!({}),
+        runtime_summary: json!({}),
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_schedule_engine_parallel(
+    mode: ScheduleEngineMode,
+    run_dir: &Path,
+    run_id: &str,
+    workload_type: &str,
+    project_root: &Path,
+    dataset_path: &Path,
+    variants: &[Variant],
+    tasks: &[Value],
+    schedule: &[TrialSlot],
+    policy_config: &PolicyConfig,
+    benchmark_config: &BenchmarkConfig,
+    variant_runtime_profiles: &[VariantRuntimeProfile],
+    behavior: &RunBehavior,
+    materialize_mode: MaterializationMode,
+    task_boundary_policy: &TaskBoundaryPolicy,
+    trials_dir: &Path,
+    evidence_dir: &Path,
+    evidence_records_path: &Path,
+    task_chain_states_path: &Path,
+    schedule_progress: &mut ScheduleProgress,
+    trial_index: &mut usize,
+    consecutive_failures: &mut BTreeMap<usize, usize>,
+    pruned_variants: &mut HashSet<usize>,
+    recovered_active_trials: &[RunControlActiveTrial],
+    baseline_id: &str,
+    run_sink: &mut dyn RunSink,
+    max_concurrency: usize,
+    remote_endpoint: Option<&str>,
+    remote_token_env: Option<&str>,
+) -> Result<()> {
+    let any_remote_executor = variant_runtime_profiles
+        .iter()
+        .any(|profile| matches!(profile.executor_kind, ExecutorKind::Remote));
+    let all_remote_executor = any_remote_executor
+        && variant_runtime_profiles
+            .iter()
+            .all(|profile| matches!(profile.executor_kind, ExecutorKind::Remote));
+    if any_remote_executor && !all_remote_executor {
+        return Err(anyhow!(
+            "parallel worker engine does not support mixed local and remote executor kinds in one run"
+        ));
+    }
+    let requested_dispatch_capacity = max_concurrency.max(1);
+    let mut dispatch_capacity = requested_dispatch_capacity;
+    let backend: Box<dyn WorkerBackend> = if all_remote_executor {
+        let endpoint = remote_endpoint
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| anyhow!("remote executor requires --remote-endpoint"))?;
+        let bearer_token = resolve_remote_bearer_token(remote_token_env)?;
+        let protocol = Arc::new(HttpRemoteWorkerProtocol::new(endpoint, bearer_token)?);
+        Box::new(RemoteWorkerBackend::new(protocol)?)
+    } else {
+        let worker_context = Arc::new(ParallelWorkerExecutionContext {
+            mode,
+            run_dir: run_dir.to_path_buf(),
+            run_id: run_id.to_string(),
+            workload_type: workload_type.to_string(),
+            project_root: project_root.to_path_buf(),
+            dataset_path: dataset_path.to_path_buf(),
+            variants: variants.to_vec(),
+            tasks: tasks.to_vec(),
+            policy_config: policy_config.clone(),
+            benchmark_config: benchmark_config.clone(),
+            variant_runtime_profiles: variant_runtime_profiles.to_vec(),
+            behavior: behavior.clone(),
+            materialize_mode,
+            task_boundary_policy: task_boundary_policy.clone(),
+            trials_dir: trials_dir.to_path_buf(),
+            evidence_dir: evidence_dir.to_path_buf(),
+            baseline_id: baseline_id.to_string(),
+        });
+        let executor_context = worker_context.clone();
+        let executor: Arc<LocalTrialExecutor> = Arc::new(move |dispatch: TrialDispatch| {
+            execute_parallel_worker_trial(executor_context.as_ref(), dispatch)
+        });
+        let local_backend = LocalThreadWorkerBackend::new(requested_dispatch_capacity, executor)?;
+        if let Some(warning) = local_backend.capacity_warning() {
+            eprintln!("{}", warning);
+        }
+        dispatch_capacity = local_backend.effective_max_in_flight();
+        Box::new(local_backend)
+    };
+
+    let mut committer = DeterministicCommitter::from_progress(schedule_progress);
+    if !recovered_active_trials.is_empty() {
+        let mut variant_idx_by_id: HashMap<String, usize> = HashMap::new();
+        for (idx, variant) in variants.iter().enumerate() {
+            variant_idx_by_id.insert(variant.id.clone(), idx);
+        }
+        for recovered in recovered_active_trials {
+            let Some(schedule_idx) = recovered.schedule_idx else {
+                continue;
+            };
+            if schedule_idx < schedule_progress.next_schedule_index
+                || schedule_idx >= schedule.len()
+            {
+                continue;
+            }
+            let variant_idx = recovered
+                .variant_id
+                .as_ref()
+                .and_then(|id| variant_idx_by_id.get(id).copied());
+            let result = TrialExecutionResult::worker_lost(
+                recovered.trial_id.clone(),
+                variant_idx,
+                Some("worker_lost".to_string()),
+            );
+            committer.enqueue_trial(schedule_idx, result)?;
+        }
+    }
+
+    let mut next_dispatch_idx = schedule_progress.next_schedule_index;
+    let mut in_flight: HashMap<String, InFlightDispatch> = HashMap::new();
+    let mut in_flight_by_variant: BTreeMap<usize, usize> = BTreeMap::new();
+
+    committer.drain_ready(
+        run_dir,
+        policy_config,
+        evidence_records_path,
+        task_chain_states_path,
+        schedule_progress,
+        *trial_index,
+        pruned_variants,
+        consecutive_failures,
+        run_sink,
+    )?;
+    write_run_control_v2(
+        run_dir,
+        run_id,
+        "running",
+        &in_flight_active_trials(&in_flight),
+        None,
+    )?;
+
+    while committer.next_commit_idx < schedule.len() || !in_flight.is_empty() {
+        let mut made_progress = false;
+        let mut dispatch_backpressured = false;
+
+        while next_dispatch_idx < schedule.len() && in_flight.len() < dispatch_capacity {
+            let slot = &schedule[next_dispatch_idx];
+            if pruned_variants.contains(&slot.variant_idx) {
+                committer.enqueue_skipped(next_dispatch_idx)?;
+                next_dispatch_idx += 1;
+                made_progress = true;
+                continue;
+            }
+            if let Some(limit) = policy_config.concurrency.max_in_flight_per_variant {
+                let variant_in_flight = in_flight_by_variant
+                    .get(&slot.variant_idx)
+                    .copied()
+                    .unwrap_or(0);
+                if variant_in_flight >= limit {
+                    break;
+                }
+            }
+
+            let proposed_trial_index = trial_index.saturating_add(1);
+            let trial_id = format!("trial_{}", proposed_trial_index);
+            let variant = &variants[slot.variant_idx];
+            let task_boundary = parse_task_boundary_from_dataset_task(&tasks[slot.task_idx])?;
+            let task_id = task_boundary
+                .task_payload
+                .get("id")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| format!("task_{}", slot.task_idx));
+            let dispatch = TrialDispatch {
+                run_id: run_id.to_string(),
+                trial_id: trial_id.clone(),
+                schedule_idx: next_dispatch_idx,
+                slot: slot.clone(),
+                variant_id: variant.id.clone(),
+                task_id,
+                repl_idx: slot.repl_idx,
+                runtime_profile: json!({}),
+                task_payload: task_boundary.task_payload,
+                effective_policy: json!({}),
+            };
+            let Some(ticket) = submit_dispatch_with_backpressure(backend.as_ref(), dispatch)?
+            else {
+                dispatch_backpressured = true;
+                break;
+            };
+            *trial_index = proposed_trial_index;
+            let started_at = Utc::now().to_rfc3339();
+            in_flight.insert(
+                ticket.ticket_id.clone(),
+                InFlightDispatch {
+                    schedule_idx: next_dispatch_idx,
+                    trial_id: trial_id.clone(),
+                    variant_idx: slot.variant_idx,
+                    variant_id: variant.id.clone(),
+                    worker_id: ticket.worker_id.clone(),
+                    started_at,
+                },
+            );
+            *in_flight_by_variant.entry(slot.variant_idx).or_default() += 1;
+            next_dispatch_idx += 1;
+            made_progress = true;
+            write_run_control_v2(
+                run_dir,
+                run_id,
+                "running",
+                &in_flight_active_trials(&in_flight),
+                None,
+            )?;
+        }
+
+        if dispatch_backpressured && in_flight.is_empty() {
+            return Err(anyhow!(
+                "parallel coordinator protocol fault: backend reported capacity with no active tickets"
+            ));
+        }
+
+        let committed = committer.drain_ready(
+            run_dir,
+            policy_config,
+            evidence_records_path,
+            task_chain_states_path,
+            schedule_progress,
+            *trial_index,
+            pruned_variants,
+            consecutive_failures,
+            run_sink,
+        )?;
+        if committed > 0 {
+            made_progress = true;
+        }
+
+        if committer.next_commit_idx >= schedule.len() && in_flight.is_empty() {
+            break;
+        }
+
+        let poll_timeout = if made_progress {
+            Duration::from_millis(0)
+        } else {
+            Duration::from_millis(50)
+        };
+        let completions = backend.poll_completions(poll_timeout)?;
+        if completions.is_empty() {
+            continue;
+        }
+
+        for completion in completions {
+            let in_flight_entry = in_flight
+                .remove(completion.ticket.ticket_id.as_str())
+                .ok_or_else(|| {
+                    anyhow!(
+                        "parallel coordinator protocol fault: completion for unknown ticket {}",
+                        completion.ticket.ticket_id
+                    )
+                })?;
+            if completion.schedule_idx != in_flight_entry.schedule_idx {
+                return Err(anyhow!(
+                    "parallel coordinator protocol fault: completion schedule_idx {} did not match dispatched schedule_idx {}",
+                    completion.schedule_idx,
+                    in_flight_entry.schedule_idx
+                ));
+            }
+            if let Some(count) = in_flight_by_variant.get_mut(&in_flight_entry.variant_idx) {
+                if *count > 0 {
+                    *count -= 1;
+                }
+                if *count == 0 {
+                    in_flight_by_variant.remove(&in_flight_entry.variant_idx);
+                }
+            }
+            let trial_result = decode_parallel_completion_result(&completion, &in_flight_entry)?;
+            committer.enqueue_trial(in_flight_entry.schedule_idx, trial_result)?;
+        }
+
+        write_run_control_v2(
+            run_dir,
+            run_id,
+            "running",
+            &in_flight_active_trials(&in_flight),
+            None,
+        )?;
+        committer.drain_ready(
+            run_dir,
+            policy_config,
+            evidence_records_path,
+            task_chain_states_path,
+            schedule_progress,
+            *trial_index,
+            pruned_variants,
+            consecutive_failures,
+            run_sink,
+        )?;
+    }
+
+    committer.drain_ready(
+        run_dir,
+        policy_config,
+        evidence_records_path,
+        task_chain_states_path,
+        schedule_progress,
+        *trial_index,
+        pruned_variants,
+        consecutive_failures,
+        run_sink,
+    )?;
+    write_run_control_v2(
+        run_dir,
+        run_id,
+        "running",
+        &in_flight_active_trials(&in_flight),
+        None,
+    )?;
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn execute_schedule_engine(
+    mode: ScheduleEngineMode,
+    run_dir: &Path,
+    run_id: &str,
+    workload_type: &str,
+    project_root: &Path,
+    dataset_path: &Path,
+    variants: &[Variant],
+    tasks: &[Value],
+    schedule: &[TrialSlot],
+    policy_config: &PolicyConfig,
+    benchmark_config: &BenchmarkConfig,
+    variant_runtime_profiles: &[VariantRuntimeProfile],
+    behavior: &RunBehavior,
+    materialize_mode: MaterializationMode,
+    task_boundary_policy: &TaskBoundaryPolicy,
+    trials_dir: &Path,
+    evidence_dir: &Path,
+    evidence_records_path: &Path,
+    task_chain_states_path: &Path,
+    schedule_progress: &mut ScheduleProgress,
+    trial_index: &mut usize,
+    consecutive_failures: &mut BTreeMap<usize, usize>,
+    pruned_variants: &mut HashSet<usize>,
+    recovered_active_trials: &[RunControlActiveTrial],
+    baseline_id: &str,
+    run_sink: &mut dyn RunSink,
+    max_concurrency: usize,
+    remote_endpoint: Option<&str>,
+    remote_token_env: Option<&str>,
+) -> Result<()> {
+    if !matches!(policy_config.state, StatePolicy::IsolatePerTrial) {
+        return Err(anyhow!(
+            "parallel worker hard cutover supports only isolate_per_trial state policy; got {:?}",
+            policy_config.state
+        ));
+    }
+    execute_schedule_engine_parallel(
+        mode,
+        run_dir,
+        run_id,
+        workload_type,
+        project_root,
+        dataset_path,
+        variants,
+        tasks,
+        schedule,
+        policy_config,
+        benchmark_config,
+        variant_runtime_profiles,
+        behavior,
+        materialize_mode,
+        task_boundary_policy,
+        trials_dir,
+        evidence_dir,
+        evidence_records_path,
+        task_chain_states_path,
+        schedule_progress,
+        trial_index,
+        consecutive_failures,
+        pruned_variants,
+        recovered_active_trials,
+        baseline_id,
+        run_sink,
+        max_concurrency,
+        remote_endpoint,
+        remote_token_env,
+    )
 }
 
 fn run_experiment_with_behavior(
@@ -3005,31 +5702,15 @@ fn run_experiment_with_behavior(
         json_value = apply_experiment_overrides(json_value, overrides_path, &project_root)?;
     }
     validate_required_fields(&json_value)?;
-    let workload_type = json_value
-        .pointer("/experiment/workload_type")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| anyhow!("missing /experiment/workload_type"))?
-        .to_string();
+    let workload_type = experiment_workload_type(&json_value)?;
 
     let execution = normalize_execution_options(&execution);
     let materialize_mode = execution.materialize.unwrap_or(MaterializationMode::Full);
-    if matches!(execution.executor, Some(ExecutorKind::Remote)) {
-        let endpoint = execution
-            .remote_endpoint
-            .as_deref()
-            .ok_or_else(|| anyhow!("remote executor requires --remote-endpoint"))?;
-        let token_env = execution.remote_token_env.as_deref().unwrap_or("unset");
-        return Err(anyhow!(
-            "remote executor is not implemented yet (endpoint: {}, token_env: {})",
-            endpoint,
-            token_env
-        ));
-    }
 
     let run_id = format!("run_{}", Utc::now().format("%Y%m%d_%H%M%S"));
     let run_dir = project_root.join(".lab").join("runs").join(&run_id);
     ensure_dir(&run_dir)?;
-    write_run_control(&run_dir, &run_id, "running", None, None)?;
+    write_run_control_v2(&run_dir, &run_id, "running", &[], None)?;
     write_run_session_state(&run_dir, &run_id, &behavior, &execution)?;
     let mut run_guard = RunControlGuard::new(&run_dir, &run_id);
 
@@ -3053,6 +5734,7 @@ fn run_experiment_with_behavior(
     let tasks = load_tasks(&dataset_path, &json_value)?;
 
     let (variants, baseline_id) = resolve_variant_plan(&json_value)?;
+    write_resolved_variants(&run_dir, &baseline_id, &variants)?;
     let replications = json_value
         .pointer("/design/replications")
         .and_then(|v| v.as_u64())
@@ -3061,14 +5743,10 @@ fn run_experiment_with_behavior(
     let trials_dir = run_dir.join("trials");
     ensure_dir(&trials_dir)?;
 
-    let analysis_dir = run_dir.join("analysis");
-    ensure_dir(&analysis_dir)?;
-
     let evidence_dir = run_dir.join("evidence");
     ensure_dir(&evidence_dir)?;
     let evidence_records_path = evidence_dir.join("evidence_records.jsonl");
     let task_chain_states_path = evidence_dir.join("task_chain_states.jsonl");
-    let artifact_store = ArtifactStore::new(run_dir.join("artifacts"));
     let benchmark_config = parse_benchmark_config(&json_value);
     let mut variant_runtime_profiles = Vec::with_capacity(variants.len());
     for variant in &variants {
@@ -3089,15 +5767,19 @@ fn run_experiment_with_behavior(
         .iter()
         .all(|profile| profile.container_mode);
 
-    let mut trial_summaries = Vec::new();
-    let mut event_counts: BTreeMap<String, BTreeMap<String, usize>> = BTreeMap::new();
-    let mut trial_event_counts: BTreeMap<String, BTreeMap<String, usize>> = BTreeMap::new();
+    let mut run_sink = JsonlRunSink::new(&run_dir)?;
+    run_sink.write_run_manifest(&RunManifestRecord {
+        schema_version: "run_manifest_v1".to_string(),
+        run_id: run_id.clone(),
+        created_at: Utc::now().to_rfc3339(),
+        workload_type: workload_type.clone(),
+        baseline_id: baseline_id.clone(),
+        variant_ids: variants.iter().map(|variant| variant.id.clone()).collect(),
+    })?;
 
     let policy_config = parse_policies(&json_value);
-    let random_seed = json_value
-        .pointer("/design/random_seed")
-        .and_then(|v| v.as_u64())
-        .unwrap_or(1);
+    let max_concurrency = experiment_max_concurrency(&json_value);
+    let random_seed = experiment_random_seed(&json_value);
     let schedule = build_trial_schedule(
         variants.len(),
         tasks.len(),
@@ -3105,11 +5787,11 @@ fn run_experiment_with_behavior(
         policy_config.scheduling,
         random_seed,
     );
+    write_resolved_schedule(&run_dir, &schedule)?;
 
     // Per-variant consecutive failure tracking (for pruning)
     let mut consecutive_failures: BTreeMap<usize, usize> = BTreeMap::new();
     let mut pruned_variants: HashSet<usize> = HashSet::new();
-    let mut chain_states: BTreeMap<String, ChainRuntimeState> = BTreeMap::new();
 
     let mut schedule_progress = ScheduleProgress {
         schema_version: "schedule_progress_v1".to_string(),
@@ -3147,21 +5829,23 @@ fn run_experiment_with_behavior(
         &evidence_dir,
         &evidence_records_path,
         &task_chain_states_path,
-        &artifact_store,
         &mut schedule_progress,
         &mut trial_index,
         &mut consecutive_failures,
         &mut pruned_variants,
-        &mut chain_states,
-        &mut trial_summaries,
-        &mut event_counts,
-        &mut trial_event_counts,
+        &[],
+        &baseline_id,
+        &mut run_sink,
+        max_concurrency,
+        execution.remote_endpoint.as_deref(),
+        execution.remote_token_env.as_deref(),
     )?;
+    run_sink.flush()?;
     validate_jsonl_against_schema("evidence_record_v1.jsonschema", &evidence_records_path)?;
     validate_jsonl_against_schema("task_chain_state_v1.jsonschema", &task_chain_states_path)?;
 
     if let Some(adapter) = benchmark_config.adapter.as_ref() {
-        let scores_path = process_benchmark_outputs(
+        let _scores_path = process_benchmark_outputs(
             &project_root,
             &run_dir,
             &run_id,
@@ -3169,16 +5853,7 @@ fn run_experiment_with_behavior(
             &evidence_records_path,
             &task_chain_states_path,
         )?;
-        apply_score_records_to_trial_summaries(&mut trial_summaries, &scores_path)?;
     }
-
-    write_analysis(
-        &analysis_dir,
-        &trial_summaries,
-        &baseline_id,
-        &event_counts,
-        &trial_event_counts,
-    )?;
 
     let grades = json!({
         "schema_version": "grades_v1",
@@ -3268,11 +5943,7 @@ pub fn describe_experiment_with_overrides(
         .and_then(|v| v.as_str())
         .unwrap_or("exp")
         .to_string();
-    let workload_type = json_value
-        .pointer("/experiment/workload_type")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| anyhow!("missing /experiment/workload_type"))?
-        .to_string();
+    let workload_type = experiment_workload_type(&json_value)?;
 
     let policy_config = parse_policies(&json_value);
     let comparison = json_value
@@ -3407,6 +6078,21 @@ impl Default for TaskBoundaryPolicy {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ConcurrencyPolicyConfig {
+    max_in_flight_per_variant: Option<usize>,
+    require_chain_lease: bool,
+}
+
+impl Default for ConcurrencyPolicyConfig {
+    fn default() -> Self {
+        Self {
+            max_in_flight_per_variant: None,
+            require_chain_lease: true,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct PolicyConfig {
     scheduling: SchedulingPolicy,
@@ -3415,6 +6101,7 @@ struct PolicyConfig {
     retry_on: Vec<String>,
     pruning_max_consecutive_failures: Option<usize>,
     task_boundary: TaskBoundaryPolicy,
+    concurrency: ConcurrencyPolicyConfig,
 }
 
 impl Default for PolicyConfig {
@@ -3426,6 +6113,7 @@ impl Default for PolicyConfig {
             retry_on: vec![],
             pruning_max_consecutive_failures: None,
             task_boundary: TaskBoundaryPolicy::default(),
+            concurrency: ConcurrencyPolicyConfig::default(),
         }
     }
 }
@@ -3464,6 +6152,14 @@ fn parse_policies(json_value: &Value) -> PolicyConfig {
         .pointer("/task_boundary/require_workspace_materialization")
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
+    let max_in_flight_per_variant = p
+        .pointer("/concurrency/max_in_flight_per_variant")
+        .and_then(|v| v.as_u64())
+        .map(|v| v as usize);
+    let require_chain_lease = p
+        .pointer("/concurrency/require_chain_lease")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
 
     PolicyConfig {
         scheduling,
@@ -3473,6 +6169,10 @@ fn parse_policies(json_value: &Value) -> PolicyConfig {
         pruning_max_consecutive_failures,
         task_boundary: TaskBoundaryPolicy {
             require_workspace_materialization,
+        },
+        concurrency: ConcurrencyPolicyConfig {
+            max_in_flight_per_variant,
+            require_chain_lease,
         },
     }
 }
@@ -3725,15 +6425,6 @@ fn validate_jsonl_against_schema(schema_name: &str, path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn outcome_from_verdict(verdict: &str) -> &'static str {
-    match verdict {
-        "pass" => "success",
-        "missing" => "missing",
-        "error" => "error",
-        _ => "failure",
-    }
-}
-
 fn build_benchmark_summary(run_id: &str, manifest: &Value, score_rows: &[Value]) -> Result<Value> {
     let (adapter_id, name, version, split) = benchmark_identity_from_manifest(manifest)?;
     let evaluator = manifest
@@ -3934,63 +6625,6 @@ fn process_benchmark_outputs(
     Ok(scores_path)
 }
 
-fn apply_score_records_to_trial_summaries(
-    trial_summaries: &mut [Value],
-    scores_path: &Path,
-) -> Result<()> {
-    if !scores_path.exists() {
-        return Ok(());
-    }
-    let scores = read_jsonl_records(scores_path)?;
-    if scores.is_empty() {
-        return Ok(());
-    }
-    let mut by_trial: BTreeMap<String, &Value> = BTreeMap::new();
-    for score in &scores {
-        if let Some(trial_id) = score
-            .pointer("/ids/trial_id")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string())
-        {
-            by_trial.insert(trial_id, score);
-        }
-    }
-
-    for summary in trial_summaries.iter_mut() {
-        let trial_id = summary
-            .pointer("/trial_id")
-            .and_then(|v| v.as_str())
-            .unwrap_or("");
-        let Some(score) = by_trial.get(trial_id) else {
-            continue;
-        };
-        let verdict = score
-            .pointer("/verdict")
-            .and_then(|v| v.as_str())
-            .unwrap_or("error");
-        let mapped_outcome = outcome_from_verdict(verdict);
-        if let Some(obj) = summary.as_object_mut() {
-            obj.insert("outcome".to_string(), json!(mapped_outcome));
-            obj.insert("success".to_string(), json!(verdict == "pass"));
-            if let Some(name) = score
-                .pointer("/primary_metric_name")
-                .and_then(|v| v.as_str())
-            {
-                obj.insert("primary_metric_name".to_string(), json!(name));
-            }
-            if let Some(value) = score.pointer("/primary_metric_value") {
-                obj.insert("primary_metric_value".to_string(), value.clone());
-            }
-            let mut metrics = obj.get("metrics").cloned().unwrap_or_else(|| json!({}));
-            if let Some(metrics_obj) = metrics.as_object_mut() {
-                metrics_obj.insert("benchmark_verdict".to_string(), json!(verdict));
-            }
-            obj.insert("metrics".to_string(), metrics);
-        }
-    }
-    Ok(())
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 struct TrialSlot {
     variant_idx: usize,
@@ -4096,6 +6730,92 @@ fn write_schedule_progress(run_dir: &Path, progress: &ScheduleProgress) -> Resul
     atomic_write_json_pretty(&schedule_progress_path(run_dir), &value)
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ResolvedVariantsManifest {
+    schema_version: String,
+    generated_at: String,
+    baseline_id: String,
+    variants: Vec<Variant>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct ResolvedScheduleManifest {
+    schema_version: String,
+    generated_at: String,
+    total_slots: usize,
+    schedule: Vec<TrialSlot>,
+}
+
+fn resolved_variants_path(run_dir: &Path) -> PathBuf {
+    run_dir.join("resolved_variants.json")
+}
+
+fn resolved_schedule_path(run_dir: &Path) -> PathBuf {
+    run_dir.join("resolved_schedule.json")
+}
+
+fn write_resolved_variants(run_dir: &Path, baseline_id: &str, variants: &[Variant]) -> Result<()> {
+    let manifest = ResolvedVariantsManifest {
+        schema_version: "resolved_variants_v1".to_string(),
+        generated_at: Utc::now().to_rfc3339(),
+        baseline_id: baseline_id.to_string(),
+        variants: variants.to_vec(),
+    };
+    let value = serde_json::to_value(&manifest)?;
+    atomic_write_json_pretty(&resolved_variants_path(run_dir), &value)?;
+    let digest = canonical_json_digest(&value);
+    atomic_write_bytes(&run_dir.join("resolved_variants.digest"), digest.as_bytes())?;
+    Ok(())
+}
+
+fn write_resolved_schedule(run_dir: &Path, schedule: &[TrialSlot]) -> Result<()> {
+    let manifest = ResolvedScheduleManifest {
+        schema_version: "resolved_schedule_v1".to_string(),
+        generated_at: Utc::now().to_rfc3339(),
+        total_slots: schedule.len(),
+        schedule: schedule.to_vec(),
+    };
+    let value = serde_json::to_value(&manifest)?;
+    atomic_write_json_pretty(&resolved_schedule_path(run_dir), &value)?;
+    let digest = canonical_json_digest(&value);
+    atomic_write_bytes(&run_dir.join("resolved_schedule.digest"), digest.as_bytes())?;
+    Ok(())
+}
+
+fn load_run_variants(run_dir: &Path, experiment: &Value) -> Result<(Vec<Variant>, String)> {
+    let manifest_path = resolved_variants_path(run_dir);
+    if !manifest_path.exists() {
+        return resolve_variant_plan(experiment);
+    }
+
+    let manifest: ResolvedVariantsManifest = serde_json::from_slice(&fs::read(&manifest_path)?)?;
+    if manifest.schema_version != "resolved_variants_v1" {
+        return Err(anyhow!(
+            "unsupported resolved variants schema_version in {}: {}",
+            manifest_path.display(),
+            manifest.schema_version
+        ));
+    }
+    if manifest.variants.is_empty() {
+        return Err(anyhow!(
+            "resolved variants manifest has no variants: {}",
+            manifest_path.display()
+        ));
+    }
+    if !manifest
+        .variants
+        .iter()
+        .any(|variant| variant.id == manifest.baseline_id)
+    {
+        return Err(anyhow!(
+            "resolved variants manifest baseline '{}' not found in variants: {}",
+            manifest.baseline_id,
+            manifest_path.display()
+        ));
+    }
+    Ok((manifest.variants, manifest.baseline_id))
+}
+
 fn should_retry_outcome(outcome: &str, exit_status: &str, retry_on: &[String]) -> bool {
     if retry_on.is_empty() {
         // When retry_on is unspecified, retry on any non-success
@@ -4114,11 +6834,30 @@ fn should_retry_outcome(outcome: &str, exit_status: &str, retry_on: &[String]) -
 
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct Variant {
     id: String,
     bindings: Value,
+    args: Vec<String>,
+    env: BTreeMap<String, String>,
+    image: Option<String>,
     runtime_overrides: Option<Value>,
+}
+
+fn variant_bindings_for_summary(variant: &Variant) -> Value {
+    if !variant.args.is_empty() || !variant.env.is_empty() || variant.image.is_some() {
+        return json!({
+            "args": variant.args,
+            "env": variant.env,
+            "image": variant.image,
+        });
+    }
+    variant.bindings.clone()
+}
+
+fn variant_digest(variant: &Variant) -> Result<String> {
+    let value = serde_json::to_value(variant)?;
+    Ok(canonical_json_digest(&value))
 }
 
 fn resolve_variant_plan(json_value: &Value) -> Result<(Vec<Variant>, String)> {
@@ -4127,37 +6866,62 @@ fn resolve_variant_plan(json_value: &Value) -> Result<(Vec<Variant>, String)> {
         .and_then(|v| v.as_str())
         .ok_or_else(|| anyhow!("missing /baseline/variant_id"))?
         .to_string();
-    let baseline_bindings = json_value
-        .pointer("/baseline/bindings")
-        .cloned()
-        .unwrap_or(json!({}));
-    if !baseline_bindings.is_object() {
-        return Err(anyhow!("invalid /baseline/bindings: expected object"));
-    }
-    let mut baseline_runtime_overrides = match json_value.pointer("/baseline/runtime_overrides") {
-        None | Some(Value::Null) => None,
-        Some(Value::Object(_)) => json_value.pointer("/baseline/runtime_overrides").cloned(),
-        Some(_) => return Err(anyhow!("/baseline/runtime_overrides must be an object")),
-    };
-    if let Some(image) =
-        parse_optional_nonempty_string(json_value.pointer("/baseline/image"), "/baseline/image")?
-    {
-        let mut overrides = baseline_runtime_overrides.unwrap_or_else(|| json!({}));
-        set_json_pointer_value(&mut overrides, "/agent/image", json!(image))?;
-        baseline_runtime_overrides = Some(overrides);
-    }
-
-    let mut variants = Vec::new();
-    variants.push(Variant {
-        id: baseline.clone(),
-        bindings: baseline_bindings,
-        runtime_overrides: baseline_runtime_overrides,
-    });
-
     if json_value.get("variants").is_some() {
         return Err(anyhow!(
             "/variants is not supported; use /variant_plan for experiment variant plans"
         ));
+    }
+
+    let clean_contract = is_clean_contract_experiment(json_value);
+
+    let mut variants = Vec::new();
+    if clean_contract {
+        let baseline_args =
+            parse_string_array_field(json_value.pointer("/baseline/args"), "/baseline/args")?;
+        let baseline_env =
+            parse_string_map_field(json_value.pointer("/baseline/env"), "/baseline/env")?;
+        let baseline_image = parse_optional_nonempty_string(
+            json_value.pointer("/baseline/image"),
+            "/baseline/image",
+        )?;
+        variants.push(Variant {
+            id: baseline.clone(),
+            bindings: json!({}),
+            args: baseline_args,
+            env: baseline_env,
+            image: baseline_image,
+            runtime_overrides: None,
+        });
+    } else {
+        let baseline_bindings = json_value
+            .pointer("/baseline/bindings")
+            .cloned()
+            .unwrap_or(json!({}));
+        if !baseline_bindings.is_object() {
+            return Err(anyhow!("invalid /baseline/bindings: expected object"));
+        }
+        let mut baseline_runtime_overrides = match json_value.pointer("/baseline/runtime_overrides")
+        {
+            None | Some(Value::Null) => None,
+            Some(Value::Object(_)) => json_value.pointer("/baseline/runtime_overrides").cloned(),
+            Some(_) => return Err(anyhow!("/baseline/runtime_overrides must be an object")),
+        };
+        if let Some(image) = parse_optional_nonempty_string(
+            json_value.pointer("/baseline/image"),
+            "/baseline/image",
+        )? {
+            let mut overrides = baseline_runtime_overrides.unwrap_or_else(|| json!({}));
+            set_json_pointer_value(&mut overrides, "/agent/image", json!(image))?;
+            baseline_runtime_overrides = Some(overrides);
+        }
+        variants.push(Variant {
+            id: baseline.clone(),
+            bindings: baseline_bindings,
+            args: Vec::new(),
+            env: BTreeMap::new(),
+            image: None,
+            runtime_overrides: baseline_runtime_overrides,
+        });
     }
 
     let variant_list: &[Value] = match json_value.pointer("/variant_plan") {
@@ -4179,33 +6943,57 @@ fn resolve_variant_plan(json_value: &Value) -> Result<(Vec<Variant>, String)> {
                 )
             })?
             .to_string();
-        let bindings = item.get("bindings").cloned().unwrap_or(json!({}));
-        if !bindings.is_object() {
-            return Err(anyhow!("/variant_plan[{}].bindings must be an object", idx));
-        }
-        let mut runtime_overrides = match item.get("runtime_overrides") {
-            None | Some(Value::Null) => None,
-            Some(Value::Object(_)) => item.get("runtime_overrides").cloned(),
-            Some(_) => {
-                return Err(anyhow!(
-                    "/variant_plan[{}].runtime_overrides must be an object",
-                    idx
-                ))
+        if clean_contract {
+            let args = parse_string_array_field(
+                item.get("args"),
+                &format!("/variant_plan[{}].args", idx),
+            )?;
+            let env =
+                parse_string_map_field(item.get("env"), &format!("/variant_plan[{}].env", idx))?;
+            let image = parse_optional_nonempty_string(
+                item.get("image"),
+                &format!("/variant_plan[{}].image", idx),
+            )?;
+            variants.push(Variant {
+                id,
+                bindings: json!({}),
+                args,
+                env,
+                image,
+                runtime_overrides: None,
+            });
+        } else {
+            let bindings = item.get("bindings").cloned().unwrap_or(json!({}));
+            if !bindings.is_object() {
+                return Err(anyhow!("/variant_plan[{}].bindings must be an object", idx));
             }
-        };
-        if let Some(image) = parse_optional_nonempty_string(
-            item.get("image"),
-            &format!("/variant_plan[{}].image", idx),
-        )? {
-            let mut overrides = runtime_overrides.unwrap_or_else(|| json!({}));
-            set_json_pointer_value(&mut overrides, "/agent/image", json!(image))?;
-            runtime_overrides = Some(overrides);
+            let mut runtime_overrides = match item.get("runtime_overrides") {
+                None | Some(Value::Null) => None,
+                Some(Value::Object(_)) => item.get("runtime_overrides").cloned(),
+                Some(_) => {
+                    return Err(anyhow!(
+                        "/variant_plan[{}].runtime_overrides must be an object",
+                        idx
+                    ))
+                }
+            };
+            if let Some(image) = parse_optional_nonempty_string(
+                item.get("image"),
+                &format!("/variant_plan[{}].image", idx),
+            )? {
+                let mut overrides = runtime_overrides.unwrap_or_else(|| json!({}));
+                set_json_pointer_value(&mut overrides, "/agent/image", json!(image))?;
+                runtime_overrides = Some(overrides);
+            }
+            variants.push(Variant {
+                id,
+                bindings,
+                args: Vec::new(),
+                env: BTreeMap::new(),
+                image: None,
+                runtime_overrides,
+            });
         }
-        variants.push(Variant {
-            id,
-            bindings,
-            runtime_overrides,
-        });
     }
     Ok((variants, baseline))
 }
@@ -4228,6 +7016,14 @@ fn merge_json_value(base: &mut Value, patch: &Value) {
 }
 
 fn resolve_runtime_for_variant(experiment: &Value, variant: &Variant) -> Result<Value> {
+    if is_clean_contract_experiment(experiment) {
+        let mut resolved = experiment.clone();
+        if let Some(image) = variant.image.as_ref() {
+            set_json_pointer_value(&mut resolved, "/runtime/image", json!(image))?;
+        }
+        return Ok(resolved);
+    }
+
     let mut resolved = experiment.clone();
     let Some(runtime_overrides) = variant.runtime_overrides.as_ref() else {
         return Ok(resolved);
@@ -4660,22 +7456,38 @@ fn parse_task_boundary_from_dataset_task(task: &Value) -> Result<TaskBoundaryMat
 }
 
 fn parse_task_boundary_from_trial_input(input: &Value) -> Result<TaskBoundaryMaterialization> {
-    let task_payload = input
-        .pointer("/task")
-        .cloned()
-        .ok_or_else(|| anyhow!("trial_input missing required /task"))?;
-    if !task_payload.is_object() {
-        return Err(anyhow!("trial_input /task must be an object"));
-    }
+    if let Some(task_payload) = input.pointer("/task").cloned() {
+        if !task_payload.is_object() {
+            return Err(anyhow!("trial_input /task must be an object"));
+        }
 
-    if let Some(ext) = input.pointer("/ext/task_boundary_v1") {
-        parse_task_boundary_ext(ext, task_payload)
-    } else if task_payload.get("schema_version").and_then(|v| v.as_str())
-        == Some(TASK_BOUNDARY_V1_SCHEMA_VERSION)
-    {
-        parse_task_boundary_from_dataset_task(&task_payload)
+        if let Some(ext) = input.pointer("/ext/task_boundary_v1") {
+            parse_task_boundary_ext(ext, task_payload)
+        } else if task_payload.get("schema_version").and_then(|v| v.as_str())
+            == Some(TASK_BOUNDARY_V1_SCHEMA_VERSION)
+        {
+            parse_task_boundary_from_dataset_task(&task_payload)
+        } else {
+            Ok(default_task_boundary(task_payload))
+        }
+    } else if input.is_object() {
+        let looks_like_legacy_envelope = input.get("ids").is_some()
+            || input.get("bindings").is_some()
+            || input.get("dependencies").is_some()
+            || input.get("policy").is_some()
+            || input.get("runtime").is_some();
+        if looks_like_legacy_envelope {
+            return Err(anyhow!("trial_input missing required /task"));
+        }
+        if input.get("schema_version").and_then(|v| v.as_str())
+            == Some(TASK_BOUNDARY_V1_SCHEMA_VERSION)
+        {
+            parse_task_boundary_from_dataset_task(input)
+        } else {
+            Ok(default_task_boundary(input.clone()))
+        }
     } else {
-        Ok(default_task_boundary(task_payload))
+        Err(anyhow!("trial_input missing required /task"))
     }
 }
 
@@ -5037,14 +7849,6 @@ struct DependencyFileStagingSpec {
     read_only: bool,
 }
 
-#[derive(Clone, Debug, Deserialize)]
-struct AgentRuntimeManifest {
-    image: String,
-    entrypoint: Vec<String>,
-    #[serde(default)]
-    default_env: BTreeMap<String, String>,
-}
-
 #[derive(Clone)]
 struct AgentRuntimeIoConfig {
     input_arg: String,
@@ -5057,6 +7861,7 @@ struct AgentRuntimeConfig {
     command_raw: Vec<String>,
     container_image: Option<String>,
     io: AgentRuntimeIoConfig,
+    clean_contract_v1: bool,
     integration_level: String,
     launch_mode: AgentLaunchMode,
     env: BTreeMap<String, String>,
@@ -5169,66 +7974,6 @@ fn parse_command_field(value: Option<&Value>, field: &str) -> Result<Option<Vec<
     }
 }
 
-fn parse_command_aliases_field(
-    value: Option<&Value>,
-    field: &str,
-) -> Result<BTreeMap<String, Vec<String>>> {
-    match value {
-        None => Ok(BTreeMap::new()),
-        Some(Value::Object(map)) => {
-            let mut parsed = BTreeMap::new();
-            for (alias, target_value) in map {
-                let alias_trimmed = alias.trim();
-                if alias_trimmed.is_empty() {
-                    return Err(anyhow!("{} contains an empty alias key", field));
-                }
-                let target = parse_command_field(
-                    Some(target_value),
-                    &format!("{}['{}']", field, alias_trimmed),
-                )?
-                .ok_or_else(|| anyhow!("{}['{}'] must define a command", field, alias_trimmed))?;
-                parsed.insert(alias_trimmed.to_string(), target);
-            }
-            Ok(parsed)
-        }
-        Some(_) => Err(anyhow!(
-            "{} must be an object<string, string|string[]>",
-            field
-        )),
-    }
-}
-
-fn default_command_aliases_for_adapter(
-    adapter_ref: &AgentAdapterRef,
-) -> BTreeMap<String, Vec<String>> {
-    let mut aliases = BTreeMap::new();
-    if adapter_ref.id == PREBUILT_REX_JESUS_ADAPTER_ID {
-        aliases.insert(
-            "rex".to_string(),
-            vec![
-                "bun".to_string(),
-                "/opt/rex/packages/infra/harness-daemon/bin/rex.js".to_string(),
-            ],
-        );
-    }
-    aliases
-}
-
-fn apply_command_aliases(
-    command: Vec<String>,
-    aliases: &BTreeMap<String, Vec<String>>,
-) -> Vec<String> {
-    if command.is_empty() {
-        return command;
-    }
-    if let Some(expansion) = aliases.get(command[0].as_str()) {
-        let mut expanded = expansion.clone();
-        expanded.extend(command.into_iter().skip(1));
-        return expanded;
-    }
-    command
-}
-
 fn parse_dependency_file_staging(
     json_value: &Value,
     exp_dir: &Path,
@@ -5282,77 +8027,49 @@ fn parse_dependency_file_staging(
     }
 }
 
-fn load_known_agent_manifest(
-    project_root: &Path,
-    id: &str,
-    version: &str,
-    registry: Option<&str>,
-) -> Result<AgentRuntimeManifest> {
-    let mut candidates = Vec::new();
-    if let Some(registry) = registry {
-        candidates.push(
-            project_root
-                .join(".lab")
-                .join("agents")
-                .join(registry)
-                .join(id)
-                .join(format!("{}.json", version)),
-        );
-    }
-    candidates.push(
-        project_root
-            .join(".lab")
-            .join("agents")
-            .join(id)
-            .join(format!("{}.json", version)),
-    );
-
-    for path in &candidates {
-        if !path.exists() {
-            continue;
-        }
-        let raw = fs::read_to_string(path)?;
-        let manifest: AgentRuntimeManifest = serde_json::from_str(&raw)
-            .map_err(|err| anyhow!("invalid known agent manifest {}: {}", path.display(), err))?;
-        if manifest.image.trim().is_empty() {
-            return Err(anyhow!(
-                "known agent manifest {} has empty image",
-                path.display()
-            ));
-        }
-        if manifest.entrypoint.is_empty() {
-            return Err(anyhow!(
-                "known agent manifest {} has empty entrypoint",
-                path.display()
-            ));
-        }
-        if manifest
-            .entrypoint
-            .iter()
-            .any(|part| part.trim().is_empty())
-        {
-            return Err(anyhow!(
-                "known agent manifest {} has an entrypoint token that is empty",
-                path.display()
-            ));
-        }
-        return Ok(manifest);
-    }
-
-    let searched = candidates
-        .iter()
-        .map(|p| p.display().to_string())
-        .collect::<Vec<_>>()
-        .join(", ");
-    Err(anyhow!(
-        "known agent ref not found: id='{}' version='{}'. searched: {}",
-        id,
-        version,
-        searched
-    ))
-}
-
 fn resolve_agent_runtime(json_value: &Value, exp_dir: &Path) -> Result<AgentRuntimeConfig> {
+    if is_clean_contract_experiment(json_value) {
+        let runtime_root = json_value
+            .pointer("/runtime")
+            .ok_or_else(|| anyhow!("runtime is required"))?;
+        let container_image = runtime_root
+            .pointer("/image")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string())
+            .ok_or_else(|| anyhow!("runtime.image is required"))?;
+        let command = parse_command_field(runtime_root.pointer("/command"), "runtime.command")?
+            .ok_or_else(|| anyhow!("runtime.command is required"))?;
+        let default_timeout_ms = runtime_root
+            .pointer("/timeout_ms")
+            .and_then(|v| v.as_u64())
+            .filter(|v| *v > 0);
+
+        let launch_mode = AgentLaunchMode::parse(None)?;
+        return Ok(AgentRuntimeConfig {
+            adapter_ref: AgentAdapterRef::default(),
+            command_raw: command,
+            container_image: Some(container_image),
+            io: AgentRuntimeIoConfig {
+                input_arg: DEFAULT_CLEAN_TASK_PATH.to_string(),
+                output_arg: DEFAULT_CLEAN_RESULT_PATH.to_string(),
+            },
+            clean_contract_v1: true,
+            integration_level: "cli_basic".to_string(),
+            launch_mode,
+            env: BTreeMap::new(),
+            env_from_host: Vec::new(),
+            trajectory_path: None,
+            causal_extraction: None,
+            default_timeout_ms,
+            tracing_mode: None,
+            force_container: true,
+            dependency_file_staging: Vec::new(),
+            dependency_services: Vec::new(),
+        });
+    }
+
     if json_value.pointer("/runtime/harness").is_some() {
         return Err(anyhow!(
             "runtime.harness is not supported; use runtime.agent"
@@ -5449,6 +8166,7 @@ fn resolve_agent_runtime(json_value: &Value, exp_dir: &Path) -> Result<AgentRunt
             input_arg,
             output_arg,
         },
+        clean_contract_v1: false,
         integration_level,
         launch_mode,
         env,
@@ -5482,6 +8200,7 @@ fn resolve_agent_runtime_env(
 #[derive(Clone)]
 struct VariantRuntimeProfile {
     experiment: Value,
+    variant_args: Vec<String>,
     agent_runtime: AgentRuntimeConfig,
     agent_runtime_env: BTreeMap<String, String>,
     invocation_source: String,
@@ -5504,11 +8223,7 @@ fn resolve_variant_runtime_profile(
     validate_required_fields(&variant_experiment)?;
 
     let mut agent_runtime = resolve_agent_runtime(&variant_experiment, project_root)?;
-    let configured_network_mode = variant_experiment
-        .pointer("/runtime/policy/network/mode")
-        .and_then(|v| v.as_str())
-        .ok_or_else(|| anyhow!("missing /runtime/policy/network/mode"))?
-        .to_string();
+    let configured_network_mode = configured_network_mode(&variant_experiment)?;
     let effective_network_mode = behavior
         .network_mode_override
         .as_deref()
@@ -5534,10 +8249,14 @@ fn resolve_variant_runtime_profile(
         resolve_agent_runtime_command(&agent_runtime.command_raw, project_root, container_mode);
     validate_agent_runtime_command(&agent_runtime.command_raw, project_root, container_mode)?;
     let invocation_default_timeout_ms = agent_runtime.default_timeout_ms;
-    let agent_runtime_env = resolve_agent_runtime_env(&agent_runtime)?;
+    let mut agent_runtime_env = resolve_agent_runtime_env(&agent_runtime)?;
+    for (key, value) in &variant.env {
+        agent_runtime_env.insert(key.clone(), value.clone());
+    }
 
     Ok(VariantRuntimeProfile {
         experiment: variant_experiment,
+        variant_args: variant.args.clone(),
         agent_runtime,
         agent_runtime_env,
         invocation_source: "runtime_agent".to_string(),
@@ -5630,6 +8349,10 @@ fn build_agent_task(
     task_boundary: &TaskBoundaryMaterialization,
     runtime_agent: &AgentRuntimeConfig,
 ) -> Value {
+    if is_clean_contract_experiment(json_value) {
+        return task_boundary.task_payload.clone();
+    }
+
     let mut policy = json_value
         .pointer("/runtime/policy")
         .cloned()
@@ -5866,7 +8589,11 @@ fn build_runtime_contract_env(
     input: &Value,
     io: &PreparedTrialIo,
     timeout_ms: Option<u64>,
+    clean_contract_v1: bool,
 ) -> BTreeMap<String, String> {
+    if clean_contract_v1 {
+        return BTreeMap::new();
+    }
     let trial_id = input
         .pointer("/ids/trial_id")
         .and_then(|v| v.as_str())
@@ -5879,6 +8606,12 @@ fn build_runtime_contract_env(
         .pointer("/ids/task_id")
         .and_then(|v| v.as_str())
         .unwrap_or("");
+    let task_image = input
+        .pointer("/task/image")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(ToString::to_string);
     let repl_idx = input
         .pointer("/ids/repl_idx")
         .and_then(|v| v.as_u64())
@@ -5904,6 +8637,9 @@ fn build_runtime_contract_env(
     env.insert(AGENTLAB_ENV_TRIAL_ID.to_string(), trial_id.to_string());
     env.insert(AGENTLAB_ENV_VARIANT_ID.to_string(), variant_id.to_string());
     env.insert(AGENTLAB_ENV_TASK_ID.to_string(), task_id.to_string());
+    if let Some(task_image) = task_image {
+        env.insert(AGENTLAB_ENV_TASK_IMAGE.to_string(), task_image);
+    }
     env.insert(AGENTLAB_ENV_REPL_IDX.to_string(), repl_idx.to_string());
     if let Some(timeout_ms) = timeout_ms {
         env.insert(AGENTLAB_ENV_TIMEOUT_MS.to_string(), timeout_ms.to_string());
@@ -5942,22 +8678,6 @@ fn command_contract_capabilities() -> AgentAdapterCapabilities {
         event_stream: true,
         strict_replay: false,
     }
-}
-
-fn command_contract_active_control(
-    request: &AdapterRunRequest<'_>,
-) -> Option<ActiveAdapterControl> {
-    Some(ActiveAdapterControl {
-        adapter_id: request.runtime.adapter_ref.id.clone(),
-        adapter_version: request.runtime.adapter_ref.version.clone(),
-        command_path: request
-            .trial_paths
-            .runtime
-            .control
-            .to_string_lossy()
-            .to_string(),
-        events_path: Some(request.io_paths.events_host.to_string_lossy().to_string()),
-    })
 }
 
 fn run_command_contract_trial(request: &AdapterRunRequest<'_>) -> Result<ProcessRunResult> {
@@ -6021,13 +8741,6 @@ impl AgentAdapter for BuiltinCommandAdapter {
         command_contract_capabilities()
     }
 
-    fn active_control(
-        &self,
-        request: &AdapterRunRequest<'_>,
-    ) -> Result<Option<ActiveAdapterControl>> {
-        Ok(command_contract_active_control(request))
-    }
-
     fn run_trial(&self, request: &AdapterRunRequest<'_>) -> Result<ProcessRunResult> {
         run_command_contract_trial(request)
     }
@@ -6040,13 +8753,6 @@ impl AgentAdapter for BuiltinCommandAdapter {
 impl AgentAdapter for PrebuiltCommandAdapter {
     fn capabilities(&self) -> AgentAdapterCapabilities {
         command_contract_capabilities()
-    }
-
-    fn active_control(
-        &self,
-        request: &AdapterRunRequest<'_>,
-    ) -> Result<Option<ActiveAdapterControl>> {
-        Ok(command_contract_active_control(request))
     }
 
     fn run_trial(&self, request: &AdapterRunRequest<'_>) -> Result<ProcessRunResult> {
@@ -6062,6 +8768,7 @@ impl AgentAdapter for PrebuiltCommandAdapter {
         let prebuilt_request = AdapterRunRequest {
             runtime_experiment: request.runtime_experiment,
             runtime: request.runtime,
+            variant_args: request.variant_args,
             runtime_env: request.runtime_env,
             runtime_overrides_env: &adapter_overrides,
             container_mode: request.container_mode,
@@ -6109,117 +8816,162 @@ fn run_builtin_adapter_container(request: &AdapterRunRequest<'_>) -> Result<Proc
     let mut cmd = Command::new("docker");
     cmd.arg("run").arg("--rm");
 
-    if request
-        .runtime_experiment
-        .pointer("/runtime/policy/sandbox/root_read_only")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(true)
-    {
+    let root_read_only = if request.runtime.clean_contract_v1 {
+        true
+    } else {
+        request
+            .runtime_experiment
+            .pointer("/runtime/policy/sandbox/root_read_only")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true)
+    };
+    if root_read_only {
         cmd.arg("--read-only");
     }
 
-    let run_as_user = request
-        .runtime_experiment
-        .pointer("/runtime/policy/sandbox/run_as_user")
-        .and_then(|v| v.as_str());
-    if let Some(user) = run_as_user {
-        cmd.args(["-u", user]);
+    if !request.runtime.clean_contract_v1 {
+        let run_as_user = request
+            .runtime_experiment
+            .pointer("/runtime/policy/sandbox/run_as_user")
+            .and_then(|v| v.as_str());
+        if let Some(user) = run_as_user {
+            cmd.args(["-u", user]);
+        }
     }
 
     if request.network_mode == "none" {
         cmd.arg("--network=none");
     }
 
-    if request
-        .runtime_experiment
-        .pointer("/runtime/policy/sandbox/hardening/no_new_privileges")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(true)
-    {
+    let no_new_privileges = if request.runtime.clean_contract_v1 {
+        true
+    } else {
+        request
+            .runtime_experiment
+            .pointer("/runtime/policy/sandbox/hardening/no_new_privileges")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true)
+    };
+    if no_new_privileges {
         cmd.args(["--security-opt", "no-new-privileges"]);
     }
-    if request
-        .runtime_experiment
-        .pointer("/runtime/policy/sandbox/hardening/drop_all_caps")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(true)
-    {
+    let drop_all_caps = if request.runtime.clean_contract_v1 {
+        true
+    } else {
+        request
+            .runtime_experiment
+            .pointer("/runtime/policy/sandbox/hardening/drop_all_caps")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true)
+    };
+    if drop_all_caps {
         cmd.args(["--cap-drop", "ALL"]);
     }
 
-    if let Some(cpu) = request
-        .runtime_experiment
-        .pointer("/runtime/policy/sandbox/resources/cpu_count")
-        .and_then(|v| v.as_u64())
-    {
+    let cpu_limit = if request.runtime.clean_contract_v1 {
+        request
+            .runtime_experiment
+            .pointer("/runtime/resources/cpus")
+            .and_then(|v| v.as_u64())
+    } else {
+        request
+            .runtime_experiment
+            .pointer("/runtime/policy/sandbox/resources/cpu_count")
+            .and_then(|v| v.as_u64())
+    };
+    if let Some(cpu) = cpu_limit {
         cmd.arg("--cpus").arg(cpu.to_string());
     }
-    if let Some(mem) = request
-        .runtime_experiment
-        .pointer("/runtime/policy/sandbox/resources/memory_mb")
-        .and_then(|v| v.as_u64())
-    {
+    let memory_limit_mb = if request.runtime.clean_contract_v1 {
+        request
+            .runtime_experiment
+            .pointer("/runtime/resources/memory_mb")
+            .and_then(|v| v.as_u64())
+    } else {
+        request
+            .runtime_experiment
+            .pointer("/runtime/policy/sandbox/resources/memory_mb")
+            .and_then(|v| v.as_u64())
+    };
+    if let Some(mem) = memory_limit_mb {
         cmd.arg("--memory").arg(format!("{}m", mem));
     }
 
-    cmd.args([
-        "-v",
-        &format!(
-            "{}:{}:ro",
-            request.trial_paths.in_dir.display(),
-            AGENTLAB_CONTRACT_IN_DIR
-        ),
-    ]);
-    cmd.args([
-        "-v",
-        &format!(
-            "{}:{}",
-            request.trial_paths.out.display(),
-            AGENTLAB_CONTRACT_OUT_DIR
-        ),
-    ]);
-    cmd.args([
-        "-v",
-        &format!(
-            "{}:{}",
-            request.trial_paths.state.display(),
-            AGENTLAB_CONTRACT_STATE_DIR
-        ),
-    ]);
-    cmd.args([
-        "-v",
-        &format!(
-            "{}:{}",
-            request.trial_paths.deps.display(),
-            AGENTLAB_CONTRACT_DEPS_DIR
-        ),
-    ]);
-    cmd.args([
-        "-v",
-        &format!(
-            "{}:{}",
-            request.trial_paths.workspace.display(),
-            AGENTLAB_CONTRACT_WORKSPACE_DIR
-        ),
-    ]);
-    cmd.args([
-        "-v",
-        &format!("{}:/dataset:ro", request.trial_paths.dataset.display()),
-    ]);
-    for mount in request.dynamic_mounts {
+    if request.runtime.clean_contract_v1 {
         cmd.args([
             "-v",
-            &format!("{}:{}:ro", mount.host_path.display(), mount.mount_path),
+            &format!(
+                "{}:{}:ro",
+                request.trial_paths.runtime.task.display(),
+                HARNESS_TASK_PATH
+            ),
         ]);
+        cmd.args([
+            "-v",
+            &format!("{}:{}", request.trial_paths.out.display(), HARNESS_OUT_DIR),
+        ]);
+    } else {
+        cmd.args([
+            "-v",
+            &format!(
+                "{}:{}:ro",
+                request.trial_paths.in_dir.display(),
+                AGENTLAB_CONTRACT_IN_DIR
+            ),
+        ]);
+        cmd.args([
+            "-v",
+            &format!(
+                "{}:{}",
+                request.trial_paths.out.display(),
+                AGENTLAB_CONTRACT_OUT_DIR
+            ),
+        ]);
+        cmd.args([
+            "-v",
+            &format!(
+                "{}:{}",
+                request.trial_paths.state.display(),
+                AGENTLAB_CONTRACT_STATE_DIR
+            ),
+        ]);
+        cmd.args([
+            "-v",
+            &format!(
+                "{}:{}",
+                request.trial_paths.deps.display(),
+                AGENTLAB_CONTRACT_DEPS_DIR
+            ),
+        ]);
+        cmd.args([
+            "-v",
+            &format!(
+                "{}:{}",
+                request.trial_paths.workspace.display(),
+                AGENTLAB_CONTRACT_WORKSPACE_DIR
+            ),
+        ]);
+        cmd.args([
+            "-v",
+            &format!("{}:/dataset:ro", request.trial_paths.dataset.display()),
+        ]);
+        for mount in request.dynamic_mounts {
+            cmd.args([
+                "-v",
+                &format!("{}:{}:ro", mount.host_path.display(), mount.mount_path),
+            ]);
+        }
+        cmd.args(["--tmpfs", "/tmp:rw"]);
+        cmd.args(["-w", AGENTLAB_CONTRACT_WORKSPACE_DIR]);
     }
-    cmd.args(["--tmpfs", "/tmp:rw"]);
-    cmd.args(["-w", AGENTLAB_CONTRACT_WORKSPACE_DIR]);
 
     for (key, value) in request.runtime_overrides_env {
         cmd.arg("-e").arg(format!("{}={}", key, value));
     }
-    for (key, value) in request.runtime_env {
-        cmd.arg("-e").arg(format!("{}={}", key, value));
+    if !request.runtime.clean_contract_v1 {
+        for (key, value) in request.runtime_env {
+            cmd.arg("-e").arg(format!("{}={}", key, value));
+        }
     }
     if let Some(setup) = request.setup_command {
         cmd.arg(image);
@@ -6258,16 +9010,22 @@ fn resolve_runtime_agent_command(request: &AdapterRunRequest<'_>) -> Result<Vec<
         return Err(anyhow!("resolved runtime.agent command is empty"));
     }
     let mut command = rendered;
-    append_runtime_io_arg(
-        &mut command,
-        &request.runtime.io.input_arg,
-        &request.io_paths.task_path,
-    )?;
-    append_runtime_io_arg(
-        &mut command,
-        &request.runtime.io.output_arg,
-        &request.io_paths.result_path,
-    )?;
+    if request.runtime.clean_contract_v1 {
+        command.extend(request.variant_args.iter().cloned());
+        command.push(request.io_paths.task_path.clone());
+        command.push(request.io_paths.result_path.clone());
+    } else {
+        append_runtime_io_arg(
+            &mut command,
+            &request.runtime.io.input_arg,
+            &request.io_paths.task_path,
+        )?;
+        append_runtime_io_arg(
+            &mut command,
+            &request.runtime.io.output_arg,
+            &request.io_paths.result_path,
+        )?;
+    }
     Ok(command)
 }
 
@@ -6481,7 +9239,67 @@ fn prepare_io_paths(
     paths: &TrialPaths,
     container_mode: bool,
     input_bytes: &[u8],
+    clean_contract_v1: bool,
 ) -> Result<PreparedTrialIo> {
+    if clean_contract_v1 {
+        let task_host = paths.runtime.task.clone();
+        let result_host = paths.runtime.result.clone();
+        let trajectory_host = paths.runtime.trajectory.clone();
+        let output_host = result_host.clone();
+        let events_host = trajectory_host.clone();
+
+        if let Some(parent) = task_host.parent() {
+            ensure_dir(parent)?;
+        }
+        if let Some(parent) = result_host.parent() {
+            ensure_dir(parent)?;
+        }
+        if let Some(parent) = trajectory_host.parent() {
+            ensure_dir(parent)?;
+        }
+
+        let input_value: Value = serde_json::from_slice(input_bytes)?;
+        let task_value = input_value
+            .pointer("/task")
+            .cloned()
+            .unwrap_or_else(|| input_value.clone());
+        atomic_write_json_pretty(&task_host, &task_value)?;
+
+        if result_host.exists() {
+            let _ = fs::remove_file(&result_host);
+        }
+        if trajectory_host.exists() {
+            let _ = fs::remove_file(&trajectory_host);
+        }
+
+        let task_path = if container_mode {
+            DEFAULT_CLEAN_TASK_PATH.to_string()
+        } else {
+            task_host.to_string_lossy().to_string()
+        };
+        let result_path = if container_mode {
+            DEFAULT_CLEAN_RESULT_PATH.to_string()
+        } else {
+            result_host.to_string_lossy().to_string()
+        };
+        let trajectory_path = if container_mode {
+            DEFAULT_CONTAINER_TRAJECTORY_PATH.to_string()
+        } else {
+            trajectory_host.to_string_lossy().to_string()
+        };
+
+        return Ok(PreparedTrialIo {
+            output_host,
+            events_host,
+            task_path,
+            bindings_path: String::new(),
+            dependencies_path: String::new(),
+            policy_path: String::new(),
+            result_path,
+            trajectory_path,
+        });
+    }
+
     let (
         task_path,
         bindings_path,
@@ -6701,15 +9519,23 @@ fn write_state_inventory(
     effective_network_mode: &str,
     invocation_source: &str,
 ) -> Result<()> {
+    let clean_contract_v1 = is_clean_contract_experiment(json_value);
     let sanitization_profile = json_value
         .pointer("/design/sanitization_profile")
         .and_then(|v| v.as_str())
         .unwrap_or("hermetic_functional");
     let integration_level = agent_runtime.integration_level.as_str();
-    let mode_requested = json_value
-        .pointer("/runtime/policy/network/mode")
-        .and_then(|v| v.as_str())
-        .unwrap_or("none");
+    let mode_requested = if clean_contract_v1 {
+        json_value
+            .pointer("/runtime/network")
+            .and_then(|v| v.as_str())
+            .unwrap_or("none")
+    } else {
+        json_value
+            .pointer("/runtime/policy/network/mode")
+            .and_then(|v| v.as_str())
+            .unwrap_or("none")
+    };
     let mode_effective = if container_mode {
         effective_network_mode
     } else {
@@ -6721,7 +9547,12 @@ fn write_state_inventory(
         "unknown"
     };
 
-    let mounts = if container_mode {
+    let mounts = if container_mode && clean_contract_v1 {
+        vec![
+            json!({"name": "in", "path": HARNESS_IN_DIR, "writable": false}),
+            json!({"name": "out", "path": HARNESS_OUT_DIR, "writable": true}),
+        ]
+    } else if container_mode {
         vec![
             json!({"name": "in", "path": AGENTLAB_CONTRACT_IN_DIR, "writable": false}),
             json!({"name": "workspace", "path": AGENTLAB_CONTRACT_WORKSPACE_DIR, "writable": true}),
@@ -6751,7 +9582,11 @@ fn write_state_inventory(
         "network": {
             "mode_requested": mode_requested,
             "mode_effective": mode_effective,
-            "allowed_hosts": json_value.pointer("/runtime/policy/network/allowed_hosts").cloned().unwrap_or(json!([])),
+            "allowed_hosts": if clean_contract_v1 {
+                json!([])
+            } else {
+                json_value.pointer("/runtime/policy/network/allowed_hosts").cloned().unwrap_or(json!([]))
+            },
             "enforcement_effective": enforcement_effective,
             "egress_self_test": {
                 "performed": false,
@@ -6819,19 +9654,124 @@ fn map_container_path_to_host(path: &str, paths: &TrialPaths) -> Result<PathBuf>
     )
 }
 
-fn count_event_types(events_path: &Path) -> Result<BTreeMap<String, usize>> {
+fn load_event_rows(
+    events_path: &Path,
+    run_id: &str,
+    trial_id: &str,
+    variant_id: &str,
+    task_id: &str,
+    repl_idx: usize,
+) -> Result<Vec<EventRow>> {
     let data = fs::read_to_string(events_path)?;
-    let mut counts: BTreeMap<String, usize> = BTreeMap::new();
-    for line in data.lines() {
+    let mut rows = Vec::new();
+    for (seq, line) in data.lines().enumerate() {
         if line.trim().is_empty() {
             continue;
         }
-        let v: Value = serde_json::from_str(line)?;
-        if let Some(et) = v.get("event_type").and_then(|v| v.as_str()) {
-            *counts.entry(et.to_string()).or_default() += 1;
+        let payload: Value = serde_json::from_str(line)?;
+        let event_type = payload
+            .get("event_type")
+            .and_then(Value::as_str)
+            .or_else(|| payload.get("type").and_then(Value::as_str))
+            .unwrap_or("unknown")
+            .to_string();
+        let ts = payload
+            .get("ts")
+            .and_then(Value::as_str)
+            .or_else(|| payload.get("timestamp").and_then(Value::as_str))
+            .map(str::to_string);
+        rows.push(EventRow {
+            run_id: run_id.to_string(),
+            trial_id: trial_id.to_string(),
+            variant_id: variant_id.to_string(),
+            task_id: task_id.to_string(),
+            repl_idx,
+            seq,
+            event_type,
+            ts,
+            payload,
+        });
+    }
+    Ok(rows)
+}
+
+fn build_metric_rows(
+    run_id: &str,
+    trial_id: &str,
+    variant_id: &str,
+    task_id: &str,
+    repl_idx: usize,
+    outcome: &str,
+    metrics: &Value,
+    primary_metric_name: &str,
+    primary_metric_value: &Value,
+) -> Vec<MetricRow> {
+    let mut rows = Vec::new();
+    if let Some(metric_obj) = metrics.as_object() {
+        for (metric_name, metric_value) in metric_obj {
+            rows.push(MetricRow {
+                run_id: run_id.to_string(),
+                trial_id: trial_id.to_string(),
+                variant_id: variant_id.to_string(),
+                task_id: task_id.to_string(),
+                repl_idx,
+                outcome: outcome.to_string(),
+                metric_name: metric_name.clone(),
+                metric_value: metric_value.clone(),
+                metric_source: None,
+            });
         }
     }
-    Ok(counts)
+    rows.push(MetricRow {
+        run_id: run_id.to_string(),
+        trial_id: trial_id.to_string(),
+        variant_id: variant_id.to_string(),
+        task_id: task_id.to_string(),
+        repl_idx,
+        outcome: outcome.to_string(),
+        metric_name: primary_metric_name.to_string(),
+        metric_value: primary_metric_value.clone(),
+        metric_source: Some("primary".to_string()),
+    });
+    rows
+}
+
+fn build_variant_snapshot_rows(
+    run_id: &str,
+    trial_id: &str,
+    variant_id: &str,
+    baseline_id: &str,
+    task_id: &str,
+    repl_idx: usize,
+    bindings: &Value,
+) -> Vec<VariantSnapshotRow> {
+    let mut rows = Vec::new();
+    if let Some(bindings_obj) = bindings.as_object() {
+        for (binding_name, binding_value) in bindings_obj {
+            rows.push(VariantSnapshotRow {
+                run_id: run_id.to_string(),
+                trial_id: trial_id.to_string(),
+                variant_id: variant_id.to_string(),
+                baseline_id: baseline_id.to_string(),
+                task_id: task_id.to_string(),
+                repl_idx,
+                binding_name: binding_name.clone(),
+                binding_value: binding_value.clone(),
+                binding_value_text: binding_value_to_text(binding_value),
+            });
+        }
+    }
+    rows
+}
+
+fn binding_value_to_text(value: &Value) -> String {
+    match value {
+        Value::Null => "null".to_string(),
+        Value::Bool(v) => v.to_string(),
+        Value::Number(v) => v.to_string(),
+        Value::String(v) => v.clone(),
+        Value::Array(_) | Value::Object(_) => serde_json::to_string(value).unwrap_or_default(),
+    }
 }
 
 fn copy_dir_filtered(src: &Path, dst: &Path, exclude: &[&str]) -> Result<()> {
@@ -6914,6 +9854,7 @@ fn resolve_command_digest_target(command: &[String]) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::AtomicUsize;
 
     struct TempDirGuard {
         path: PathBuf,
@@ -7035,6 +9976,8 @@ mod tests {
         });
         atomic_write_json_pretty(&run_dir.join("resolved_experiment.json"), &resolved)
             .expect("write resolved");
+        let (variants, baseline_id) = resolve_variant_plan(&resolved).expect("variant plan");
+        write_resolved_variants(run_dir, &baseline_id, &variants).expect("write resolved variants");
     }
 
     fn seed_parent_trial(
@@ -7127,6 +10070,28 @@ mod tests {
                     .to_string(),
             ),
         }
+    }
+
+    fn write_test_run_control(
+        run_dir: &Path,
+        run_id: &str,
+        status: &str,
+        active_trial_id: Option<&str>,
+        active_control: Option<&ActiveAdapterControl>,
+    ) {
+        let active_trials = active_trial_id
+            .map(|trial_id| {
+                vec![RunControlActiveTrial {
+                    trial_id: trial_id.to_string(),
+                    worker_id: "worker_1".to_string(),
+                    schedule_idx: None,
+                    variant_id: None,
+                    started_at: Some(Utc::now().to_rfc3339()),
+                    control: active_control.cloned(),
+                }]
+            })
+            .unwrap_or_default();
+        write_run_control_v2(run_dir, run_id, status, &active_trials, None).expect("run control");
     }
 
     fn spawn_pause_ack_writer(
@@ -7314,10 +10279,120 @@ mod tests {
     }
 
     #[test]
+    fn resolve_remote_bearer_token_reads_env_when_present() {
+        let key = "AGENTLAB_TEST_REMOTE_TOKEN";
+        let previous = env::var(key).ok();
+        env::set_var(key, "token_123");
+        let token = resolve_remote_bearer_token(Some(key)).expect("token resolution");
+        assert_eq!(token.as_deref(), Some("token_123"));
+        if let Some(previous) = previous {
+            env::set_var(key, previous);
+        } else {
+            env::remove_var(key);
+        }
+    }
+
+    #[test]
+    fn resolve_remote_bearer_token_skips_unset_and_errors_for_missing_env() {
+        assert!(resolve_remote_bearer_token(Some("unset"))
+            .expect("unset should be treated as no-token")
+            .is_none());
+        let key = "AGENTLAB_TEST_REMOTE_TOKEN_MISSING";
+        let previous = env::var(key).ok();
+        env::remove_var(key);
+        let err = resolve_remote_bearer_token(Some(key)).expect_err("missing env should fail");
+        assert!(
+            err.to_string().contains("is not set"),
+            "unexpected error: {}",
+            err
+        );
+        if let Some(previous) = previous {
+            env::set_var(key, previous);
+        }
+    }
+
+    #[test]
+    fn remote_retry_settings_apply_env_overrides() {
+        let attempts_key = AGENTLAB_REMOTE_PROTOCOL_RETRY_MAX_ATTEMPTS_ENV;
+        let backoff_key = AGENTLAB_REMOTE_PROTOCOL_RETRY_BASE_BACKOFF_MS_ENV;
+        let attempts_prev = env::var(attempts_key).ok();
+        let backoff_prev = env::var(backoff_key).ok();
+
+        env::set_var(attempts_key, "5");
+        env::set_var(backoff_key, "75");
+        let settings = resolve_remote_retry_settings_from_env().expect("settings");
+        assert_eq!(settings.max_attempts, 5);
+        assert_eq!(settings.base_backoff_ms, 75);
+
+        if let Some(value) = attempts_prev {
+            env::set_var(attempts_key, value);
+        } else {
+            env::remove_var(attempts_key);
+        }
+        if let Some(value) = backoff_prev {
+            env::set_var(backoff_key, value);
+        } else {
+            env::remove_var(backoff_key);
+        }
+    }
+
+    #[test]
+    fn remote_protocol_timeout_settings_apply_env_overrides() {
+        let connect_key = AGENTLAB_REMOTE_PROTOCOL_CONNECT_TIMEOUT_MS_ENV;
+        let submit_key = AGENTLAB_REMOTE_PROTOCOL_SUBMIT_TIMEOUT_MS_ENV;
+        let poll_grace_key = AGENTLAB_REMOTE_PROTOCOL_POLL_TIMEOUT_GRACE_MS_ENV;
+        let pause_key = AGENTLAB_REMOTE_PROTOCOL_PAUSE_TIMEOUT_MS_ENV;
+        let stop_key = AGENTLAB_REMOTE_PROTOCOL_STOP_TIMEOUT_MS_ENV;
+        let connect_prev = env::var(connect_key).ok();
+        let submit_prev = env::var(submit_key).ok();
+        let poll_grace_prev = env::var(poll_grace_key).ok();
+        let pause_prev = env::var(pause_key).ok();
+        let stop_prev = env::var(stop_key).ok();
+
+        env::set_var(connect_key, "2500");
+        env::set_var(submit_key, "45000");
+        env::set_var(poll_grace_key, "1500");
+        env::set_var(pause_key, "12000");
+        env::set_var(stop_key, "16000");
+        let settings = resolve_remote_protocol_timeout_settings_from_env().expect("settings");
+        assert_eq!(settings.connect_timeout_ms, 2500);
+        assert_eq!(settings.submit_timeout_ms, 45000);
+        assert_eq!(settings.poll_timeout_grace_ms, 1500);
+        assert_eq!(settings.pause_timeout_ms, 12000);
+        assert_eq!(settings.stop_timeout_ms, 16000);
+
+        if let Some(value) = connect_prev {
+            env::set_var(connect_key, value);
+        } else {
+            env::remove_var(connect_key);
+        }
+        if let Some(value) = submit_prev {
+            env::set_var(submit_key, value);
+        } else {
+            env::remove_var(submit_key);
+        }
+        if let Some(value) = poll_grace_prev {
+            env::set_var(poll_grace_key, value);
+        } else {
+            env::remove_var(poll_grace_key);
+        }
+        if let Some(value) = pause_prev {
+            env::set_var(pause_key, value);
+        } else {
+            env::remove_var(pause_key);
+        }
+        if let Some(value) = stop_prev {
+            env::set_var(stop_key, value);
+        } else {
+            env::remove_var(stop_key);
+        }
+    }
+
+    #[test]
     fn continue_run_accepts_paused_and_interrupted_terminal_statuses() {
         for status in ["paused", "interrupted"] {
             let (_root, run_dir) = create_run_dir("agentlab_continue_statuses", "run_1");
-            write_run_control(&run_dir, "run_1", status, None, None).expect("run control");
+            write_test_run_control(&run_dir, "run_1", status, None, None);
 
             let err =
                 continue_run(&run_dir).expect_err("continue should reach run session state load");
@@ -7371,7 +10446,7 @@ mod tests {
         });
         atomic_write_json_pretty(&run_dir.join("resolved_experiment.json"), &resolved)
             .expect("resolved");
-        write_run_control(&run_dir, "run_1", "failed", None, None).expect("run control");
+        write_test_run_control(&run_dir, "run_1", "failed", None, None);
         let schedule = build_trial_schedule(1, 1, 1, parse_policies(&resolved).scheduling, 1);
         let schedule_progress = ScheduleProgress {
             schema_version: "schedule_progress_v1".to_string(),
@@ -7547,7 +10622,7 @@ mod tests {
                 "repl_idx": 0
             }
         });
-        let env = build_runtime_contract_env("run_1", &input, &io, Some(12345));
+        let env = build_runtime_contract_env("run_1", &input, &io, Some(12345), false);
         assert_eq!(
             env.get(AGENTLAB_ENV_TASK_PATH).map(String::as_str),
             Some(AGENTLAB_TASK_PATH)
@@ -7559,6 +10634,26 @@ mod tests {
         assert_eq!(
             env.get(AGENTLAB_ENV_RESULT_PATH).map(String::as_str),
             Some(AGENTLAB_RESULT_PATH)
+        );
+    }
+
+    #[test]
+    fn build_runtime_contract_env_is_empty_for_clean_contract() {
+        let io = PreparedTrialIo {
+            output_host: PathBuf::from("/tmp/out.json"),
+            events_host: PathBuf::from("/tmp/events.jsonl"),
+            task_path: HARNESS_TASK_PATH.to_string(),
+            bindings_path: String::new(),
+            dependencies_path: String::new(),
+            policy_path: String::new(),
+            result_path: HARNESS_RESULT_PATH.to_string(),
+            trajectory_path: String::new(),
+        };
+        let input = json!({ "id": "task_1" });
+        let env = build_runtime_contract_env("run_1", &input, &io, Some(12345), true);
+        assert!(
+            env.is_empty(),
+            "clean contract should not project AGENTLAB_* env vars"
         );
     }
 
@@ -7629,6 +10724,7 @@ mod tests {
                 input_arg: "--input".to_string(),
                 output_arg: "--output".to_string(),
             },
+            clean_contract_v1: false,
             integration_level: "cli_basic".to_string(),
             launch_mode: AgentLaunchMode::File,
             env: BTreeMap::new(),
@@ -7962,14 +11058,13 @@ mod tests {
         write_resolved_experiment(&run_dir, "cli_events", true);
         let trial_dir = seed_parent_trial(&run_dir, "trial_1", json!([]), "running", None);
         let control = active_control_for_trial(&trial_dir);
-        write_run_control(
+        write_test_run_control(
             &run_dir,
             "run_1",
             "running",
             Some("trial_1"),
             Some(&control),
-        )
-        .expect("run control");
+        );
 
         let err = pause_run(&run_dir, Some("trial_2"), Some("pause"), 1)
             .err()
@@ -7989,14 +11084,13 @@ mod tests {
         let control_path = trial_dir.join("state").join("lab_control.json");
         let events_path = trial_dir.join("state").join("events.jsonl");
         let control = active_control_for_trial(&trial_dir);
-        write_run_control(
+        write_test_run_control(
             &run_dir,
             "run_1",
             "running",
             Some("trial_1"),
             Some(&control),
-        )
-        .expect("run control");
+        );
 
         let ack_thread = spawn_pause_ack_writer(control_path.clone(), events_path);
         let paused = pause_run(&run_dir, None, Some("pause"), 2).expect("pause success");
@@ -8012,14 +11106,13 @@ mod tests {
         let control_path = trial_dir.join("state").join("lab_control.json");
         let events_path = trial_dir.join("state").join("events.jsonl");
         let control = active_control_for_trial(&trial_dir);
-        write_run_control(
+        write_test_run_control(
             &run_dir,
             "run_1",
             "running",
             Some("trial_1"),
             Some(&control),
-        )
-        .expect("run control");
+        );
 
         let ack_thread = spawn_pause_ack_writer(control_path.clone(), events_path);
         let paused = pause_run(&run_dir, None, Some("manual_pause"), 2).expect("pause success");
@@ -8041,7 +11134,7 @@ mod tests {
         );
         assert_eq!(
             run_control
-                .pointer("/active_trial_id")
+                .pointer("/active_trials/trial_1/trial_id")
                 .and_then(|v| v.as_str())
                 .unwrap_or(""),
             "trial_1"
@@ -8091,14 +11184,13 @@ mod tests {
         );
         ensure_dir(&trial_dir.join("state").join("cp1")).expect("checkpoint path");
         let control = active_control_for_trial(&trial_dir);
-        write_run_control(
+        write_test_run_control(
             &run_dir,
             "run_1",
             "running",
             Some("trial_1"),
             Some(&control),
-        )
-        .expect("run control");
+        );
 
         let err = resume_trial(&run_dir, None, None, &BTreeMap::new(), false)
             .err()
@@ -8123,8 +11215,7 @@ mod tests {
         );
         ensure_dir(&trial_dir.join("state").join("cp1")).expect("checkpoint path");
         let control = active_control_for_trial(&trial_dir);
-        write_run_control(&run_dir, "run_1", "paused", Some("trial_1"), Some(&control))
-            .expect("run control");
+        write_test_run_control(&run_dir, "run_1", "paused", Some("trial_1"), Some(&control));
 
         let err = resume_trial(&run_dir, None, None, &BTreeMap::new(), false)
             .err()
@@ -8152,8 +11243,7 @@ mod tests {
         );
         ensure_dir(&trial_dir.join("state").join("cp_resume")).expect("checkpoint path");
         let control = active_control_for_trial(&trial_dir);
-        write_run_control(&run_dir, "run_1", "paused", Some("trial_1"), Some(&control))
-            .expect("run control");
+        write_test_run_control(&run_dir, "run_1", "paused", Some("trial_1"), Some(&control));
 
         let mut set_bindings = BTreeMap::new();
         set_bindings.insert("resume.override".to_string(), json!(42));
@@ -8305,6 +11395,48 @@ mod tests {
     }
 
     #[test]
+    fn validate_required_fields_v1_accepts_flat_shape() {
+        let spec = json!({
+            "version": "1.0",
+            "experiment": { "id": "e", "name": "n" },
+            "dataset": { "path": "tasks.jsonl" },
+            "design": { "replications": 1 },
+            "baseline": { "variant_id": "base" },
+            "runtime": {
+                "image": "my-harness:latest",
+                "command": ["python", "harness.py"],
+                "timeout_ms": 1000,
+                "network": "none"
+            }
+        });
+        validate_required_fields(&spec).expect("valid v1 spec should pass");
+    }
+
+    #[test]
+    fn validate_required_fields_v1_reports_flat_runtime_requirements() {
+        let spec = json!({
+            "version": "1.0",
+            "experiment": { "id": "e", "name": "n" },
+            "dataset": { "path": "tasks.jsonl" },
+            "design": { "replications": 1 },
+            "baseline": { "variant_id": "base" },
+            "runtime": {}
+        });
+        let err = validate_required_fields(&spec).expect_err("should fail");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("/runtime/image"),
+            "missing runtime.image: {}",
+            msg
+        );
+        assert!(
+            msg.contains("/runtime/command"),
+            "missing runtime.command: {}",
+            msg
+        );
+    }
+
+    #[test]
     fn resolve_variant_plan_rejects_legacy_variants_field() {
         let spec = json!({
             "baseline": { "variant_id": "base", "bindings": {} },
@@ -8362,6 +11494,92 @@ mod tests {
         assert_eq!(baseline_id, "base");
         assert_eq!(variants.len(), 1);
         assert_eq!(variants[0].id, "base");
+    }
+
+    #[test]
+    fn load_run_variants_falls_back_to_experiment_when_manifest_missing() {
+        let (_root, run_dir) = create_run_dir("agentlab_variants_fallback", "run_1");
+        let spec = json!({
+            "baseline": { "variant_id": "base", "bindings": {} },
+            "variant_plan": [{ "variant_id": "alt", "bindings": { "temperature": 1.2 } }]
+        });
+
+        let (variants, baseline_id) =
+            load_run_variants(&run_dir, &spec).expect("load fallback variants");
+        assert_eq!(baseline_id, "base");
+        assert_eq!(variants.len(), 2);
+        assert_eq!(variants[0].id, "base");
+        assert_eq!(variants[1].id, "alt");
+    }
+
+    #[test]
+    fn load_run_variants_prefers_resolved_manifest_over_experiment() {
+        let (_root, run_dir) = create_run_dir("agentlab_variants_manifest_preferred", "run_1");
+        let original = json!({
+            "baseline": { "variant_id": "base", "bindings": {} },
+            "variant_plan": [{ "variant_id": "alt", "bindings": { "temperature": 1.2 } }]
+        });
+        let (resolved_variants, resolved_baseline) =
+            resolve_variant_plan(&original).expect("resolve variants");
+        write_resolved_variants(&run_dir, &resolved_baseline, &resolved_variants)
+            .expect("write manifest");
+
+        let changed = json!({
+            "baseline": { "variant_id": "changed", "bindings": {} },
+            "variant_plan": [{ "variant_id": "new", "bindings": { "temperature": 0.2 } }]
+        });
+        let (loaded_variants, loaded_baseline) =
+            load_run_variants(&run_dir, &changed).expect("load manifest variants");
+
+        assert_eq!(loaded_baseline, "base");
+        assert_eq!(loaded_variants.len(), 2);
+        assert_eq!(loaded_variants[0].id, "base");
+        assert_eq!(loaded_variants[1].id, "alt");
+    }
+
+    #[test]
+    fn resolve_variant_plan_parses_clean_contract_args_env_image() {
+        let spec = json!({
+            "version": "1.0",
+            "baseline": {
+                "variant_id": "control",
+                "args": ["--temperature", "0.7"],
+                "env": { "DEBUG": "0" }
+            },
+            "variant_plan": [
+                {
+                    "variant_id": "hot",
+                    "args": ["--temperature", "0.9"],
+                    "env": { "DEBUG": "1" },
+                    "image": "my-harness-v2:latest"
+                }
+            ]
+        });
+
+        let (variants, baseline_id) = resolve_variant_plan(&spec).expect("variant plan");
+        assert_eq!(baseline_id, "control");
+        assert_eq!(variants.len(), 2);
+        assert_eq!(variants[0].args, vec!["--temperature", "0.7"]);
+        assert_eq!(variants[1].env.get("DEBUG").map(String::as_str), Some("1"));
+        assert_eq!(variants[1].image.as_deref(), Some("my-harness-v2:latest"));
+    }
+
+    #[test]
+    fn variant_digest_changes_with_variant_configuration() {
+        let base = Variant {
+            id: "base".to_string(),
+            bindings: json!({}),
+            args: vec!["--temperature".to_string(), "0.7".to_string()],
+            env: BTreeMap::new(),
+            image: None,
+            runtime_overrides: None,
+        };
+        let mut changed = base.clone();
+        changed.args = vec!["--temperature".to_string(), "1.2".to_string()];
+
+        let base_digest = variant_digest(&base).expect("base digest");
+        let changed_digest = variant_digest(&changed).expect("changed digest");
+        assert_ne!(base_digest, changed_digest);
     }
 
     #[test]
@@ -8458,6 +11676,9 @@ mod tests {
         let variant = Variant {
             id: "treatment".to_string(),
             bindings: json!({}),
+            args: Vec::new(),
+            env: BTreeMap::new(),
+            image: None,
             runtime_overrides: Some(json!({
                 "agent": {
                     "custom_image": {
@@ -8621,6 +11842,1863 @@ JSONL
     }
 
     #[test]
+    fn p0_freeze_benchmark_adaptation_trial_shape_fixture_parses() {
+        let fixture: Value = serde_json::from_str(include_str!(
+            "../testdata/p0_benchmark_adaptation_trial_shape.json"
+        ))
+        .expect("fixture json");
+        let resolved = fixture
+            .pointer("/resolved_experiment")
+            .cloned()
+            .expect("resolved fixture");
+        let benchmark = parse_benchmark_config(&resolved);
+        assert_eq!(benchmark.policy.task_model, TaskModel::Dependent);
+        assert_eq!(benchmark.policy.scoring_lifecycle, "predict_then_score");
+        assert_eq!(
+            benchmark.policy.required_evidence_classes,
+            vec!["agent_patch".to_string(), "grader_report".to_string()]
+        );
+        assert_eq!(
+            benchmark
+                .adapter
+                .as_ref()
+                .map(|adapter| adapter.command.len())
+                .unwrap_or(0),
+            2
+        );
+
+        let dataset_task = fixture
+            .pointer("/dataset_task_row")
+            .cloned()
+            .expect("dataset task row");
+        let boundary = parse_task_boundary_from_dataset_task(&dataset_task).expect("task boundary");
+        assert_eq!(
+            boundary
+                .task_payload
+                .pointer("/id")
+                .and_then(|v| v.as_str())
+                .unwrap_or(""),
+            "swebench__django__12345"
+        );
+        assert_eq!(
+            boundary
+                .task_payload
+                .pointer("/image")
+                .and_then(|v| v.as_str())
+                .unwrap_or(""),
+            "ghcr.io/acme/swebench-task:20260222"
+        );
+        assert_eq!(
+            boundary
+                .task_payload
+                .pointer("/workspace/repo")
+                .and_then(|v| v.as_str())
+                .unwrap_or(""),
+            "django/django"
+        );
+        assert_eq!(boundary.workspace_files.len(), 1);
+        assert_eq!(boundary.mount_references.len(), 1);
+        assert_eq!(boundary.limits.max_steps, Some(12));
+        assert_eq!(boundary.limits.max_total_tokens, Some(16000));
+        assert_eq!(boundary.limits.max_tool_calls, Some(32));
+        assert_eq!(boundary.limits.trial_seconds, Some(1800));
+    }
+
+    #[test]
+    fn p6_run_control_v2_writer_emits_active_trials_without_legacy_mirrors() {
+        let (_root, run_dir) = create_run_dir("agentlab_run_control_v2_writer", "run_1");
+        write_test_run_control(&run_dir, "run_1", "running", Some("trial_1"), None);
+        let run_control = load_json_file(&run_control_path(&run_dir)).expect("run control");
+
+        assert_eq!(
+            run_control
+                .pointer("/schema_version")
+                .and_then(|v| v.as_str())
+                .unwrap_or(""),
+            "run_control_v2"
+        );
+        assert_eq!(
+            run_control
+                .pointer("/active_trials/trial_1/trial_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or(""),
+            "trial_1"
+        );
+        assert!(
+            run_control.pointer("/active_trial_id").is_none(),
+            "legacy /active_trial_id should be removed in P6 cleanup"
+        );
+        assert!(
+            run_control.pointer("/active_adapter").is_none(),
+            "legacy /active_adapter should be removed in P6 cleanup"
+        );
+    }
+
+    #[test]
+    fn p1_run_control_v2_schema_accepts_writer_payload() {
+        let (_root, run_dir) = create_run_dir("agentlab_run_control_v2_schema", "run_1");
+        write_test_run_control(&run_dir, "run_1", "running", Some("trial_1"), None);
+        let run_control = load_json_file(&run_control_path(&run_dir)).expect("run control");
+        let schema = compile_schema("run_control_v2.jsonschema").expect("schema");
+        match schema.validate(&run_control) {
+            Ok(_) => {}
+            Err(errors) => {
+                let mut messages = Vec::new();
+                for err in errors {
+                    messages.push(err.to_string());
+                }
+                panic!(
+                    "run_control_v2 schema validation failed: {}",
+                    messages.join(" | ")
+                );
+            }
+        };
+    }
+
+    #[test]
+    fn p1_run_control_helpers_read_active_trial_and_control_from_v2_shape() {
+        let run_control = json!({
+            "schema_version": "run_control_v2",
+            "run_id": "run_1",
+            "status": "running",
+            "active_trials": {
+                "trial_alpha": {
+                    "trial_id": "trial_alpha",
+                    "worker_id": "worker_1",
+                    "schedule_idx": 7,
+                    "variant_id": "base",
+                    "started_at": "2026-02-22T00:00:00Z",
+                    "control": {
+                        "id": "builtin.command_contract",
+                        "version": "v1",
+                        "command_path": "/tmp/control.json",
+                        "events_path": "/tmp/events.jsonl"
+                    }
+                }
+            },
+            "updated_at": "2026-02-22T00:00:00Z"
+        });
+
+        let ids = run_control_active_trial_ids(&run_control);
+        assert_eq!(ids, vec!["trial_alpha".to_string()]);
+        let control = run_control_active_adapter_for_trial(&run_control, "trial_alpha")
+            .expect("active adapter control");
+        assert_eq!(
+            control
+                .pointer("/command_path")
+                .and_then(|v| v.as_str())
+                .unwrap_or(""),
+            "/tmp/control.json"
+        );
+    }
+
+    fn worker_dispatch_fixture(schedule_idx: usize, trial_id: &str) -> TrialDispatch {
+        TrialDispatch {
+            run_id: "run_fixture".to_string(),
+            trial_id: trial_id.to_string(),
+            schedule_idx,
+            slot: TrialSlot {
+                variant_idx: 0,
+                task_idx: schedule_idx,
+                repl_idx: 0,
+            },
+            variant_id: "baseline".to_string(),
+            task_id: format!("task_{}", schedule_idx),
+            repl_idx: 0,
+            runtime_profile: json!({ "runtime": { "agent": { "image": "img" } } }),
+            task_payload: json!({ "id": format!("task_{}", schedule_idx) }),
+            effective_policy: json!({ "timeout_ms": 1000 }),
+        }
+    }
+
+    fn worker_completion_fixture(
+        ticket: &WorkerTicket,
+        schedule_idx: usize,
+        classification: &str,
+    ) -> TrialCompletion {
+        TrialCompletion {
+            ticket: ticket.clone(),
+            schedule_idx,
+            completion_seq: None,
+            terminal_status: "succeeded".to_string(),
+            classification: classification.to_string(),
+            artifacts: json!({ "result": "ok" }),
+            metrics: json!({ "latency_ms": 10 }),
+            runtime_summary: json!({ "engine": "fixture" }),
+        }
+    }
+
+    fn worker_completion_fixture_with_seq(
+        ticket: &WorkerTicket,
+        schedule_idx: usize,
+        classification: &str,
+        completion_seq: u64,
+    ) -> TrialCompletion {
+        let mut completion = worker_completion_fixture(ticket, schedule_idx, classification);
+        completion.completion_seq = Some(completion_seq);
+        completion
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct P2EDeterminismFixture {
+        schema_version: String,
+        arrivals: Vec<P2EDeterminismArrival>,
+        expected_commit_schedule_idx: Vec<usize>,
+    }
+
+    #[derive(Debug, Deserialize)]
+    struct P2EDeterminismArrival {
+        tick: usize,
+        schedule_idx: usize,
+        trial_id: String,
+        classification: String,
+    }
+
+    struct OutOfOrderCompletionSimulator {
+        by_tick: BTreeMap<usize, Vec<TrialCompletion>>,
+    }
+
+    impl OutOfOrderCompletionSimulator {
+        fn from_fixture(fixture: &P2EDeterminismFixture) -> Self {
+            let mut by_tick: BTreeMap<usize, Vec<TrialCompletion>> = BTreeMap::new();
+            for row in fixture.arrivals.iter() {
+                let ticket = WorkerTicket {
+                    worker_id: format!("worker_{}", row.trial_id),
+                    ticket_id: format!("ticket_{}", row.trial_id),
+                    trial_id: row.trial_id.clone(),
+                };
+                by_tick
+                    .entry(row.tick)
+                    .or_default()
+                    .push(worker_completion_fixture(
+                        &ticket,
+                        row.schedule_idx,
+                        row.classification.as_str(),
+                    ));
+            }
+            Self { by_tick }
+        }
+
+        fn max_tick(&self) -> usize {
+            self.by_tick.keys().copied().max().unwrap_or(0)
+        }
+
+        fn poll_tick(&mut self, tick: usize) -> Vec<TrialCompletion> {
+            self.by_tick.remove(&tick).unwrap_or_default()
+        }
+    }
+
+    fn load_p2e_determinism_fixture() -> P2EDeterminismFixture {
+        let fixture: P2EDeterminismFixture =
+            serde_json::from_str(include_str!("../testdata/p2e_determinism_fixture.json"))
+                .expect("p2e fixture json");
+        assert_eq!(fixture.schema_version, "p2e_determinism_fixture_v1");
+        fixture
+    }
+
+    fn drain_ready_completions_in_schedule_order(
+        pending: &mut BTreeMap<usize, TrialCompletion>,
+        next_commit_idx: &mut usize,
+    ) -> Vec<TrialCompletion> {
+        let mut ready = Vec::new();
+        loop {
+            let Some(completion) = pending.remove(next_commit_idx) else {
+                break;
+            };
+            *next_commit_idx += 1;
+            ready.push(completion);
+        }
+        ready
+    }
+
+    #[test]
+    fn p2c_local_thread_worker_backend_enforces_capacity_and_polls_completions() {
+        let executor: Arc<LocalTrialExecutor> = Arc::new(|dispatch| {
+            thread::sleep(Duration::from_millis(80));
+            Ok(TrialCompletion {
+                ticket: WorkerTicket {
+                    worker_id: "ignored".to_string(),
+                    ticket_id: "ignored".to_string(),
+                    trial_id: dispatch.trial_id.clone(),
+                },
+                schedule_idx: usize::MAX,
+                completion_seq: None,
+                terminal_status: "succeeded".to_string(),
+                classification: format!("completed_{}", dispatch.trial_id),
+                artifacts: json!({}),
+                metrics: json!({}),
+                runtime_summary: json!({}),
+            })
+        });
+        let backend = LocalThreadWorkerBackend::new(1, executor).expect("backend");
+
+        let dispatch_a = worker_dispatch_fixture(0, "trial_alpha");
+        let dispatch_b = worker_dispatch_fixture(1, "trial_beta");
+        let ticket_a = backend.submit(dispatch_a.clone()).expect("submit A");
+        let err = backend
+            .submit(dispatch_b.clone())
+            .expect_err("capacity should block submit B while A is in-flight");
+        assert!(
+            err.to_string().contains("at capacity"),
+            "unexpected error: {}",
+            err
+        );
+
+        let completions = backend
+            .poll_completions(Duration::from_secs(2))
+            .expect("poll completions");
+        assert_eq!(completions.len(), 1);
+        assert_eq!(completions[0].ticket.ticket_id, ticket_a.ticket_id);
+        assert_eq!(completions[0].ticket.trial_id, dispatch_a.trial_id);
+        assert_eq!(completions[0].schedule_idx, dispatch_a.schedule_idx);
+
+        let ticket_b = backend
+            .submit(dispatch_b.clone())
+            .expect("submit B after drain");
+        let completions = backend
+            .poll_completions(Duration::from_secs(2))
+            .expect("poll completions");
+        assert_eq!(completions.len(), 1);
+        assert_eq!(completions[0].ticket.ticket_id, ticket_b.ticket_id);
+        assert_eq!(completions[0].schedule_idx, dispatch_b.schedule_idx);
+    }
+
+    #[test]
+    fn p5b_local_worker_capacity_ceiling_resolves_with_warning() {
+        let (effective, warning) = resolve_local_worker_max_in_flight(8, Some(3));
+        assert_eq!(effective, 3);
+        assert!(
+            warning
+                .as_deref()
+                .unwrap_or("")
+                .contains("capacity ceiling applied"),
+            "expected capacity warning, got: {:?}",
+            warning
+        );
+
+        let (effective_noop, warning_noop) = resolve_local_worker_max_in_flight(2, Some(4));
+        assert_eq!(effective_noop, 2);
+        assert!(warning_noop.is_none());
+    }
+
+    #[test]
+    fn p5b_submit_backpressure_classifies_capacity_as_retryable() {
+        let executor: Arc<LocalTrialExecutor> = Arc::new(|dispatch| {
+            thread::sleep(Duration::from_millis(80));
+            Ok(TrialCompletion {
+                ticket: WorkerTicket {
+                    worker_id: "ignored".to_string(),
+                    ticket_id: "ignored".to_string(),
+                    trial_id: dispatch.trial_id.clone(),
+                },
+                schedule_idx: dispatch.schedule_idx,
+                completion_seq: None,
+                terminal_status: "succeeded".to_string(),
+                classification: "ok".to_string(),
+                artifacts: json!({}),
+                metrics: json!({}),
+                runtime_summary: json!({}),
+            })
+        });
+        let backend =
+            LocalThreadWorkerBackend::new_with_ceiling(1, executor, None).expect("backend");
+        let dispatch_a = worker_dispatch_fixture(0, "trial_a");
+        let dispatch_b = worker_dispatch_fixture(1, "trial_b");
+
+        let ticket_a = submit_dispatch_with_backpressure(&backend, dispatch_a.clone())
+            .expect("submit A")
+            .expect("ticket A");
+        let blocked = submit_dispatch_with_backpressure(&backend, dispatch_b.clone())
+            .expect("submit B should be classified as backpressure");
+        assert!(
+            blocked.is_none(),
+            "capacity backpressure should return None instead of failing run"
+        );
+
+        let drained = backend
+            .poll_completions(Duration::from_secs(2))
+            .expect("drain completion");
+        assert_eq!(drained.len(), 1);
+        assert_eq!(drained[0].ticket.ticket_id, ticket_a.ticket_id);
+
+        let ticket_b = submit_dispatch_with_backpressure(&backend, dispatch_b.clone())
+            .expect("submit B after drain")
+            .expect("ticket B");
+        assert_eq!(ticket_b.trial_id, dispatch_b.trial_id);
+    }
+
+    #[test]
+    fn p5b_local_worker_backend_drains_burst_completions_without_loss() {
+        let executor: Arc<LocalTrialExecutor> = Arc::new(|dispatch| {
+            Ok(TrialCompletion {
+                ticket: WorkerTicket {
+                    worker_id: "ignored".to_string(),
+                    ticket_id: "ignored".to_string(),
+                    trial_id: dispatch.trial_id.clone(),
+                },
+                schedule_idx: dispatch.schedule_idx,
+                completion_seq: None,
+                terminal_status: "succeeded".to_string(),
+                classification: "ok".to_string(),
+                artifacts: json!({}),
+                metrics: json!({}),
+                runtime_summary: json!({}),
+            })
+        });
+        let backend =
+            LocalThreadWorkerBackend::new_with_ceiling(32, executor, None).expect("backend");
+
+        let mut expected_ticket_ids: HashSet<String> = HashSet::new();
+        for idx in 0..32usize {
+            let dispatch = worker_dispatch_fixture(idx, &format!("trial_{}", idx));
+            let ticket = backend.submit(dispatch).expect("submit burst dispatch");
+            expected_ticket_ids.insert(ticket.ticket_id);
+        }
+
+        let mut seen_ticket_ids: HashSet<String> = HashSet::new();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while seen_ticket_ids.len() < expected_ticket_ids.len() {
+            assert!(
+                Instant::now() < deadline,
+                "timed out draining burst completions: seen={} expected={}",
+                seen_ticket_ids.len(),
+                expected_ticket_ids.len()
+            );
+            let completions = backend
+                .poll_completions(Duration::from_millis(250))
+                .expect("poll burst completions");
+            if completions.is_empty() {
+                continue;
+            }
+            for completion in completions {
+                assert!(
+                    expected_ticket_ids.contains(&completion.ticket.ticket_id),
+                    "unexpected completion ticket {}",
+                    completion.ticket.ticket_id
+                );
+                assert!(
+                    seen_ticket_ids.insert(completion.ticket.ticket_id.clone()),
+                    "duplicate completion ticket {}",
+                    completion.ticket.ticket_id
+                );
+            }
+        }
+
+        assert_eq!(seen_ticket_ids.len(), 32);
+        let trailing = backend
+            .poll_completions(Duration::from_millis(1))
+            .expect("trailing poll");
+        assert!(
+            trailing.is_empty(),
+            "completion queue should be fully drained"
+        );
+    }
+
+    #[test]
+    fn p2c_local_thread_worker_backend_ticket_map_drives_pause_and_stop() {
+        let executor: Arc<LocalTrialExecutor> = Arc::new(|dispatch| {
+            thread::sleep(Duration::from_millis(120));
+            Ok(TrialCompletion {
+                ticket: WorkerTicket {
+                    worker_id: "ignored".to_string(),
+                    ticket_id: "ignored".to_string(),
+                    trial_id: dispatch.trial_id.clone(),
+                },
+                schedule_idx: 0,
+                completion_seq: None,
+                terminal_status: "succeeded".to_string(),
+                classification: "ok".to_string(),
+                artifacts: json!({}),
+                metrics: json!({}),
+                runtime_summary: json!({}),
+            })
+        });
+        let backend = LocalThreadWorkerBackend::new(2, executor).expect("backend");
+        let dispatch = worker_dispatch_fixture(2, "trial_pause");
+        let ticket = backend.submit(dispatch.clone()).expect("submit");
+
+        let ack = backend
+            .request_pause(&ticket.worker_id, "checkpoint_now")
+            .expect("pause ack");
+        assert_eq!(ack.worker_id, ticket.worker_id);
+        assert_eq!(ack.trial_id, ticket.trial_id);
+        assert_eq!(ack.label, "checkpoint_now");
+        assert!(ack.accepted);
+
+        backend
+            .request_stop(&ticket.worker_id, "unit test stop")
+            .expect("stop should accept known worker");
+        let err = backend
+            .request_pause("unknown.worker", "x")
+            .expect_err("unknown worker should fail");
+        assert!(
+            err.to_string().contains("unknown active worker"),
+            "unexpected error: {}",
+            err
+        );
+
+        let _ = backend
+            .poll_completions(Duration::from_secs(2))
+            .expect("drain completion");
+    }
+
+    #[test]
+    fn p2d_remote_backend_fake_harness_round_trips_protocol_contract() {
+        let harness = Arc::new(FakeRemoteWorkerHarness::new());
+        let backend = RemoteWorkerBackend::new(harness.clone()).expect("remote backend");
+        let dispatch = worker_dispatch_fixture(7, "trial_remote_1");
+        let ticket = backend.submit(dispatch.clone()).expect("submit");
+
+        let pause = backend
+            .request_pause(&ticket.worker_id, "checkpoint_1")
+            .expect("pause");
+        assert!(pause.accepted);
+        assert_eq!(pause.worker_id, ticket.worker_id);
+        assert_eq!(pause.trial_id, ticket.trial_id);
+
+        backend
+            .request_stop(&ticket.worker_id, "done")
+            .expect("stop");
+
+        harness
+            .enqueue_completion(worker_completion_fixture(
+                &ticket,
+                dispatch.schedule_idx,
+                "remote_ok",
+            ))
+            .expect("enqueue completion");
+
+        let completions = backend
+            .poll_completions(Duration::from_millis(250))
+            .expect("poll");
+        assert_eq!(completions.len(), 1);
+        assert_eq!(completions[0].ticket.ticket_id, ticket.ticket_id);
+        assert_eq!(completions[0].classification, "remote_ok");
+
+        let submit_requests = harness.submit_requests().expect("submit requests");
+        assert_eq!(submit_requests.len(), 1);
+        assert_eq!(submit_requests[0].schema_version, REMOTE_SUBMIT_SCHEMA_V1);
+        assert_eq!(submit_requests[0].dispatch.trial_id, dispatch.trial_id);
+
+        let poll_requests = harness.poll_requests().expect("poll requests");
+        assert_eq!(poll_requests.len(), 1);
+        assert_eq!(poll_requests[0].schema_version, REMOTE_POLL_SCHEMA_V1);
+        assert_eq!(poll_requests[0].timeout_ms, 250);
+
+        let pause_requests = harness.pause_requests().expect("pause requests");
+        assert_eq!(pause_requests.len(), 1);
+        assert_eq!(pause_requests[0].schema_version, REMOTE_PAUSE_SCHEMA_V1);
+        let stop_requests = harness.stop_requests().expect("stop requests");
+        assert_eq!(stop_requests.len(), 1);
+        assert_eq!(stop_requests[0].schema_version, REMOTE_STOP_SCHEMA_V1);
+    }
+
+    #[test]
+    fn p2d_remote_backend_pause_and_stop_require_active_worker() {
+        let harness = Arc::new(FakeRemoteWorkerHarness::new());
+        let backend = RemoteWorkerBackend::new(harness).expect("remote backend");
+        let pause_err = backend
+            .request_pause("unknown.worker", "checkpoint")
+            .expect_err("pause should reject unknown worker");
+        assert!(
+            pause_err.to_string().contains("unknown active worker"),
+            "unexpected pause error: {}",
+            pause_err
+        );
+        let stop_err = backend
+            .request_stop("unknown.worker", "stop")
+            .expect_err("stop should reject unknown worker");
+        assert!(
+            stop_err.to_string().contains("unknown active worker"),
+            "unexpected stop error: {}",
+            stop_err
+        );
+    }
+
+    #[test]
+    fn p2d_remote_backend_rejects_mismatched_completion_contracts() {
+        let harness = Arc::new(FakeRemoteWorkerHarness::new());
+        let backend = RemoteWorkerBackend::new(harness.clone()).expect("remote backend");
+        let dispatch = worker_dispatch_fixture(9, "trial_remote_contract");
+        let ticket = backend.submit(dispatch.clone()).expect("submit");
+
+        let mut mismatched = worker_completion_fixture(&ticket, dispatch.schedule_idx, "bad");
+        mismatched.ticket.trial_id = "wrong_trial".to_string();
+        harness
+            .enqueue_completion(mismatched)
+            .expect("enqueue bad completion");
+        let err = backend
+            .poll_completions(Duration::from_millis(1))
+            .expect_err("mismatch should fail");
+        assert!(
+            err.to_string().contains(REMOTE_BACKEND_QUARANTINED_PREFIX),
+            "unexpected error: {}",
+            err
+        );
+        assert!(
+            err.to_string().contains("did not match submitted trial_id"),
+            "unexpected error: {}",
+            err
+        );
+
+        let err = backend
+            .submit(worker_dispatch_fixture(10, "trial_after_fault"))
+            .expect_err("quarantined backend should reject subsequent submissions");
+        assert!(
+            err.to_string().contains(REMOTE_BACKEND_QUARANTINED_PREFIX),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn p2d_remote_backend_rejects_mismatched_completion_worker_id() {
+        let harness = Arc::new(FakeRemoteWorkerHarness::new());
+        let backend = RemoteWorkerBackend::new(harness.clone()).expect("remote backend");
+        let dispatch = worker_dispatch_fixture(13, "trial_remote_worker_mismatch");
+        let ticket = backend.submit(dispatch.clone()).expect("submit");
+
+        let mut mismatched = worker_completion_fixture(&ticket, dispatch.schedule_idx, "bad");
+        mismatched.ticket.worker_id = "wrong.worker".to_string();
+        harness
+            .enqueue_completion(mismatched)
+            .expect("enqueue bad completion");
+        let err = backend
+            .poll_completions(Duration::from_millis(1))
+            .expect_err("mismatch should fail");
+        assert!(
+            err.to_string().contains(REMOTE_BACKEND_QUARANTINED_PREFIX),
+            "unexpected error: {}",
+            err
+        );
+        assert!(
+            err.to_string().contains("did not match submitted worker_id"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn p2d_remote_backend_dedupes_duplicate_delivery_by_completion_seq() {
+        let harness = Arc::new(FakeRemoteWorkerHarness::new());
+        let backend = RemoteWorkerBackend::new(harness.clone()).expect("remote backend");
+        let dispatch = worker_dispatch_fixture(11, "trial_remote_dupe");
+        let ticket = backend.submit(dispatch.clone()).expect("submit");
+
+        harness
+            .enqueue_completion(worker_completion_fixture_with_seq(
+                &ticket,
+                dispatch.schedule_idx,
+                "remote_ok",
+                7,
+            ))
+            .expect("enqueue completion A");
+        harness
+            .enqueue_completion(worker_completion_fixture_with_seq(
+                &ticket,
+                dispatch.schedule_idx,
+                "remote_ok",
+                7,
+            ))
+            .expect("enqueue duplicate completion A");
+
+        let completions = backend
+            .poll_completions(Duration::from_millis(1))
+            .expect("poll completions");
+        assert_eq!(completions.len(), 1);
+        assert_eq!(completions[0].ticket.ticket_id, ticket.ticket_id);
+        assert_eq!(completions[0].completion_seq, Some(7));
+
+        let trailing = backend
+            .poll_completions(Duration::from_millis(1))
+            .expect("trailing poll");
+        assert!(
+            trailing.is_empty(),
+            "duplicate completion should be dropped instead of redelivered"
+        );
+    }
+
+    #[test]
+    fn p2d_remote_backend_retries_retryable_submit_errors() {
+        #[derive(Clone)]
+        struct RetryableSubmitProtocol {
+            submit_attempts: Arc<AtomicUsize>,
+        }
+
+        impl RetryableSubmitProtocol {
+            fn new() -> Self {
+                Self {
+                    submit_attempts: Arc::new(AtomicUsize::new(0)),
+                }
+            }
+        }
+
+        impl RemoteWorkerProtocol for RetryableSubmitProtocol {
+            fn submit(&self, request: RemoteSubmitRequest) -> Result<RemoteSubmitResponse> {
+                let attempt = self.submit_attempts.fetch_add(1, Ordering::SeqCst) + 1;
+                if attempt < 3 {
+                    return Err(anyhow!(
+                        "remote worker http POST http://127.0.0.1:7777/v1/worker/submit failed: 503 service unavailable"
+                    ));
+                }
+                Ok(RemoteSubmitResponse {
+                    schema_version: REMOTE_SUBMIT_SCHEMA_V1.to_string(),
+                    ticket: WorkerTicket {
+                        worker_id: "retry.worker.1".to_string(),
+                        ticket_id: "retry.ticket.1".to_string(),
+                        trial_id: request.dispatch.trial_id,
+                    },
+                })
+            }
+
+            fn poll(&self, _request: RemotePollRequest) -> Result<RemotePollResponse> {
+                Ok(RemotePollResponse {
+                    schema_version: REMOTE_POLL_SCHEMA_V1.to_string(),
+                    completions: Vec::new(),
+                })
+            }
+
+            fn pause(&self, request: RemotePauseRequest) -> Result<RemotePauseResponse> {
+                Ok(RemotePauseResponse {
+                    schema_version: REMOTE_PAUSE_SCHEMA_V1.to_string(),
+                    ack: WorkerPauseAck {
+                        worker_id: request.worker_id,
+                        trial_id: "trial_x".to_string(),
+                        label: request.label,
+                        accepted: true,
+                    },
+                })
+            }
+
+            fn stop(&self, _request: RemoteStopRequest) -> Result<RemoteStopResponse> {
+                Ok(RemoteStopResponse {
+                    schema_version: REMOTE_STOP_SCHEMA_V1.to_string(),
+                    accepted: true,
+                })
+            }
+        }
+
+        let protocol = RetryableSubmitProtocol::new();
+        let attempts = protocol.submit_attempts.clone();
+        let backend = RemoteWorkerBackend::new(Arc::new(protocol)).expect("remote backend");
+        let dispatch = worker_dispatch_fixture(12, "trial_remote_retry");
+        let ticket = backend
+            .submit(dispatch.clone())
+            .expect("submit should retry");
+        assert_eq!(ticket.ticket_id, "retry.ticket.1");
+        assert_eq!(ticket.trial_id, dispatch.trial_id);
+        assert_eq!(attempts.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn p2d_remote_backend_retries_typed_retryable_submit_errors() {
+        #[derive(Clone)]
+        struct TypedRetryableSubmitProtocol {
+            submit_attempts: Arc<AtomicUsize>,
+        }
+
+        impl TypedRetryableSubmitProtocol {
+            fn new() -> Self {
+                Self {
+                    submit_attempts: Arc::new(AtomicUsize::new(0)),
+                }
+            }
+        }
+
+        impl RemoteWorkerProtocol for TypedRetryableSubmitProtocol {
+            fn submit(&self, request: RemoteSubmitRequest) -> Result<RemoteSubmitResponse> {
+                let attempt = self.submit_attempts.fetch_add(1, Ordering::SeqCst) + 1;
+                if attempt < 2 {
+                    return Err(anyhow!(RemoteProtocolError::retryable(
+                        "synthetic retryable transport fault"
+                    )));
+                }
+                Ok(RemoteSubmitResponse {
+                    schema_version: REMOTE_SUBMIT_SCHEMA_V1.to_string(),
+                    ticket: WorkerTicket {
+                        worker_id: "typed.retry.worker.1".to_string(),
+                        ticket_id: "typed.retry.ticket.1".to_string(),
+                        trial_id: request.dispatch.trial_id,
+                    },
+                })
+            }
+
+            fn poll(&self, _request: RemotePollRequest) -> Result<RemotePollResponse> {
+                Ok(RemotePollResponse {
+                    schema_version: REMOTE_POLL_SCHEMA_V1.to_string(),
+                    completions: Vec::new(),
+                })
+            }
+
+            fn pause(&self, request: RemotePauseRequest) -> Result<RemotePauseResponse> {
+                Ok(RemotePauseResponse {
+                    schema_version: REMOTE_PAUSE_SCHEMA_V1.to_string(),
+                    ack: WorkerPauseAck {
+                        worker_id: request.worker_id,
+                        trial_id: "trial_x".to_string(),
+                        label: request.label,
+                        accepted: true,
+                    },
+                })
+            }
+
+            fn stop(&self, _request: RemoteStopRequest) -> Result<RemoteStopResponse> {
+                Ok(RemoteStopResponse {
+                    schema_version: REMOTE_STOP_SCHEMA_V1.to_string(),
+                    accepted: true,
+                })
+            }
+        }
+
+        let protocol = TypedRetryableSubmitProtocol::new();
+        let attempts = protocol.submit_attempts.clone();
+        let backend = RemoteWorkerBackend::new(Arc::new(protocol)).expect("remote backend");
+        let dispatch = worker_dispatch_fixture(14, "trial_remote_retry_typed");
+        let ticket = backend.submit(dispatch).expect("submit should retry");
+        assert_eq!(ticket.ticket_id, "typed.retry.ticket.1");
+        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn p2d_remote_backend_rejects_schema_version_mismatch() {
+        #[derive(Clone)]
+        struct BadSchemaProtocol;
+        impl RemoteWorkerProtocol for BadSchemaProtocol {
+            fn submit(&self, request: RemoteSubmitRequest) -> Result<RemoteSubmitResponse> {
+                Ok(RemoteSubmitResponse {
+                    schema_version: "remote_worker_submit_v0".to_string(),
+                    ticket: WorkerTicket {
+                        worker_id: "w1".to_string(),
+                        ticket_id: "t1".to_string(),
+                        trial_id: request.dispatch.trial_id,
+                    },
+                })
+            }
+
+            fn poll(&self, _request: RemotePollRequest) -> Result<RemotePollResponse> {
+                Ok(RemotePollResponse {
+                    schema_version: REMOTE_POLL_SCHEMA_V1.to_string(),
+                    completions: Vec::new(),
+                })
+            }
+
+            fn pause(&self, request: RemotePauseRequest) -> Result<RemotePauseResponse> {
+                Ok(RemotePauseResponse {
+                    schema_version: REMOTE_PAUSE_SCHEMA_V1.to_string(),
+                    ack: WorkerPauseAck {
+                        worker_id: request.worker_id,
+                        trial_id: "trial_x".to_string(),
+                        label: request.label,
+                        accepted: true,
+                    },
+                })
+            }
+
+            fn stop(&self, _request: RemoteStopRequest) -> Result<RemoteStopResponse> {
+                Ok(RemoteStopResponse {
+                    schema_version: REMOTE_STOP_SCHEMA_V1.to_string(),
+                    accepted: true,
+                })
+            }
+        }
+
+        let backend = RemoteWorkerBackend::new(Arc::new(BadSchemaProtocol)).expect("remote backend");
+        let dispatch = worker_dispatch_fixture(3, "trial_schema");
+        let err = backend
+            .submit(dispatch)
+            .expect_err("schema mismatch should fail");
+        assert!(
+            err.to_string().contains("submit schema_version"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn p2e_out_of_order_completion_simulator_replays_fixture_ticks() {
+        let fixture = load_p2e_determinism_fixture();
+        let mut simulator = OutOfOrderCompletionSimulator::from_fixture(&fixture);
+
+        let tick0 = simulator.poll_tick(0);
+        assert_eq!(tick0.len(), 2);
+        assert_eq!(tick0[0].schedule_idx, 2);
+        assert_eq!(tick0[0].classification, "arrive_2");
+        assert_eq!(tick0[1].schedule_idx, 0);
+        assert_eq!(tick0[1].classification, "arrive_0");
+
+        let tick1 = simulator.poll_tick(1);
+        assert_eq!(tick1.len(), 2);
+        assert_eq!(tick1[0].schedule_idx, 3);
+        assert_eq!(tick1[0].classification, "arrive_3");
+        assert_eq!(tick1[1].schedule_idx, 1);
+        assert_eq!(tick1[1].classification, "arrive_1");
+
+        let tick2 = simulator.poll_tick(2);
+        assert!(tick2.is_empty(), "fixture should have no tick=2 arrivals");
+    }
+
+    #[test]
+    fn p2e_determinism_fixture_commits_contiguously_despite_out_of_order_arrivals() {
+        let fixture = load_p2e_determinism_fixture();
+        let mut simulator = OutOfOrderCompletionSimulator::from_fixture(&fixture);
+        let max_tick = simulator.max_tick();
+
+        let mut pending: BTreeMap<usize, TrialCompletion> = BTreeMap::new();
+        let mut next_commit_idx = 0usize;
+        let mut committed_schedule_idx = Vec::new();
+        for tick in 0..=max_tick {
+            for completion in simulator.poll_tick(tick) {
+                pending.insert(completion.schedule_idx, completion);
+            }
+            let ready =
+                drain_ready_completions_in_schedule_order(&mut pending, &mut next_commit_idx);
+            for completion in ready {
+                committed_schedule_idx.push(completion.schedule_idx);
+            }
+        }
+        let trailing =
+            drain_ready_completions_in_schedule_order(&mut pending, &mut next_commit_idx);
+        for completion in trailing {
+            committed_schedule_idx.push(completion.schedule_idx);
+        }
+
+        assert_eq!(
+            committed_schedule_idx, fixture.expected_commit_schedule_idx,
+            "commits must be deterministic and contiguous by schedule_idx"
+        );
+        assert!(
+            pending.is_empty(),
+            "pending completion buffer should fully drain by final commit"
+        );
+    }
+
+    fn write_run_control_v2_multi_active_fixture(run_dir: &Path, status: &str, trials: &[&str]) {
+        let mut active_trials = serde_json::Map::new();
+        for (idx, trial_id) in trials.iter().enumerate() {
+            active_trials.insert(
+                (*trial_id).to_string(),
+                json!({
+                    "trial_id": trial_id,
+                    "worker_id": format!("worker_{}", idx),
+                    "schedule_idx": idx,
+                    "variant_id": "base",
+                    "started_at": "2026-02-22T00:00:00Z",
+                    "control": {
+                        "id": BUILTIN_COMMAND_ADAPTER_ID,
+                        "version": BUILTIN_COMMAND_ADAPTER_VERSION,
+                        "command_path": format!("/tmp/{}.control.json", trial_id),
+                        "events_path": format!("/tmp/{}.events.jsonl", trial_id)
+                    }
+                }),
+            );
+        }
+        let payload = json!({
+            "schema_version": "run_control_v2",
+            "run_id": "run_1",
+            "status": status,
+            "active_trials": active_trials,
+            "updated_at": "2026-02-22T00:00:00Z"
+        });
+        atomic_write_json_pretty(&run_control_path(run_dir), &payload)
+            .expect("run control fixture");
+    }
+
+    #[test]
+    fn p2e_pause_scaffolding_marks_interrupted_when_multi_flight_pause_fails() {
+        let (_root, run_dir) = create_run_dir("agentlab_p2e_pause_scaffold", "run_1");
+        write_resolved_experiment(&run_dir, "cli_events", true);
+        write_run_control_v2_multi_active_fixture(&run_dir, "running", &["trial_a", "trial_b"]);
+
+        let err = match pause_run(&run_dir, None, Some("checkpoint"), 1) {
+            Ok(_) => {
+                panic!("pause fan-out should fail when fixture trial dirs/controls are absent")
+            }
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains("pause_partial_failure"),
+            "unexpected error: {}",
+            err
+        );
+        let run_control = load_json_file(&run_control_path(&run_dir)).expect("run control");
+        assert_eq!(
+            run_control
+                .pointer("/status")
+                .and_then(|v| v.as_str())
+                .unwrap_or(""),
+            "interrupted"
+        );
+    }
+
+    #[test]
+    fn p2e_resume_scaffolding_requires_trial_id_when_multi_flight_is_active() {
+        let (_root, run_dir) = create_run_dir("agentlab_p2e_resume_scaffold", "run_1");
+        write_run_control_v2_multi_active_fixture(&run_dir, "paused", &["trial_a", "trial_b"]);
+
+        let err = match resume_trial(&run_dir, None, None, &BTreeMap::new(), false) {
+            Ok(_) => {
+                panic!("resume without trial_id should fail when multiple active trials exist")
+            }
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains("resume_multiple_active_trials"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn p3a_deterministic_committer_buffers_out_of_order_and_dedupes_commits() {
+        let (_root, run_dir) = create_run_dir("agentlab_p3a_committer", "run_1");
+        let mut schedule_progress = ScheduleProgress {
+            schema_version: "schedule_progress_v1".to_string(),
+            run_id: "run_1".to_string(),
+            total_slots: 3,
+            next_schedule_index: 0,
+            next_trial_index: 2,
+            schedule: vec![
+                TrialSlot {
+                    variant_idx: 0,
+                    task_idx: 0,
+                    repl_idx: 0,
+                },
+                TrialSlot {
+                    variant_idx: 0,
+                    task_idx: 1,
+                    repl_idx: 0,
+                },
+                TrialSlot {
+                    variant_idx: 0,
+                    task_idx: 2,
+                    repl_idx: 0,
+                },
+            ],
+            completed_slots: Vec::new(),
+            pruned_variants: Vec::new(),
+            consecutive_failures: BTreeMap::new(),
+            use_container: false,
+            updated_at: Utc::now().to_rfc3339(),
+        };
+        let mut run_sink = JsonlRunSink::new(&run_dir).expect("sink");
+        let mut committer = DeterministicCommitter::from_progress(&schedule_progress);
+        let policy_config = PolicyConfig::default();
+        let evidence_records_path = run_dir.join("runtime").join("p3a_evidence.jsonl");
+        let chain_state_path = run_dir.join("runtime").join("p3a_chain_state.jsonl");
+        let mut pruned_variants: HashSet<usize> = HashSet::new();
+        let mut consecutive_failures: BTreeMap<usize, usize> = BTreeMap::new();
+
+        let inserted = committer
+            .enqueue_trial(
+                1,
+                TrialExecutionResult::minimal("trial_2".to_string(), "completed", Some(0)),
+            )
+            .expect("enqueue idx=1");
+        assert!(inserted, "first enqueue should be accepted");
+        assert_eq!(
+            committer
+                .drain_ready(
+                    &run_dir,
+                    &policy_config,
+                    &evidence_records_path,
+                    &chain_state_path,
+                    &mut schedule_progress,
+                    2,
+                    &mut pruned_variants,
+                    &mut consecutive_failures,
+                    &mut run_sink
+                )
+                .expect("drain"),
+            0,
+            "idx=1 cannot commit until idx=0 arrives"
+        );
+
+        committer
+            .enqueue_trial(
+                0,
+                TrialExecutionResult::minimal("trial_1".to_string(), "completed", Some(0)),
+            )
+            .expect("enqueue idx=0");
+        assert_eq!(
+            committer
+                .drain_ready(
+                    &run_dir,
+                    &policy_config,
+                    &evidence_records_path,
+                    &chain_state_path,
+                    &mut schedule_progress,
+                    2,
+                    &mut pruned_variants,
+                    &mut consecutive_failures,
+                    &mut run_sink
+                )
+                .expect("drain"),
+            2,
+            "contiguous commit should drain idx=0 and idx=1"
+        );
+        assert_eq!(
+            schedule_progress
+                .completed_slots
+                .iter()
+                .map(|slot| slot.schedule_index)
+                .collect::<Vec<_>>(),
+            vec![0, 1]
+        );
+
+        let duplicate_committed = committer
+            .enqueue_trial(
+                1,
+                TrialExecutionResult::minimal("trial_2".to_string(), "completed", Some(0)),
+            )
+            .expect("enqueue duplicate committed");
+        assert!(
+            !duplicate_committed,
+            "duplicate completion for committed slot must be idempotently dropped"
+        );
+    }
+
+    #[test]
+    fn p3b_benchmark_preflight_stages_frozen_input_and_records_task_image() {
+        let root = TempDirGuard::new("agentlab_p3b_preflight");
+        let trial_dir = root.path.join("trial_1");
+        ensure_dir(&trial_dir).expect("trial dir");
+        let trial_input_path = trial_dir.join("trial_input.json");
+        atomic_write_json_pretty(
+            &trial_input_path,
+            &json!({
+                "schema_version": "agent_task_v1",
+                "ids": { "trial_id": "trial_1" }
+            }),
+        )
+        .expect("trial input");
+
+        let benchmark = BenchmarkConfig {
+            policy: BenchmarkPolicyConfig::default(),
+            adapter: Some(BenchmarkAdapterConfig {
+                command: vec!["echo".to_string(), "ok".to_string()],
+                manifest: None,
+            }),
+        };
+        stage_benchmark_trial_preflight(
+            &benchmark,
+            &trial_dir,
+            "run_1",
+            "trial_1",
+            4,
+            "candidate",
+            &json!({
+                "id": "task_9",
+                "image": "ghcr.io/acme/task:20260222",
+                "grading": { "enabled": false }
+            }),
+            &trial_input_path,
+        )
+        .expect("preflight");
+
+        let preflight =
+            load_json_file(&trial_dir.join("benchmark_preflight.json")).expect("preflight json");
+        assert_eq!(
+            preflight
+                .pointer("/task_image")
+                .and_then(|v| v.as_str())
+                .unwrap_or(""),
+            "ghcr.io/acme/task:20260222"
+        );
+        assert_eq!(
+            preflight
+                .pointer("/grading/enabled")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true),
+            false
+        );
+        assert!(
+            trial_dir
+                .join("artifacts")
+                .join("benchmark_frozen_agent_input")
+                .join("trial_input.json")
+                .exists(),
+            "frozen trial_input must be staged for grading/replay"
+        );
+    }
+
+    #[test]
+    fn p3c_run_control_v2_writer_supports_multi_flight_active_trials() {
+        let (_root, run_dir) = create_run_dir("agentlab_p3c_run_control", "run_1");
+        let active_trials = vec![
+            RunControlActiveTrial {
+                trial_id: "trial_1".to_string(),
+                worker_id: "worker_a".to_string(),
+                schedule_idx: Some(1),
+                variant_id: Some("base".to_string()),
+                started_at: Some("2026-02-22T00:00:00Z".to_string()),
+                control: None,
+            },
+            RunControlActiveTrial {
+                trial_id: "trial_2".to_string(),
+                worker_id: "worker_b".to_string(),
+                schedule_idx: Some(2),
+                variant_id: Some("candidate".to_string()),
+                started_at: Some("2026-02-22T00:00:01Z".to_string()),
+                control: None,
+            },
+        ];
+        write_run_control_v2(&run_dir, "run_1", "running", &active_trials, None)
+            .expect("write run control v2");
+        let run_control = load_json_file(&run_control_path(&run_dir)).expect("run control");
+        assert_eq!(
+            run_control
+                .pointer("/active_trials/trial_1/schedule_idx")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(0),
+            1
+        );
+        assert_eq!(
+            run_control
+                .pointer("/active_trials/trial_2/variant_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or(""),
+            "candidate"
+        );
+        assert!(
+            run_control.pointer("/active_trial_id").is_none(),
+            "legacy active_trial_id mirror field should be removed"
+        );
+        assert!(
+            run_control.pointer("/active_adapter").is_none(),
+            "legacy active_adapter mirror field should be removed"
+        );
+    }
+
+    #[test]
+    fn p4_cutover_uses_parallel_engine_path_for_isolate_policy() {
+        let (_root, run_dir) = create_run_dir("agentlab_p4_parallel_path", "run_1");
+        write_run_control_v2(&run_dir, "run_1", "paused", &[], None).expect("run control");
+        let trials_dir = run_dir.join("trials");
+        let evidence_dir = run_dir.join("evidence");
+        ensure_dir(&trials_dir).expect("trials dir");
+        ensure_dir(&evidence_dir).expect("evidence dir");
+        let evidence_records_path = evidence_dir.join("evidence_records.jsonl");
+        let task_chain_states_path = evidence_dir.join("task_chain_states.jsonl");
+        fs::write(&evidence_records_path, "").expect("evidence rows");
+        fs::write(&task_chain_states_path, "").expect("chain rows");
+
+        let mut schedule_progress = ScheduleProgress {
+            schema_version: "schedule_progress_v1".to_string(),
+            run_id: "run_1".to_string(),
+            total_slots: 0,
+            next_schedule_index: 0,
+            next_trial_index: 0,
+            schedule: Vec::new(),
+            completed_slots: Vec::new(),
+            pruned_variants: Vec::new(),
+            consecutive_failures: BTreeMap::new(),
+            use_container: false,
+            updated_at: Utc::now().to_rfc3339(),
+        };
+        let mut trial_index = 0_usize;
+        let mut consecutive_failures: BTreeMap<usize, usize> = BTreeMap::new();
+        let mut pruned_variants: HashSet<usize> = HashSet::new();
+        let mut run_sink = JsonlRunSink::new(&run_dir).expect("sink");
+        execute_schedule_engine(
+            ScheduleEngineMode::ContinueRun,
+            &run_dir,
+            "run_1",
+            "agent_runtime",
+            &run_dir,
+            &run_dir.join("dataset.jsonl"),
+            &[],
+            &[],
+            &[],
+            &PolicyConfig::default(),
+            &BenchmarkConfig::default(),
+            &[],
+            &RunBehavior::default(),
+            MaterializationMode::Full,
+            &TaskBoundaryPolicy::default(),
+            &trials_dir,
+            &evidence_dir,
+            &evidence_records_path,
+            &task_chain_states_path,
+            &mut schedule_progress,
+            &mut trial_index,
+            &mut consecutive_failures,
+            &mut pruned_variants,
+            &[],
+            "base",
+            &mut run_sink,
+            2,
+            None,
+            None,
+        )
+        .expect("parallel engine should no-op cleanly");
+
+        let run_control = load_json_file(&run_control_path(&run_dir)).expect("run control");
+        assert_eq!(
+            run_control
+                .pointer("/status")
+                .and_then(|v| v.as_str())
+                .unwrap_or(""),
+            "running"
+        );
+        let active_trials = run_control
+            .pointer("/active_trials")
+            .and_then(|v| v.as_object())
+            .cloned()
+            .unwrap_or_default();
+        assert!(
+            active_trials.is_empty(),
+            "parallel engine should end with no active trials"
+        );
+    }
+
+    #[test]
+    fn p5a_recovered_active_trials_commit_as_worker_lost_deterministically() {
+        let (_root, run_dir) = create_run_dir("agentlab_p5a_worker_lost", "run_1");
+        let trials_dir = run_dir.join("trials");
+        let evidence_dir = run_dir.join("evidence");
+        ensure_dir(&trials_dir).expect("trials dir");
+        ensure_dir(&evidence_dir).expect("evidence dir");
+        let evidence_records_path = evidence_dir.join("evidence_records.jsonl");
+        let task_chain_states_path = evidence_dir.join("task_chain_states.jsonl");
+        fs::write(&evidence_records_path, "").expect("evidence rows");
+        fs::write(&task_chain_states_path, "").expect("chain rows");
+
+        let variants = vec![Variant {
+            id: "base".to_string(),
+            bindings: json!({}),
+            args: Vec::new(),
+            env: BTreeMap::new(),
+            image: None,
+            runtime_overrides: None,
+        }];
+        let schedule = vec![TrialSlot {
+            variant_idx: 0,
+            task_idx: 0,
+            repl_idx: 0,
+        }];
+        let mut schedule_progress = ScheduleProgress {
+            schema_version: "schedule_progress_v1".to_string(),
+            run_id: "run_1".to_string(),
+            total_slots: 1,
+            next_schedule_index: 0,
+            next_trial_index: 0,
+            schedule: schedule.clone(),
+            completed_slots: Vec::new(),
+            pruned_variants: Vec::new(),
+            consecutive_failures: BTreeMap::new(),
+            use_container: false,
+            updated_at: Utc::now().to_rfc3339(),
+        };
+        let recovered_active_trials = vec![RunControlActiveTrial {
+            trial_id: "trial_orphan".to_string(),
+            worker_id: "worker_dead".to_string(),
+            schedule_idx: Some(0),
+            variant_id: Some("base".to_string()),
+            started_at: Some(Utc::now().to_rfc3339()),
+            control: None,
+        }];
+        let mut trial_index = 0_usize;
+        let mut consecutive_failures: BTreeMap<usize, usize> = BTreeMap::new();
+        let mut pruned_variants: HashSet<usize> = HashSet::new();
+        let mut run_sink = JsonlRunSink::new(&run_dir).expect("sink");
+        let policy_config = PolicyConfig {
+            pruning_max_consecutive_failures: Some(1),
+            ..PolicyConfig::default()
+        };
+        execute_schedule_engine(
+            ScheduleEngineMode::ContinueRun,
+            &run_dir,
+            "run_1",
+            "agent_runtime",
+            &run_dir,
+            &run_dir.join("dataset.jsonl"),
+            &variants,
+            &[json!({"id":"task_1"})],
+            &schedule,
+            &policy_config,
+            &BenchmarkConfig::default(),
+            &[],
+            &RunBehavior::default(),
+            MaterializationMode::Full,
+            &TaskBoundaryPolicy::default(),
+            &trials_dir,
+            &evidence_dir,
+            &evidence_records_path,
+            &task_chain_states_path,
+            &mut schedule_progress,
+            &mut trial_index,
+            &mut consecutive_failures,
+            &mut pruned_variants,
+            &recovered_active_trials,
+            "base",
+            &mut run_sink,
+            1,
+            None,
+            None,
+        )
+        .expect("parallel recovery handling");
+
+        assert_eq!(schedule_progress.next_schedule_index, 1);
+        assert_eq!(schedule_progress.completed_slots.len(), 1);
+        assert_eq!(schedule_progress.completed_slots[0].schedule_index, 0);
+        assert_eq!(
+            schedule_progress.completed_slots[0].trial_id,
+            "trial_orphan"
+        );
+        assert_eq!(schedule_progress.completed_slots[0].status, "failed");
+        assert_eq!(consecutive_failures.get(&0).copied().unwrap_or(0), 1);
+        assert!(pruned_variants.contains(&0));
+    }
+
+    #[test]
+    fn p5a_pause_run_fans_out_to_all_active_trials() {
+        let (_root, run_dir) = create_run_dir("agentlab_p5a_pause_fanout", "run_1");
+        write_resolved_experiment(&run_dir, "cli_events", true);
+        let trial_a_dir = seed_parent_trial(&run_dir, "trial_1", json!([]), "running", None);
+        let trial_b_dir = seed_parent_trial(&run_dir, "trial_2", json!([]), "running", None);
+        let control_a = active_control_for_trial(&trial_a_dir);
+        let control_b = active_control_for_trial(&trial_b_dir);
+
+        let active_trials = vec![
+            RunControlActiveTrial {
+                trial_id: "trial_1".to_string(),
+                worker_id: "worker_a".to_string(),
+                schedule_idx: Some(1),
+                variant_id: Some("base".to_string()),
+                started_at: Some(Utc::now().to_rfc3339()),
+                control: Some(control_a.clone()),
+            },
+            RunControlActiveTrial {
+                trial_id: "trial_2".to_string(),
+                worker_id: "worker_b".to_string(),
+                schedule_idx: Some(2),
+                variant_id: Some("base".to_string()),
+                started_at: Some(Utc::now().to_rfc3339()),
+                control: Some(control_b.clone()),
+            },
+        ];
+        write_run_control_v2(&run_dir, "run_1", "running", &active_trials, None).expect("control");
+
+        let ack_a = spawn_pause_ack_writer(
+            trial_a_dir.join("state").join("lab_control.json"),
+            trial_a_dir.join("state").join("events.jsonl"),
+        );
+        let ack_b = spawn_pause_ack_writer(
+            trial_b_dir.join("state").join("lab_control.json"),
+            trial_b_dir.join("state").join("events.jsonl"),
+        );
+        let paused = pause_run(&run_dir, None, Some("fanout_pause"), 2).expect("pause fanout");
+        ack_a.join().expect("ack a");
+        ack_b.join().expect("ack b");
+
+        assert_eq!(paused.run_id, "run_1");
+        assert_eq!(paused.trial_id, "multi");
+        assert_eq!(paused.label, "fanout_pause");
+        assert!(paused.checkpoint_acked);
+        assert!(paused.stop_acked);
+
+        let run_control = load_json_file(&run_control_path(&run_dir)).expect("run control");
+        assert_eq!(
+            run_control
+                .pointer("/status")
+                .and_then(|v| v.as_str())
+                .unwrap_or(""),
+            "paused"
+        );
+        let active = run_control
+            .pointer("/active_trials")
+            .and_then(|v| v.as_object())
+            .cloned()
+            .unwrap_or_default();
+        assert_eq!(active.len(), 2);
+
+        let trial_a_state = load_json_file(&trial_a_dir.join("trial_state.json")).expect("a state");
+        assert_eq!(
+            trial_a_state
+                .pointer("/status")
+                .and_then(|v| v.as_str())
+                .unwrap_or(""),
+            "paused"
+        );
+        let trial_b_state = load_json_file(&trial_b_dir.join("trial_state.json")).expect("b state");
+        assert_eq!(
+            trial_b_state
+                .pointer("/status")
+                .and_then(|v| v.as_str())
+                .unwrap_or(""),
+            "paused"
+        );
+    }
+
+    #[test]
+    fn p5a_pause_run_partial_fanout_sets_interrupted_and_keeps_survivor_active() {
+        let (_root, run_dir) = create_run_dir("agentlab_p5a_pause_partial", "run_1");
+        write_resolved_experiment(&run_dir, "cli_events", true);
+        let trial_a_dir = seed_parent_trial(&run_dir, "trial_1", json!([]), "running", None);
+        let trial_b_dir = seed_parent_trial(&run_dir, "trial_2", json!([]), "running", None);
+        let control_a = active_control_for_trial(&trial_a_dir);
+        let control_b = active_control_for_trial(&trial_b_dir);
+
+        let active_trials = vec![
+            RunControlActiveTrial {
+                trial_id: "trial_1".to_string(),
+                worker_id: "worker_a".to_string(),
+                schedule_idx: Some(1),
+                variant_id: Some("base".to_string()),
+                started_at: Some(Utc::now().to_rfc3339()),
+                control: Some(control_a.clone()),
+            },
+            RunControlActiveTrial {
+                trial_id: "trial_2".to_string(),
+                worker_id: "worker_b".to_string(),
+                schedule_idx: Some(2),
+                variant_id: Some("base".to_string()),
+                started_at: Some(Utc::now().to_rfc3339()),
+                control: Some(control_b.clone()),
+            },
+        ];
+        write_run_control_v2(&run_dir, "run_1", "running", &active_trials, None).expect("control");
+
+        let ack_a = spawn_pause_ack_writer(
+            trial_a_dir.join("state").join("lab_control.json"),
+            trial_a_dir.join("state").join("events.jsonl"),
+        );
+        let err = match pause_run(&run_dir, None, Some("fanout_pause"), 1) {
+            Ok(_) => panic!("partial pause should fail"),
+            Err(err) => err,
+        };
+        ack_a.join().expect("ack a");
+        assert!(
+            err.to_string().contains("pause_partial_failure"),
+            "unexpected error: {}",
+            err
+        );
+
+        let run_control = load_json_file(&run_control_path(&run_dir)).expect("run control");
+        assert_eq!(
+            run_control
+                .pointer("/status")
+                .and_then(|v| v.as_str())
+                .unwrap_or(""),
+            "interrupted"
+        );
+        let active = run_control
+            .pointer("/active_trials")
+            .and_then(|v| v.as_object())
+            .cloned()
+            .unwrap_or_default();
+        assert_eq!(active.len(), 1);
+        assert!(active.contains_key("trial_2"));
+
+        let trial_a_state = load_json_file(&trial_a_dir.join("trial_state.json")).expect("a state");
+        assert_eq!(
+            trial_a_state
+                .pointer("/status")
+                .and_then(|v| v.as_str())
+                .unwrap_or(""),
+            "paused"
+        );
+        let trial_b_state = load_json_file(&trial_b_dir.join("trial_state.json")).expect("b state");
+        assert_eq!(
+            trial_b_state
+                .pointer("/status")
+                .and_then(|v| v.as_str())
+                .unwrap_or(""),
+            "running"
+        );
+    }
+
+    fn p7_trial_result_with_trial_record(schedule_idx: usize) -> TrialExecutionResult {
+        let trial_id = format!("trial_{}", schedule_idx + 1);
+        let mut result = TrialExecutionResult::minimal(trial_id.clone(), "completed", Some(0));
+        result.deferred_trial_records.push(TrialRecord {
+            run_id: "run_1".to_string(),
+            trial_id,
+            baseline_id: "base".to_string(),
+            workload_type: "agent_harness".to_string(),
+            variant_id: "base".to_string(),
+            task_index: schedule_idx,
+            task_id: format!("task_{}", schedule_idx),
+            repl_idx: 0,
+            outcome: "success".to_string(),
+            success: true,
+            status_code: "0".to_string(),
+            container_mode: false,
+            integration_level: "cli_basic".to_string(),
+            network_mode_requested: "none".to_string(),
+            network_mode_effective: "none".to_string(),
+            primary_metric_name: "success".to_string(),
+            primary_metric_value: json!(1.0),
+            metrics: json!({"success": 1.0, "status_code": "0"}),
+            bindings: json!({}),
+            hook_events_total: 0,
+            has_hook_events: false,
+        });
+        result
+    }
+
+    fn p7_commit_trial_rows_for_arrival_order(
+        prefix: &str,
+        arrival_order: &[usize],
+    ) -> (Vec<String>, Vec<usize>) {
+        let (_root, run_dir) = create_run_dir(prefix, "run_1");
+        let slot_count = arrival_order.len();
+        let mut schedule_progress = ScheduleProgress {
+            schema_version: "schedule_progress_v1".to_string(),
+            run_id: "run_1".to_string(),
+            total_slots: slot_count,
+            next_schedule_index: 0,
+            next_trial_index: slot_count,
+            schedule: (0..slot_count)
+                .map(|idx| TrialSlot {
+                    variant_idx: 0,
+                    task_idx: idx,
+                    repl_idx: 0,
+                })
+                .collect(),
+            completed_slots: Vec::new(),
+            pruned_variants: Vec::new(),
+            consecutive_failures: BTreeMap::new(),
+            use_container: false,
+            updated_at: Utc::now().to_rfc3339(),
+        };
+        let policy_config = PolicyConfig::default();
+        let evidence_records_path = run_dir.join("runtime").join("p7_evidence.jsonl");
+        let chain_state_path = run_dir.join("runtime").join("p7_chain_state.jsonl");
+        let mut pruned_variants: HashSet<usize> = HashSet::new();
+        let mut consecutive_failures: BTreeMap<usize, usize> = BTreeMap::new();
+        let mut run_sink = BufferedRunSink::default();
+        let mut committer = DeterministicCommitter::from_progress(&schedule_progress);
+
+        for schedule_idx in arrival_order {
+            let inserted = committer
+                .enqueue_trial(
+                    *schedule_idx,
+                    p7_trial_result_with_trial_record(*schedule_idx),
+                )
+                .expect("enqueue trial");
+            assert!(inserted, "arrival order should not contain duplicates");
+            let _ = committer
+                .drain_ready(
+                    &run_dir,
+                    &policy_config,
+                    &evidence_records_path,
+                    &chain_state_path,
+                    &mut schedule_progress,
+                    slot_count,
+                    &mut pruned_variants,
+                    &mut consecutive_failures,
+                    &mut run_sink,
+                )
+                .expect("drain ready");
+        }
+        let _ = committer
+            .drain_ready(
+                &run_dir,
+                &policy_config,
+                &evidence_records_path,
+                &chain_state_path,
+                &mut schedule_progress,
+                slot_count,
+                &mut pruned_variants,
+                &mut consecutive_failures,
+                &mut run_sink,
+            )
+            .expect("final drain");
+
+        let committed_trial_ids = run_sink
+            .trial_records
+            .iter()
+            .map(|row| row.trial_id.clone())
+            .collect::<Vec<_>>();
+        let committed_schedule_idx = schedule_progress
+            .completed_slots
+            .iter()
+            .map(|slot| slot.schedule_index)
+            .collect::<Vec<_>>();
+        (committed_trial_ids, committed_schedule_idx)
+    }
+
+    #[test]
+    fn p7_concurrency_cap_honors_max_in_flight_four() {
+        let current_in_flight = Arc::new(AtomicUsize::new(0));
+        let peak_in_flight = Arc::new(AtomicUsize::new(0));
+        let current_in_flight_for_worker = current_in_flight.clone();
+        let peak_in_flight_for_worker = peak_in_flight.clone();
+        let executor: Arc<LocalTrialExecutor> = Arc::new(move |dispatch| {
+            let running_now = current_in_flight_for_worker.fetch_add(1, Ordering::SeqCst) + 1;
+            let _ = peak_in_flight_for_worker.fetch_max(running_now, Ordering::SeqCst);
+            thread::sleep(Duration::from_millis(120));
+            current_in_flight_for_worker.fetch_sub(1, Ordering::SeqCst);
+            Ok(TrialCompletion {
+                ticket: WorkerTicket {
+                    worker_id: "ignored".to_string(),
+                    ticket_id: "ignored".to_string(),
+                    trial_id: dispatch.trial_id.clone(),
+                },
+                schedule_idx: dispatch.schedule_idx,
+                completion_seq: None,
+                terminal_status: "succeeded".to_string(),
+                classification: "ok".to_string(),
+                artifacts: json!({}),
+                metrics: json!({}),
+                runtime_summary: json!({}),
+            })
+        });
+        let backend =
+            LocalThreadWorkerBackend::new_with_ceiling(4, executor, Some(4)).expect("backend");
+        assert_eq!(backend.effective_max_in_flight(), 4);
+
+        let total_slots = 16usize;
+        let mut next_schedule_idx = 0usize;
+        let mut completed = 0usize;
+        let mut in_flight_ticket_ids: HashSet<String> = HashSet::new();
+        let mut peak_scheduler_in_flight = 0usize;
+        let deadline = Instant::now() + Duration::from_secs(10);
+
+        while completed < total_slots {
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for p7 concurrency test to drain: completed={} total={}",
+                completed,
+                total_slots
+            );
+            while next_schedule_idx < total_slots && in_flight_ticket_ids.len() < 4 {
+                let dispatch = worker_dispatch_fixture(
+                    next_schedule_idx,
+                    &format!("trial_{}", next_schedule_idx + 1),
+                );
+                let ticket = backend.submit(dispatch).expect("submit under cap");
+                assert!(
+                    in_flight_ticket_ids.insert(ticket.ticket_id.clone()),
+                    "duplicate ticket id {}",
+                    ticket.ticket_id
+                );
+                next_schedule_idx += 1;
+            }
+            peak_scheduler_in_flight = peak_scheduler_in_flight.max(in_flight_ticket_ids.len());
+
+            let completions = backend
+                .poll_completions(Duration::from_millis(250))
+                .expect("poll completions");
+            if completions.is_empty() {
+                continue;
+            }
+            for completion in completions {
+                assert!(
+                    in_flight_ticket_ids.remove(completion.ticket.ticket_id.as_str()),
+                    "completion for unknown ticket {}",
+                    completion.ticket.ticket_id
+                );
+                completed += 1;
+            }
+        }
+
+        assert_eq!(peak_scheduler_in_flight, 4);
+        assert!(
+            peak_in_flight.load(Ordering::SeqCst) <= 4,
+            "executor observed in-flight count above cap"
+        );
+        assert!(
+            peak_in_flight.load(Ordering::SeqCst) >= 2,
+            "expected at least some parallel overlap at max_concurrency=4"
+        );
+    }
+
+    #[test]
+    fn p7_parallel_and_serial_equivalent_final_aggregates_ordering_normalized() {
+        let serial_arrivals = [0usize, 1, 2, 3];
+        let parallel_arrivals = [2usize, 0, 3, 1];
+
+        let (serial_trial_ids, serial_commit_idx) =
+            p7_commit_trial_rows_for_arrival_order("agentlab_p7_serial_parity", &serial_arrivals);
+        let (parallel_trial_ids, parallel_commit_idx) = p7_commit_trial_rows_for_arrival_order(
+            "agentlab_p7_parallel_parity",
+            &parallel_arrivals,
+        );
+
+        assert_eq!(serial_commit_idx, vec![0, 1, 2, 3]);
+        assert_eq!(parallel_commit_idx, serial_commit_idx);
+        assert_eq!(
+            parallel_trial_ids, serial_trial_ids,
+            "ordering-normalized final aggregates should match serial-equivalent output"
+        );
+    }
+
+    #[test]
+    fn p7_release_gate_rejects_non_isolate_state_policy() {
+        let (_root, run_dir) = create_run_dir("agentlab_p7_release_gate", "run_1");
+        write_run_control_v2(&run_dir, "run_1", "paused", &[], None).expect("run control");
+        let trials_dir = run_dir.join("trials");
+        let evidence_dir = run_dir.join("evidence");
+        ensure_dir(&trials_dir).expect("trials dir");
+        ensure_dir(&evidence_dir).expect("evidence dir");
+        let evidence_records_path = evidence_dir.join("evidence_records.jsonl");
+        let task_chain_states_path = evidence_dir.join("task_chain_states.jsonl");
+        fs::write(&evidence_records_path, "").expect("evidence rows");
+        fs::write(&task_chain_states_path, "").expect("chain rows");
+
+        let mut schedule_progress = ScheduleProgress {
+            schema_version: "schedule_progress_v1".to_string(),
+            run_id: "run_1".to_string(),
+            total_slots: 0,
+            next_schedule_index: 0,
+            next_trial_index: 0,
+            schedule: Vec::new(),
+            completed_slots: Vec::new(),
+            pruned_variants: Vec::new(),
+            consecutive_failures: BTreeMap::new(),
+            use_container: false,
+            updated_at: Utc::now().to_rfc3339(),
+        };
+        let mut trial_index = 0_usize;
+        let mut consecutive_failures: BTreeMap<usize, usize> = BTreeMap::new();
+        let mut pruned_variants: HashSet<usize> = HashSet::new();
+        let mut run_sink = JsonlRunSink::new(&run_dir).expect("sink");
+        let policy_config = PolicyConfig {
+            state: StatePolicy::PersistPerTask,
+            ..PolicyConfig::default()
+        };
+        let err = execute_schedule_engine(
+            ScheduleEngineMode::ContinueRun,
+            &run_dir,
+            "run_1",
+            "agent_runtime",
+            &run_dir,
+            &run_dir.join("dataset.jsonl"),
+            &[],
+            &[],
+            &[],
+            &policy_config,
+            &BenchmarkConfig::default(),
+            &[],
+            &RunBehavior::default(),
+            MaterializationMode::Full,
+            &TaskBoundaryPolicy::default(),
+            &trials_dir,
+            &evidence_dir,
+            &evidence_records_path,
+            &task_chain_states_path,
+            &mut schedule_progress,
+            &mut trial_index,
+            &mut consecutive_failures,
+            &mut pruned_variants,
+            &[],
+            "base",
+            &mut run_sink,
+            4,
+            None,
+            None,
+        )
+        .expect_err("non-isolate policy should be rejected by hard cutover release gate");
+        assert!(
+            err.to_string().contains("supports only isolate_per_trial"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[test]
     fn parse_task_boundary_extracts_runtime_fields() {
         let task = json!({
             "schema_version": "task_boundary_v1",
@@ -8748,6 +13826,23 @@ JSONL
     }
 
     #[test]
+    fn parse_task_boundary_from_trial_input_accepts_clean_task_payload() {
+        let input = json!({
+            "id": "task_1",
+            "prompt": "hello"
+        });
+        let parsed = parse_task_boundary_from_trial_input(&input).expect("clean payload");
+        assert_eq!(
+            parsed
+                .task_payload
+                .get("id")
+                .and_then(|v| v.as_str())
+                .unwrap_or(""),
+            "task_1"
+        );
+    }
+
+    #[test]
     fn materialize_workspace_files_writes_utf8_and_base64() {
         let root = TempDirGuard::new("agentlab_task_boundary_workspace_files");
         let exp_dir = root.path.join("exp");
@@ -8849,6 +13944,9 @@ JSONL
         let variant = Variant {
             id: "baseline".to_string(),
             bindings: json!({ "model": "demo" }),
+            args: Vec::new(),
+            env: BTreeMap::new(),
+            image: None,
             runtime_overrides: None,
         };
         let task_boundary = TaskBoundaryMaterialization {
@@ -9091,6 +14189,8 @@ JSONL
         assert_eq!(config.retry_max_attempts, 1);
         assert!(config.retry_on.is_empty());
         assert!(config.pruning_max_consecutive_failures.is_none());
+        assert_eq!(config.concurrency.max_in_flight_per_variant, None);
+        assert!(config.concurrency.require_chain_lease);
     }
 
     #[test]
@@ -9106,6 +14206,10 @@ JSONL
                     },
                     "pruning": {
                         "max_consecutive_failures": 5
+                    },
+                    "concurrency": {
+                        "max_in_flight_per_variant": 2,
+                        "require_chain_lease": false
                     }
                 }
             }
@@ -9116,6 +14220,8 @@ JSONL
         assert_eq!(config.retry_max_attempts, 3);
         assert_eq!(config.retry_on, vec!["error", "timeout"]);
         assert_eq!(config.pruning_max_consecutive_failures, Some(5));
+        assert_eq!(config.concurrency.max_in_flight_per_variant, Some(2));
+        assert!(!config.concurrency.require_chain_lease);
     }
 
     #[test]
@@ -9148,6 +14254,7 @@ JSONL
         let config = parse_policies(&spec);
         assert_eq!(config.scheduling, SchedulingPolicy::VariantSequential);
         assert_eq!(config.state, StatePolicy::IsolatePerTrial);
+        assert!(config.concurrency.require_chain_lease);
     }
 
     #[test]
@@ -9163,5 +14270,24 @@ JSONL
         let config = parse_policies(&spec);
         assert_eq!(config.retry_max_attempts, 1);
         assert!(config.retry_on.is_empty());
+        assert!(config.concurrency.require_chain_lease);
+    }
+
+    #[test]
+    fn parse_policies_reads_concurrency_fields() {
+        let spec = json!({
+            "design": {
+                "policies": {
+                    "concurrency": {
+                        "max_in_flight_per_variant": 4,
+                        "require_chain_lease": true
+                    }
+                }
+            }
+        });
+
+        let config = parse_policies(&spec);
+        assert_eq!(config.concurrency.max_in_flight_per_variant, Some(4));
+        assert!(config.concurrency.require_chain_lease);
     }
 }

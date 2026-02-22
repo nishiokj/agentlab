@@ -1,0 +1,37 @@
+version: "1.0"
+experiment:
+  id: my_eval
+  name: My Evaluation
+
+dataset:
+  path: tasks.jsonl
+  limit: 50
+
+design:
+  comparison: paired
+  replications: 3
+  seed: 42
+
+baseline:
+  variant_id: control
+
+variant_plan:
+  - variant_id: hot
+    args: [--temperature, "0.9"]
+  - variant_id: new_model
+    image: my-harness-v2:latest
+    args: [--model, claude-4]
+  - variant_id: combined
+    image: my-harness-v2:latest
+    args: [--temperature, "0.9", --model, claude-4]
+    env:
+      DEBUG: "1"
+
+runtime:
+  image: my-harness:latest
+  command: [python, harness.py]
+  timeout_ms: 300000
+  network: none
+  resources:
+    cpus: 2
+    memory_mb: 2048
