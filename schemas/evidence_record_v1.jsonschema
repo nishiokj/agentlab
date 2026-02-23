@@ -4,9 +4,13 @@
   "title": "Evidence Record v1",
   "type": "object",
   "additionalProperties": false,
-  "required": ["schema_version", "ids", "runtime", "evidence"],
+  "required": ["schema_version", "schedule_idx", "slot_commit_id", "attempt", "row_seq", "ids", "runtime", "evidence"],
   "properties": {
     "schema_version": { "const": "evidence_record_v1" },
+    "schedule_idx": { "type": "integer", "minimum": 0 },
+    "slot_commit_id": { "type": "string", "minLength": 1 },
+    "attempt": { "type": "integer", "minimum": 1 },
+    "row_seq": { "type": "integer", "minimum": 0 },
     "ts": { "type": "string", "format": "date-time" },
     "ids": {
       "type": "object",

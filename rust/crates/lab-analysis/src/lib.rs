@@ -17,6 +17,8 @@ static VIEW_BUNDLES: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/views");
 
 const FACTS_DIR: &str = "facts";
 #[cfg(feature = "duckdb_engine")]
+const RUNTIME_DIR: &str = "runtime";
+#[cfg(feature = "duckdb_engine")]
 const FACTS_TRIALS_FILE: &str = "trials.jsonl";
 #[cfg(feature = "duckdb_engine")]
 const FACTS_METRICS_LONG_FILE: &str = "metrics_long.jsonl";
@@ -24,6 +26,10 @@ const FACTS_METRICS_LONG_FILE: &str = "metrics_long.jsonl";
 const FACTS_EVENTS_FILE: &str = "events.jsonl";
 #[cfg(feature = "duckdb_engine")]
 const FACTS_VARIANT_SNAPSHOTS_FILE: &str = "variant_snapshots.jsonl";
+#[cfg(feature = "duckdb_engine")]
+const SLOT_COMMIT_JOURNAL_FILE: &str = "slot_commit_journal.jsonl";
+#[cfg(feature = "duckdb_engine")]
+const SCHEDULE_PROGRESS_FILE: &str = "schedule_progress.json";
 
 #[cfg(feature = "duckdb_engine")]
 const ANALYSIS_DB_FILE: &str = "agentlab.duckdb";
@@ -394,6 +400,8 @@ LOAD json;
         &sql_literal("../facts/metrics_long.jsonl"),
         &sql_literal("../facts/events.jsonl"),
         &sql_literal("../facts/variant_snapshots.jsonl"),
+        &sql_literal("../runtime/slot_commit_journal.jsonl"),
+        &sql_literal("../runtime/schedule_progress.json"),
     ));
     let metadata_sql = build_metadata_view_sql(context);
     sql.push_str(&metadata_sql);
@@ -414,12 +422,22 @@ fn build_load_sql_absolute(context: &RunAnalysisContext, bundle_sql: Option<&str
     let metrics_path = context.facts_dir.join(FACTS_METRICS_LONG_FILE);
     let events_path = context.facts_dir.join(FACTS_EVENTS_FILE);
     let variant_snapshots_path = context.facts_dir.join(FACTS_VARIANT_SNAPSHOTS_FILE);
+    let slot_commit_journal_path = context
+        .run_dir
+        .join("runtime")
+        .join("slot_commit_journal.jsonl");
+    let schedule_progress_path = context
+        .run_dir
+        .join("runtime")
+        .join("schedule_progress.json");
     let mut sql = String::from("LOAD json;\n");
     sql.push_str(&build_fact_views_sql(
         &sql_literal_path(&trials_path),
         &sql_literal_path(&metrics_path),
         &sql_literal_path(&events_path),
         &sql_literal_path(&variant_snapshots_path),
+        &sql_literal_path(&slot_commit_journal_path),
+        &sql_literal_path(&schedule_progress_path),
     ));
     sql.push_str(&build_metadata_view_sql(context));
     sql.push('\n');
@@ -461,16 +479,67 @@ fn build_fact_views_sql(
     metrics_long_path: &str,
     events_path: &str,
     variant_snapshots_path: &str,
+    slot_commit_journal_path: &str,
+    schedule_progress_path: &str,
 ) -> String {
     format!(
-        "CREATE OR REPLACE VIEW trials AS
+        "CREATE OR REPLACE VIEW slot_commit_journal_commits AS
 WITH raw AS (
     SELECT to_json(r) AS row_json
     FROM read_json_auto({}, format='newline_delimited', union_by_name=true) AS r
 )
 SELECT
+    try_cast(json_extract(row_json, '$.schedule_idx') AS BIGINT) AS schedule_idx,
+    json_extract_string(row_json, '$.slot_commit_id') AS slot_commit_id
+FROM raw
+WHERE json_extract_string(row_json, '$.record_type') = 'commit';
+
+CREATE OR REPLACE VIEW schedule_progress_runtime AS
+SELECT
+    coalesce(try_cast(next_schedule_index AS BIGINT), 9223372036854775807) AS next_schedule_index
+FROM read_json_auto({}, union_by_name=true);
+
+CREATE OR REPLACE VIEW committed_slot_publications AS
+SELECT
+    c.schedule_idx,
+    c.slot_commit_id
+FROM slot_commit_journal_commits c
+CROSS JOIN schedule_progress_runtime p
+WHERE c.schedule_idx < p.next_schedule_index;
+
+CREATE OR REPLACE VIEW committed_slot_guard AS
+SELECT count(*) AS committed_count
+FROM committed_slot_publications;
+
+CREATE OR REPLACE VIEW trials AS
+WITH raw AS (
+    SELECT to_json(r) AS row_json
+    FROM read_json_auto({}, format='newline_delimited', union_by_name=true) AS r
+),
+filtered AS (
+    SELECT row_json
+    FROM raw
+    WHERE (
+        (
+            json_extract_string(row_json, '$.slot_commit_id') IS NULL
+            OR try_cast(json_extract(row_json, '$.schedule_idx') AS BIGINT) IS NULL
+        )
+        AND (SELECT committed_count FROM committed_slot_guard) = 0
+    )
+    OR EXISTS (
+        SELECT 1
+        FROM committed_slot_publications c
+        WHERE c.slot_commit_id = json_extract_string(row_json, '$.slot_commit_id')
+          AND c.schedule_idx = try_cast(json_extract(row_json, '$.schedule_idx') AS BIGINT)
+    )
+)
+SELECT
     json_extract_string(row_json, '$.run_id') AS run_id,
     json_extract_string(row_json, '$.trial_id') AS trial_id,
+    try_cast(json_extract(row_json, '$.schedule_idx') AS BIGINT) AS schedule_idx,
+    json_extract_string(row_json, '$.slot_commit_id') AS slot_commit_id,
+    try_cast(json_extract(row_json, '$.attempt') AS BIGINT) AS attempt,
+    try_cast(json_extract(row_json, '$.row_seq') AS BIGINT) AS row_seq,
     json_extract_string(row_json, '$.variant_id') AS variant_id,
     json_extract_string(row_json, '$.baseline_id') AS baseline_id,
     json_extract_string(row_json, '$.task_id') AS task_id,
@@ -479,49 +548,112 @@ SELECT
     json_extract_string(row_json, '$.primary_metric_name') AS primary_metric_name,
     json_extract_string(row_json, '$.primary_metric_value') AS primary_metric_value,
     json_extract(row_json, '$.bindings') AS bindings
-FROM raw;
+FROM filtered;
 
 CREATE OR REPLACE VIEW metrics_long AS
 WITH raw AS (
     SELECT to_json(r) AS row_json
     FROM read_json_auto({}, format='newline_delimited', union_by_name=true) AS r
+),
+filtered AS (
+    SELECT row_json
+    FROM raw
+    WHERE (
+        (
+            json_extract_string(row_json, '$.slot_commit_id') IS NULL
+            OR try_cast(json_extract(row_json, '$.schedule_idx') AS BIGINT) IS NULL
+        )
+        AND (SELECT committed_count FROM committed_slot_guard) = 0
+    )
+    OR EXISTS (
+        SELECT 1
+        FROM committed_slot_publications c
+        WHERE c.slot_commit_id = json_extract_string(row_json, '$.slot_commit_id')
+          AND c.schedule_idx = try_cast(json_extract(row_json, '$.schedule_idx') AS BIGINT)
+    )
 )
 SELECT
     json_extract_string(row_json, '$.run_id') AS run_id,
     json_extract_string(row_json, '$.trial_id') AS trial_id,
+    try_cast(json_extract(row_json, '$.schedule_idx') AS BIGINT) AS schedule_idx,
+    json_extract_string(row_json, '$.slot_commit_id') AS slot_commit_id,
+    try_cast(json_extract(row_json, '$.attempt') AS BIGINT) AS attempt,
+    try_cast(json_extract(row_json, '$.row_seq') AS BIGINT) AS row_seq,
     json_extract_string(row_json, '$.variant_id') AS variant_id,
     json_extract_string(row_json, '$.task_id') AS task_id,
     json_extract_string(row_json, '$.metric_name') AS metric_name,
     json_extract_string(row_json, '$.metric_value') AS metric_value
-FROM raw;
+FROM filtered;
 
 CREATE OR REPLACE VIEW events AS
 WITH raw AS (
     SELECT to_json(r) AS row_json
     FROM read_json_auto({}, format='newline_delimited', union_by_name=true) AS r
+),
+filtered AS (
+    SELECT row_json
+    FROM raw
+    WHERE (
+        (
+            json_extract_string(row_json, '$.slot_commit_id') IS NULL
+            OR try_cast(json_extract(row_json, '$.schedule_idx') AS BIGINT) IS NULL
+        )
+        AND (SELECT committed_count FROM committed_slot_guard) = 0
+    )
+    OR EXISTS (
+        SELECT 1
+        FROM committed_slot_publications c
+        WHERE c.slot_commit_id = json_extract_string(row_json, '$.slot_commit_id')
+          AND c.schedule_idx = try_cast(json_extract(row_json, '$.schedule_idx') AS BIGINT)
+    )
 )
 SELECT
     json_extract_string(row_json, '$.run_id') AS run_id,
     json_extract_string(row_json, '$.trial_id') AS trial_id,
+    try_cast(json_extract(row_json, '$.schedule_idx') AS BIGINT) AS schedule_idx,
+    json_extract_string(row_json, '$.slot_commit_id') AS slot_commit_id,
+    try_cast(json_extract(row_json, '$.attempt') AS BIGINT) AS attempt,
+    try_cast(json_extract(row_json, '$.row_seq') AS BIGINT) AS row_seq,
     json_extract_string(row_json, '$.variant_id') AS variant_id,
     json_extract_string(row_json, '$.event_type') AS event_type
-FROM raw;
+FROM filtered;
 
 CREATE OR REPLACE VIEW variant_snapshots AS
 WITH raw AS (
     SELECT to_json(r) AS row_json
     FROM read_json_auto({}, format='newline_delimited', union_by_name=true) AS r
+),
+filtered AS (
+    SELECT row_json
+    FROM raw
+    WHERE (
+        (
+            json_extract_string(row_json, '$.slot_commit_id') IS NULL
+            OR try_cast(json_extract(row_json, '$.schedule_idx') AS BIGINT) IS NULL
+        )
+        AND (SELECT committed_count FROM committed_slot_guard) = 0
+    )
+    OR EXISTS (
+        SELECT 1
+        FROM committed_slot_publications c
+        WHERE c.slot_commit_id = json_extract_string(row_json, '$.slot_commit_id')
+          AND c.schedule_idx = try_cast(json_extract(row_json, '$.schedule_idx') AS BIGINT)
+    )
 )
 SELECT
     json_extract_string(row_json, '$.run_id') AS run_id,
     json_extract_string(row_json, '$.trial_id') AS trial_id,
+    try_cast(json_extract(row_json, '$.schedule_idx') AS BIGINT) AS schedule_idx,
+    json_extract_string(row_json, '$.slot_commit_id') AS slot_commit_id,
+    try_cast(json_extract(row_json, '$.attempt') AS BIGINT) AS attempt,
+    try_cast(json_extract(row_json, '$.row_seq') AS BIGINT) AS row_seq,
     json_extract_string(row_json, '$.variant_id') AS variant_id,
     json_extract_string(row_json, '$.task_id') AS task_id,
     try_cast(json_extract(row_json, '$.repl_idx') AS BIGINT) AS repl_idx,
     json_extract_string(row_json, '$.binding_name') AS binding_name,
     json_extract(row_json, '$.binding_value') AS binding_value,
     json_extract_string(row_json, '$.binding_value_text') AS binding_value_text
-FROM raw;
+FROM filtered;
 
 CREATE OR REPLACE VIEW bindings_long AS
 SELECT
@@ -588,7 +720,12 @@ FROM trials
 GROUP BY run_id
 ORDER BY run_id;
 ",
-        trials_path, metrics_long_path, events_path, variant_snapshots_path
+        slot_commit_journal_path,
+        schedule_progress_path,
+        trials_path,
+        metrics_long_path,
+        events_path,
+        variant_snapshots_path
     )
 }
 
@@ -597,6 +734,7 @@ fn materialize_run_duckdb(context: &RunAnalysisContext) -> Result<()> {
     ensure_dir(&context.analysis_dir)?;
     ensure_dir(&context.facts_dir)?;
     ensure_fact_files(&context.facts_dir)?;
+    ensure_runtime_files(&context.run_dir)?;
     fs::write(
         context.analysis_dir.join("duckdb_view_context.json"),
         serde_json::to_vec_pretty(&serde_json::json!({
@@ -639,6 +777,7 @@ fn query_run_with_materialized_db(context: &RunAnalysisContext, sql: &str) -> Re
 fn query_run_with_ephemeral_db(context: &RunAnalysisContext, sql: &str) -> Result<QueryTable> {
     ensure_dir(&context.facts_dir)?;
     ensure_fact_files(&context.facts_dir)?;
+    ensure_runtime_files(&context.run_dir)?;
     let conn = Connection::open_in_memory()
         .context("failed to open in-memory DuckDB for fallback query")?;
     load_json_extension(&conn)?;
@@ -674,6 +813,27 @@ fn ensure_fact_files(facts_dir: &Path) -> Result<()> {
             fs::write(&path, b"")
                 .with_context(|| format!("failed to initialize {}", path.display()))?;
         }
+    }
+    Ok(())
+}
+
+#[cfg(feature = "duckdb_engine")]
+fn ensure_runtime_files(run_dir: &Path) -> Result<()> {
+    let runtime_dir = run_dir.join(RUNTIME_DIR);
+    ensure_dir(&runtime_dir)?;
+    let journal_path = runtime_dir.join(SLOT_COMMIT_JOURNAL_FILE);
+    if !journal_path.exists() {
+        fs::write(&journal_path, b"")
+            .with_context(|| format!("failed to initialize {}", journal_path.display()))?;
+    }
+    let progress_path = runtime_dir.join(SCHEDULE_PROGRESS_FILE);
+    if !progress_path.exists() {
+        let default_progress = serde_json::json!({
+            "schema_version": "schedule_progress_v2",
+            "next_schedule_index": 9223372036854775807_i64
+        });
+        fs::write(&progress_path, serde_json::to_vec(&default_progress)?)
+            .with_context(|| format!("failed to initialize {}", progress_path.display()))?;
     }
     Ok(())
 }

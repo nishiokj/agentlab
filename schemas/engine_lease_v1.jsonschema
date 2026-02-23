@@ -1,0 +1,29 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agent-lab.local/schemas/engine_lease_v1.json",
+  "title": "Engine Lease v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "run_id",
+    "owner_id",
+    "pid",
+    "hostname",
+    "started_at",
+    "heartbeat_at",
+    "expires_at",
+    "epoch"
+  ],
+  "properties": {
+    "schema_version": { "const": "engine_lease_v1" },
+    "run_id": { "type": "string", "minLength": 1 },
+    "owner_id": { "type": "string", "minLength": 1 },
+    "pid": { "type": "integer", "minimum": 1 },
+    "hostname": { "type": "string", "minLength": 1 },
+    "started_at": { "type": "string", "format": "date-time" },
+    "heartbeat_at": { "type": "string", "format": "date-time" },
+    "expires_at": { "type": "string", "format": "date-time" },
+    "epoch": { "type": "integer", "minimum": 1 }
+  }
+}

@@ -1,0 +1,29 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agent-lab.local/schemas/operation_lease_v1.json",
+  "title": "Operation Lease v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "operation_id",
+    "op_type",
+    "owner_pid",
+    "owner_host",
+    "acquired_at",
+    "expires_at"
+  ],
+  "properties": {
+    "schema_version": { "const": "operation_lease_v1" },
+    "operation_id": { "type": "string", "minLength": 1 },
+    "op_type": {
+      "type": "string",
+      "enum": ["continue", "recover", "pause", "kill", "resume", "fork", "replay"]
+    },
+    "owner_pid": { "type": "integer", "minimum": 1 },
+    "owner_host": { "type": "string", "minLength": 1 },
+    "acquired_at": { "type": "string", "format": "date-time" },
+    "expires_at": { "type": "string", "format": "date-time" },
+    "stale_takeover_of": { "type": "string", "minLength": 1 }
+  }
+}

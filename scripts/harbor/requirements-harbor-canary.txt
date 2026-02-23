@@ -1,0 +1,6 @@
+# Harbor dependency specs for the non-blocking canary lane.
+#
+# Populate with latest-minor ranges for early API drift detection.
+# Example:
+# harbor-framework>=1.4,<1.5
+# terminal-bench-harbor>=0.7,<0.8

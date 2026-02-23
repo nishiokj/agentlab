@@ -1,0 +1,6 @@
+# Harbor dependency specs for the blocking pinned compatibility lane.
+#
+# Populate with exact Harbor package pins used in production.
+# Example:
+# harbor-framework==1.4.2
+# terminal-bench-harbor==0.7.1

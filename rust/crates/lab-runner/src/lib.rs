@@ -32,8 +32,8 @@ use std::os::unix::fs::symlink;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Component, Path, PathBuf};
-use std::process::{Command, Stdio};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::process::{Command, Output, Stdio};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -92,6 +92,9 @@ const PARALLEL_WORKER_CONTROL_SCHEMA_V1: &str = "parallel_worker_control_v1";
 const PARALLEL_WORKER_CONTROL_RESPONSE_COMPLETED: &str = "completed";
 const PARALLEL_WORKER_CONTROL_RESPONSE_FAILED: &str = "failed";
 const KILL_RUN_WORKER_CONTROL_TIMEOUT_SECONDS: u64 = 30;
+const OPERATION_LEASE_TTL_SECONDS: i64 = 30;
+const ENGINE_LEASE_HEARTBEAT_SECONDS: i64 = 2;
+const ENGINE_LEASE_TTL_SECONDS: i64 = 6;
 const WORKSPACE_EVIDENCE_EXCLUDE_PREFIXES: &[&str] = &[
     "logs",
     ".haiku",
@@ -1716,6 +1719,16 @@ pub struct ResumeResult {
     pub fork: ForkResult,
 }
 
+pub struct RecoverResult {
+    pub run_id: String,
+    pub previous_status: String,
+    pub recovered_status: String,
+    pub rewound_to_schedule_idx: usize,
+    pub active_trials_released: usize,
+    pub committed_slots_verified: usize,
+    pub notes: Vec<String>,
+}
+
 enum ForkSelector {
     Checkpoint(String),
     Step(u64),
@@ -1723,41 +1736,412 @@ enum ForkSelector {
 }
 
 #[derive(Debug)]
-struct RunOperationLock {
+struct RunOperationLease {
     path: PathBuf,
+    operation_id: String,
 }
 
-impl Drop for RunOperationLock {
+impl Drop for RunOperationLease {
     fn drop(&mut self) {
-        let _ = fs::remove_file(&self.path);
+        let should_remove = fs::read(&self.path)
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<OperationLeaseRecord>(&bytes).ok())
+            .map(|record| record.operation_id == self.operation_id)
+            .unwrap_or(false);
+        if should_remove {
+            let _ = fs::remove_file(&self.path);
+        }
     }
 }
 
-fn acquire_run_operation_lock(run_dir: &Path) -> Result<RunOperationLock> {
-    let lock_path = run_dir.join("runtime").join("operation.lock");
-    if let Some(parent) = lock_path.parent() {
+#[derive(Debug, Clone, Copy)]
+enum RunOperationType {
+    Continue,
+    Recover,
+    Pause,
+    Kill,
+    Resume,
+    Fork,
+    Replay,
+}
+
+impl RunOperationType {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Continue => "continue",
+            Self::Recover => "recover",
+            Self::Pause => "pause",
+            Self::Kill => "kill",
+            Self::Resume => "resume",
+            Self::Fork => "fork",
+            Self::Replay => "replay",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct OperationLeaseRecord {
+    schema_version: String,
+    operation_id: String,
+    op_type: String,
+    owner_pid: u32,
+    owner_host: String,
+    acquired_at: String,
+    expires_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    stale_takeover_of: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct EngineLeaseRecord {
+    schema_version: String,
+    run_id: String,
+    owner_id: String,
+    pid: u32,
+    hostname: String,
+    started_at: String,
+    heartbeat_at: String,
+    expires_at: String,
+    epoch: u64,
+}
+
+struct EngineLeaseGuard {
+    stop: Arc<AtomicBool>,
+    join_handle: Option<thread::JoinHandle<()>>,
+}
+
+impl Drop for EngineLeaseGuard {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        if let Some(handle) = self.join_handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+fn operation_lease_path(run_dir: &Path) -> PathBuf {
+    run_dir.join("runtime").join("operation_lease.json")
+}
+
+fn engine_lease_path(run_dir: &Path) -> PathBuf {
+    run_dir.join("runtime").join("engine_lease.json")
+}
+
+fn operation_owner_host() -> String {
+    env::var("HOSTNAME")
+        .or_else(|_| env::var("COMPUTERNAME"))
+        .unwrap_or_else(|_| "unknown-host".to_string())
+}
+
+fn parse_rfc3339_utc(raw: &str) -> Option<chrono::DateTime<Utc>> {
+    chrono::DateTime::parse_from_rfc3339(raw)
+        .ok()
+        .map(|ts| ts.with_timezone(&Utc))
+}
+
+fn operation_lease_is_stale(record: &OperationLeaseRecord, now: chrono::DateTime<Utc>) -> bool {
+    parse_rfc3339_utc(&record.expires_at)
+        .map(|expires_at| now > expires_at)
+        .unwrap_or(true)
+}
+
+fn engine_lease_is_stale(record: &EngineLeaseRecord, now: chrono::DateTime<Utc>) -> bool {
+    parse_rfc3339_utc(&record.expires_at)
+        .map(|expires_at| now > expires_at)
+        .unwrap_or(true)
+}
+
+fn next_unique_id(prefix: &str) -> String {
+    static UNIQUE_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
+    let nonce = UNIQUE_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let ts = Utc::now().timestamp_nanos_opt().unwrap_or(0);
+    let raw = format!(
+        "{}:{}:{}:{}:{}",
+        prefix,
+        ts,
+        std::process::id(),
+        nonce,
+        operation_owner_host()
+    );
+    let digest = sha256_bytes(raw.as_bytes());
+    format!("{}_{}", prefix, &digest[..16])
+}
+
+fn make_operation_lease_record(
+    op_type: RunOperationType,
+    stale_takeover_of: Option<String>,
+) -> OperationLeaseRecord {
+    let now = Utc::now();
+    let expires = now + chrono::Duration::seconds(OPERATION_LEASE_TTL_SECONDS);
+    OperationLeaseRecord {
+        schema_version: "operation_lease_v1".to_string(),
+        operation_id: next_unique_id("op"),
+        op_type: op_type.as_str().to_string(),
+        owner_pid: std::process::id(),
+        owner_host: operation_owner_host(),
+        acquired_at: now.to_rfc3339(),
+        expires_at: expires.to_rfc3339(),
+        stale_takeover_of,
+    }
+}
+
+fn acquire_run_operation_lease(
+    run_dir: &Path,
+    op_type: RunOperationType,
+) -> Result<RunOperationLease> {
+    let lease_path = operation_lease_path(run_dir);
+    if let Some(parent) = lease_path.parent() {
         ensure_dir(parent)?;
     }
     match fs::OpenOptions::new()
         .write(true)
         .create_new(true)
-        .open(&lock_path)
+        .open(&lease_path)
     {
         Ok(mut file) => {
-            let payload = format!(
-                "{{\"pid\":{},\"acquired_at\":\"{}\"}}\n",
-                std::process::id(),
-                Utc::now().to_rfc3339()
-            );
-            let _ = file.write_all(payload.as_bytes());
+            let lease = make_operation_lease_record(op_type, None);
+            let bytes = serde_json::to_vec_pretty(&lease)?;
+            file.write_all(&bytes)?;
+            file.write_all(b"\n")?;
             let _ = file.sync_all();
-            Ok(RunOperationLock { path: lock_path })
+            if let Some(parent) = lease_path.parent() {
+                if let Ok(dir) = fs::File::open(parent) {
+                    let _ = dir.sync_all();
+                }
+            }
+            Ok(RunOperationLease {
+                path: lease_path,
+                operation_id: lease.operation_id,
+            })
         }
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Err(anyhow!(
-            "operation_in_progress: run is already under control operation"
-        )),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            let now = Utc::now();
+            let existing = fs::read(&lease_path)
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<OperationLeaseRecord>(&bytes).ok());
+            if let Some(existing) = existing {
+                if operation_lease_is_stale(&existing, now) {
+                    let replacement =
+                        make_operation_lease_record(op_type, Some(existing.operation_id.clone()));
+                    atomic_write_json_pretty(&lease_path, &serde_json::to_value(&replacement)?)?;
+                    return Ok(RunOperationLease {
+                        path: lease_path,
+                        operation_id: replacement.operation_id,
+                    });
+                }
+            }
+            Err(anyhow!(
+                "operation_in_progress: run is already under control operation"
+            ))
+        }
         Err(e) => Err(e.into()),
     }
+}
+
+fn load_engine_lease(run_dir: &Path) -> Result<Option<EngineLeaseRecord>> {
+    let path = engine_lease_path(run_dir);
+    if !path.exists() {
+        return Ok(None);
+    }
+    let bytes = fs::read(path)?;
+    Ok(Some(serde_json::from_slice::<EngineLeaseRecord>(&bytes)?))
+}
+
+fn write_engine_lease(run_dir: &Path, lease: &EngineLeaseRecord) -> Result<()> {
+    atomic_write_json_pretty(&engine_lease_path(run_dir), &serde_json::to_value(lease)?)
+}
+
+fn make_engine_lease(run_id: &str, epoch: u64) -> EngineLeaseRecord {
+    let now = Utc::now();
+    let expires = now + chrono::Duration::seconds(ENGINE_LEASE_TTL_SECONDS);
+    EngineLeaseRecord {
+        schema_version: "engine_lease_v1".to_string(),
+        run_id: run_id.to_string(),
+        owner_id: next_unique_id("owner"),
+        pid: std::process::id(),
+        hostname: operation_owner_host(),
+        started_at: now.to_rfc3339(),
+        heartbeat_at: now.to_rfc3339(),
+        expires_at: expires.to_rfc3339(),
+        epoch,
+    }
+}
+
+fn ensure_engine_lease_for_run(run_dir: &Path, run_id: &str) -> Result<EngineLeaseRecord> {
+    if let Some(existing) = load_engine_lease(run_dir)? {
+        if existing.run_id != run_id {
+            return Err(anyhow!(
+                "engine lease run_id mismatch: lease has {}, run expects {}",
+                existing.run_id,
+                run_id
+            ));
+        }
+        return Ok(existing);
+    }
+    let lease = make_engine_lease(run_id, 1);
+    write_engine_lease(run_dir, &lease)?;
+    Ok(lease)
+}
+
+fn start_engine_lease_heartbeat(run_dir: &Path, run_id: &str) -> Result<EngineLeaseGuard> {
+    let existing = ensure_engine_lease_for_run(run_dir, run_id)?;
+    let mut heartbeat_lease = make_engine_lease(run_id, existing.epoch + 1);
+    write_engine_lease(run_dir, &heartbeat_lease)?;
+    let run_dir = run_dir.to_path_buf();
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop_signal = stop.clone();
+    let join_handle = thread::spawn(move || {
+        while !stop_signal.load(Ordering::SeqCst) {
+            thread::sleep(Duration::from_secs(ENGINE_LEASE_HEARTBEAT_SECONDS as u64));
+            let now = Utc::now();
+            heartbeat_lease.heartbeat_at = now.to_rfc3339();
+            heartbeat_lease.expires_at =
+                (now + chrono::Duration::seconds(ENGINE_LEASE_TTL_SECONDS)).to_rfc3339();
+            let _ = write_engine_lease(&run_dir, &heartbeat_lease);
+        }
+    });
+    Ok(EngineLeaseGuard {
+        stop,
+        join_handle: Some(join_handle),
+    })
+}
+
+fn adopt_engine_lease_for_recovery(
+    run_dir: &Path,
+    run_id: &str,
+    force: bool,
+) -> Result<EngineLeaseRecord> {
+    let now = Utc::now();
+    let existing = load_engine_lease(run_dir)?;
+    if let Some(ref lease) = existing {
+        if lease.run_id != run_id {
+            return Err(anyhow!(
+                "engine lease run_id mismatch: lease has {}, run expects {}",
+                lease.run_id,
+                run_id
+            ));
+        }
+        if !force && !engine_lease_is_stale(lease, now) {
+            return Err(anyhow!(
+                "run_owner_alive: engine owner '{}' pid={} lease expires {}",
+                lease.owner_id,
+                lease.pid,
+                lease.expires_at
+            ));
+        }
+    }
+    let epoch = existing.map(|lease| lease.epoch + 1).unwrap_or(1);
+    let adopted = make_engine_lease(run_id, epoch);
+    write_engine_lease(run_dir, &adopted)?;
+    Ok(adopted)
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SlotCommitRowCounts {
+    trials: usize,
+    metrics: usize,
+    events: usize,
+    variant_snapshots: usize,
+    evidence: usize,
+    chain_states: usize,
+    predictions: usize,
+    scores: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SlotCommitRecord {
+    schema_version: String,
+    record_type: String,
+    run_id: String,
+    schedule_idx: usize,
+    slot_commit_id: String,
+    trial_id: String,
+    slot_status: String,
+    attempt: usize,
+    recorded_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    expected_rows: Option<SlotCommitRowCounts>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    payload_digest: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    written_rows: Option<SlotCommitRowCounts>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    facts_fsync_completed: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    runtime_fsync_completed: Option<bool>,
+}
+
+fn slot_commit_journal_path(run_dir: &Path) -> PathBuf {
+    run_dir.join("runtime").join("slot_commit_journal.jsonl")
+}
+
+fn append_slot_commit_record(run_dir: &Path, record: &SlotCommitRecord) -> Result<()> {
+    let path = slot_commit_journal_path(run_dir);
+    if let Some(parent) = path.parent() {
+        ensure_dir(parent)?;
+    }
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)?;
+    serde_json::to_writer(&mut file, record)?;
+    file.write_all(b"\n")?;
+    file.sync_all()?;
+    if let Some(parent) = path.parent() {
+        if let Ok(dir) = fs::File::open(parent) {
+            let _ = dir.sync_all();
+        }
+    }
+    Ok(())
+}
+
+fn load_slot_commit_records(run_dir: &Path) -> Result<Vec<SlotCommitRecord>> {
+    let path = slot_commit_journal_path(run_dir);
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let raw = fs::read_to_string(path)?;
+    let mut rows = Vec::new();
+    for line in raw.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        rows.push(serde_json::from_str::<SlotCommitRecord>(trimmed)?);
+    }
+    Ok(rows)
+}
+
+fn highest_attempt_by_schedule(records: &[SlotCommitRecord]) -> HashMap<usize, usize> {
+    let mut by_schedule = HashMap::new();
+    for record in records {
+        let entry = by_schedule.entry(record.schedule_idx).or_insert(0);
+        if record.attempt > *entry {
+            *entry = record.attempt;
+        }
+    }
+    by_schedule
+}
+
+fn make_slot_commit_id(
+    run_id: &str,
+    schedule_idx: usize,
+    attempt: usize,
+    payload_digest: &str,
+) -> String {
+    let raw = format!("{}:{}:{}:{}", run_id, schedule_idx, attempt, payload_digest);
+    let digest = sha256_bytes(raw.as_bytes());
+    format!("slot_{}", &digest[..24])
+}
+
+fn commit_record_by_schedule(records: &[SlotCommitRecord]) -> BTreeMap<usize, SlotCommitRecord> {
+    let mut by_schedule = BTreeMap::new();
+    for record in records {
+        if record.record_type == "commit" {
+            by_schedule.insert(record.schedule_idx, record.clone());
+        }
+    }
+    by_schedule
 }
 
 #[derive(Debug, Deserialize)]
@@ -2407,6 +2791,7 @@ pub struct ExperimentSummary {
     pub state_policy: String,
     pub comparison: String,
     pub retry_max_attempts: usize,
+    pub preflight_warnings: Vec<String>,
 }
 
 pub fn run_experiment(path: &Path, use_container: bool) -> Result<RunResult> {
@@ -2517,7 +2902,7 @@ fn find_project_root_from_run_dir(run_dir: &Path) -> Result<PathBuf> {
 /// verifies schedule integrity, and re-enters the trial loop from the next
 /// unprocessed slot.
 pub fn continue_run(run_dir: &Path) -> Result<RunResult> {
-    let _op_lock = acquire_run_operation_lock(run_dir)?;
+    let _op_lease = acquire_run_operation_lease(run_dir, RunOperationType::Continue)?;
     let run_dir = run_dir
         .canonicalize()
         .unwrap_or_else(|_| run_dir.to_path_buf());
@@ -2535,7 +2920,8 @@ pub fn continue_run(run_dir: &Path) -> Result<RunResult> {
         "completed" => return Err(anyhow!("run already completed — nothing to continue")),
         "running" => {
             return Err(anyhow!(
-                "run is currently active — cannot continue a running experiment"
+                "run is currently active — cannot continue a running experiment; run `lab recover --run-dir {}` first",
+                run_dir.display()
             ))
         }
         other => return Err(anyhow!("unexpected run status: {}", other)),
@@ -2546,6 +2932,7 @@ pub fn continue_run(run_dir: &Path) -> Result<RunResult> {
         .and_then(|v| v.as_str())
         .ok_or_else(|| anyhow!("missing run_id in run_control.json"))?
         .to_string();
+    let _engine_lease_guard = start_engine_lease_heartbeat(&run_dir, &run_id)?;
     let run_session = load_run_session_state(&run_dir)?;
     if run_session.run_id != run_id {
         return Err(anyhow!(
@@ -2564,7 +2951,7 @@ pub fn continue_run(run_dir: &Path) -> Result<RunResult> {
             "schedule_progress.json not found — this run predates continue support"
         ));
     }
-    let progress: ScheduleProgress = serde_json::from_slice(&fs::read(&progress_path)?)?;
+    let progress = load_schedule_progress(&run_dir)?;
     if progress.next_schedule_index >= progress.total_slots {
         return Err(anyhow!(
             "all {} schedule slots were already processed — nothing to continue",
@@ -2770,8 +3157,164 @@ pub fn continue_run(run_dir: &Path) -> Result<RunResult> {
     })
 }
 
+fn recover_reconciled_status(previous: &str) -> &'static str {
+    match previous {
+        "completed" => "completed",
+        "killed" => "killed",
+        _ => "interrupted",
+    }
+}
+
+pub fn recover_run(run_dir: &Path, force: bool) -> Result<RecoverResult> {
+    let _op_lease = acquire_run_operation_lease(run_dir, RunOperationType::Recover)?;
+    let run_dir = run_dir
+        .canonicalize()
+        .map_err(|_| anyhow!("run_dir not found: {}", run_dir.display()))?;
+
+    let control_path = run_control_path(&run_dir);
+    let control = load_json_file(&control_path)?;
+    let previous_status = control
+        .pointer("/status")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown")
+        .to_string();
+    let run_id = control
+        .pointer("/run_id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("missing run_id in run_control.json"))?
+        .to_string();
+    let run_session = load_run_session_state(&run_dir)?;
+    if run_session.run_id != run_id {
+        return Err(anyhow!(
+            "run session state mismatch: run_control has {}, run_session_state has {}",
+            run_id,
+            run_session.run_id
+        ));
+    }
+
+    let progress_path = schedule_progress_path(&run_dir);
+    if !progress_path.exists() {
+        return Err(anyhow!(
+            "schedule_progress.json not found — this run predates recover support"
+        ));
+    }
+    let mut progress = load_schedule_progress(&run_dir)?;
+    let journal_records = load_slot_commit_records(&run_dir)?;
+    adopt_engine_lease_for_recovery(&run_dir, &run_id, force)?;
+    let committed_by_schedule = commit_record_by_schedule(&journal_records);
+
+    let mut committed_prefix_len = 0usize;
+    while committed_by_schedule.contains_key(&committed_prefix_len) {
+        committed_prefix_len += 1;
+    }
+
+    let mut divergence_idx: Option<usize> = None;
+    let comparable = std::cmp::min(progress.completed_slots.len(), committed_prefix_len);
+    for idx in 0..comparable {
+        let slot = &progress.completed_slots[idx];
+        let committed = committed_by_schedule
+            .get(&idx)
+            .ok_or_else(|| anyhow!("missing committed slot at schedule_idx {}", idx))?;
+        if slot.schedule_index != idx || slot.slot_commit_id != committed.slot_commit_id {
+            divergence_idx = Some(idx);
+            break;
+        }
+    }
+    if divergence_idx.is_none() && progress.completed_slots.len() > committed_prefix_len {
+        divergence_idx = Some(committed_prefix_len);
+    }
+    let rewound_to = divergence_idx.unwrap_or(progress.next_schedule_index);
+    if let Some(idx) = divergence_idx {
+        progress.completed_slots.truncate(idx);
+        progress.pruned_variants.clear();
+        progress.consecutive_failures.clear();
+    }
+    if committed_prefix_len > progress.completed_slots.len() {
+        for idx in progress.completed_slots.len()..committed_prefix_len {
+            if let Some(committed) = committed_by_schedule.get(&idx) {
+                progress.completed_slots.push(SlotCompletion {
+                    schedule_index: idx,
+                    trial_id: committed.trial_id.clone(),
+                    status: committed.slot_status.clone(),
+                    slot_commit_id: committed.slot_commit_id.clone(),
+                    attempt: committed.attempt.max(1),
+                });
+            }
+        }
+    }
+    progress.next_schedule_index = progress.completed_slots.len();
+    progress.schema_version = "schedule_progress_v2".to_string();
+    progress.updated_at = Utc::now().to_rfc3339();
+
+    let active_trials = run_control_active_trials(&control);
+    let mut active_trials_released = 0usize;
+    for active in active_trials {
+        let Some(schedule_idx) = active.schedule_idx else {
+            continue;
+        };
+        if schedule_idx < progress.next_schedule_index
+            && committed_by_schedule.contains_key(&schedule_idx)
+        {
+            continue;
+        }
+        let trial_dir = run_dir.join("trials").join(&active.trial_id);
+        if trial_dir.exists() {
+            let _ = write_trial_state(
+                &trial_dir,
+                &active.trial_id,
+                "failed",
+                None,
+                None,
+                Some("worker_lost_recovered"),
+            );
+        }
+        active_trials_released += 1;
+    }
+
+    write_schedule_progress(&run_dir, &progress)?;
+    let recovered_status = recover_reconciled_status(&previous_status).to_string();
+    write_run_control_v2(&run_dir, &run_id, &recovered_status, &[], None)?;
+    let notes = vec![
+        format!("engine lease adopted for run {}", run_id),
+        format!("committed prefix length {}", committed_prefix_len),
+        "active trials reconciled and released".to_string(),
+    ];
+    let report = json!({
+        "schema_version": "recovery_report_v1",
+        "run_id": run_id.clone(),
+        "previous_status": previous_status.clone(),
+        "recovered_status": recovered_status.clone(),
+        "rewound_to_schedule_idx": rewound_to,
+        "active_trials_released": active_trials_released,
+        "committed_slots_verified": committed_prefix_len,
+        "notes": notes,
+        "recovered_at": Utc::now().to_rfc3339(),
+    });
+    let recovery_report_path = run_dir.join("runtime").join("recovery_report.json");
+    atomic_write_json_pretty(&recovery_report_path, &report)?;
+
+    Ok(RecoverResult {
+        run_id,
+        previous_status: previous_status.clone(),
+        recovered_status,
+        rewound_to_schedule_idx: rewound_to,
+        active_trials_released,
+        committed_slots_verified: committed_prefix_len,
+        notes: report
+            .pointer("/notes")
+            .and_then(Value::as_array)
+            .map(|rows| {
+                rows.iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default(),
+    })
+}
+
 pub fn replay_trial(run_dir: &Path, trial_id: &str, strict: bool) -> Result<ReplayResult> {
-    let _op_lock = acquire_run_operation_lock(run_dir)?;
+    let _op_lease = acquire_run_operation_lease(run_dir, RunOperationType::Replay)?;
     let run_dir = run_dir
         .canonicalize()
         .map_err(|_| anyhow!("run_dir not found: {}", run_dir.display()))?;
@@ -3002,7 +3545,7 @@ pub fn fork_trial(
     set_bindings: &BTreeMap<String, Value>,
     strict: bool,
 ) -> Result<ForkResult> {
-    let _op_lock = acquire_run_operation_lock(run_dir)?;
+    let _op_lease = acquire_run_operation_lease(run_dir, RunOperationType::Fork)?;
     fork_trial_inner(run_dir, from_trial, selector, set_bindings, strict)
 }
 
@@ -3366,7 +3909,7 @@ pub fn pause_run(
     label: Option<&str>,
     timeout_seconds: u64,
 ) -> Result<PauseResult> {
-    let _op_lock = acquire_run_operation_lock(run_dir)?;
+    let _op_lease = acquire_run_operation_lease(run_dir, RunOperationType::Pause)?;
     let run_dir = run_dir
         .canonicalize()
         .map_err(|_| anyhow!("run_dir not found: {}", run_dir.display()))?;
@@ -3619,7 +4162,7 @@ pub fn pause_run(
 }
 
 pub fn kill_run(run_dir: &Path) -> Result<KillResult> {
-    let _op_lock = acquire_run_operation_lock(run_dir)?;
+    let _op_lease = acquire_run_operation_lease(run_dir, RunOperationType::Kill)?;
     let run_dir = run_dir
         .canonicalize()
         .map_err(|_| anyhow!("run_dir not found: {}", run_dir.display()))?;
@@ -3695,7 +4238,7 @@ pub fn resume_trial(
     set_bindings: &BTreeMap<String, Value>,
     strict: bool,
 ) -> Result<ResumeResult> {
-    let _op_lock = acquire_run_operation_lock(run_dir)?;
+    let _op_lease = acquire_run_operation_lease(run_dir, RunOperationType::Resume)?;
     let run_dir = run_dir
         .canonicalize()
         .map_err(|_| anyhow!("run_dir not found: {}", run_dir.display()))?;
@@ -4384,6 +4927,11 @@ fn validate_required_fields(json_value: &Value) -> Result<()> {
     if image_source != "global" && image_source != "per_task" {
         invalid.push("/runtime/agent/image_source (must be 'global' or 'per_task')");
     }
+    if image_source == "per_task" && sandbox_mode != "container" {
+        invalid.push(
+            "/runtime/agent/image_source (value 'per_task' requires /runtime/policy/sandbox/mode='container')",
+        );
+    }
     if sandbox_mode == "container" {
         let runtime_agent_image = json_value
             .pointer("/runtime/agent/image")
@@ -4698,6 +5246,13 @@ impl TrialExecutor {
             .and_then(|v| v.as_str())
             .map(|s| s.to_string())
             .unwrap_or_else(|| format!("task_{}", task_idx));
+        if agent_runtime.image_source == ImageSource::PerTask && task_boundary.task_image.is_none()
+        {
+            return Err(anyhow!(
+                "task.image is required for task '{}' when runtime.agent.image_source='per_task'",
+                task_id
+            ));
+        }
         let benchmark_grading_enabled = benchmark_config.adapter.is_some()
             && !is_clean_contract_experiment(trial_experiment)
             && task_boundary
@@ -4720,6 +5275,14 @@ impl TrialExecutor {
             .get(&chain_key)
             .map(|state| state.step_index + 1)
             .unwrap_or(0);
+        let task_workspace = task_boundary
+            .task_workspace
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let has_custom_task_workspace =
+            task_workspace.is_some_and(|workspace| workspace != AGENTLAB_CONTRACT_WORKSPACE_DIR);
+        let has_chain_snapshot = chain_states.contains_key(&chain_key);
 
         *trial_index += 1;
         let trial_id = format!("trial_{}", *trial_index);
@@ -4732,6 +5295,21 @@ impl TrialExecutor {
         let trial_paths = TrialPaths::new(&trial_dir, project_root, dataset_path)?;
         trial_paths.prepare(false)?;
         stage_dependencies_for_trial(agent_runtime, &trial_paths)?;
+        if container_mode
+            && agent_runtime.image_source == ImageSource::PerTask
+            && has_custom_task_workspace
+            && (matches!(effective_policy.state_policy, StatePolicy::IsolatePerTrial)
+                || !has_chain_snapshot)
+        {
+            let task_image = task_boundary.task_image.as_deref().ok_or_else(|| {
+                anyhow!(
+                    "task.image is required for task '{}' when runtime.agent.image_source='per_task'",
+                    task_id
+                )
+            })?;
+            let source_workspace = task_workspace.unwrap_or(AGENTLAB_CONTRACT_WORKSPACE_DIR);
+            seed_workspace_from_task_image(task_image, source_workspace, &trial_paths.workspace)?;
+        }
         if !matches!(effective_policy.state_policy, StatePolicy::IsolatePerTrial) {
             if let Some(chain_state) = chain_states.get(&chain_key) {
                 restore_workspace_from_snapshot(
@@ -5320,6 +5898,7 @@ impl TrialExecutor {
                 &io_paths.events_host,
                 run_id,
                 &trial_id,
+                schedule_idx,
                 &variant.id,
                 &task_id,
                 repl,
@@ -5330,6 +5909,7 @@ impl TrialExecutor {
         let metric_rows = build_metric_rows(
             run_id,
             &trial_id,
+            schedule_idx,
             &variant.id,
             &task_id,
             repl,
@@ -5341,6 +5921,7 @@ impl TrialExecutor {
         let variant_snapshot_rows = build_variant_snapshot_rows(
             run_id,
             &trial_id,
+            schedule_idx,
             &variant.id,
             baseline_id,
             &task_id,
@@ -5350,6 +5931,10 @@ impl TrialExecutor {
         run_sink.append_trial_record(&TrialRecord {
             run_id: run_id.to_string(),
             trial_id: trial_id.clone(),
+            schedule_idx,
+            slot_commit_id: String::new(),
+            attempt: 0,
+            row_seq: 0,
             baseline_id: baseline_id.to_string(),
             workload_type: workload_type.to_string(),
             variant_id: variant.id.clone(),
@@ -5406,28 +5991,220 @@ impl TrialExecutor {
 
 struct RunCoordinator;
 
+fn slot_commit_payload_digest_for_result(
+    schedule_idx: usize,
+    trial_result: &TrialExecutionResult,
+) -> Result<String> {
+    let payload = json!({
+        "schedule_idx": schedule_idx,
+        "trial_id": trial_result.trial_id.clone(),
+        "slot_status": trial_result.slot_status.clone(),
+        "trial_rows": trial_result.deferred_trial_records.clone(),
+        "metric_rows": trial_result.deferred_metric_rows.clone(),
+        "event_rows": trial_result.deferred_event_rows.clone(),
+        "variant_snapshot_rows": trial_result.deferred_variant_snapshot_rows.clone(),
+        "evidence_rows": trial_result.deferred_evidence_records.clone(),
+        "chain_state_rows": trial_result.deferred_chain_state_records.clone(),
+        "benchmark_prediction_rows": trial_result.deferred_benchmark_prediction_records.clone(),
+        "benchmark_score_rows": trial_result.deferred_benchmark_score_records.clone(),
+    });
+    Ok(canonical_json_digest(&payload))
+}
+
+fn annotate_row_identity(
+    value: &mut Value,
+    schedule_idx: usize,
+    slot_commit_id: &str,
+    attempt: usize,
+    row_seq: usize,
+) {
+    let Some(obj) = value.as_object_mut() else {
+        return;
+    };
+    obj.insert("schedule_idx".to_string(), json!(schedule_idx));
+    obj.insert("slot_commit_id".to_string(), json!(slot_commit_id));
+    obj.insert("attempt".to_string(), json!(attempt));
+    obj.insert("row_seq".to_string(), json!(row_seq));
+}
+
+fn annotate_value_rows(
+    rows: &[Value],
+    schedule_idx: usize,
+    slot_commit_id: &str,
+    attempt: usize,
+) -> Vec<Value> {
+    rows.iter()
+        .enumerate()
+        .map(|(row_seq, row)| {
+            let mut next = row.clone();
+            annotate_row_identity(&mut next, schedule_idx, slot_commit_id, attempt, row_seq);
+            next
+        })
+        .collect()
+}
+
+fn annotate_trial_rows(
+    rows: &[TrialRecord],
+    schedule_idx: usize,
+    slot_commit_id: &str,
+    attempt: usize,
+) -> Vec<TrialRecord> {
+    rows.iter()
+        .enumerate()
+        .map(|(row_seq, row)| {
+            let mut next = row.clone();
+            next.schedule_idx = schedule_idx;
+            next.slot_commit_id = slot_commit_id.to_string();
+            next.attempt = attempt;
+            next.row_seq = row_seq;
+            next
+        })
+        .collect()
+}
+
+fn annotate_metric_rows(
+    rows: &[MetricRow],
+    schedule_idx: usize,
+    slot_commit_id: &str,
+    attempt: usize,
+) -> Vec<MetricRow> {
+    rows.iter()
+        .enumerate()
+        .map(|(row_seq, row)| {
+            let mut next = row.clone();
+            next.schedule_idx = schedule_idx;
+            next.slot_commit_id = slot_commit_id.to_string();
+            next.attempt = attempt;
+            next.row_seq = row_seq;
+            next
+        })
+        .collect()
+}
+
+fn annotate_event_rows(
+    rows: &[EventRow],
+    schedule_idx: usize,
+    slot_commit_id: &str,
+    attempt: usize,
+) -> Vec<EventRow> {
+    rows.iter()
+        .enumerate()
+        .map(|(row_seq, row)| {
+            let mut next = row.clone();
+            next.schedule_idx = schedule_idx;
+            next.slot_commit_id = slot_commit_id.to_string();
+            next.attempt = attempt;
+            next.row_seq = row_seq;
+            next
+        })
+        .collect()
+}
+
+fn annotate_variant_snapshot_rows(
+    rows: &[VariantSnapshotRow],
+    schedule_idx: usize,
+    slot_commit_id: &str,
+    attempt: usize,
+) -> Vec<VariantSnapshotRow> {
+    rows.iter()
+        .enumerate()
+        .map(|(row_seq, row)| {
+            let mut next = row.clone();
+            next.schedule_idx = schedule_idx;
+            next.slot_commit_id = slot_commit_id.to_string();
+            next.attempt = attempt;
+            next.row_seq = row_seq;
+            next
+        })
+        .collect()
+}
+
 impl RunCoordinator {
     fn commit_skipped_pruned_slot(
         run_dir: &Path,
         schedule_progress: &mut ScheduleProgress,
         schedule_idx: usize,
         run_sink: &mut dyn RunSink,
+        slot_attempts: &mut HashMap<usize, usize>,
     ) -> Result<()> {
+        let attempt = slot_attempts.get(&schedule_idx).copied().unwrap_or(0) + 1;
+        let payload_digest = canonical_json_digest(&json!({
+            "schedule_idx": schedule_idx,
+            "status": "skipped_pruned"
+        }));
+        let slot_commit_id = make_slot_commit_id(
+            &schedule_progress.run_id,
+            schedule_idx,
+            attempt,
+            &payload_digest,
+        );
+        let empty_counts = SlotCommitRowCounts {
+            trials: 0,
+            metrics: 0,
+            events: 0,
+            variant_snapshots: 0,
+            evidence: 0,
+            chain_states: 0,
+            predictions: 0,
+            scores: 0,
+        };
+        append_slot_commit_record(
+            run_dir,
+            &SlotCommitRecord {
+                schema_version: "slot_commit_record_v1".to_string(),
+                record_type: "intent".to_string(),
+                run_id: schedule_progress.run_id.clone(),
+                schedule_idx,
+                slot_commit_id: slot_commit_id.clone(),
+                trial_id: String::new(),
+                slot_status: "skipped_pruned".to_string(),
+                attempt,
+                recorded_at: Utc::now().to_rfc3339(),
+                expected_rows: Some(empty_counts.clone()),
+                payload_digest: Some(payload_digest),
+                written_rows: None,
+                facts_fsync_completed: None,
+                runtime_fsync_completed: None,
+            },
+        )?;
         run_sink.flush()?;
+        append_slot_commit_record(
+            run_dir,
+            &SlotCommitRecord {
+                schema_version: "slot_commit_record_v1".to_string(),
+                record_type: "commit".to_string(),
+                run_id: schedule_progress.run_id.clone(),
+                schedule_idx,
+                slot_commit_id: slot_commit_id.clone(),
+                trial_id: String::new(),
+                slot_status: "skipped_pruned".to_string(),
+                attempt,
+                recorded_at: Utc::now().to_rfc3339(),
+                expected_rows: None,
+                payload_digest: None,
+                written_rows: Some(empty_counts),
+                facts_fsync_completed: Some(true),
+                runtime_fsync_completed: Some(true),
+            },
+        )?;
 
         let mut next_progress = schedule_progress.clone();
         next_progress.completed_slots.push(SlotCompletion {
             schedule_index: schedule_idx,
             trial_id: String::new(),
             status: "skipped_pruned".to_string(),
+            slot_commit_id,
+            attempt,
         });
         next_progress.next_schedule_index = schedule_idx + 1;
         next_progress.updated_at = Utc::now().to_rfc3339();
         write_schedule_progress(run_dir, &next_progress)?;
         *schedule_progress = next_progress;
+        slot_attempts.insert(schedule_idx, attempt);
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn commit_trial_slot(
         run_dir: &Path,
         policy_config: &PolicyConfig,
@@ -5442,26 +6219,132 @@ impl RunCoordinator {
         consecutive_failures: &mut BTreeMap<usize, usize>,
         trial_result: &TrialExecutionResult,
         run_sink: &mut dyn RunSink,
+        slot_attempts: &mut HashMap<usize, usize>,
     ) -> Result<()> {
-        for record in &trial_result.deferred_evidence_records {
+        let attempt = slot_attempts.get(&schedule_idx).copied().unwrap_or(0) + 1;
+        let payload_digest = slot_commit_payload_digest_for_result(schedule_idx, trial_result)?;
+        let slot_commit_id = make_slot_commit_id(
+            &schedule_progress.run_id,
+            schedule_idx,
+            attempt,
+            &payload_digest,
+        );
+        let expected_rows = SlotCommitRowCounts {
+            trials: trial_result.deferred_trial_records.len(),
+            metrics: trial_result.deferred_metric_rows.len(),
+            events: trial_result.deferred_event_rows.len(),
+            variant_snapshots: trial_result.deferred_variant_snapshot_rows.len(),
+            evidence: trial_result.deferred_evidence_records.len(),
+            chain_states: trial_result.deferred_chain_state_records.len(),
+            predictions: trial_result.deferred_benchmark_prediction_records.len(),
+            scores: trial_result.deferred_benchmark_score_records.len(),
+        };
+        append_slot_commit_record(
+            run_dir,
+            &SlotCommitRecord {
+                schema_version: "slot_commit_record_v1".to_string(),
+                record_type: "intent".to_string(),
+                run_id: schedule_progress.run_id.clone(),
+                schedule_idx,
+                slot_commit_id: slot_commit_id.clone(),
+                trial_id: trial_result.trial_id.clone(),
+                slot_status: trial_result.slot_status.clone(),
+                attempt,
+                recorded_at: Utc::now().to_rfc3339(),
+                expected_rows: Some(expected_rows.clone()),
+                payload_digest: Some(payload_digest),
+                written_rows: None,
+                facts_fsync_completed: None,
+                runtime_fsync_completed: None,
+            },
+        )?;
+
+        let evidence_rows = annotate_value_rows(
+            &trial_result.deferred_evidence_records,
+            schedule_idx,
+            &slot_commit_id,
+            attempt,
+        );
+        for record in &evidence_rows {
             append_jsonl(evidence_records_path, record)?;
         }
-        for record in &trial_result.deferred_chain_state_records {
+        let chain_rows = annotate_value_rows(
+            &trial_result.deferred_chain_state_records,
+            schedule_idx,
+            &slot_commit_id,
+            attempt,
+        );
+        for record in &chain_rows {
             append_jsonl(task_chain_states_path, record)?;
         }
-        for row in &trial_result.deferred_benchmark_prediction_records {
+        let prediction_rows = annotate_value_rows(
+            &trial_result.deferred_benchmark_prediction_records,
+            schedule_idx,
+            &slot_commit_id,
+            attempt,
+        );
+        for row in &prediction_rows {
             append_jsonl(benchmark_predictions_path, row)?;
         }
-        for row in &trial_result.deferred_benchmark_score_records {
+        let score_rows = annotate_value_rows(
+            &trial_result.deferred_benchmark_score_records,
+            schedule_idx,
+            &slot_commit_id,
+            attempt,
+        );
+        for row in &score_rows {
             append_jsonl(benchmark_scores_path, row)?;
         }
-        for row in &trial_result.deferred_trial_records {
+        let trial_rows = annotate_trial_rows(
+            &trial_result.deferred_trial_records,
+            schedule_idx,
+            &slot_commit_id,
+            attempt,
+        );
+        for row in &trial_rows {
             run_sink.append_trial_record(row)?;
         }
-        run_sink.append_metric_rows(&trial_result.deferred_metric_rows)?;
-        run_sink.append_event_rows(&trial_result.deferred_event_rows)?;
-        run_sink.append_variant_snapshot(&trial_result.deferred_variant_snapshot_rows)?;
+        let metric_rows = annotate_metric_rows(
+            &trial_result.deferred_metric_rows,
+            schedule_idx,
+            &slot_commit_id,
+            attempt,
+        );
+        let event_rows = annotate_event_rows(
+            &trial_result.deferred_event_rows,
+            schedule_idx,
+            &slot_commit_id,
+            attempt,
+        );
+        let snapshot_rows = annotate_variant_snapshot_rows(
+            &trial_result.deferred_variant_snapshot_rows,
+            schedule_idx,
+            &slot_commit_id,
+            attempt,
+        );
+        run_sink.append_metric_rows(&metric_rows)?;
+        run_sink.append_event_rows(&event_rows)?;
+        run_sink.append_variant_snapshot(&snapshot_rows)?;
         run_sink.flush()?;
+        append_slot_commit_record(
+            run_dir,
+            &SlotCommitRecord {
+                schema_version: "slot_commit_record_v1".to_string(),
+                record_type: "commit".to_string(),
+                run_id: schedule_progress.run_id.clone(),
+                schedule_idx,
+                slot_commit_id: slot_commit_id.clone(),
+                trial_id: trial_result.trial_id.clone(),
+                slot_status: trial_result.slot_status.clone(),
+                attempt,
+                recorded_at: Utc::now().to_rfc3339(),
+                expected_rows: None,
+                payload_digest: None,
+                written_rows: Some(expected_rows),
+                facts_fsync_completed: Some(true),
+                runtime_fsync_completed: Some(true),
+            },
+        )?;
 
         let mut next_consecutive_failures = consecutive_failures.clone();
         let mut next_pruned_variants = pruned_variants.clone();
@@ -5487,6 +6370,8 @@ impl RunCoordinator {
             schedule_index: schedule_idx,
             trial_id: trial_result.trial_id.clone(),
             status: trial_result.slot_status.clone(),
+            slot_commit_id,
+            attempt,
         });
         next_progress.next_schedule_index = schedule_idx + 1;
         next_progress.next_trial_index = trial_index;
@@ -5498,6 +6383,7 @@ impl RunCoordinator {
         *schedule_progress = next_progress;
         *consecutive_failures = next_consecutive_failures;
         *pruned_variants = next_pruned_variants;
+        slot_attempts.insert(schedule_idx, attempt);
         Ok(())
     }
 }
@@ -5512,18 +6398,25 @@ struct DeterministicCommitter {
     next_commit_idx: usize,
     committed_keys: HashSet<String>,
     pending_by_schedule: BTreeMap<usize, PendingSlotCommit>,
+    slot_attempts: HashMap<usize, usize>,
 }
 
 impl DeterministicCommitter {
-    fn from_progress(progress: &ScheduleProgress) -> Self {
+    fn from_progress(progress: &ScheduleProgress, journal_records: &[SlotCommitRecord]) -> Self {
         let mut committed_keys = HashSet::new();
+        let mut slot_attempts = highest_attempt_by_schedule(journal_records);
         for slot in &progress.completed_slots {
             committed_keys.insert(Self::commit_key_for_slot_completion(slot));
+            let entry = slot_attempts.entry(slot.schedule_index).or_insert(0);
+            if slot.attempt > *entry {
+                *entry = slot.attempt;
+            }
         }
         Self {
             next_commit_idx: progress.next_schedule_index,
             committed_keys,
             pending_by_schedule: BTreeMap::new(),
+            slot_attempts,
         }
     }
 
@@ -5605,6 +6498,7 @@ impl DeterministicCommitter {
                         schedule_progress,
                         schedule_idx,
                         run_sink,
+                        &mut self.slot_attempts,
                     )?;
                 }
                 PendingSlotCommit::Trial(result) => {
@@ -5622,6 +6516,7 @@ impl DeterministicCommitter {
                         consecutive_failures,
                         &result,
                         run_sink,
+                        &mut self.slot_attempts,
                     )?;
                 }
             }
@@ -5970,6 +6865,21 @@ fn decode_parallel_completion_result(
         }
         return Ok(result);
     }
+    if completion.classification == "local_worker_error" {
+        let detail = completion
+            .artifacts
+            .pointer("/error")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .unwrap_or("unknown local worker error");
+        return Err(anyhow!(
+            "local worker trial execution failed (trial_id={}, schedule_idx={}): {}",
+            in_flight.trial_id,
+            in_flight.schedule_idx,
+            detail
+        ));
+    }
     Ok(TrialExecutionResult::worker_lost(
         in_flight.trial_id.clone(),
         Some(in_flight.variant_idx),
@@ -6159,7 +7069,8 @@ fn execute_schedule_engine_parallel(
         Box::new(local_backend)
     };
 
-    let mut committer = DeterministicCommitter::from_progress(schedule_progress);
+    let journal_records = load_slot_commit_records(run_dir)?;
+    let mut committer = DeterministicCommitter::from_progress(schedule_progress, &journal_records);
     if !recovered_active_trials.is_empty() {
         let mut variant_idx_by_id: HashMap<String, usize> = HashMap::new();
         for (idx, variant) in variants.iter().enumerate() {
@@ -6509,6 +7420,7 @@ fn run_experiment_with_behavior(
     ensure_dir(&run_dir)?;
     write_run_control_v2(&run_dir, &run_id, "running", &[], None)?;
     write_run_session_state(&run_dir, &run_id, &behavior, &execution)?;
+    let _engine_lease_guard = start_engine_lease_heartbeat(&run_dir, &run_id)?;
     let mut run_guard = RunControlGuard::new(&run_dir, &run_id);
 
     let resolved_path = run_dir.join("resolved_experiment.json");
@@ -6564,6 +7476,43 @@ fn run_experiment_with_behavior(
         .iter()
         .all(|profile| profile.container_mode);
 
+    // Preflight checks — abort before trial execution if anything is fatally wrong
+    {
+        let checks = collect_preflight_checks(
+            &json_value,
+            &exp_dir,
+            &tasks,
+            &benchmark_config,
+            &variants,
+            &variant_runtime_profiles,
+        );
+
+        let preflight = PreflightReport {
+            passed: checks
+                .iter()
+                .all(|c| c.passed || matches!(c.severity, PreflightSeverity::Warning)),
+            checks,
+        };
+
+        // Print warnings even when passing
+        for check in &preflight.checks {
+            if !check.passed && matches!(check.severity, PreflightSeverity::Warning) {
+                eprintln!("[WARN] {}: {}", check.name, check.message);
+            } else if check.passed
+                && matches!(check.severity, PreflightSeverity::Warning)
+                && check.message.contains("will be")
+            {
+                eprintln!("[WARN] {}: {}", check.name, check.message);
+            }
+        }
+
+        if !preflight.passed {
+            // Clean up the partial run directory before aborting
+            run_guard.complete("preflight_failed")?;
+            return Err(anyhow!("preflight failed:\n{}", preflight));
+        }
+    }
+
     let mut run_sink = JsonlRunSink::new(&run_dir)?;
     run_sink.write_run_manifest(&RunManifestRecord {
         schema_version: "run_manifest_v1".to_string(),
@@ -6591,7 +7540,7 @@ fn run_experiment_with_behavior(
     let mut pruned_variants: HashSet<usize> = HashSet::new();
 
     let mut schedule_progress = ScheduleProgress {
-        schema_version: "schedule_progress_v1".to_string(),
+        schema_version: "schedule_progress_v2".to_string(),
         run_id: run_id.clone(),
         total_slots: schedule.len(),
         next_schedule_index: 0,
@@ -6753,6 +7702,42 @@ pub fn describe_experiment_with_overrides(
         .unwrap_or("paired")
         .to_string();
 
+    // Collect preflight warnings (lightweight: dataset + config checks only, no Docker)
+    let benchmark_config = parse_benchmark_config(&json_value);
+    let tasks_for_preflight = load_tasks(&dataset_path, &json_value).unwrap_or_default();
+    let is_clean = is_clean_contract_experiment(&json_value);
+    let mut preflight_warnings = Vec::new();
+    for check in check_dataset_task_ids(&tasks_for_preflight, &benchmark_config) {
+        if matches!(check.severity, PreflightSeverity::Warning) || !check.passed {
+            preflight_warnings.push(format!("[{}] {}", check.name, check.message));
+        }
+    }
+    {
+        let grader_check = check_benchmark_grader_reachable(
+            &benchmark_config,
+            &resolve_variant_runtime_profile(
+                &json_value,
+                baseline_variant,
+                &project_root,
+                false,
+                &RunBehavior::default(),
+                &RunExecutionOptions::default(),
+            )?,
+            &tasks_for_preflight,
+            is_clean,
+        );
+        if matches!(grader_check.severity, PreflightSeverity::Warning)
+            && !grader_check.message.contains("no benchmark")
+        {
+            preflight_warnings.push(format!("[{}] {}", grader_check.name, grader_check.message));
+        }
+    }
+    for check in check_dependency_files_exist(&json_value, &exp_dir) {
+        if !check.passed {
+            preflight_warnings.push(format!("[{}] {}", check.name, check.message));
+        }
+    }
+
     Ok(ExperimentSummary {
         exp_id,
         workload_type,
@@ -6779,7 +7764,925 @@ pub fn describe_experiment_with_overrides(
         },
         comparison,
         retry_max_attempts: policy_config.retry_max_attempts,
+        preflight_warnings,
     })
+}
+
+// ---------------------------------------------------------------------------
+// Preflight checks
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize)]
+pub enum PreflightSeverity {
+    Error,
+    Warning,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct PreflightCheck {
+    pub name: &'static str,
+    pub passed: bool,
+    pub severity: PreflightSeverity,
+    pub message: String,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct PreflightReport {
+    pub passed: bool,
+    pub checks: Vec<PreflightCheck>,
+}
+
+impl std::fmt::Display for PreflightReport {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        for check in &self.checks {
+            let icon = if check.passed {
+                "PASS"
+            } else {
+                match check.severity {
+                    PreflightSeverity::Error => "FAIL",
+                    PreflightSeverity::Warning => "WARN",
+                }
+            };
+            writeln!(f, "[{}] {}: {}", icon, check.name, check.message)?;
+        }
+        Ok(())
+    }
+}
+
+pub fn preflight_experiment(path: &Path, overrides_path: Option<&Path>) -> Result<PreflightReport> {
+    let exp_dir = path
+        .parent()
+        .unwrap_or(Path::new("."))
+        .canonicalize()
+        .unwrap_or_else(|_| PathBuf::from("."));
+    let project_root = find_project_root(&exp_dir)
+        .canonicalize()
+        .unwrap_or_else(|_| find_project_root(&exp_dir));
+    let raw_yaml = fs::read_to_string(path)?;
+    let yaml_value: serde_yaml::Value = serde_yaml::from_str(&raw_yaml)?;
+    let mut json_value: Value = serde_json::to_value(yaml_value)?;
+    if let Some(overrides_path) = overrides_path {
+        json_value = apply_experiment_overrides(json_value, overrides_path, &project_root)?;
+    }
+    validate_required_fields(&json_value)?;
+
+    let dataset_path = resolve_dataset_path(&json_value, &exp_dir)?;
+    let tasks = load_tasks(&dataset_path, &json_value)?;
+    let (variants, _baseline_id) = resolve_variant_plan(&json_value)?;
+    let benchmark_config = parse_benchmark_config(&json_value);
+    let mut variant_runtime_profiles = Vec::with_capacity(variants.len());
+    for variant in &variants {
+        variant_runtime_profiles.push(resolve_variant_runtime_profile(
+            &json_value,
+            variant,
+            &project_root,
+            false,
+            &RunBehavior::default(),
+            &RunExecutionOptions::default(),
+        )?);
+    }
+    let checks = collect_preflight_checks(
+        &json_value,
+        &exp_dir,
+        &tasks,
+        &benchmark_config,
+        &variants,
+        &variant_runtime_profiles,
+    );
+
+    let passed = checks
+        .iter()
+        .all(|c| c.passed || matches!(c.severity, PreflightSeverity::Warning));
+
+    Ok(PreflightReport { passed, checks })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct GraderReachabilityCheckKey {
+    container_mode: bool,
+    image_source: ImageSource,
+    container_image: Option<String>,
+    resolved_binary: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct ContainerReadinessCheckKey {
+    container_mode: bool,
+    image_source: ImageSource,
+    container_image: Option<String>,
+}
+
+#[derive(Debug, Default)]
+struct PerTaskImageScanResult {
+    unique_images: Vec<String>,
+    missing_task_ids: Vec<String>,
+    parse_errors: Vec<String>,
+}
+
+fn format_preview(items: &[String], limit: usize) -> String {
+    if items.is_empty() {
+        return "(none)".to_string();
+    }
+    let shown = items.iter().take(limit).cloned().collect::<Vec<_>>();
+    if items.len() <= limit {
+        shown.join(", ")
+    } else {
+        format!("{}, ... (+{} more)", shown.join(", "), items.len() - limit)
+    }
+}
+
+fn annotate_preflight_check_with_variants(
+    check: &mut PreflightCheck,
+    variant_ids: &[String],
+    total_variants: usize,
+) {
+    if total_variants <= 1 || variant_ids.is_empty() {
+        return;
+    }
+    let prefix = if variant_ids.len() == 1 {
+        format!("variant '{}': ", variant_ids[0])
+    } else {
+        format!("variants [{}]: ", variant_ids.join(", "))
+    };
+    check.message = format!("{}{}", prefix, check.message);
+}
+
+fn resolve_preflight_grader_binary(
+    adapter: &BenchmarkAdapterConfig,
+    runtime_profile: &VariantRuntimeProfile,
+) -> String {
+    let mut render_env = BTreeMap::new();
+    render_env.insert("WORKSPACE".to_string(), "/workspace".to_string());
+    for (key, value) in &runtime_profile.agent_runtime_env {
+        render_env.insert(key.clone(), value.clone());
+    }
+    let rendered_cmd = apply_agentlab_template_to_command(&adapter.command, &render_env);
+    rendered_cmd.first().cloned().unwrap_or_default()
+}
+
+fn check_benchmark_grader_reachable_for_variants(
+    benchmark_config: &BenchmarkConfig,
+    variants: &[Variant],
+    variant_runtime_profiles: &[VariantRuntimeProfile],
+    tasks: &[Value],
+    is_clean: bool,
+) -> Vec<PreflightCheck> {
+    if variants.is_empty() || variant_runtime_profiles.is_empty() {
+        return Vec::new();
+    }
+    if benchmark_config.adapter.is_none() || is_clean {
+        return vec![check_benchmark_grader_reachable(
+            benchmark_config,
+            &variant_runtime_profiles[0],
+            tasks,
+            is_clean,
+        )];
+    }
+
+    let adapter = benchmark_config
+        .adapter
+        .as_ref()
+        .expect("adapter checked above");
+    let mut grouped: BTreeMap<GraderReachabilityCheckKey, Vec<usize>> = BTreeMap::new();
+    for (idx, profile) in variant_runtime_profiles.iter().enumerate() {
+        let key = GraderReachabilityCheckKey {
+            container_mode: profile.container_mode,
+            image_source: profile.agent_runtime.image_source,
+            container_image: profile.agent_runtime.container_image.clone(),
+            resolved_binary: resolve_preflight_grader_binary(adapter, profile),
+        };
+        grouped.entry(key).or_default().push(idx);
+    }
+
+    let mut checks = Vec::new();
+    for indices in grouped.values() {
+        let representative = indices[0];
+        let mut check = check_benchmark_grader_reachable(
+            benchmark_config,
+            &variant_runtime_profiles[representative],
+            tasks,
+            is_clean,
+        );
+        let variant_ids = indices
+            .iter()
+            .filter_map(|idx| variants.get(*idx).map(|variant| variant.id.clone()))
+            .collect::<Vec<_>>();
+        annotate_preflight_check_with_variants(&mut check, &variant_ids, variants.len());
+        checks.push(check);
+    }
+    checks
+}
+
+fn check_container_ready_for_variants(
+    variants: &[Variant],
+    variant_runtime_profiles: &[VariantRuntimeProfile],
+    tasks: &[Value],
+) -> Vec<PreflightCheck> {
+    if variants.is_empty() || variant_runtime_profiles.is_empty() {
+        return Vec::new();
+    }
+    let mut grouped: BTreeMap<ContainerReadinessCheckKey, Vec<usize>> = BTreeMap::new();
+    for (idx, profile) in variant_runtime_profiles.iter().enumerate() {
+        let key = ContainerReadinessCheckKey {
+            container_mode: profile.container_mode,
+            image_source: profile.agent_runtime.image_source,
+            container_image: profile.agent_runtime.container_image.clone(),
+        };
+        grouped.entry(key).or_default().push(idx);
+    }
+
+    let mut checks = Vec::new();
+    for indices in grouped.values() {
+        let representative = indices[0];
+        let mut scoped_checks =
+            check_container_ready(&variant_runtime_profiles[representative], tasks);
+        let variant_ids = indices
+            .iter()
+            .filter_map(|idx| variants.get(*idx).map(|variant| variant.id.clone()))
+            .collect::<Vec<_>>();
+        for check in &mut scoped_checks {
+            annotate_preflight_check_with_variants(check, &variant_ids, variants.len());
+        }
+        checks.extend(scoped_checks);
+    }
+    checks
+}
+
+fn collect_per_task_images_for_preflight(tasks: &[Value]) -> PerTaskImageScanResult {
+    let mut unique_images = HashSet::new();
+    let mut result = PerTaskImageScanResult::default();
+    for (idx, task) in tasks.iter().enumerate() {
+        let boundary = match parse_task_boundary_from_dataset_task(task) {
+            Ok(boundary) => boundary,
+            Err(err) => {
+                result
+                    .parse_errors
+                    .push(format!("line {}: {}", idx + 1, err));
+                continue;
+            }
+        };
+        let task_id = boundary
+            .task_payload
+            .get("id")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(ToString::to_string)
+            .unwrap_or_else(|| format!("line {}", idx + 1));
+        match boundary
+            .task_image
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            Some(image) => {
+                if unique_images.insert(image.to_string()) {
+                    result.unique_images.push(image.to_string());
+                }
+            }
+            None => result.missing_task_ids.push(task_id),
+        }
+    }
+    result.unique_images.sort();
+    result
+}
+
+fn collect_preflight_checks(
+    json_value: &Value,
+    exp_dir: &Path,
+    tasks: &[Value],
+    benchmark_config: &BenchmarkConfig,
+    variants: &[Variant],
+    variant_runtime_profiles: &[VariantRuntimeProfile],
+) -> Vec<PreflightCheck> {
+    let mut checks = Vec::new();
+    if variants.is_empty() {
+        checks.push(PreflightCheck {
+            name: "variant_runtime_profiles",
+            passed: false,
+            severity: PreflightSeverity::Error,
+            message: "no variants available in experiment".to_string(),
+        });
+        return checks;
+    }
+    if variant_runtime_profiles.is_empty() {
+        checks.push(PreflightCheck {
+            name: "variant_runtime_profiles",
+            passed: false,
+            severity: PreflightSeverity::Error,
+            message: "failed to resolve runtime profile for baseline variant".to_string(),
+        });
+        return checks;
+    }
+    let is_clean = is_clean_contract_experiment(json_value);
+
+    // Structural checks (probe_trial_input, dataset_task_ids) are now
+    // validated at build time in build_swebench_curated_ab_experiment.mjs.
+    // Only machine-state-dependent checks remain here.
+    checks.extend(check_benchmark_grader_reachable_for_variants(
+        benchmark_config,
+        variants,
+        variant_runtime_profiles,
+        tasks,
+        is_clean,
+    ));
+    checks.extend(check_container_ready_for_variants(
+        variants,
+        variant_runtime_profiles,
+        tasks,
+    ));
+    checks.extend(check_dependency_files_exist(json_value, exp_dir));
+    checks
+}
+
+#[cfg(test)]
+fn check_probe_trial_input(
+    json_value: &Value,
+    tasks: &[Value],
+    baseline_variant: &Variant,
+    agent_runtime: &AgentRuntimeConfig,
+    is_clean: bool,
+) -> PreflightCheck {
+    let name = "probe_trial_input";
+    let first_task = match tasks.first() {
+        Some(t) => t,
+        None => {
+            return PreflightCheck {
+                name,
+                passed: false,
+                severity: PreflightSeverity::Error,
+                message: "dataset is empty — no tasks to validate".to_string(),
+            };
+        }
+    };
+
+    let task_boundary = match parse_task_boundary_from_dataset_task(first_task) {
+        Ok(tb) => tb,
+        Err(e) => {
+            return PreflightCheck {
+                name,
+                passed: false,
+                severity: PreflightSeverity::Error,
+                message: format!("failed to parse task boundary for first task: {}", e),
+            };
+        }
+    };
+
+    let probe_input = build_agent_task(
+        json_value,
+        "preflight_probe",
+        "preflight_trial_0",
+        baseline_variant,
+        0,
+        0,
+        &task_boundary,
+        agent_runtime,
+    );
+
+    if is_clean {
+        return PreflightCheck {
+            name,
+            passed: true,
+            severity: PreflightSeverity::Error,
+            message: "clean_contract_v1 — task payload returned as-is, no schema validation needed"
+                .to_string(),
+        };
+    }
+
+    let schema = match compile_schema("agent_task_v1.jsonschema") {
+        Ok(s) => s,
+        Err(e) => {
+            return PreflightCheck {
+                name,
+                passed: false,
+                severity: PreflightSeverity::Error,
+                message: format!("failed to load agent_task_v1 schema: {}", e),
+            };
+        }
+    };
+
+    let validation_errors: Vec<String> = schema
+        .validate(&probe_input)
+        .err()
+        .map(|errors| errors.map(|e| e.to_string()).collect())
+        .unwrap_or_default();
+
+    if validation_errors.is_empty() {
+        PreflightCheck {
+            name,
+            passed: true,
+            severity: PreflightSeverity::Error,
+            message: "probe trial input passes agent_task_v1 schema".to_string(),
+        }
+    } else {
+        PreflightCheck {
+            name,
+            passed: false,
+            severity: PreflightSeverity::Error,
+            message: format!(
+                "probe trial input fails agent_task_v1 schema: {}",
+                validation_errors.join("; ")
+            ),
+        }
+    }
+}
+
+fn check_dataset_task_ids(
+    tasks: &[Value],
+    benchmark_config: &BenchmarkConfig,
+) -> Vec<PreflightCheck> {
+    let mut checks = Vec::new();
+    let mut seen_ids: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+    let mut missing_ids = Vec::new();
+    let mut grading_disabled_lines = Vec::new();
+    let has_benchmark = benchmark_config.adapter.is_some();
+
+    for (idx, task) in tasks.iter().enumerate() {
+        let line_num = idx + 1;
+        // For task_boundary rows, ID is at task.id inside the boundary
+        let id = task
+            .pointer("/task/id")
+            .and_then(|v| v.as_str())
+            .or_else(|| task.get("id").and_then(|v| v.as_str()));
+
+        match id {
+            Some(id_str) if !id_str.is_empty() => {
+                seen_ids
+                    .entry(id_str.to_string())
+                    .or_default()
+                    .push(line_num);
+            }
+            _ => {
+                missing_ids.push(line_num);
+            }
+        }
+
+        if has_benchmark {
+            if let Some(enabled) = task
+                .pointer("/task/grading/enabled")
+                .or_else(|| task.pointer("/grading/enabled"))
+                .and_then(|v| v.as_bool())
+            {
+                if !enabled {
+                    grading_disabled_lines.push(line_num);
+                }
+            }
+        }
+    }
+
+    if !missing_ids.is_empty() {
+        checks.push(PreflightCheck {
+            name: "dataset_task_ids",
+            passed: false,
+            severity: PreflightSeverity::Error,
+            message: format!("tasks missing 'id' field at lines: {:?}", missing_ids),
+        });
+    }
+
+    let duplicates: Vec<_> = seen_ids
+        .iter()
+        .filter(|(_, lines)| lines.len() > 1)
+        .collect();
+    if !duplicates.is_empty() {
+        let dup_details: Vec<String> = duplicates
+            .iter()
+            .map(|(id, lines)| format!("'{}' at lines {:?}", id, lines))
+            .collect();
+        checks.push(PreflightCheck {
+            name: "dataset_task_ids",
+            passed: false,
+            severity: PreflightSeverity::Error,
+            message: format!("duplicate task IDs: {}", dup_details.join(", ")),
+        });
+    }
+
+    if missing_ids.is_empty() && duplicates.is_empty() {
+        checks.push(PreflightCheck {
+            name: "dataset_task_ids",
+            passed: true,
+            severity: PreflightSeverity::Error,
+            message: format!("all {} tasks have unique IDs", tasks.len()),
+        });
+    }
+
+    if !grading_disabled_lines.is_empty() {
+        checks.push(PreflightCheck {
+            name: "dataset_task_ids",
+            passed: true,
+            severity: PreflightSeverity::Warning,
+            message: format!(
+                "benchmark configured but grading.enabled=false at lines: {:?} — these tasks will not be scored",
+                grading_disabled_lines
+            ),
+        });
+    }
+
+    checks
+}
+
+fn check_benchmark_grader_reachable(
+    benchmark_config: &BenchmarkConfig,
+    runtime_profile: &VariantRuntimeProfile,
+    tasks: &[Value],
+    is_clean: bool,
+) -> PreflightCheck {
+    let name = "benchmark_grader_reachable";
+
+    let adapter = match benchmark_config.adapter.as_ref() {
+        Some(a) => a,
+        None => {
+            return PreflightCheck {
+                name,
+                passed: true,
+                severity: PreflightSeverity::Warning,
+                message: "no benchmark adapter configured — grading skipped".to_string(),
+            };
+        }
+    };
+
+    if is_clean {
+        return PreflightCheck {
+            name,
+            passed: true,
+            severity: PreflightSeverity::Warning,
+            message: "clean_contract_v1 experiment — benchmark grading will be silently skipped"
+                .to_string(),
+        };
+    }
+
+    if !runtime_profile.container_mode {
+        return PreflightCheck {
+            name,
+            passed: true,
+            severity: PreflightSeverity::Warning,
+            message:
+                "local process mode — inline grading won't run, only post-run batch processing"
+                    .to_string(),
+        };
+    }
+
+    let images = match runtime_profile.agent_runtime.image_source {
+        ImageSource::Global => match runtime_profile.agent_runtime.container_image.as_deref() {
+            Some(image) => vec![image.to_string()],
+            None => {
+                return PreflightCheck {
+                    name,
+                    passed: false,
+                    severity: PreflightSeverity::Error,
+                    message: "benchmark adapter configured but no container image specified"
+                        .to_string(),
+                };
+            }
+        },
+        ImageSource::PerTask => {
+            let scan = collect_per_task_images_for_preflight(tasks);
+            if !scan.parse_errors.is_empty() {
+                return PreflightCheck {
+                    name,
+                    passed: false,
+                    severity: PreflightSeverity::Error,
+                    message: format!(
+                        "failed to parse task image boundary rows: {}",
+                        format_preview(&scan.parse_errors, 3)
+                    ),
+                };
+            }
+            if !scan.missing_task_ids.is_empty() {
+                return PreflightCheck {
+                    name,
+                    passed: false,
+                    severity: PreflightSeverity::Error,
+                    message: format!(
+                        "tasks missing task.image in per-task mode: {}",
+                        format_preview(&scan.missing_task_ids, 5)
+                    ),
+                };
+            }
+            if scan.unique_images.is_empty() {
+                return PreflightCheck {
+                    name,
+                    passed: false,
+                    severity: PreflightSeverity::Error,
+                    message: "no task images found in dataset for per-task image mode".to_string(),
+                };
+            }
+            scan.unique_images
+        }
+    };
+
+    // Render templates in the grader binary name using placeholder env.
+    let mut render_env = BTreeMap::new();
+    render_env.insert("WORKSPACE".to_string(), "/workspace".to_string());
+    for (k, v) in &runtime_profile.agent_runtime_env {
+        render_env.insert(k.clone(), v.clone());
+    }
+    let rendered_cmd = apply_agentlab_template_to_command(&adapter.command, &render_env);
+    let resolved_binary = rendered_cmd
+        .first()
+        .map(|value| value.as_str())
+        .unwrap_or("");
+    if resolved_binary.trim().is_empty() {
+        return PreflightCheck {
+            name,
+            passed: false,
+            severity: PreflightSeverity::Error,
+            message: "benchmark adapter command resolved to an empty binary token".to_string(),
+        };
+    }
+
+    let mut failures = Vec::new();
+    for image in &images {
+        match Command::new("docker")
+            .args([
+                "run",
+                "--rm",
+                "--entrypoint",
+                "which",
+                image,
+                resolved_binary,
+            ])
+            .output()
+        {
+            Ok(out) if out.status.success() => {}
+            Ok(out) => failures.push(format!("{} ({})", image, output_error_detail(&out))),
+            Err(err) => failures.push(format!("{} ({})", image, err)),
+        }
+    }
+
+    if failures.is_empty() {
+        return PreflightCheck {
+            name,
+            passed: true,
+            severity: PreflightSeverity::Error,
+            message: if images.len() == 1 {
+                format!(
+                    "grader binary '{}' found in image '{}'",
+                    resolved_binary, images[0]
+                )
+            } else {
+                format!(
+                    "grader binary '{}' found in all {} required images",
+                    resolved_binary,
+                    images.len()
+                )
+            },
+        };
+    }
+
+    PreflightCheck {
+        name,
+        passed: false,
+        severity: PreflightSeverity::Error,
+        message: format!(
+            "grader binary '{}' not found in required images: {}",
+            resolved_binary,
+            format_preview(&failures, 3)
+        ),
+    }
+}
+
+fn check_container_ready(
+    runtime_profile: &VariantRuntimeProfile,
+    tasks: &[Value],
+) -> Vec<PreflightCheck> {
+    let name = "container_ready";
+
+    if !runtime_profile.container_mode {
+        return vec![PreflightCheck {
+            name,
+            passed: true,
+            severity: PreflightSeverity::Error,
+            message: "local process mode — Docker checks skipped".to_string(),
+        }];
+    }
+
+    let mut checks = Vec::new();
+
+    // Check Docker daemon reachability
+    let docker_ok = match std::process::Command::new("docker")
+        .arg("info")
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+    {
+        Ok(status) if status.success() => {
+            checks.push(PreflightCheck {
+                name,
+                passed: true,
+                severity: PreflightSeverity::Error,
+                message: "Docker daemon is reachable".to_string(),
+            });
+            true
+        }
+        Ok(_) | Err(_) => {
+            checks.push(PreflightCheck {
+                name,
+                passed: false,
+                severity: PreflightSeverity::Error,
+                message: "Docker daemon is not reachable — container execution will fail"
+                    .to_string(),
+            });
+            false
+        }
+    };
+
+    if !docker_ok {
+        return checks;
+    }
+
+    let images = match runtime_profile.agent_runtime.image_source {
+        ImageSource::PerTask => {
+            let scan = collect_per_task_images_for_preflight(tasks);
+            if !scan.parse_errors.is_empty() {
+                checks.push(PreflightCheck {
+                    name,
+                    passed: false,
+                    severity: PreflightSeverity::Error,
+                    message: format!(
+                        "failed to parse task image boundary rows: {}",
+                        format_preview(&scan.parse_errors, 3)
+                    ),
+                });
+                return checks;
+            }
+            if !scan.missing_task_ids.is_empty() {
+                checks.push(PreflightCheck {
+                    name,
+                    passed: false,
+                    severity: PreflightSeverity::Error,
+                    message: format!(
+                        "tasks missing task.image in per-task mode: {}",
+                        format_preview(&scan.missing_task_ids, 5)
+                    ),
+                });
+                return checks;
+            }
+            if scan.unique_images.is_empty() {
+                checks.push(PreflightCheck {
+                    name,
+                    passed: false,
+                    severity: PreflightSeverity::Error,
+                    message: "no task images found in dataset for per-task image mode".to_string(),
+                });
+                return checks;
+            }
+            scan.unique_images
+        }
+        ImageSource::Global => runtime_profile
+            .agent_runtime
+            .container_image
+            .clone()
+            .map(|image| vec![image])
+            .unwrap_or_default(),
+    };
+
+    if images.is_empty() {
+        checks.push(PreflightCheck {
+            name,
+            passed: false,
+            severity: PreflightSeverity::Error,
+            message: "no container image resolved for container execution".to_string(),
+        });
+        return checks;
+    }
+
+    let mut missing_images = Vec::new();
+    for image in &images {
+        if let Err(err) = ensure_container_image_ready(image) {
+            missing_images.push(format!("{} ({})", image, err));
+        }
+    }
+    if !missing_images.is_empty() {
+        checks.push(PreflightCheck {
+            name,
+            passed: false,
+            severity: PreflightSeverity::Error,
+            message: format!(
+                "container images not available: {}",
+                format_preview(&missing_images, 3)
+            ),
+        });
+        return checks;
+    }
+    checks.push(PreflightCheck {
+        name,
+        passed: true,
+        severity: PreflightSeverity::Error,
+        message: if runtime_profile.agent_runtime.image_source == ImageSource::PerTask {
+            format!(
+                "all {} per-task images available for execution",
+                images.len()
+            )
+        } else {
+            format!("image '{}' available for execution", images[0])
+        },
+    });
+
+    let mut shell_missing = Vec::new();
+    for image in &images {
+        match Command::new("docker")
+            .args([
+                "run",
+                "--rm",
+                "--entrypoint",
+                "/bin/sh",
+                image,
+                "-c",
+                "exit 0",
+            ])
+            .output()
+        {
+            Ok(out) if out.status.success() => {}
+            Ok(out) => shell_missing.push(format!("{} ({})", image, output_error_detail(&out))),
+            Err(err) => shell_missing.push(format!("{} ({})", image, err)),
+        }
+    }
+    if shell_missing.is_empty() {
+        checks.push(PreflightCheck {
+            name,
+            passed: true,
+            severity: PreflightSeverity::Error,
+            message: if runtime_profile.agent_runtime.image_source == ImageSource::PerTask {
+                format!("/bin/sh available in all {} per-task images", images.len())
+            } else {
+                "/bin/sh available in image".to_string()
+            },
+        });
+    } else {
+        checks.push(PreflightCheck {
+            name,
+            passed: false,
+            severity: PreflightSeverity::Error,
+            message: format!(
+                "/bin/sh not available in required images: {} — entrypoint wrapper will fail",
+                format_preview(&shell_missing, 3)
+            ),
+        });
+    }
+
+    checks
+}
+
+fn check_dependency_files_exist(json_value: &Value, exp_dir: &Path) -> Vec<PreflightCheck> {
+    let name = "dependency_files_exist";
+    let staging = match parse_dependency_file_staging(json_value, exp_dir) {
+        Ok(s) => s,
+        Err(e) => {
+            return vec![PreflightCheck {
+                name,
+                passed: false,
+                severity: PreflightSeverity::Error,
+                message: format!("failed to parse file_staging config: {}", e),
+            }];
+        }
+    };
+
+    if staging.is_empty() {
+        return vec![PreflightCheck {
+            name,
+            passed: true,
+            severity: PreflightSeverity::Error,
+            message: "no file_staging dependencies configured".to_string(),
+        }];
+    }
+
+    let mut checks = Vec::new();
+    for spec in &staging {
+        let exists = spec.source_from_host.exists();
+        if spec.required {
+            checks.push(PreflightCheck {
+                name,
+                passed: exists,
+                severity: PreflightSeverity::Error,
+                message: if exists {
+                    format!("required file exists: {}", spec.source_from_host.display())
+                } else {
+                    format!(
+                        "required file missing: {} — trial execution will fail",
+                        spec.source_from_host.display()
+                    )
+                },
+            });
+        } else if !exists {
+            checks.push(PreflightCheck {
+                name,
+                passed: true,
+                severity: PreflightSeverity::Warning,
+                message: format!("optional file missing: {}", spec.source_from_host.display()),
+            });
+        }
+    }
+
+    if checks.is_empty() {
+        checks.push(PreflightCheck {
+            name,
+            passed: true,
+            severity: PreflightSeverity::Error,
+            message: format!("all {} file_staging entries present", staging.len()),
+        });
+    }
+
+    checks
 }
 
 // ---------------------------------------------------------------------------
@@ -7546,6 +9449,10 @@ struct SlotCompletion {
     schedule_index: usize,
     trial_id: String,
     status: String, // "completed" | "failed" | "skipped_pruned"
+    #[serde(default)]
+    slot_commit_id: String,
+    #[serde(default = "default_slot_attempt")]
+    attempt: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -7563,12 +9470,62 @@ struct ScheduleProgress {
     updated_at: String,
 }
 
+fn default_slot_attempt() -> usize {
+    1
+}
+
+fn legacy_slot_commit_id(run_id: &str, slot: &SlotCompletion) -> String {
+    let raw = format!(
+        "legacy:{}:{}:{}:{}",
+        run_id, slot.schedule_index, slot.trial_id, slot.status
+    );
+    let digest = sha256_bytes(raw.as_bytes());
+    format!("legacy_{}", &digest[..24])
+}
+
+fn normalize_schedule_progress(progress: &mut ScheduleProgress) {
+    progress.schema_version = "schedule_progress_v2".to_string();
+    for slot in &mut progress.completed_slots {
+        if slot.attempt == 0 {
+            slot.attempt = 1;
+        }
+        if slot.slot_commit_id.trim().is_empty() {
+            slot.slot_commit_id = legacy_slot_commit_id(&progress.run_id, slot);
+        }
+    }
+}
+
 fn schedule_progress_path(run_dir: &Path) -> PathBuf {
     run_dir.join("runtime").join("schedule_progress.json")
 }
 
+fn load_schedule_progress(run_dir: &Path) -> Result<ScheduleProgress> {
+    let path = schedule_progress_path(run_dir);
+    let bytes = fs::read(&path)?;
+    let value: Value = serde_json::from_slice(&bytes)?;
+    let schema_version = value
+        .get("schema_version")
+        .and_then(Value::as_str)
+        .unwrap_or("schedule_progress_v1")
+        .to_string();
+    let mut progress: ScheduleProgress = serde_json::from_value(value)?;
+    match schema_version.as_str() {
+        "schedule_progress_v1" | "schedule_progress_v2" => {
+            normalize_schedule_progress(&mut progress);
+            Ok(progress)
+        }
+        other => Err(anyhow!(
+            "unsupported schedule_progress schema_version '{}' in {}",
+            other,
+            path.display()
+        )),
+    }
+}
+
 fn write_schedule_progress(run_dir: &Path, progress: &ScheduleProgress) -> Result<()> {
-    let value = serde_json::to_value(progress)?;
+    let mut next = progress.clone();
+    normalize_schedule_progress(&mut next);
+    let value = serde_json::to_value(next)?;
     atomic_write_json_pretty(&schedule_progress_path(run_dir), &value)
 }
 
@@ -8790,7 +10747,7 @@ struct AgentRuntimeConfig {
     dependency_services: Vec<Value>,
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 enum ImageSource {
     Global,
     PerTask,
@@ -9191,6 +11148,13 @@ fn resolve_variant_runtime_profile(
             ExecutorKind::LocalProcess
         }
     });
+    if agent_runtime.image_source == ImageSource::PerTask
+        && !matches!(executor_kind, ExecutorKind::LocalDocker)
+    {
+        return Err(anyhow!(
+            "runtime.agent.image_source='per_task' requires container execution"
+        ));
+    }
     let container_mode = matches!(executor_kind, ExecutorKind::LocalDocker);
     agent_runtime.command_raw =
         resolve_agent_runtime_command(&agent_runtime.command_raw, project_root, container_mode);
@@ -9433,6 +11397,12 @@ fn append_jsonl(path: &Path, value: &Value) -> Result<()> {
         .open(path)?;
     serde_json::to_writer(&mut file, value)?;
     writeln!(&mut file)?;
+    file.sync_all()?;
+    if let Some(parent) = path.parent() {
+        if let Ok(dir) = fs::File::open(parent) {
+            let _ = dir.sync_all();
+        }
+    }
     Ok(())
 }
 
@@ -9873,27 +11843,13 @@ fn run_builtin_adapter_container(request: &AdapterRunRequest<'_>) -> Result<Proc
         return Err(anyhow!("allowlist_enforced not implemented in Rust runner"));
     }
     let image = resolve_container_image(request)?;
+    ensure_container_image_ready(&image)?;
     let workspace = resolve_container_workspace(request);
     if request.runtime.image_source == ImageSource::PerTask {
         if request.agent_artifact.is_none() {
             return Err(anyhow!(
                 "runtime.agent.artifact is required when runtime.agent.image_source='per_task'"
             ));
-        }
-        if let Some(workspace) = workspace {
-            if !workspace.starts_with(AGENTLAB_CONTRACT_WORKSPACE_DIR) {
-                let root_read_only = request
-                    .runtime_experiment
-                    .pointer("/runtime/policy/sandbox/root_read_only")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(true);
-                if root_read_only {
-                    return Err(anyhow!(
-                        "per-task image workspace '{}' requires runtime.policy.sandbox.root_read_only=false",
-                        workspace
-                    ));
-                }
-            }
         }
     }
 
@@ -9922,17 +11878,21 @@ fn resolve_container_image(request: &AdapterRunRequest<'_>) -> Result<String> {
 }
 
 fn resolve_container_workspace<'a>(request: &'a AdapterRunRequest<'_>) -> Option<&'a str> {
-    request
-        .task_workspace
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .or_else(|| {
-            if request.runtime.clean_contract_v1 {
-                None
-            } else {
-                Some(AGENTLAB_CONTRACT_WORKSPACE_DIR)
-            }
-        })
+    let per_task_workspace = if request.runtime.image_source == ImageSource::PerTask {
+        request
+            .task_workspace
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+    } else {
+        None
+    };
+    per_task_workspace.or_else(|| {
+        if request.runtime.clean_contract_v1 {
+            None
+        } else {
+            Some(AGENTLAB_CONTRACT_WORKSPACE_DIR)
+        }
+    })
 }
 
 fn append_container_sandbox_args(
@@ -10076,6 +12036,14 @@ fn append_container_sandbox_args(
                 AGENTLAB_CONTRACT_WORKSPACE_DIR
             ),
         ]);
+        if let Some(workspace) = workspace {
+            if workspace != AGENTLAB_CONTRACT_WORKSPACE_DIR {
+                cmd.args([
+                    "-v",
+                    &format!("{}:{}", request.trial_paths.workspace.display(), workspace),
+                ]);
+            }
+        }
         cmd.args([
             "-v",
             &format!("{}:/dataset:ro", request.trial_paths.dataset.display()),
@@ -10182,7 +12150,7 @@ fn run_baked_container(
     let grader_command = resolve_benchmark_grader_command(request);
 
     let mut cmd = Command::new("docker");
-    cmd.arg("run").arg("--rm");
+    cmd.arg("run").arg("--rm").args(["--pull", "never"]);
     append_container_sandbox_args(&mut cmd, request, workspace);
     append_container_env_args(&mut cmd, request, workspace);
     cmd.arg(image);
@@ -10207,16 +12175,79 @@ fn run_checked_command(mut cmd: Command, step: &str) -> Result<std::process::Out
     if out.status.success() {
         return Ok(out);
     }
+    let detail = output_error_detail(&out);
+    Err(anyhow!("{}: {}", step, detail))
+}
+
+fn output_error_detail(out: &Output) -> String {
     let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
     let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    let detail = if !stderr.is_empty() {
+    if !stderr.is_empty() {
         stderr
     } else if !stdout.is_empty() {
         stdout
     } else {
         "command exited non-zero".to_string()
+    }
+}
+
+fn ensure_container_image_ready(image: &str) -> Result<()> {
+    let inspect_output = Command::new("docker")
+        .args(["image", "inspect", image])
+        .output()?;
+    if inspect_output.status.success() {
+        return Ok(());
+    }
+    let pull_output = Command::new("docker").args(["pull", image]).output()?;
+    if pull_output.status.success() {
+        return Ok(());
+    }
+    Err(anyhow!(
+        "container image not available: {} (pull: {})",
+        image,
+        output_error_detail(&pull_output),
+    ))
+}
+
+fn seed_workspace_from_task_image(
+    image: &str,
+    source_workspace: &str,
+    host_workspace: &Path,
+) -> Result<()> {
+    ensure_container_image_ready(image)?;
+    if host_workspace.exists() {
+        fs::remove_dir_all(host_workspace)?;
+    }
+    ensure_dir(host_workspace)?;
+
+    let mut create = Command::new("docker");
+    create.arg("create");
+    create.arg(image);
+    create.args(["tail", "-f", "/dev/null"]);
+    let create_out = run_checked_command(create, "docker create failed (workspace seed)")?;
+    let container_id = String::from_utf8_lossy(&create_out.stdout)
+        .trim()
+        .to_string();
+    if container_id.is_empty() {
+        return Err(anyhow!(
+            "docker create failed (workspace seed): missing container id"
+        ));
+    }
+    let _cleanup = ContainerCleanupGuard {
+        container_id: container_id.clone(),
     };
-    Err(anyhow!("{}: {}", step, detail))
+
+    let mut start = Command::new("docker");
+    start.args(["start", &container_id]);
+    run_checked_command(start, "docker start failed (workspace seed)")?;
+
+    let mut cp = Command::new("docker");
+    cp.arg("cp");
+    cp.arg(format!("{}:{}/.", container_id, source_workspace));
+    cp.arg(host_workspace);
+    run_checked_command(cp, "docker cp failed (workspace seed)")?;
+
+    Ok(())
 }
 
 fn run_injected_container(
@@ -10959,6 +12990,7 @@ fn load_event_rows(
     events_path: &Path,
     run_id: &str,
     trial_id: &str,
+    schedule_idx: usize,
     variant_id: &str,
     task_id: &str,
     repl_idx: usize,
@@ -10984,6 +13016,10 @@ fn load_event_rows(
         rows.push(EventRow {
             run_id: run_id.to_string(),
             trial_id: trial_id.to_string(),
+            schedule_idx,
+            slot_commit_id: String::new(),
+            attempt: 0,
+            row_seq: seq,
             variant_id: variant_id.to_string(),
             task_id: task_id.to_string(),
             repl_idx,
@@ -10999,6 +13035,7 @@ fn load_event_rows(
 fn build_metric_rows(
     run_id: &str,
     trial_id: &str,
+    schedule_idx: usize,
     variant_id: &str,
     task_id: &str,
     repl_idx: usize,
@@ -11009,10 +13046,14 @@ fn build_metric_rows(
 ) -> Vec<MetricRow> {
     let mut rows = Vec::new();
     if let Some(metric_obj) = metrics.as_object() {
-        for (metric_name, metric_value) in metric_obj {
+        for (row_seq, (metric_name, metric_value)) in metric_obj.iter().enumerate() {
             rows.push(MetricRow {
                 run_id: run_id.to_string(),
                 trial_id: trial_id.to_string(),
+                schedule_idx,
+                slot_commit_id: String::new(),
+                attempt: 0,
+                row_seq,
                 variant_id: variant_id.to_string(),
                 task_id: task_id.to_string(),
                 repl_idx,
@@ -11026,6 +13067,10 @@ fn build_metric_rows(
     rows.push(MetricRow {
         run_id: run_id.to_string(),
         trial_id: trial_id.to_string(),
+        schedule_idx,
+        slot_commit_id: String::new(),
+        attempt: 0,
+        row_seq: rows.len(),
         variant_id: variant_id.to_string(),
         task_id: task_id.to_string(),
         repl_idx,
@@ -11040,6 +13085,7 @@ fn build_metric_rows(
 fn build_variant_snapshot_rows(
     run_id: &str,
     trial_id: &str,
+    schedule_idx: usize,
     variant_id: &str,
     baseline_id: &str,
     task_id: &str,
@@ -11048,10 +13094,14 @@ fn build_variant_snapshot_rows(
 ) -> Vec<VariantSnapshotRow> {
     let mut rows = Vec::new();
     if let Some(bindings_obj) = bindings.as_object() {
-        for (binding_name, binding_value) in bindings_obj {
+        for (row_seq, (binding_name, binding_value)) in bindings_obj.iter().enumerate() {
             rows.push(VariantSnapshotRow {
                 run_id: run_id.to_string(),
                 trial_id: trial_id.to_string(),
+                schedule_idx,
+                slot_commit_id: String::new(),
+                attempt: 0,
+                row_seq,
                 variant_id: variant_id.to_string(),
                 baseline_id: baseline_id.to_string(),
                 task_id: task_id.to_string(),
@@ -11265,6 +13315,32 @@ mod tests {
                 "agent": {
                     "command": harness_success_command(),
                     "image": "img",
+                    "integration_level": integration_level,
+                    "io": { "input_arg": "--input", "output_arg": "--output" }
+                },
+                "policy": {
+                    "timeout_ms": 600000,
+                    "sandbox": { "mode": "local" },
+                    "network": { "mode": "none", "allowed_hosts": [] }
+                }
+            }
+        });
+        atomic_write_json_pretty(&run_dir.join("resolved_experiment.json"), &resolved)
+            .expect("write resolved");
+        let (variants, baseline_id) = resolve_variant_plan(&resolved).expect("variant plan");
+        write_resolved_variants(run_dir, &baseline_id, &variants).expect("write resolved variants");
+    }
+
+    fn write_resolved_experiment_local_process(run_dir: &Path, integration_level: &str) {
+        let resolved = json!({
+            "version": "0.3",
+            "experiment": { "id": "e", "name": "n", "workload_type": "agent_harness" },
+            "dataset": { "path": "tasks.jsonl" },
+            "design": { "sanitization_profile": "hermetic_functional", "replications": 1 },
+            "baseline": { "variant_id": "base", "bindings": {} },
+            "runtime": {
+                "agent": {
+                    "command": harness_success_command(),
                     "integration_level": integration_level,
                     "io": { "input_arg": "--input", "output_arg": "--output" }
                 },
@@ -11910,6 +13986,57 @@ mod tests {
     }
 
     #[test]
+    fn resolve_variant_runtime_profile_rejects_per_task_in_local_executor() {
+        let root = TempDirGuard::new("agentlab_per_task_local_reject");
+        let exp_dir = root.path.join("exp");
+        ensure_dir(&exp_dir).expect("exp dir");
+        let spec = json!({
+            "version": "0.3",
+            "experiment": { "id": "e", "name": "n", "workload_type": "agent_harness" },
+            "dataset": { "path": "tasks.jsonl", "provider": "local_jsonl", "suite_id": "s", "schema_version": "v1", "split_id": "dev", "limit": 1 },
+            "design": { "sanitization_profile": "hermetic_functional", "comparison": "paired", "replications": 1, "random_seed": 1, "shuffle_tasks": false, "max_concurrency": 1 },
+            "baseline": { "variant_id": "base", "bindings": {} },
+            "runtime": {
+                "agent": {
+                    "command": ["rex", "run"],
+                    "image_source": "per_task",
+                    "artifact": ".lab/agents/rex-current.tar.gz"
+                },
+                "policy": {
+                    "timeout_ms": 600000,
+                    "sandbox": { "mode": "local" },
+                    "network": { "mode": "none", "allowed_hosts": [] }
+                }
+            }
+        });
+        let variant = Variant {
+            id: "base".to_string(),
+            bindings: json!({}),
+            args: Vec::new(),
+            env: BTreeMap::new(),
+            image: None,
+            runtime_overrides: None,
+        };
+        let err = match resolve_variant_runtime_profile(
+            &spec,
+            &variant,
+            &exp_dir,
+            false,
+            &RunBehavior::default(),
+            &RunExecutionOptions::default(),
+        ) {
+            Ok(_) => panic!("per-task local runtime should be rejected"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string()
+                .contains("requires /runtime/policy/sandbox/mode='container'"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[test]
     fn resolve_agent_runtime_rejects_legacy_aliases() {
         let root = TempDirGuard::new("agentlab_command_aliases");
         let exp_dir = root.path.join("exp");
@@ -12116,7 +14243,7 @@ mod tests {
     }
 
     #[test]
-    fn run_operation_lock_is_exclusive() {
+    fn run_operation_lease_is_exclusive() {
         let run_dir = std::env::temp_dir().join(format!(
             "agentlab_lock_test_{}_{}",
             std::process::id(),
@@ -12124,15 +14251,18 @@ mod tests {
         ));
         ensure_dir(&run_dir).expect("temp run dir");
 
-        let lock1 = acquire_run_operation_lock(&run_dir).expect("first lock must succeed");
-        let err = acquire_run_operation_lock(&run_dir).expect_err("second lock must fail");
+        let lock1 = acquire_run_operation_lease(&run_dir, RunOperationType::Continue)
+            .expect("first lock must succeed");
+        let err = acquire_run_operation_lease(&run_dir, RunOperationType::Continue)
+            .expect_err("second lock must fail");
         assert!(
             err.to_string().contains("operation_in_progress"),
             "unexpected lock error: {}",
             err
         );
         drop(lock1);
-        let lock2 = acquire_run_operation_lock(&run_dir).expect("lock should be re-acquirable");
+        let lock2 = acquire_run_operation_lease(&run_dir, RunOperationType::Continue)
+            .expect("lock should be re-acquirable");
         drop(lock2);
         let _ = fs::remove_dir_all(run_dir);
     }
@@ -12306,7 +14436,7 @@ mod tests {
     #[test]
     fn fork_trial_non_strict_falls_back_to_input_only_when_checkpoint_missing() {
         let (_root, run_dir) = create_run_dir("agentlab_fork_input_fallback", "run_1");
-        write_resolved_experiment(&run_dir, "cli_events", true);
+        write_resolved_experiment_local_process(&run_dir, "cli_events");
         seed_parent_trial(
             &run_dir,
             "trial_1",
@@ -12572,7 +14702,7 @@ mod tests {
     #[test]
     fn resume_run_uses_pause_label_and_forks_with_binding_overrides() {
         let (_root, run_dir) = create_run_dir("agentlab_resume_success", "run_1");
-        write_resolved_experiment(&run_dir, "sdk_full", true);
+        write_resolved_experiment_local_process(&run_dir, "sdk_full");
         let trial_dir = seed_parent_trial(
             &run_dir,
             "trial_1",
@@ -12786,6 +14916,37 @@ mod tests {
         assert!(
             err.to_string().contains("/runtime/agent/artifact"),
             "expected missing artifact error: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn validate_required_fields_rejects_per_task_image_source_in_local_mode() {
+        let spec = json!({
+            "version": "0.3",
+            "experiment": { "id": "e", "name": "n", "workload_type": "agent_harness" },
+            "dataset": { "path": "tasks.jsonl", "provider": "local_jsonl", "suite_id": "s", "schema_version": "v1", "split_id": "dev", "limit": 50 },
+            "design": { "sanitization_profile": "hermetic_functional", "comparison": "paired", "replications": 1, "random_seed": 1337, "shuffle_tasks": true, "max_concurrency": 1 },
+            "baseline": { "variant_id": "base", "bindings": {} },
+            "runtime": {
+                "agent": {
+                    "command": ["node", "/app/h.js"],
+                    "image_source": "per_task",
+                    "artifact": ".lab/agents/rex-current.tar.gz"
+                },
+                "policy": {
+                    "timeout_ms": 600000,
+                    "sandbox": { "mode": "local" },
+                    "network": { "mode": "none", "allowed_hosts": [] }
+                }
+            }
+        });
+        let err = validate_required_fields(&spec)
+            .expect_err("per-task image source in local mode should fail");
+        assert!(
+            err.to_string()
+                .contains("requires /runtime/policy/sandbox/mode='container'"),
+            "unexpected error: {}",
             err
         );
     }
@@ -13185,13 +15346,13 @@ mod tests {
         ensure_dir(&benchmark_dir).expect("benchmark dir");
         fs::write(
             benchmark_dir.join("predictions.jsonl"),
-            r#"{"schema_version":"benchmark_prediction_record_v1","ids":{"run_id":"run_123","trial_id":"trial_1","variant_id":"base","task_id":"task_1","repl_idx":0},"benchmark":{"adapter_id":"demo_adapter","name":"demo_suite","split":"dev"},"prediction":{"kind":"json","value":{"patch":"diff --git"}}}
+            r#"{"schema_version":"benchmark_prediction_record_v1","schedule_idx":0,"slot_commit_id":"slot_fixture","attempt":1,"row_seq":0,"ids":{"run_id":"run_123","trial_id":"trial_1","variant_id":"base","task_id":"task_1","repl_idx":0},"benchmark":{"adapter_id":"demo_adapter","name":"demo_suite","split":"dev"},"prediction":{"kind":"json","value":{"patch":"diff --git"}}}
 "#,
         )
         .expect("predictions");
         fs::write(
             benchmark_dir.join("scores.jsonl"),
-            r#"{"schema_version":"benchmark_score_record_v1","ids":{"run_id":"run_123","trial_id":"trial_1","variant_id":"base","task_id":"task_1","repl_idx":0},"benchmark":{"adapter_id":"demo_adapter","name":"demo_suite","split":"dev"},"verdict":"pass","primary_metric_name":"resolved","primary_metric_value":1.0,"metrics":{"resolved":1.0},"evaluator":{"name":"demo_eval","mode":"custom"}}
+            r#"{"schema_version":"benchmark_score_record_v1","schedule_idx":0,"slot_commit_id":"slot_fixture","attempt":1,"row_seq":0,"ids":{"run_id":"run_123","trial_id":"trial_1","variant_id":"base","task_id":"task_1","repl_idx":0},"benchmark":{"adapter_id":"demo_adapter","name":"demo_suite","split":"dev"},"verdict":"pass","primary_metric_name":"resolved","primary_metric_value":1.0,"metrics":{"resolved":1.0},"evaluator":{"name":"demo_eval","mode":"custom"}}
 "#,
         )
         .expect("scores");
@@ -13257,7 +15418,7 @@ mod tests {
         ensure_dir(&benchmark_dir).expect("benchmark dir");
         fs::write(
             benchmark_dir.join("scores.jsonl"),
-            r#"{"schema_version":"benchmark_score_record_v1","ids":{"run_id":"run_456","trial_id":"trial_9","variant_id":"base","task_id":"task_9","repl_idx":0},"benchmark":{"adapter_id":"fallback_adapter","name":"suite_x","split":"dev"},"verdict":"fail","primary_metric_name":"resolved","primary_metric_value":0.0,"metrics":{"resolved":0.0},"evaluator":{"name":"fallback_eval","mode":"custom"}}
+            r#"{"schema_version":"benchmark_score_record_v1","schedule_idx":0,"slot_commit_id":"slot_fixture","attempt":1,"row_seq":0,"ids":{"run_id":"run_456","trial_id":"trial_9","variant_id":"base","task_id":"task_9","repl_idx":0},"benchmark":{"adapter_id":"fallback_adapter","name":"suite_x","split":"dev"},"verdict":"fail","primary_metric_name":"resolved","primary_metric_value":0.0,"metrics":{"resolved":0.0},"evaluator":{"name":"fallback_eval","mode":"custom"}}
 "#,
         )
         .expect("scores");
@@ -14329,7 +16490,7 @@ mod tests {
             updated_at: Utc::now().to_rfc3339(),
         };
         let mut run_sink = JsonlRunSink::new(&run_dir).expect("sink");
-        let mut committer = DeterministicCommitter::from_progress(&schedule_progress);
+        let mut committer = DeterministicCommitter::from_progress(&schedule_progress, &[]);
         let policy_config = PolicyConfig::default();
         let evidence_records_path = run_dir.join("runtime").join("p3a_evidence.jsonl");
         let chain_state_path = run_dir.join("runtime").join("p3a_chain_state.jsonl");
@@ -15105,6 +17266,10 @@ mod tests {
         result.deferred_trial_records.push(TrialRecord {
             run_id: "run_1".to_string(),
             trial_id,
+            schedule_idx,
+            slot_commit_id: String::new(),
+            attempt: 0,
+            row_seq: 0,
             baseline_id: "base".to_string(),
             workload_type: "agent_harness".to_string(),
             variant_id: "base".to_string(),
@@ -15203,6 +17368,7 @@ mod tests {
 
         let mut pruned_variants: HashSet<usize> = HashSet::new();
         let mut consecutive_failures: BTreeMap<usize, usize> = BTreeMap::new();
+        let mut slot_attempts: HashMap<usize, usize> = HashMap::new();
         let trial_result =
             TrialExecutionResult::minimal("trial_1".to_string(), "completed", Some(0));
         let mut sink = FlushFailRunSink;
@@ -15220,6 +17386,7 @@ mod tests {
             &mut consecutive_failures,
             &trial_result,
             &mut sink,
+            &mut slot_attempts,
         )
         .expect_err("flush failure should abort slot commit");
         assert!(
@@ -15276,7 +17443,7 @@ mod tests {
         let mut pruned_variants: HashSet<usize> = HashSet::new();
         let mut consecutive_failures: BTreeMap<usize, usize> = BTreeMap::new();
         let mut run_sink = BufferedRunSink::default();
-        let mut committer = DeterministicCommitter::from_progress(&schedule_progress);
+        let mut committer = DeterministicCommitter::from_progress(&schedule_progress, &[]);
 
         for schedule_idx in arrival_order {
             let inserted = committer
@@ -16230,5 +18397,473 @@ mod tests {
         let config = parse_policies(&spec);
         assert_eq!(config.concurrency.max_in_flight_per_variant, Some(4));
         assert!(config.concurrency.require_chain_lease);
+    }
+
+    // -----------------------------------------------------------------------
+    // Preflight check unit tests
+    // -----------------------------------------------------------------------
+
+    fn test_agent_runtime() -> AgentRuntimeConfig {
+        AgentRuntimeConfig {
+            adapter_ref: AgentAdapterRef::default(),
+            command_raw: vec!["echo".to_string()],
+            container_image: Some("test:latest".to_string()),
+            image_source: ImageSource::Global,
+            agent_artifact: None,
+            io: AgentRuntimeIoConfig {
+                input_arg: "--input".to_string(),
+                output_arg: "--output".to_string(),
+            },
+            clean_contract_v1: false,
+            integration_level: "cli_basic".to_string(),
+            launch_mode: AgentLaunchMode::File,
+            env: BTreeMap::new(),
+            env_from_host: Vec::new(),
+            trajectory_path: None,
+            causal_extraction: None,
+            default_timeout_ms: Some(600000),
+            tracing_mode: None,
+            force_container: false,
+            dependency_file_staging: Vec::new(),
+            dependency_services: Vec::new(),
+        }
+    }
+
+    fn test_variant() -> Variant {
+        Variant {
+            id: "baseline".to_string(),
+            bindings: json!({}),
+            args: Vec::new(),
+            env: BTreeMap::new(),
+            image: None,
+            runtime_overrides: None,
+        }
+    }
+
+    fn test_runtime_profile(
+        runtime: AgentRuntimeConfig,
+        container_mode: bool,
+        executor_kind: ExecutorKind,
+    ) -> VariantRuntimeProfile {
+        VariantRuntimeProfile {
+            experiment: json!({}),
+            variant_args: Vec::new(),
+            agent_runtime: runtime,
+            agent_runtime_env: BTreeMap::new(),
+            invocation_source: "test".to_string(),
+            invocation_default_timeout_ms: None,
+            executor_kind,
+            container_mode,
+            configured_network_mode: "none".to_string(),
+            effective_network_mode: "none".to_string(),
+        }
+    }
+
+    #[test]
+    fn preflight_dataset_task_ids_missing_id_errors() {
+        let tasks = vec![
+            json!({"prompt": "do something"}),
+            json!({"id": "task_2", "prompt": "ok"}),
+        ];
+        let benchmark_config = BenchmarkConfig::default();
+        let checks = check_dataset_task_ids(&tasks, &benchmark_config);
+        let error_check = checks.iter().find(|c| !c.passed).unwrap();
+        assert!(error_check.message.contains("missing 'id'"));
+        assert!(error_check.message.contains("1"));
+    }
+
+    #[test]
+    fn preflight_dataset_task_ids_duplicate_errors() {
+        let tasks = vec![
+            json!({"id": "dup_id", "prompt": "a"}),
+            json!({"id": "dup_id", "prompt": "b"}),
+            json!({"id": "unique", "prompt": "c"}),
+        ];
+        let benchmark_config = BenchmarkConfig::default();
+        let checks = check_dataset_task_ids(&tasks, &benchmark_config);
+        let dup_check = checks.iter().find(|c| !c.passed).unwrap();
+        assert!(dup_check.message.contains("duplicate task IDs"));
+        assert!(dup_check.message.contains("dup_id"));
+    }
+
+    #[test]
+    fn preflight_dataset_task_ids_all_unique_passes() {
+        let tasks = vec![
+            json!({"id": "t1", "prompt": "a"}),
+            json!({"id": "t2", "prompt": "b"}),
+        ];
+        let benchmark_config = BenchmarkConfig::default();
+        let checks = check_dataset_task_ids(&tasks, &benchmark_config);
+        assert!(checks.iter().all(|c| c.passed));
+    }
+
+    #[test]
+    fn preflight_dataset_task_ids_grading_disabled_warning() {
+        let tasks = vec![json!({"id": "t1", "grading": {"enabled": false}})];
+        let benchmark_config = BenchmarkConfig {
+            adapter: Some(BenchmarkAdapterConfig {
+                command: vec!["grader".to_string()],
+                manifest: None,
+            }),
+            ..BenchmarkConfig::default()
+        };
+        let checks = check_dataset_task_ids(&tasks, &benchmark_config);
+        let warn = checks
+            .iter()
+            .find(|c| matches!(c.severity, PreflightSeverity::Warning))
+            .unwrap();
+        assert!(warn.message.contains("grading.enabled=false"));
+    }
+
+    #[test]
+    fn preflight_probe_trial_input_empty_dataset_errors() {
+        let tasks: Vec<Value> = vec![];
+        let variant = test_variant();
+        let runtime = test_agent_runtime();
+        let json_value = json!({
+            "version": "0.5",
+            "runtime": {"policy": {"timeout_ms": 600000}}
+        });
+        let check = check_probe_trial_input(&json_value, &tasks, &variant, &runtime, false);
+        assert!(!check.passed);
+        assert!(check.message.contains("dataset is empty"));
+    }
+
+    #[test]
+    fn preflight_probe_trial_input_valid_passes() {
+        let tasks = vec![json!({"id": "t1", "prompt": "hello"})];
+        let variant = test_variant();
+        let runtime = test_agent_runtime();
+        let json_value = json!({
+            "version": "0.5",
+            "runtime": {
+                "policy": {
+                    "timeout_ms": 600000,
+                    "network": {
+                        "mode": "none",
+                        "allowed_hosts": []
+                    },
+                    "sandbox": {
+                        "mode": "container"
+                    }
+                }
+            }
+        });
+        let check = check_probe_trial_input(&json_value, &tasks, &variant, &runtime, false);
+        assert!(check.passed, "expected pass but got: {}", check.message);
+    }
+
+    #[test]
+    fn preflight_collect_per_task_images_scans_all_tasks() {
+        let tasks = vec![
+            json!({
+                "schema_version": "task_boundary_v2",
+                "task": {"id": "t1", "image": "img/a:latest"}
+            }),
+            json!({
+                "schema_version": "task_boundary_v2",
+                "task": {"id": "t2", "image": "img/b:latest"}
+            }),
+            json!({
+                "schema_version": "task_boundary_v2",
+                "task": {"id": "t3", "image": "img/a:latest"}
+            }),
+            json!({"id": "t4"}),
+        ];
+        let scan = collect_per_task_images_for_preflight(&tasks);
+        assert!(scan.parse_errors.is_empty());
+        assert_eq!(
+            scan.unique_images,
+            vec!["img/a:latest".to_string(), "img/b:latest".to_string()]
+        );
+        assert_eq!(scan.missing_task_ids, vec!["t4".to_string()]);
+    }
+
+    #[test]
+    fn preflight_collect_per_task_images_records_parse_errors() {
+        let tasks = vec![
+            json!({
+                "schema_version": "task_boundary_v2",
+                "task": {"id": "ok", "image": "img/a:latest"}
+            }),
+            json!({
+                "schema_version": "task_boundary_v2",
+                "task": {"id": "bad", "image": ""}
+            }),
+        ];
+        let scan = collect_per_task_images_for_preflight(&tasks);
+        assert_eq!(scan.unique_images, vec!["img/a:latest".to_string()]);
+        assert!(scan.missing_task_ids.is_empty());
+        assert_eq!(scan.parse_errors.len(), 1);
+        assert!(scan.parse_errors[0].contains("line 2"));
+    }
+
+    #[test]
+    fn preflight_dependency_files_required_missing_errors() {
+        let tmp = TempDirGuard::new("preflight_deps");
+        let json_value = json!({
+            "runtime": {
+                "dependencies": {
+                    "file_staging": [{
+                        "source_from_host": tmp.path.join("nonexistent.txt").to_string_lossy().to_string(),
+                        "destination_path": "/data/file.txt",
+                        "required": true
+                    }]
+                }
+            }
+        });
+        let checks = check_dependency_files_exist(&json_value, &tmp.path);
+        let err = checks.iter().find(|c| !c.passed).unwrap();
+        assert!(err.message.contains("required file missing"));
+    }
+
+    #[test]
+    fn preflight_dependency_files_optional_missing_warns() {
+        let tmp = TempDirGuard::new("preflight_deps_opt");
+        let json_value = json!({
+            "runtime": {
+                "dependencies": {
+                    "file_staging": [{
+                        "source_from_host": tmp.path.join("nonexistent.txt").to_string_lossy().to_string(),
+                        "destination_path": "/data/file.txt",
+                        "required": false
+                    }]
+                }
+            }
+        });
+        let checks = check_dependency_files_exist(&json_value, &tmp.path);
+        let warn = checks
+            .iter()
+            .find(|c| matches!(c.severity, PreflightSeverity::Warning))
+            .unwrap();
+        assert!(warn.message.contains("optional file missing"));
+        assert!(warn.passed);
+    }
+
+    #[test]
+    fn preflight_dependency_files_required_exists_passes() {
+        let tmp = TempDirGuard::new("preflight_deps_ok");
+        let file_path = tmp.path.join("data.bin");
+        fs::write(&file_path, b"content").unwrap();
+        let json_value = json!({
+            "runtime": {
+                "dependencies": {
+                    "file_staging": [{
+                        "source_from_host": file_path.to_string_lossy().to_string(),
+                        "destination_path": "/data/file.txt",
+                        "required": true
+                    }]
+                }
+            }
+        });
+        let checks = check_dependency_files_exist(&json_value, &tmp.path);
+        assert!(checks.iter().all(|c| c.passed));
+    }
+
+    #[test]
+    fn preflight_benchmark_grader_no_adapter_passes() {
+        let benchmark_config = BenchmarkConfig::default();
+        let runtime = test_agent_runtime();
+        let profile = test_runtime_profile(runtime, true, ExecutorKind::LocalDocker);
+        let check = check_benchmark_grader_reachable(&benchmark_config, &profile, &[], false);
+        assert!(check.passed);
+        assert!(check.message.contains("no benchmark adapter"));
+    }
+
+    #[test]
+    fn preflight_benchmark_grader_clean_contract_warns() {
+        let benchmark_config = BenchmarkConfig {
+            adapter: Some(BenchmarkAdapterConfig {
+                command: vec!["grader".to_string()],
+                manifest: None,
+            }),
+            ..BenchmarkConfig::default()
+        };
+        let runtime = test_agent_runtime();
+        let profile = test_runtime_profile(runtime, true, ExecutorKind::LocalDocker);
+        let check = check_benchmark_grader_reachable(&benchmark_config, &profile, &[], true);
+        assert!(check.passed);
+        assert!(matches!(check.severity, PreflightSeverity::Warning));
+        assert!(check.message.contains("clean_contract_v1"));
+    }
+
+    #[test]
+    fn preflight_benchmark_grader_local_mode_warns() {
+        let benchmark_config = BenchmarkConfig {
+            adapter: Some(BenchmarkAdapterConfig {
+                command: vec!["grader".to_string()],
+                manifest: None,
+            }),
+            ..BenchmarkConfig::default()
+        };
+        let mut runtime = test_agent_runtime();
+        runtime.container_image = None;
+        let mut profile = test_runtime_profile(runtime, false, ExecutorKind::LocalProcess);
+        profile.configured_network_mode = "full".to_string();
+        profile.effective_network_mode = "full".to_string();
+        let check = check_benchmark_grader_reachable(&benchmark_config, &profile, &[], false);
+        assert!(check.passed);
+        assert!(matches!(check.severity, PreflightSeverity::Warning));
+        assert!(check.message.contains("local process mode"));
+    }
+
+    #[test]
+    fn preflight_benchmark_grader_per_task_mode_requires_task_images() {
+        let benchmark_config = BenchmarkConfig {
+            adapter: Some(BenchmarkAdapterConfig {
+                command: vec!["grader".to_string()],
+                manifest: None,
+            }),
+            ..BenchmarkConfig::default()
+        };
+        let mut runtime = test_agent_runtime();
+        runtime.image_source = ImageSource::PerTask;
+        runtime.container_image = None;
+        let profile = test_runtime_profile(runtime, true, ExecutorKind::LocalDocker);
+        let tasks = vec![json!({"id": "t1"})];
+        let check = check_benchmark_grader_reachable(&benchmark_config, &profile, &tasks, false);
+        assert!(!check.passed);
+        assert!(check
+            .message
+            .contains("tasks missing task.image in per-task mode"));
+    }
+
+    #[test]
+    fn preflight_container_ready_local_mode_skips() {
+        let mut runtime = test_agent_runtime();
+        runtime.container_image = None;
+        let mut profile = test_runtime_profile(runtime, false, ExecutorKind::LocalProcess);
+        profile.configured_network_mode = "full".to_string();
+        profile.effective_network_mode = "full".to_string();
+        let tasks = vec![json!({"id": "t1"})];
+        let checks = check_container_ready(&profile, &tasks);
+        assert_eq!(checks.len(), 1);
+        assert!(checks[0].passed);
+        assert!(checks[0].message.contains("Docker checks skipped"));
+    }
+
+    #[test]
+    fn preflight_variant_grouped_checks_avoid_duplicate_local_container_checks() {
+        let mut runtime_a = test_agent_runtime();
+        runtime_a.container_image = None;
+        let mut runtime_b = test_agent_runtime();
+        runtime_b.container_image = None;
+        let mut profile_a = test_runtime_profile(runtime_a, false, ExecutorKind::LocalProcess);
+        profile_a.configured_network_mode = "full".to_string();
+        profile_a.effective_network_mode = "full".to_string();
+        let mut profile_b = test_runtime_profile(runtime_b, false, ExecutorKind::LocalProcess);
+        profile_b.configured_network_mode = "full".to_string();
+        profile_b.effective_network_mode = "full".to_string();
+
+        let variants = vec![
+            Variant {
+                id: "base".to_string(),
+                bindings: json!({}),
+                args: Vec::new(),
+                env: BTreeMap::new(),
+                image: None,
+                runtime_overrides: None,
+            },
+            Variant {
+                id: "treatment".to_string(),
+                bindings: json!({}),
+                args: Vec::new(),
+                env: BTreeMap::new(),
+                image: None,
+                runtime_overrides: None,
+            },
+        ];
+        let checks = check_container_ready_for_variants(
+            &variants,
+            &[profile_a, profile_b],
+            &[json!({"id": "t1"})],
+        );
+        assert_eq!(checks.len(), 1);
+        assert!(checks[0].passed);
+        assert!(checks[0].message.contains("variants [base, treatment]"));
+    }
+
+    #[test]
+    fn preflight_variant_grouped_benchmark_no_adapter_reports_once() {
+        let benchmark_config = BenchmarkConfig::default();
+        let profile_a = test_runtime_profile(test_agent_runtime(), true, ExecutorKind::LocalDocker);
+        let profile_b = test_runtime_profile(test_agent_runtime(), true, ExecutorKind::LocalDocker);
+        let variants = vec![
+            Variant {
+                id: "base".to_string(),
+                bindings: json!({}),
+                args: Vec::new(),
+                env: BTreeMap::new(),
+                image: None,
+                runtime_overrides: None,
+            },
+            Variant {
+                id: "treatment".to_string(),
+                bindings: json!({}),
+                args: Vec::new(),
+                env: BTreeMap::new(),
+                image: None,
+                runtime_overrides: None,
+            },
+        ];
+        let checks = check_benchmark_grader_reachable_for_variants(
+            &benchmark_config,
+            &variants,
+            &[profile_a, profile_b],
+            &[],
+            false,
+        );
+        assert_eq!(checks.len(), 1);
+        assert!(checks[0].passed);
+        assert!(checks[0].message.contains("no benchmark adapter"));
+    }
+
+    #[test]
+    fn preflight_report_display_formats_all_checks() {
+        let report = PreflightReport {
+            passed: false,
+            checks: vec![
+                PreflightCheck {
+                    name: "test_pass",
+                    passed: true,
+                    severity: PreflightSeverity::Error,
+                    message: "ok".to_string(),
+                },
+                PreflightCheck {
+                    name: "test_fail",
+                    passed: false,
+                    severity: PreflightSeverity::Error,
+                    message: "broken".to_string(),
+                },
+                PreflightCheck {
+                    name: "test_warn",
+                    passed: false,
+                    severity: PreflightSeverity::Warning,
+                    message: "heads up".to_string(),
+                },
+            ],
+        };
+        let output = format!("{}", report);
+        assert!(output.contains("[PASS] test_pass: ok"));
+        assert!(output.contains("[FAIL] test_fail: broken"));
+        assert!(output.contains("[WARN] test_warn: heads up"));
+    }
+
+    #[test]
+    fn preflight_dataset_task_ids_boundary_format() {
+        let tasks = vec![
+            json!({
+                "schema_version": "task_boundary_v1",
+                "task": {"id": "boundary_task_1", "prompt": "hello"}
+            }),
+            json!({
+                "schema_version": "task_boundary_v1",
+                "task": {"id": "boundary_task_2", "prompt": "world"}
+            }),
+        ];
+        let benchmark_config = BenchmarkConfig::default();
+        let checks = check_dataset_task_ids(&tasks, &benchmark_config);
+        assert!(checks.iter().all(|c| c.passed));
+        assert!(checks[0].message.contains("2 tasks have unique IDs"));
     }
 }

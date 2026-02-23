@@ -130,6 +130,22 @@ export interface ResumeResponse {
   resume: ResumeResult;
 }
 
+export interface RecoverResult {
+  run_id: string;
+  previous_status: string;
+  recovered_status: string;
+  rewound_to_schedule_idx: number;
+  active_trials_released: number;
+  committed_slots_verified: number;
+  notes: string[];
+}
+
+export interface RecoverResponse {
+  ok: true;
+  command: 'recover';
+  recover: RecoverResult;
+}
+
 export interface ValidateResponse {
   ok: true;
   command: 'knobs-validate' | 'schema-validate' | 'hooks-validate';
@@ -144,6 +160,7 @@ export type JsonCommandResponse =
   | ForkResponse
   | PauseResponse
   | ResumeResponse
+  | RecoverResponse
   | PublishResponse
   | ValidateResponse;
 
@@ -201,6 +218,11 @@ export interface ResumeArgs extends CommandOptions {
   label?: string;
   set?: JsonMap;
   strict?: boolean;
+}
+
+export interface RecoverArgs extends CommandOptions {
+  runDir: string;
+  force?: boolean;
 }
 
 export interface PublishArgs extends CommandOptions {

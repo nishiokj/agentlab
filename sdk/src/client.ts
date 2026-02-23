@@ -20,6 +20,8 @@ import type {
   PauseResponse,
   PublishArgs,
   PublishResponse,
+  RecoverArgs,
+  RecoverResponse,
   ReadAnalysisArgs,
   ReadAnalysisResponse,
   ReadBenchmarkArgs,
@@ -165,6 +167,14 @@ export class LabClient {
       cmd.push('--strict');
     }
     return this.runJson<ResumeResponse>(cmd, args);
+  }
+
+  async recover(args: RecoverArgs): Promise<RecoverResponse> {
+    const cmd = ['recover', '--run-dir', args.runDir, '--json'];
+    if (args.force) {
+      cmd.push('--force');
+    }
+    return this.runJson<RecoverResponse>(cmd, args);
   }
 
   async publish(args: PublishArgs): Promise<PublishResponse> {

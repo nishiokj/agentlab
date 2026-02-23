@@ -1,0 +1,88 @@
+name: Harbor Phase 3 Compatibility
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/harbor-phase3-compat.yml"
+      - "scripts/harbor/**"
+      - ".lab/experiments/terminal_bench2_harbor*.yaml"
+      - "docs/HARBOR_*"
+  workflow_dispatch:
+    inputs:
+      canary_blocking:
+        description: "Set true to make canary failures blocking for this run."
+        required: false
+        type: boolean
+        default: false
+  schedule:
+    - cron: "17 8 * * *"
+
+jobs:
+  harbor-config-notice:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate Harbor lane configuration
+        run: |
+          missing=0
+          if [[ -z "${{ vars.HARBOR_PIP_SPEC_PINNED }}" ]]; then
+            echo "::warning::Missing vars.HARBOR_PIP_SPEC_PINNED; pinned Harbor lane will be skipped."
+            missing=1
+          fi
+          if [[ -z "${{ vars.HARBOR_EVALUATOR_CMD_JSON_PINNED }}" ]]; then
+            echo "::warning::Missing vars.HARBOR_EVALUATOR_CMD_JSON_PINNED; pinned Harbor lane will be skipped."
+            missing=1
+          fi
+          if [[ -z "${{ vars.HARBOR_PIP_SPEC_CANARY }}" ]]; then
+            echo "::warning::Missing vars.HARBOR_PIP_SPEC_CANARY; canary Harbor lane will be skipped."
+          fi
+          if [[ -z "${{ vars.HARBOR_EVALUATOR_CMD_JSON_CANARY }}" ]]; then
+            echo "::warning::Missing vars.HARBOR_EVALUATOR_CMD_JSON_CANARY; canary Harbor lane will be skipped."
+          fi
+          if [[ "${missing}" -eq 0 ]]; then
+            echo "Harbor pinned lane vars detected."
+          fi
+
+  harbor-pinned:
+    needs: harbor-config-notice
+    if: ${{ vars.HARBOR_PIP_SPEC_PINNED != '' && vars.HARBOR_EVALUATOR_CMD_JSON_PINNED != '' }}
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Run Harbor pinned lane (blocking)
+        env:
+          HARBOR_PIP_SPECS: ${{ vars.HARBOR_PIP_SPEC_PINNED }}
+          HARBOR_EVALUATOR_CMD_JSON: ${{ vars.HARBOR_EVALUATOR_CMD_JSON_PINNED }}
+          HARBOR_ENFORCE_DEP_SPECS: "1"
+          HARBOR_REQUIRE_EVALUATOR_CMD: "1"
+          HARBOR_RUN_SMOKE_DESCRIBE: "0"
+        run: bash scripts/harbor/run_harbor_phase3_lane.sh pinned
+
+  harbor-canary:
+    needs: harbor-config-notice
+    if: ${{ vars.HARBOR_PIP_SPEC_CANARY != '' && vars.HARBOR_EVALUATOR_CMD_JSON_CANARY != '' }}
+    runs-on: ubuntu-latest
+    continue-on-error: ${{ !(github.event_name == 'workflow_dispatch' && inputs.canary_blocking) }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Run Harbor canary lane (non-blocking by default)
+        env:
+          HARBOR_PIP_SPECS: ${{ vars.HARBOR_PIP_SPEC_CANARY }}
+          HARBOR_EVALUATOR_CMD_JSON: ${{ vars.HARBOR_EVALUATOR_CMD_JSON_CANARY }}
+          HARBOR_ENFORCE_DEP_SPECS: "1"
+          HARBOR_REQUIRE_EVALUATOR_CMD: "1"
+          HARBOR_RUN_SMOKE_DESCRIBE: "0"
+        run: bash scripts/harbor/run_harbor_phase3_lane.sh canary

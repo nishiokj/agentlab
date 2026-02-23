@@ -1,0 +1,60 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agent-lab.local/schemas/slot_commit_record_v1.json",
+  "title": "Slot Commit Record v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "record_type",
+    "run_id",
+    "schedule_idx",
+    "slot_commit_id",
+    "trial_id",
+    "slot_status",
+    "attempt",
+    "recorded_at"
+  ],
+  "properties": {
+    "schema_version": { "const": "slot_commit_record_v1" },
+    "record_type": { "type": "string", "enum": ["intent", "commit", "abort"] },
+    "run_id": { "type": "string", "minLength": 1 },
+    "schedule_idx": { "type": "integer", "minimum": 0 },
+    "slot_commit_id": { "type": "string", "minLength": 1 },
+    "trial_id": { "type": "string" },
+    "slot_status": { "type": "string", "minLength": 1 },
+    "attempt": { "type": "integer", "minimum": 1 },
+    "recorded_at": { "type": "string", "format": "date-time" },
+    "expected_rows": { "$ref": "#/$defs/row_counts" },
+    "payload_digest": { "type": "string", "minLength": 1 },
+    "written_rows": { "$ref": "#/$defs/row_counts" },
+    "facts_fsync_completed": { "type": "boolean" },
+    "runtime_fsync_completed": { "type": "boolean" }
+  },
+  "$defs": {
+    "row_counts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "trials",
+        "metrics",
+        "events",
+        "variant_snapshots",
+        "evidence",
+        "chain_states",
+        "predictions",
+        "scores"
+      ],
+      "properties": {
+        "trials": { "type": "integer", "minimum": 0 },
+        "metrics": { "type": "integer", "minimum": 0 },
+        "events": { "type": "integer", "minimum": 0 },
+        "variant_snapshots": { "type": "integer", "minimum": 0 },
+        "evidence": { "type": "integer", "minimum": 0 },
+        "chain_states": { "type": "integer", "minimum": 0 },
+        "predictions": { "type": "integer", "minimum": 0 },
+        "scores": { "type": "integer", "minimum": 0 }
+      }
+    }
+  }
+}

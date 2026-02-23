@@ -1,0 +1,8 @@
+# Optional Harbor dependency manifest for ad-hoc/local runs.
+#
+# Keep Harbor deps isolated from runner core dependencies.
+# Install only in Harbor-specific environments/images.
+#
+# For CI Phase 3 lanes, use:
+# - scripts/harbor/requirements-harbor-pinned.txt
+# - scripts/harbor/requirements-harbor-canary.txt
