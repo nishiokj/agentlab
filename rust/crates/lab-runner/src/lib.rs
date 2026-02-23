@@ -175,6 +175,9 @@ struct AdapterRunRequest<'a> {
     benchmark_adapter: Option<&'a BenchmarkAdapterConfig>,
     benchmark_grading_enabled: bool,
     run_id: &'a str,
+    task_image: Option<&'a str>,
+    task_workspace: Option<&'a str>,
+    agent_artifact: Option<&'a Path>,
 }
 
 #[derive(Clone)]
@@ -333,7 +336,11 @@ fn parse_optional_positive_usize_env(name: &str) -> Result<Option<usize>> {
                 return Ok(None);
             }
             let parsed = trimmed.parse::<usize>().map_err(|_| {
-                anyhow!("{} must be a positive integer when set (got: {})", name, raw)
+                anyhow!(
+                    "{} must be a positive integer when set (got: {})",
+                    name,
+                    raw
+                )
             })?;
             if parsed == 0 {
                 return Err(anyhow!("{} must be > 0 when set", name));
@@ -353,7 +360,11 @@ fn parse_optional_positive_u64_env(name: &str) -> Result<Option<u64>> {
                 return Ok(None);
             }
             let parsed = trimmed.parse::<u64>().map_err(|_| {
-                anyhow!("{} must be a positive integer when set (got: {})", name, raw)
+                anyhow!(
+                    "{} must be a positive integer when set (got: {})",
+                    name,
+                    raw
+                )
             })?;
             if parsed == 0 {
                 return Err(anyhow!("{} must be > 0 when set", name));
@@ -1037,11 +1048,7 @@ impl RemoteWorkerBackend {
             return Err(Self::quarantined_error(reason));
         }
 
-        let Some(ticket_ids) = state
-            .active_tickets_by_worker
-            .get(worker_id)
-            .cloned()
-        else {
+        let Some(ticket_ids) = state.active_tickets_by_worker.get(worker_id).cloned() else {
             return Err(anyhow!(
                 "remote worker backend {} failed: unknown active worker {}",
                 op_name,
@@ -1262,7 +1269,11 @@ impl RemoteWorkerBackend {
     fn retry_backoff_delay(&self, attempt: usize) -> Duration {
         let shift = attempt.saturating_sub(1).min(8) as u32;
         let multiplier = 1u64 << shift;
-        Duration::from_millis(self.retry_settings.base_backoff_ms.saturating_mul(multiplier))
+        Duration::from_millis(
+            self.retry_settings
+                .base_backoff_ms
+                .saturating_mul(multiplier),
+        )
     }
 
     fn call_protocol_with_retry<T>(
@@ -1920,7 +1931,9 @@ fn parallel_worker_control_path(run_dir: &Path) -> PathBuf {
     run_dir.join("runtime").join("parallel_worker_control.json")
 }
 
-fn load_parallel_worker_control_state(run_dir: &Path) -> Result<Option<ParallelWorkerControlState>> {
+fn load_parallel_worker_control_state(
+    run_dir: &Path,
+) -> Result<Option<ParallelWorkerControlState>> {
     let path = parallel_worker_control_path(run_dir);
     if !path.exists() {
         return Ok(None);
@@ -1955,12 +1968,13 @@ fn write_parallel_worker_control_response(
     run_dir: &Path,
     response: ParallelWorkerControlResponse,
 ) -> Result<()> {
-    let mut state = load_parallel_worker_control_state(run_dir)?.unwrap_or(ParallelWorkerControlState {
-        schema_version: PARALLEL_WORKER_CONTROL_SCHEMA_V1.to_string(),
-        request: None,
-        response: None,
-        updated_at: Utc::now().to_rfc3339(),
-    });
+    let mut state =
+        load_parallel_worker_control_state(run_dir)?.unwrap_or(ParallelWorkerControlState {
+            schema_version: PARALLEL_WORKER_CONTROL_SCHEMA_V1.to_string(),
+            request: None,
+            response: None,
+            updated_at: Utc::now().to_rfc3339(),
+        });
     state.response = Some(response);
     state.updated_at = Utc::now().to_rfc3339();
     write_parallel_worker_control_state(run_dir, &state)
@@ -2908,6 +2922,9 @@ pub fn replay_trial(run_dir: &Path, trial_id: &str, strict: bool) -> Result<Repl
         benchmark_adapter: None,
         benchmark_grading_enabled: false,
         run_id: &run_id,
+        task_image: task_boundary.task_image.as_deref(),
+        task_workspace: task_boundary.task_workspace.as_deref(),
+        agent_artifact: agent_runtime.agent_artifact.as_deref(),
     };
     let proc_result = adapter.run_trial(&run_request)?;
     let status = proc_result.status;
@@ -3189,6 +3206,9 @@ fn fork_trial_inner(
         benchmark_adapter: None,
         benchmark_grading_enabled: false,
         run_id: &run_id,
+        task_image: task_boundary.task_image.as_deref(),
+        task_workspace: task_boundary.task_workspace.as_deref(),
+        agent_artifact: agent_runtime.agent_artifact.as_deref(),
     };
     let proc_result = adapter.run_trial(&run_request)?;
     let status = proc_result.status;
@@ -3394,7 +3414,13 @@ pub fn pause_run(
             .map(|entry| (entry.trial_id.clone(), entry))
             .collect();
     if active_trials_use_worker_control_plane(&active_by_id, &target_trials) {
-        return request_parallel_worker_pause(&run_dir, &run_id, &target_trials, &pause_label, timeout);
+        return request_parallel_worker_pause(
+            &run_dir,
+            &run_id,
+            &target_trials,
+            &pause_label,
+            timeout,
+        );
     }
 
     let resolved = load_json_file(&run_dir.join("resolved_experiment.json"))?;
@@ -3626,7 +3652,8 @@ pub fn kill_run(run_dir: &Path) -> Result<KillResult> {
             .into_iter()
             .map(|entry| (entry.trial_id.clone(), entry))
             .collect();
-    if status == "running" && active_trials_use_worker_control_plane(&active_by_id, &active_trial_ids)
+    if status == "running"
+        && active_trials_use_worker_control_plane(&active_by_id, &active_trial_ids)
     {
         return request_parallel_worker_stop(
             &run_dir,
@@ -4350,6 +4377,13 @@ fn validate_required_fields(json_value: &Value) -> Result<()> {
         .pointer("/runtime/policy/sandbox/mode")
         .and_then(|v| v.as_str())
         .unwrap_or("local");
+    let image_source = json_value
+        .pointer("/runtime/agent/image_source")
+        .and_then(|v| v.as_str())
+        .unwrap_or("global");
+    if image_source != "global" && image_source != "per_task" {
+        invalid.push("/runtime/agent/image_source (must be 'global' or 'per_task')");
+    }
     if sandbox_mode == "container" {
         let runtime_agent_image = json_value
             .pointer("/runtime/agent/image")
@@ -4357,8 +4391,18 @@ fn validate_required_fields(json_value: &Value) -> Result<()> {
             .map(|v| v.trim().to_string())
             .unwrap_or_default();
         let has_container_image = !runtime_agent_image.is_empty();
-        if !has_container_image {
+        if image_source != "per_task" && !has_container_image {
             missing.push("/runtime/agent/image");
+        }
+        if image_source == "per_task" {
+            let agent_artifact = json_value
+                .pointer("/runtime/agent/artifact")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .unwrap_or("");
+            if agent_artifact.is_empty() {
+                missing.push("/runtime/agent/artifact");
+            }
         }
     }
     if json_value.pointer("/benchmark").is_some() {
@@ -4815,26 +4859,26 @@ impl TrialExecutor {
         atomic_write_json_pretty(&pre_snapshot_path, &pre_snapshot_manifest)?;
         let pre_snapshot_ref = artifact_store.put_file(&pre_snapshot_path)?;
 
-        let (chain_root_snapshot_ref, chain_root_snapshot_path) =
-            if let Some(existing) = chain_states.get(&chain_key) {
-                (
-                    existing.chain_root_snapshot_ref.clone(),
-                    existing.chain_root_snapshot_path.clone(),
-                )
-            } else {
-                let root_workspace =
-                    chains_dir.join(chain_root_workspace_dir_name(trial_id.as_str()));
-                if root_workspace.exists() {
-                    fs::remove_dir_all(&root_workspace)?;
-                }
-                ensure_dir(&root_workspace)?;
-                copy_dir_filtered(
-                    &trial_paths.workspace,
-                    &root_workspace,
-                    WORKSPACE_EVIDENCE_EXCLUDE_PREFIXES,
-                )?;
-                (pre_snapshot_ref.clone(), root_workspace)
-            };
+        let (chain_root_snapshot_ref, chain_root_snapshot_path) = if let Some(existing) =
+            chain_states.get(&chain_key)
+        {
+            (
+                existing.chain_root_snapshot_ref.clone(),
+                existing.chain_root_snapshot_path.clone(),
+            )
+        } else {
+            let root_workspace = chains_dir.join(chain_root_workspace_dir_name(trial_id.as_str()));
+            if root_workspace.exists() {
+                fs::remove_dir_all(&root_workspace)?;
+            }
+            ensure_dir(&root_workspace)?;
+            copy_dir_filtered(
+                &trial_paths.workspace,
+                &root_workspace,
+                WORKSPACE_EVIDENCE_EXCLUDE_PREFIXES,
+            )?;
+            (pre_snapshot_ref.clone(), root_workspace)
+        };
 
         let mut status = String::new();
         let mut trial_output: Value =
@@ -4893,6 +4937,9 @@ impl TrialExecutor {
                 benchmark_adapter: benchmark_config.adapter.as_ref(),
                 benchmark_grading_enabled,
                 run_id,
+                task_image: task_boundary.task_image.as_deref(),
+                task_workspace: task_boundary.task_workspace.as_deref(),
+                agent_artifact: agent_runtime.agent_artifact.as_deref(),
             };
             let proc_result = adapter.run_trial(&run_request)?;
             status = proc_result.status;
@@ -5198,21 +5245,52 @@ impl TrialExecutor {
             let _ = validate_hooks(&manifest, &io_paths.events_host, &schema);
         }
 
-        let outcome = trial_output
+        let benchmark_score_row = deferred_benchmark_score_records.first();
+        let mut outcome = trial_output
             .get("outcome")
             .and_then(|v| v.as_str())
             .unwrap_or("error")
             .to_string();
+        if benchmark_grading_enabled && grade_error_reason.is_none() {
+            if let Some(mapped_outcome) = benchmark_score_row
+                .and_then(|row| row.pointer("/verdict"))
+                .and_then(Value::as_str)
+                .and_then(benchmark_verdict_to_trial_outcome)
+            {
+                outcome = mapped_outcome.to_string();
+            }
+        }
         let mut metrics = trial_output.get("metrics").cloned().unwrap_or(json!({}));
         if let Some(obj) = metrics.as_object_mut() {
             obj.insert("status_code".to_string(), json!(status.clone()));
+            if let Some(verdict) = benchmark_score_row
+                .and_then(|row| row.pointer("/verdict"))
+                .and_then(Value::as_str)
+            {
+                obj.insert("benchmark_verdict".to_string(), json!(verdict));
+            }
             if let Some(reason) = grade_error_reason.as_ref() {
                 obj.insert("grade_error".to_string(), json!(true));
                 obj.insert("grade_error_reason".to_string(), json!(reason));
             }
         }
-        let (primary_metric_name, primary_metric_value) =
-            if let Some(obj) = trial_output.get("objective").and_then(|v| v.as_object()) {
+        let benchmark_primary = benchmark_score_row.and_then(|row| {
+            let name = row
+                .pointer("/primary_metric_name")
+                .and_then(Value::as_str)
+                .map(str::to_string)?;
+            let value = row
+                .pointer("/primary_metric_value")
+                .cloned()
+                .unwrap_or(json!(null));
+            Some((name, value))
+        });
+        let (primary_metric_name, primary_metric_value) = if benchmark_grading_enabled
+            && grade_error_reason.is_none()
+        {
+            if let Some((name, value)) = benchmark_primary {
+                (name, value)
+            } else if let Some(obj) = trial_output.get("objective").and_then(|v| v.as_object()) {
                 let name = obj
                     .get("name")
                     .and_then(|v| v.as_str())
@@ -5223,7 +5301,19 @@ impl TrialExecutor {
             } else {
                 let fallback = if outcome == "success" { 1.0 } else { 0.0 };
                 ("success".to_string(), json!(fallback))
-            };
+            }
+        } else if let Some(obj) = trial_output.get("objective").and_then(|v| v.as_object()) {
+            let name = obj
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("primary_metric")
+                .to_string();
+            let value = obj.get("value").cloned().unwrap_or(json!(null));
+            (name, value)
+        } else {
+            let fallback = if outcome == "success" { 1.0 } else { 0.0 };
+            ("success".to_string(), json!(fallback))
+        };
         let bindings = variant_bindings_for_summary(variant);
         let event_rows = if io_paths.events_host.exists() {
             load_event_rows(
@@ -5668,10 +5758,12 @@ fn process_parallel_worker_control_request(
                     }
                 };
                 checkpoint_acked_all &= pause_ack.accepted;
-                if let Err(err) =
-                    backend.request_stop(&dispatch.worker_id, format!("pause:{}", pause_label).as_str())
-                {
-                    failed_trials.push(format!("{}: pause stop request failed ({})", trial_id, err));
+                if let Err(err) = backend.request_stop(
+                    &dispatch.worker_id,
+                    format!("pause:{}", pause_label).as_str(),
+                ) {
+                    failed_trials
+                        .push(format!("{}: pause stop request failed ({})", trial_id, err));
                     stop_acked_all = false;
                     continue;
                 }
@@ -5712,7 +5804,13 @@ fn process_parallel_worker_control_request(
                 requested_by: Some("user".to_string()),
             };
             if failed_trials.is_empty() {
-                write_run_control_v2(run_dir, run_id, "paused", &paused_active_trials, Some(&pause_meta))?;
+                write_run_control_v2(
+                    run_dir,
+                    run_id,
+                    "paused",
+                    &paused_active_trials,
+                    Some(&pause_meta),
+                )?;
                 write_parallel_worker_control_response(
                     run_dir,
                     ParallelWorkerControlResponse {
@@ -5731,7 +5829,13 @@ fn process_parallel_worker_control_request(
             }
 
             let survivors = in_flight_active_trials(in_flight);
-            write_run_control_v2(run_dir, run_id, "interrupted", &survivors, Some(&pause_meta))?;
+            write_run_control_v2(
+                run_dir,
+                run_id,
+                "interrupted",
+                &survivors,
+                Some(&pause_meta),
+            )?;
             let message = format!(
                 "pause request failed for {} of {} targeted trial(s): {}",
                 failed_trials.len(),
@@ -5776,9 +5880,14 @@ fn process_parallel_worker_control_request(
                 }
 
                 let trial_dir = run_dir.join("trials").join(trial_id);
-                if let Err(err) =
-                    write_trial_state(&trial_dir, trial_id, "killed", None, None, Some("killed_by_user"))
-                {
+                if let Err(err) = write_trial_state(
+                    &trial_dir,
+                    trial_id,
+                    "killed",
+                    None,
+                    None,
+                    Some("killed_by_user"),
+                ) {
                     failed_trials.push(format!(
                         "{}: failed to write trial_state ({})",
                         trial_id, err
@@ -7565,6 +7674,16 @@ fn should_retry_outcome(outcome: &str, exit_status: &str, retry_on: &[String]) -
     false
 }
 
+fn benchmark_verdict_to_trial_outcome(verdict: &str) -> Option<&'static str> {
+    match verdict {
+        "pass" => Some("success"),
+        "fail" => Some("failure"),
+        "missing" => Some("missing"),
+        "error" => Some("error"),
+        _ => None,
+    }
+}
+
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -8084,6 +8203,7 @@ fn count_tasks(path: &Path, json_value: &Value) -> Result<usize> {
 }
 
 const TASK_BOUNDARY_V1_SCHEMA_VERSION: &str = "task_boundary_v1";
+const TASK_BOUNDARY_V2_SCHEMA_VERSION: &str = "task_boundary_v2";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct WorkspaceFileSpec {
@@ -8130,6 +8250,8 @@ struct TaskBoundaryMaterialization {
     workspace_files: Vec<WorkspaceFileSpec>,
     mount_references: Vec<MountReferenceSpec>,
     limits: TaskBoundaryLimits,
+    task_image: Option<String>,
+    task_workspace: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -8139,16 +8261,32 @@ struct ResolvedMountReference {
 }
 
 fn default_task_boundary(task_payload: Value) -> TaskBoundaryMaterialization {
+    let task_image = task_payload
+        .pointer("/image")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(ToString::to_string);
+    let task_workspace = task_payload
+        .pointer("/workspace")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(ToString::to_string);
     TaskBoundaryMaterialization {
         task_payload,
         workspace_files: Vec::new(),
         mount_references: Vec::new(),
         limits: TaskBoundaryLimits::default(),
+        task_image,
+        task_workspace,
     }
 }
 
 fn parse_task_boundary_from_dataset_task(task: &Value) -> Result<TaskBoundaryMaterialization> {
-    if task.get("schema_version").and_then(|v| v.as_str()) != Some(TASK_BOUNDARY_V1_SCHEMA_VERSION)
+    let schema_version = task.get("schema_version").and_then(|v| v.as_str());
+    if schema_version != Some(TASK_BOUNDARY_V1_SCHEMA_VERSION)
+        && schema_version != Some(TASK_BOUNDARY_V2_SCHEMA_VERSION)
     {
         return Ok(default_task_boundary(task.clone()));
     }
@@ -8179,12 +8317,31 @@ fn parse_task_boundary_from_dataset_task(task: &Value) -> Result<TaskBoundaryMat
     if !task_payload.is_object() {
         return Err(anyhow!("task boundary field 'task' must be an object"));
     }
+    let task_image = task_payload
+        .pointer("/image")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(ToString::to_string);
+    if task_payload.get("image").is_some() && task_image.is_none() {
+        return Err(anyhow!(
+            "task boundary field 'task.image' must be a non-empty string when provided"
+        ));
+    }
+    let task_workspace = task_payload
+        .pointer("/workspace")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(ToString::to_string);
 
     Ok(TaskBoundaryMaterialization {
         task_payload,
         workspace_files: parse_workspace_files(obj.get("workspace_files"))?,
         mount_references: parse_mount_references(obj.get("mount_references"))?,
         limits: parse_task_limits(obj.get("limits"))?,
+        task_image,
+        task_workspace,
     })
 }
 
@@ -8198,6 +8355,8 @@ fn parse_task_boundary_from_trial_input(input: &Value) -> Result<TaskBoundaryMat
             parse_task_boundary_ext(ext, task_payload)
         } else if task_payload.get("schema_version").and_then(|v| v.as_str())
             == Some(TASK_BOUNDARY_V1_SCHEMA_VERSION)
+            || task_payload.get("schema_version").and_then(|v| v.as_str())
+                == Some(TASK_BOUNDARY_V2_SCHEMA_VERSION)
         {
             parse_task_boundary_from_dataset_task(&task_payload)
         } else {
@@ -8214,6 +8373,8 @@ fn parse_task_boundary_from_trial_input(input: &Value) -> Result<TaskBoundaryMat
         }
         if input.get("schema_version").and_then(|v| v.as_str())
             == Some(TASK_BOUNDARY_V1_SCHEMA_VERSION)
+            || input.get("schema_version").and_then(|v| v.as_str())
+                == Some(TASK_BOUNDARY_V2_SCHEMA_VERSION)
         {
             parse_task_boundary_from_dataset_task(input)
         } else {
@@ -8238,12 +8399,31 @@ fn parse_task_boundary_ext(
             ));
         }
     }
+    let task_image = task_payload
+        .pointer("/image")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(ToString::to_string);
+    if task_payload.get("image").is_some() && task_image.is_none() {
+        return Err(anyhow!(
+            "trial_input /task.image must be a non-empty string when provided"
+        ));
+    }
+    let task_workspace = task_payload
+        .pointer("/workspace")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(ToString::to_string);
 
     Ok(TaskBoundaryMaterialization {
         task_payload,
         workspace_files: parse_workspace_files(obj.get("workspace_files"))?,
         mount_references: parse_mount_references(obj.get("mount_references"))?,
         limits: parse_task_limits(obj.get("limits"))?,
+        task_image,
+        task_workspace,
     })
 }
 
@@ -8593,6 +8773,8 @@ struct AgentRuntimeConfig {
     adapter_ref: AgentAdapterRef,
     command_raw: Vec<String>,
     container_image: Option<String>,
+    image_source: ImageSource,
+    agent_artifact: Option<PathBuf>,
     io: AgentRuntimeIoConfig,
     clean_contract_v1: bool,
     integration_level: String,
@@ -8606,6 +8788,25 @@ struct AgentRuntimeConfig {
     force_container: bool,
     dependency_file_staging: Vec<DependencyFileStagingSpec>,
     dependency_services: Vec<Value>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ImageSource {
+    Global,
+    PerTask,
+}
+
+impl ImageSource {
+    fn parse(raw: Option<&str>) -> Result<Self> {
+        match raw.unwrap_or("global") {
+            "global" => Ok(Self::Global),
+            "per_task" => Ok(Self::PerTask),
+            other => Err(anyhow!(
+                "runtime.agent.image_source must be 'global' or 'per_task' (got '{}')",
+                other
+            )),
+        }
+    }
 }
 
 fn resolve_host_path_from_spec(raw: &str, exp_dir: &Path) -> Result<PathBuf> {
@@ -8784,6 +8985,8 @@ fn resolve_agent_runtime(json_value: &Value, exp_dir: &Path) -> Result<AgentRunt
             adapter_ref: AgentAdapterRef::default(),
             command_raw: command,
             container_image: Some(container_image),
+            image_source: ImageSource::Global,
+            agent_artifact: None,
             io: AgentRuntimeIoConfig {
                 input_arg: DEFAULT_CLEAN_TASK_PATH.to_string(),
                 output_arg: DEFAULT_CLEAN_RESULT_PATH.to_string(),
@@ -8849,6 +9052,15 @@ fn resolve_agent_runtime(json_value: &Value, exp_dir: &Path) -> Result<AgentRunt
         .and_then(|v| v.as_str())
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
+    let image_source = ImageSource::parse(agent.pointer("/image_source").and_then(|v| v.as_str()))?;
+    let agent_artifact =
+        parse_optional_nonempty_string(agent.pointer("/artifact"), "runtime.agent.artifact")?
+            .map(|p| normalize_path(&exp_dir.join(p)));
+    if image_source == ImageSource::PerTask && agent_artifact.is_none() {
+        return Err(anyhow!(
+            "runtime.agent.artifact is required when runtime.agent.image_source='per_task'"
+        ));
+    }
 
     let command = parse_command_field(agent.pointer("/command"), "runtime.agent.command")?
         .ok_or_else(|| anyhow!("runtime.agent.command is required"))?;
@@ -8895,6 +9107,8 @@ fn resolve_agent_runtime(json_value: &Value, exp_dir: &Path) -> Result<AgentRunt
         adapter_ref,
         command_raw: command,
         container_image,
+        image_source,
+        agent_artifact,
         io: AgentRuntimeIoConfig {
             input_arg,
             output_arg,
@@ -9082,8 +9296,9 @@ fn build_agent_task(
     task_boundary: &TaskBoundaryMaterialization,
     runtime_agent: &AgentRuntimeConfig,
 ) -> Value {
+    let normalized_task_payload = normalize_task_prompt_aliases(&task_boundary.task_payload);
     if is_clean_contract_experiment(json_value) {
-        return task_boundary.task_payload.clone();
+        return normalized_task_payload;
     }
 
     let mut policy = json_value
@@ -9106,7 +9321,7 @@ fn build_agent_task(
             "task_id": task_boundary.task_payload.get("id").and_then(|v| v.as_str()).unwrap_or(&format!("task_{}", task_idx)),
             "repl_idx": repl
         },
-        "task": task_boundary.task_payload.clone(),
+        "task": normalized_task_payload,
         "bindings": variant.bindings.clone(),
         "dependencies": {
             "services": runtime_agent.dependency_services.clone()
@@ -9122,6 +9337,74 @@ fn build_agent_task(
         }
     }
     input
+}
+
+fn normalize_task_prompt_aliases(task_payload: &Value) -> Value {
+    let mut normalized = task_payload.clone();
+    let canonical_prompt = normalized
+        .pointer("/input/prompt")
+        .and_then(Value::as_str)
+        .or_else(|| normalized.pointer("/prompt").and_then(Value::as_str))
+        .or_else(|| {
+            normalized
+                .pointer("/swebench/input/prompt")
+                .and_then(Value::as_str)
+        })
+        .map(str::to_string);
+
+    let Some(prompt) = canonical_prompt else {
+        return normalized;
+    };
+
+    let Some(root_obj) = normalized.as_object_mut() else {
+        return normalized;
+    };
+
+    // Canonicalize to task.input.prompt for runtime/harness consumption.
+    let input_slot = root_obj
+        .entry("input".to_string())
+        .or_insert_with(|| json!({}));
+    if !input_slot.is_object() {
+        *input_slot = json!({});
+    }
+    if let Some(input_obj) = input_slot.as_object_mut() {
+        input_obj.insert("prompt".to_string(), Value::String(prompt.clone()));
+    }
+
+    // Drop duplicated top-level prompt alias if it is identical.
+    let drop_top_level_prompt = root_obj
+        .get("prompt")
+        .and_then(Value::as_str)
+        .is_some_and(|value| value == prompt);
+    if drop_top_level_prompt {
+        root_obj.remove("prompt");
+    }
+
+    // Drop duplicated swebench.input.prompt alias if it is identical.
+    if let Some(swebench_slot) = root_obj.get_mut("swebench") {
+        if let Some(swebench_obj) = swebench_slot.as_object_mut() {
+            let mut remove_input = false;
+            if let Some(swebench_input_slot) = swebench_obj.get_mut("input") {
+                if let Some(swebench_input_obj) = swebench_input_slot.as_object_mut() {
+                    let drop_nested_prompt = swebench_input_obj
+                        .get("prompt")
+                        .and_then(Value::as_str)
+                        .is_some_and(|value| value == prompt);
+                    if drop_nested_prompt {
+                        swebench_input_obj.remove("prompt");
+                    }
+                    if swebench_input_obj.is_empty() {
+                        remove_input = true;
+                    }
+                }
+            }
+            if remove_input {
+                swebench_obj.remove("input");
+            }
+        }
+    }
+
+    normalized
 }
 
 fn sanitize_for_fs(raw: &str) -> String {
@@ -9403,7 +9686,7 @@ fn build_runtime_contract_env(
 fn apply_agentlab_template(raw: &str, env: &BTreeMap<String, String>) -> String {
     let mut rendered = raw.to_string();
     for (key, value) in env {
-        if !key.starts_with("AGENTLAB_") {
+        if !key.starts_with("AGENTLAB_") && key != "WORKSPACE" {
             continue;
         }
         let needle = format!("${{{}}}", key);
@@ -9533,6 +9816,9 @@ impl AgentAdapter for PrebuiltCommandAdapter {
             benchmark_adapter: request.benchmark_adapter,
             benchmark_grading_enabled: request.benchmark_grading_enabled,
             run_id: request.run_id,
+            task_image: request.task_image,
+            task_workspace: request.task_workspace,
+            agent_artifact: request.agent_artifact,
         };
         run_command_contract_trial(&prebuilt_request)
     }
@@ -9568,6 +9854,14 @@ fn resolve_benchmark_grader_command(request: &AdapterRunRequest<'_>) -> Option<V
     for (key, value) in request.runtime_env {
         render_env.insert(key.clone(), value.clone());
     }
+    let workspace = if request.container_mode {
+        resolve_container_workspace(request)
+            .unwrap_or(AGENTLAB_CONTRACT_WORKSPACE_DIR)
+            .to_string()
+    } else {
+        request.trial_paths.workspace.to_string_lossy().to_string()
+    };
+    render_env.insert("WORKSPACE".to_string(), workspace);
     Some(apply_agentlab_template_to_command(
         &adapter.command,
         &render_env,
@@ -9575,21 +9869,77 @@ fn resolve_benchmark_grader_command(request: &AdapterRunRequest<'_>) -> Option<V
 }
 
 fn run_builtin_adapter_container(request: &AdapterRunRequest<'_>) -> Result<ProcessRunResult> {
-    let image = request
-        .runtime
-        .container_image
-        .as_deref()
-        .ok_or_else(|| anyhow!("container image required for container mode"))?;
-
     if request.network_mode == "allowlist_enforced" {
         return Err(anyhow!("allowlist_enforced not implemented in Rust runner"));
     }
-    let command = resolve_runtime_agent_command(request)?;
-    let grader_command = resolve_benchmark_grader_command(request);
+    let image = resolve_container_image(request)?;
+    let workspace = resolve_container_workspace(request);
+    if request.runtime.image_source == ImageSource::PerTask {
+        if request.agent_artifact.is_none() {
+            return Err(anyhow!(
+                "runtime.agent.artifact is required when runtime.agent.image_source='per_task'"
+            ));
+        }
+        if let Some(workspace) = workspace {
+            if !workspace.starts_with(AGENTLAB_CONTRACT_WORKSPACE_DIR) {
+                let root_read_only = request
+                    .runtime_experiment
+                    .pointer("/runtime/policy/sandbox/root_read_only")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(true);
+                if root_read_only {
+                    return Err(anyhow!(
+                        "per-task image workspace '{}' requires runtime.policy.sandbox.root_read_only=false",
+                        workspace
+                    ));
+                }
+            }
+        }
+    }
 
-    let mut cmd = Command::new("docker");
-    cmd.arg("run").arg("--rm");
+    if let Some(artifact) = request.agent_artifact {
+        run_injected_container(request, &image, artifact, workspace)
+    } else {
+        run_baked_container(request, &image, workspace)
+    }
+}
 
+fn resolve_container_image(request: &AdapterRunRequest<'_>) -> Result<String> {
+    let task_image = request
+        .task_image
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    match request.runtime.image_source {
+        ImageSource::PerTask => task_image.map(ToString::to_string).ok_or_else(|| {
+            anyhow!("task.image is required when runtime.agent.image_source='per_task'")
+        }),
+        ImageSource::Global => request
+            .runtime
+            .container_image
+            .clone()
+            .ok_or_else(|| anyhow!("container image required for container mode")),
+    }
+}
+
+fn resolve_container_workspace<'a>(request: &'a AdapterRunRequest<'_>) -> Option<&'a str> {
+    request
+        .task_workspace
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            if request.runtime.clean_contract_v1 {
+                None
+            } else {
+                Some(AGENTLAB_CONTRACT_WORKSPACE_DIR)
+            }
+        })
+}
+
+fn append_container_sandbox_args(
+    cmd: &mut Command,
+    request: &AdapterRunRequest<'_>,
+    workspace: Option<&str>,
+) {
     let root_read_only = if request.runtime.clean_contract_v1 {
         true
     } else {
@@ -9629,6 +9979,7 @@ fn run_builtin_adapter_container(request: &AdapterRunRequest<'_>) -> Result<Proc
     if no_new_privileges {
         cmd.args(["--security-opt", "no-new-privileges"]);
     }
+
     let drop_all_caps = if request.runtime.clean_contract_v1 {
         true
     } else {
@@ -9736,9 +10087,17 @@ fn run_builtin_adapter_container(request: &AdapterRunRequest<'_>) -> Result<Proc
             ]);
         }
         cmd.args(["--tmpfs", "/tmp:rw"]);
-        cmd.args(["-w", AGENTLAB_CONTRACT_WORKSPACE_DIR]);
+        if let Some(workspace) = workspace {
+            cmd.args(["-w", workspace]);
+        }
     }
+}
 
+fn append_container_env_args(
+    cmd: &mut Command,
+    request: &AdapterRunRequest<'_>,
+    workspace: Option<&str>,
+) {
     for (key, value) in request.runtime_overrides_env {
         cmd.arg("-e").arg(format!("{}={}", key, value));
     }
@@ -9747,16 +10106,27 @@ fn run_builtin_adapter_container(request: &AdapterRunRequest<'_>) -> Result<Proc
             cmd.arg("-e").arg(format!("{}={}", key, value));
         }
     }
+    if let Some(workspace) = workspace {
+        cmd.arg("-e").arg(format!("WORKSPACE={}", workspace));
+    }
+}
 
+fn append_container_entrypoint(
+    cmd: &mut Command,
+    request: &AdapterRunRequest<'_>,
+    command: &[String],
+    grader_command: Option<Vec<String>>,
+) {
     if let Some(grader_command) = grader_command {
-        cmd.arg(image);
         let setup_block = if let Some(setup) = request.setup_command {
             format!("{}\nsetup_status=$?", setup)
         } else {
             "setup_status=0".to_string()
         };
-        let grade_error_marker_path =
-            output_peer_path(&request.io_paths.result_path, BENCHMARK_GRADE_ERROR_FILENAME);
+        let grade_error_marker_path = output_peer_path(
+            &request.io_paths.result_path,
+            BENCHMARK_GRADE_ERROR_FILENAME,
+        );
         let wrapped = format!(
             "set +e\n\
              rm -f {marker}\n\
@@ -9784,7 +10154,7 @@ fn run_builtin_adapter_container(request: &AdapterRunRequest<'_>) -> Result<Proc
              exit 0",
             marker = shell_quote(&grade_error_marker_path),
             setup = setup_block,
-            agent = shell_join(&command),
+            agent = shell_join(command),
             agent_exit_env = AGENTLAB_ENV_AGENT_EXIT_STATUS,
             grader = shell_join(&grader_command),
             score_env = AGENTLAB_ENV_BENCHMARK_SCORE_PATH,
@@ -9794,17 +10164,120 @@ fn run_builtin_adapter_container(request: &AdapterRunRequest<'_>) -> Result<Proc
         cmd.arg("-lc");
         cmd.arg(wrapped);
     } else if let Some(setup) = request.setup_command {
-        cmd.arg(image);
-        let wrapped = format!("{} && exec {}", setup, shell_join(&command));
+        let wrapped = format!("{} && exec {}", setup, shell_join(command));
         cmd.arg("/bin/sh");
         cmd.arg("-lc");
         cmd.arg(wrapped);
     } else {
-        cmd.arg(image);
         cmd.args(command);
     }
+}
 
+fn run_baked_container(
+    request: &AdapterRunRequest<'_>,
+    image: &str,
+    workspace: Option<&str>,
+) -> Result<ProcessRunResult> {
+    let command = resolve_runtime_agent_command(request)?;
+    let grader_command = resolve_benchmark_grader_command(request);
+
+    let mut cmd = Command::new("docker");
+    cmd.arg("run").arg("--rm");
+    append_container_sandbox_args(&mut cmd, request, workspace);
+    append_container_env_args(&mut cmd, request, workspace);
+    cmd.arg(image);
+    append_container_entrypoint(&mut cmd, request, &command, grader_command);
     run_adapter_process(cmd, &request.io_paths.output_host, None)
+}
+
+struct ContainerCleanupGuard {
+    container_id: String,
+}
+
+impl Drop for ContainerCleanupGuard {
+    fn drop(&mut self) {
+        let _ = Command::new("docker")
+            .args(["rm", "-f", &self.container_id])
+            .output();
+    }
+}
+
+fn run_checked_command(mut cmd: Command, step: &str) -> Result<std::process::Output> {
+    let out = cmd.output()?;
+    if out.status.success() {
+        return Ok(out);
+    }
+    let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+    let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let detail = if !stderr.is_empty() {
+        stderr
+    } else if !stdout.is_empty() {
+        stdout
+    } else {
+        "command exited non-zero".to_string()
+    };
+    Err(anyhow!("{}: {}", step, detail))
+}
+
+fn run_injected_container(
+    request: &AdapterRunRequest<'_>,
+    image: &str,
+    artifact: &Path,
+    workspace: Option<&str>,
+) -> Result<ProcessRunResult> {
+    if !artifact.exists() {
+        return Err(anyhow!(
+            "runtime.agent.artifact not found: {}",
+            artifact.display()
+        ));
+    }
+
+    let command = resolve_runtime_agent_command(request)?;
+    let grader_command = resolve_benchmark_grader_command(request);
+
+    let mut create = Command::new("docker");
+    create.arg("create");
+    append_container_sandbox_args(&mut create, request, workspace);
+    append_container_env_args(&mut create, request, workspace);
+    create.arg(image);
+    create.args(["tail", "-f", "/dev/null"]);
+    let create_out = run_checked_command(create, "docker create failed")?;
+    let container_id = String::from_utf8_lossy(&create_out.stdout)
+        .trim()
+        .to_string();
+    if container_id.is_empty() {
+        return Err(anyhow!("docker create failed: missing container id"));
+    }
+    let _cleanup = ContainerCleanupGuard {
+        container_id: container_id.clone(),
+    };
+
+    let mut start = Command::new("docker");
+    start.args(["start", &container_id]);
+    run_checked_command(start, "docker start failed")?;
+
+    let mut copy = Command::new("docker");
+    copy.arg("cp");
+    copy.arg(artifact);
+    copy.arg(format!("{}:/tmp/agent.tar.gz", container_id));
+    run_checked_command(copy, "docker cp failed")?;
+
+    let mut unpack = Command::new("docker");
+    unpack.args(["exec", &container_id, "/bin/sh", "-lc"]);
+    unpack.arg(
+        "mkdir -p /opt/agent && tar xzf /tmp/agent.tar.gz -C /opt/agent && rm -f /tmp/agent.tar.gz",
+    );
+    run_checked_command(unpack, "docker exec artifact unpack failed")?;
+
+    let mut exec = Command::new("docker");
+    exec.args(["exec"]);
+    if let Some(workspace) = workspace {
+        exec.args(["-w", workspace]);
+    }
+    append_container_env_args(&mut exec, request, workspace);
+    exec.arg(&container_id);
+    append_container_entrypoint(&mut exec, request, &command, grader_command);
+    run_adapter_process(exec, &request.io_paths.output_host, None)
 }
 
 fn append_runtime_io_arg(command: &mut Vec<String>, arg_spec: &str, path: &str) -> Result<()> {
@@ -9824,8 +10297,16 @@ fn append_runtime_io_arg(command: &mut Vec<String>, arg_spec: &str, path: &str) 
 }
 
 fn resolve_runtime_agent_command(request: &AdapterRunRequest<'_>) -> Result<Vec<String>> {
-    let rendered =
-        apply_agentlab_template_to_command(&request.runtime.command_raw, request.runtime_env);
+    let mut render_env = request.runtime_env.clone();
+    let workspace = if request.container_mode {
+        resolve_container_workspace(request)
+            .unwrap_or(AGENTLAB_CONTRACT_WORKSPACE_DIR)
+            .to_string()
+    } else {
+        request.trial_paths.workspace.to_string_lossy().to_string()
+    };
+    render_env.insert("WORKSPACE".to_string(), workspace);
+    let rendered = apply_agentlab_template_to_command(&request.runtime.command_raw, &render_env);
     if rendered.is_empty() {
         return Err(anyhow!("resolved runtime.agent command is empty"));
     }
@@ -11342,6 +11823,14 @@ mod tests {
     }
 
     #[test]
+    fn apply_agentlab_template_supports_workspace_variable() {
+        let mut env = BTreeMap::new();
+        env.insert("WORKSPACE".to_string(), "/testbed".to_string());
+        let rendered = apply_agentlab_template("${WORKSPACE}/repo", &env);
+        assert_eq!(rendered, "/testbed/repo");
+    }
+
+    #[test]
     fn resolve_agent_runtime_parses_launch_mode_stdio() {
         let root = TempDirGuard::new("agentlab_launch_mode_parse");
         let exp_dir = root.path.join("exp");
@@ -11387,6 +11876,37 @@ mod tests {
 
         let agent_runtime = resolve_agent_runtime(&spec, &exp_dir).expect("resolve runtime");
         assert_eq!(agent_runtime.command_raw, vec!["rex"]);
+    }
+
+    #[test]
+    fn resolve_agent_runtime_per_task_requires_artifact() {
+        let root = TempDirGuard::new("agentlab_per_task_requires_artifact");
+        let exp_dir = root.path.join("exp");
+        ensure_dir(&exp_dir).expect("exp dir");
+        let spec = json!({
+            "runtime": {
+                "agent": {
+                    "command": ["rex", "run"],
+                    "image_source": "per_task"
+                },
+                "policy": {
+                    "timeout_ms": 600000,
+                    "sandbox": { "mode": "container" },
+                    "network": { "mode": "none", "allowed_hosts": [] }
+                }
+            }
+        });
+
+        let err = match resolve_agent_runtime(&spec, &exp_dir) {
+            Ok(_) => panic!("missing artifact should fail"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string()
+                .contains("runtime.agent.artifact is required"),
+            "unexpected error: {}",
+            err
+        );
     }
 
     #[test]
@@ -11540,6 +12060,8 @@ mod tests {
             adapter_ref: AgentAdapterRef::default(),
             command_raw: vec![],
             container_image: None,
+            image_source: ImageSource::Global,
+            agent_artifact: None,
             io: AgentRuntimeIoConfig {
                 input_arg: "--input".to_string(),
                 output_arg: "--output".to_string(),
@@ -12215,6 +12737,60 @@ mod tests {
     }
 
     #[test]
+    fn validate_required_fields_allows_per_task_image_source_without_global_image() {
+        let spec = json!({
+            "version": "0.3",
+            "experiment": { "id": "e", "name": "n", "workload_type": "agent_harness" },
+            "dataset": { "path": "tasks.jsonl", "provider": "local_jsonl", "suite_id": "s", "schema_version": "v1", "split_id": "dev", "limit": 50 },
+            "design": { "sanitization_profile": "hermetic_functional", "comparison": "paired", "replications": 1, "random_seed": 1337, "shuffle_tasks": true, "max_concurrency": 1 },
+            "baseline": { "variant_id": "base", "bindings": {} },
+            "runtime": {
+                "agent": {
+                    "command": ["node", "/app/h.js"],
+                    "image_source": "per_task",
+                    "artifact": ".lab/agents/rex-current.tar.gz"
+                },
+                "policy": {
+                    "timeout_ms": 600000,
+                    "sandbox": { "mode": "container" },
+                    "network": { "mode": "none", "allowed_hosts": [] }
+                }
+            }
+        });
+        validate_required_fields(&spec)
+            .expect("per-task image mode should not require runtime.agent.image");
+    }
+
+    #[test]
+    fn validate_required_fields_requires_artifact_for_per_task_image_source() {
+        let spec = json!({
+            "version": "0.3",
+            "experiment": { "id": "e", "name": "n", "workload_type": "agent_harness" },
+            "dataset": { "path": "tasks.jsonl", "provider": "local_jsonl", "suite_id": "s", "schema_version": "v1", "split_id": "dev", "limit": 50 },
+            "design": { "sanitization_profile": "hermetic_functional", "comparison": "paired", "replications": 1, "random_seed": 1337, "shuffle_tasks": true, "max_concurrency": 1 },
+            "baseline": { "variant_id": "base", "bindings": {} },
+            "runtime": {
+                "agent": {
+                    "command": ["node", "/app/h.js"],
+                    "image_source": "per_task"
+                },
+                "policy": {
+                    "timeout_ms": 600000,
+                    "sandbox": { "mode": "container" },
+                    "network": { "mode": "none", "allowed_hosts": [] }
+                }
+            }
+        });
+        let err =
+            validate_required_fields(&spec).expect_err("missing per-task artifact should fail");
+        assert!(
+            err.to_string().contains("/runtime/agent/artifact"),
+            "expected missing artifact error: {}",
+            err
+        );
+    }
+
+    #[test]
     fn validate_required_fields_v1_accepts_flat_shape() {
         let spec = json!({
             "version": "1.0",
@@ -12700,7 +13276,8 @@ mod tests {
         )
         .expect("benchmark processing should succeed");
 
-        let manifest = load_json_file(&benchmark_dir.join("adapter_manifest.json")).expect("manifest");
+        let manifest =
+            load_json_file(&benchmark_dir.join("adapter_manifest.json")).expect("manifest");
         assert_eq!(
             manifest
                 .pointer("/adapter_id")
@@ -13341,7 +13918,8 @@ mod tests {
             err
         );
         assert!(
-            err.to_string().contains("did not match submitted worker_id"),
+            err.to_string()
+                .contains("did not match submitted worker_id"),
             "unexpected error: {}",
             err
         );
@@ -13571,7 +14149,8 @@ mod tests {
             }
         }
 
-        let backend = RemoteWorkerBackend::new(Arc::new(BadSchemaProtocol)).expect("remote backend");
+        let backend =
+            RemoteWorkerBackend::new(Arc::new(BadSchemaProtocol)).expect("remote backend");
         let dispatch = worker_dispatch_fixture(3, "trial_schema");
         let err = backend
             .submit(dispatch)
@@ -14366,8 +14945,14 @@ mod tests {
         );
         let mut in_flight_by_variant = BTreeMap::new();
         in_flight_by_variant.insert(dispatch.slot.variant_idx, 1);
-        write_run_control_v2(&run_dir, "run_1", "running", &in_flight_active_trials(&in_flight), None)
-            .expect("run control");
+        write_run_control_v2(
+            &run_dir,
+            "run_1",
+            "running",
+            &in_flight_active_trials(&in_flight),
+            None,
+        )
+        .expect("run control");
 
         write_parallel_worker_control_request(
             &run_dir,
@@ -14449,8 +15034,14 @@ mod tests {
         );
         let mut in_flight_by_variant = BTreeMap::new();
         in_flight_by_variant.insert(dispatch.slot.variant_idx, 1);
-        write_run_control_v2(&run_dir, "run_1", "running", &in_flight_active_trials(&in_flight), None)
-            .expect("run control");
+        write_run_control_v2(
+            &run_dir,
+            "run_1",
+            "running",
+            &in_flight_active_trials(&in_flight),
+            None,
+        )
+        .expect("run control");
 
         write_parallel_worker_control_request(
             &run_dir,
@@ -14494,7 +15085,10 @@ mod tests {
             .and_then(|v| v.as_object())
             .cloned()
             .unwrap_or_default();
-        assert!(active.is_empty(), "active trials should be empty after kill");
+        assert!(
+            active.is_empty(),
+            "active trials should be empty after kill"
+        );
         let trial_state = load_json_file(&trial_dir.join("trial_state.json")).expect("trial state");
         assert_eq!(
             trial_state
@@ -14609,7 +15203,8 @@ mod tests {
 
         let mut pruned_variants: HashSet<usize> = HashSet::new();
         let mut consecutive_failures: BTreeMap<usize, usize> = BTreeMap::new();
-        let trial_result = TrialExecutionResult::minimal("trial_1".to_string(), "completed", Some(0));
+        let trial_result =
+            TrialExecutionResult::minimal("trial_1".to_string(), "completed", Some(0));
         let mut sink = FlushFailRunSink;
         let err = RunCoordinator::commit_trial_slot(
             &run_dir,
@@ -14959,6 +15554,29 @@ mod tests {
     }
 
     #[test]
+    fn parse_task_boundary_v2_extracts_task_image_and_workspace() {
+        let task = json!({
+            "schema_version": "task_boundary_v2",
+            "task": {
+                "id": "task_1",
+                "image": "swebench/sweb.eval.x86_64.astropy__astropy-12907:latest",
+                "workspace": "/testbed",
+                "prompt": "solve this"
+            },
+            "workspace_files": [],
+            "mount_references": [],
+            "limits": {}
+        });
+
+        let parsed = parse_task_boundary_from_dataset_task(&task).expect("parse boundary");
+        assert_eq!(
+            parsed.task_image.as_deref(),
+            Some("swebench/sweb.eval.x86_64.astropy__astropy-12907:latest")
+        );
+        assert_eq!(parsed.task_workspace.as_deref(), Some("/testbed"));
+    }
+
+    #[test]
     fn parse_task_boundary_rejects_unsupported_keys() {
         let task = json!({
             "schema_version": "task_boundary_v1",
@@ -15001,6 +15619,8 @@ mod tests {
             workspace_files: Vec::new(),
             mount_references: Vec::new(),
             limits: TaskBoundaryLimits::default(),
+            task_image: None,
+            task_workspace: None,
         };
         let not_required = TaskBoundaryPolicy {
             require_workspace_materialization: false,
@@ -15057,6 +15677,25 @@ mod tests {
                 .unwrap_or(""),
             "task_1"
         );
+    }
+
+    #[test]
+    fn parse_task_boundary_from_trial_input_preserves_task_image_and_workspace() {
+        let input = json!({
+            "schema_version": "agent_task_v1",
+            "task": {
+                "id": "task_1",
+                "image": "swebench/sweb.eval.x86_64.astropy__astropy-12907:latest",
+                "workspace": "/testbed",
+                "input": { "prompt": "hello" }
+            }
+        });
+        let parsed = parse_task_boundary_from_trial_input(&input).expect("agent task input");
+        assert_eq!(
+            parsed.task_image.as_deref(),
+            Some("swebench/sweb.eval.x86_64.astropy__astropy-12907:latest")
+        );
+        assert_eq!(parsed.task_workspace.as_deref(), Some("/testbed"));
     }
 
     #[test]
@@ -15185,6 +15824,8 @@ mod tests {
                 max_tool_calls: Some(9),
                 trial_seconds: Some(90),
             },
+            task_image: None,
+            task_workspace: None,
         };
 
         let input = build_agent_task(
@@ -15218,6 +15859,77 @@ mod tests {
                 .and_then(|v| v.as_str())
                 .unwrap_or(""),
             "input.txt"
+        );
+    }
+
+    #[test]
+    fn normalize_task_prompt_aliases_deduplicates_identical_fields() {
+        let task = json!({
+            "id": "swebench_astropy_astropy_12907",
+            "input": { "prompt": "same prompt", "repo": "astropy/astropy" },
+            "prompt": "same prompt",
+            "swebench": {
+                "input": { "prompt": "same prompt", "base_commit": "abc123" }
+            }
+        });
+
+        let normalized = normalize_task_prompt_aliases(&task);
+        assert_eq!(
+            normalized
+                .pointer("/input/prompt")
+                .and_then(|v| v.as_str())
+                .unwrap_or(""),
+            "same prompt"
+        );
+        assert!(
+            normalized.pointer("/prompt").is_none(),
+            "top-level duplicated prompt should be removed"
+        );
+        assert!(
+            normalized.pointer("/swebench/input/prompt").is_none(),
+            "nested duplicated prompt should be removed"
+        );
+        assert_eq!(
+            normalized
+                .pointer("/swebench/input/base_commit")
+                .and_then(|v| v.as_str())
+                .unwrap_or(""),
+            "abc123"
+        );
+    }
+
+    #[test]
+    fn normalize_task_prompt_aliases_preserves_distinct_prompt_fields() {
+        let task = json!({
+            "id": "task_1",
+            "input": { "prompt": "canonical prompt" },
+            "prompt": "different top-level prompt",
+            "swebench": {
+                "input": { "prompt": "different nested prompt" }
+            }
+        });
+
+        let normalized = normalize_task_prompt_aliases(&task);
+        assert_eq!(
+            normalized
+                .pointer("/input/prompt")
+                .and_then(|v| v.as_str())
+                .unwrap_or(""),
+            "canonical prompt"
+        );
+        assert_eq!(
+            normalized
+                .pointer("/prompt")
+                .and_then(|v| v.as_str())
+                .unwrap_or(""),
+            "different top-level prompt"
+        );
+        assert_eq!(
+            normalized
+                .pointer("/swebench/input/prompt")
+                .and_then(|v| v.as_str())
+                .unwrap_or(""),
+            "different nested prompt"
         );
     }
 
@@ -15386,6 +16098,18 @@ mod tests {
         assert!(should_retry_outcome("error", "0", &triggers));
         assert!(should_retry_outcome("timeout", "0", &triggers));
         assert!(!should_retry_outcome("success", "1", &triggers)); // failure not in triggers
+    }
+
+    #[test]
+    fn benchmark_verdict_maps_to_trial_outcome() {
+        assert_eq!(benchmark_verdict_to_trial_outcome("pass"), Some("success"));
+        assert_eq!(benchmark_verdict_to_trial_outcome("fail"), Some("failure"));
+        assert_eq!(
+            benchmark_verdict_to_trial_outcome("missing"),
+            Some("missing")
+        );
+        assert_eq!(benchmark_verdict_to_trial_outcome("error"), Some("error"));
+        assert_eq!(benchmark_verdict_to_trial_outcome("unknown"), None);
     }
 
     // -----------------------------------------------------------------------

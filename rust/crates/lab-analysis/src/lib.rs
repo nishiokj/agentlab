@@ -639,8 +639,8 @@ fn query_run_with_materialized_db(context: &RunAnalysisContext, sql: &str) -> Re
 fn query_run_with_ephemeral_db(context: &RunAnalysisContext, sql: &str) -> Result<QueryTable> {
     ensure_dir(&context.facts_dir)?;
     ensure_fact_files(&context.facts_dir)?;
-    let conn =
-        Connection::open_in_memory().context("failed to open in-memory DuckDB for fallback query")?;
+    let conn = Connection::open_in_memory()
+        .context("failed to open in-memory DuckDB for fallback query")?;
     load_json_extension(&conn)?;
     let bundle_sql = load_view_bundle_sql(context.view_set)?;
     let load_sql = build_load_sql_absolute(context, bundle_sql.as_deref());

@@ -1457,8 +1457,14 @@ fn build_live_scoreboard_table(
 fn fetch_scoreboard_metric_names(run_dir: &Path, metric_limit: usize) -> Result<Vec<String>> {
     let sql = format!(
         "SELECT metric_name
-         FROM metrics_long
-         WHERE metric_name <> 'status_code'
+         FROM metrics_long m
+         WHERE m.metric_name <> 'status_code'
+           AND m.metric_name <> 'success'
+           AND NOT EXISTS (
+             SELECT 1
+             FROM trials t
+             WHERE t.primary_metric_name = m.metric_name
+           )
          GROUP BY metric_name
          ORDER BY metric_name
          LIMIT {}",

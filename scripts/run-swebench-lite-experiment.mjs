@@ -27,7 +27,20 @@ function loadAgentRuntimeCommand() {
     return fromShell.trim().split(/\s+/);
   }
 
-  return ['python', './harness.py', 'run'];
+  const defaultCandidates = [
+    ['python', './harness.py', 'run'],
+    ['python', './examples/clean_harness/harness.py', 'run'],
+  ];
+  for (const candidate of defaultCandidates) {
+    const entry = candidate[1];
+    if (existsSync(resolve(process.cwd(), entry))) {
+      return candidate;
+    }
+  }
+
+  throw new Error(
+    'No harness entrypoint found. Set AGENTLAB_AGENT_RUNTIME_CMD_JSON, or add ./harness.py or ./examples/clean_harness/harness.py',
+  );
 }
 
 function loadPositiveInt(raw, fallback, label) {
