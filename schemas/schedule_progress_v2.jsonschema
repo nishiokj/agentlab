@@ -1,0 +1,68 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agent-lab.local/schemas/schedule_progress_v2.json",
+  "title": "Schedule Progress v2",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "run_id",
+    "total_slots",
+    "next_schedule_index",
+    "next_trial_index",
+    "schedule",
+    "completed_slots",
+    "pruned_variants",
+    "consecutive_failures",
+    "use_container",
+    "updated_at"
+  ],
+  "properties": {
+    "schema_version": { "const": "schedule_progress_v2" },
+    "run_id": { "type": "string", "minLength": 1 },
+    "total_slots": { "type": "integer", "minimum": 0 },
+    "next_schedule_index": { "type": "integer", "minimum": 0 },
+    "next_trial_index": { "type": "integer", "minimum": 0 },
+    "schedule": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["variant_idx", "task_idx", "repl_idx"],
+        "properties": {
+          "variant_idx": { "type": "integer", "minimum": 0 },
+          "task_idx": { "type": "integer", "minimum": 0 },
+          "repl_idx": { "type": "integer", "minimum": 0 }
+        }
+      }
+    },
+    "completed_slots": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["schedule_index", "trial_id", "status", "slot_commit_id", "attempt"],
+        "properties": {
+          "schedule_index": { "type": "integer", "minimum": 0 },
+          "trial_id": { "type": "string" },
+          "status": {
+            "type": "string",
+            "enum": ["completed", "failed", "skipped_pruned"]
+          },
+          "slot_commit_id": { "type": "string", "minLength": 1 },
+          "attempt": { "type": "integer", "minimum": 1 }
+        }
+      }
+    },
+    "pruned_variants": {
+      "type": "array",
+      "items": { "type": "integer", "minimum": 0 }
+    },
+    "consecutive_failures": {
+      "type": "object",
+      "additionalProperties": { "type": "integer", "minimum": 0 }
+    },
+    "use_container": { "type": "boolean" },
+    "updated_at": { "type": "string", "format": "date-time" }
+  }
+}

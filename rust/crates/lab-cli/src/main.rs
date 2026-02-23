@@ -163,6 +163,15 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+    #[command(about = "Recover a durable run after stale owner crash/interruption")]
+    Recover {
+        #[arg(long)]
+        run_dir: PathBuf,
+        #[arg(long)]
+        force: bool,
+        #[arg(long)]
+        json: bool,
+    },
     #[command(about = "Kill a running or paused experiment immediately")]
     Kill {
         run: String,
@@ -285,6 +294,13 @@ enum Commands {
         force: bool,
         #[arg(long, value_enum)]
         profile: Option<InitProfileArg>,
+    },
+    Preflight {
+        experiment: PathBuf,
+        #[arg(long)]
+        overrides: Option<PathBuf>,
+        #[arg(long)]
+        json: bool,
     },
     Clean {
         #[arg(long)]
@@ -545,6 +561,37 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
             }
             println!("run_id: {}", result.run_id);
             println!("run_dir: {}", result.run_dir.display());
+        }
+        Commands::Recover {
+            run_dir,
+            force,
+            json,
+        } => {
+            let result = lab_runner::recover_run(&run_dir, force)?;
+            if json {
+                return Ok(Some(json!({
+                    "ok": true,
+                    "command": "recover",
+                    "recover": recover_result_to_json(&result),
+                })));
+            }
+            println!("run_id: {}", result.run_id);
+            println!("previous_status: {}", result.previous_status);
+            println!("recovered_status: {}", result.recovered_status);
+            println!(
+                "rewound_to_schedule_idx: {}",
+                result.rewound_to_schedule_idx
+            );
+            println!("active_trials_released: {}", result.active_trials_released);
+            println!(
+                "committed_slots_verified: {}",
+                result.committed_slots_verified
+            );
+            if result.notes.is_empty() {
+                println!("notes: (none)");
+            } else {
+                println!("notes: {}", result.notes.join(" | "));
+            }
         }
         Commands::Kill { run, json } => {
             let run_dir = resolve_run_dir_arg(&run)?;
@@ -980,6 +1027,32 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
             );
             println!("next: lab describe {}", exp_show);
         }
+        Commands::Preflight {
+            experiment,
+            overrides,
+            json,
+        } => {
+            let report = lab_runner::preflight_experiment(&experiment, overrides.as_deref())?;
+            if json {
+                return Ok(Some(json!({
+                    "ok": report.passed,
+                    "command": "preflight",
+                    "checks": report.checks.iter().map(|c| json!({
+                        "name": c.name,
+                        "passed": c.passed,
+                        "severity": match c.severity {
+                            lab_runner::PreflightSeverity::Error => "error",
+                            lab_runner::PreflightSeverity::Warning => "warning",
+                        },
+                        "message": c.message,
+                    })).collect::<Vec<_>>()
+                })));
+            }
+            print_preflight_report(&report);
+            if !report.passed {
+                std::process::exit(1);
+            }
+        }
         Commands::Clean { init, runs } => {
             let root = std::env::current_dir()?;
             let lab_dir = root.join(".lab");
@@ -1262,6 +1335,7 @@ fn command_json_mode(command: &Commands) -> bool {
         | Commands::Pause { json, .. }
         | Commands::Resume { json, .. }
         | Commands::Continue { json, .. }
+        | Commands::Recover { json, .. }
         | Commands::Kill { json, .. }
         | Commands::Describe { json, .. }
         | Commands::Views { json, .. }
@@ -1271,7 +1345,8 @@ fn command_json_mode(command: &Commands) -> bool {
         | Commands::KnobsValidate { json, .. }
         | Commands::SchemaValidate { json, .. }
         | Commands::HooksValidate { json, .. }
-        | Commands::Publish { json, .. } => *json,
+        | Commands::Publish { json, .. }
+        | Commands::Preflight { json, .. } => *json,
         _ => false,
     }
 }
@@ -1342,6 +1417,18 @@ fn resume_result_to_json(result: &lab_runner::ResumeResult) -> Value {
     })
 }
 
+fn recover_result_to_json(result: &lab_runner::RecoverResult) -> Value {
+    json!({
+        "run_id": result.run_id,
+        "previous_status": result.previous_status,
+        "recovered_status": result.recovered_status,
+        "rewound_to_schedule_idx": result.rewound_to_schedule_idx,
+        "active_trials_released": result.active_trials_released,
+        "committed_slots_verified": result.committed_slots_verified,
+        "notes": result.notes,
+    })
+}
+
 fn parse_set_bindings(values: &[String]) -> Result<BTreeMap<String, Value>> {
     let mut out = BTreeMap::new();
     for raw in values {
@@ -1378,7 +1465,8 @@ fn summary_to_json(summary: &lab_runner::ExperimentSummary) -> Value {
         "scheduling": summary.scheduling,
         "state_policy": summary.state_policy,
         "comparison": summary.comparison,
-        "retry_max_attempts": summary.retry_max_attempts
+        "retry_max_attempts": summary.retry_max_attempts,
+        "preflight_warnings": summary.preflight_warnings
     })
 }
 
@@ -1400,6 +1488,31 @@ fn print_summary(summary: &lab_runner::ExperimentSummary) {
     }
     if let Some(mode) = &summary.causal_extraction {
         println!("causal_extraction: {}", mode);
+    }
+    if !summary.preflight_warnings.is_empty() {
+        println!("preflight_warnings:");
+        for w in &summary.preflight_warnings {
+            println!("  - {}", w);
+        }
+    }
+}
+
+fn print_preflight_report(report: &lab_runner::PreflightReport) {
+    for check in &report.checks {
+        let icon = if check.passed {
+            "PASS"
+        } else {
+            match check.severity {
+                lab_runner::PreflightSeverity::Error => "FAIL",
+                lab_runner::PreflightSeverity::Warning => "WARN",
+            }
+        };
+        println!("[{}] {}: {}", icon, check.name, check.message);
+    }
+    if report.passed {
+        println!("\npreflight: all checks passed");
+    } else {
+        println!("\npreflight: FAILED — resolve errors above before running");
     }
 }
 
@@ -1457,8 +1570,14 @@ fn build_live_scoreboard_table(
 fn fetch_scoreboard_metric_names(run_dir: &Path, metric_limit: usize) -> Result<Vec<String>> {
     let sql = format!(
         "SELECT metric_name
-         FROM metrics_long
-         WHERE metric_name <> 'status_code'
+         FROM metrics_long m
+         WHERE m.metric_name <> 'status_code'
+           AND m.metric_name <> 'success'
+           AND NOT EXISTS (
+             SELECT 1
+             FROM trials t
+             WHERE t.primary_metric_name = m.metric_name
+           )
          GROUP BY metric_name
          ORDER BY metric_name
          LIMIT {}",

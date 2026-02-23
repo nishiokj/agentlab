@@ -1,0 +1,32 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agent-lab.local/schemas/recovery_report_v1.json",
+  "title": "Recovery Report v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "run_id",
+    "previous_status",
+    "recovered_status",
+    "rewound_to_schedule_idx",
+    "active_trials_released",
+    "committed_slots_verified",
+    "notes",
+    "recovered_at"
+  ],
+  "properties": {
+    "schema_version": { "const": "recovery_report_v1" },
+    "run_id": { "type": "string", "minLength": 1 },
+    "previous_status": { "type": "string", "minLength": 1 },
+    "recovered_status": { "type": "string", "minLength": 1 },
+    "rewound_to_schedule_idx": { "type": "integer", "minimum": 0 },
+    "active_trials_released": { "type": "integer", "minimum": 0 },
+    "committed_slots_verified": { "type": "integer", "minimum": 0 },
+    "notes": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "recovered_at": { "type": "string", "format": "date-time" }
+  }
+}

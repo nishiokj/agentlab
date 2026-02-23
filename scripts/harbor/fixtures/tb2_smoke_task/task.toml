@@ -1,0 +1,10 @@
+id = "tb2_smoke_echo"
+prompt = "Print diagnostics, create a patch artifact, and exit successfully."
+
+[environment]
+image = "python:3.11-slim"
+workspace = "/agentlab/workspace"
+
+[limits]
+max_runtime_seconds = 60
+max_tool_calls = 20

@@ -26,6 +26,10 @@ pub struct RunManifestRecord {
 pub struct TrialRecord {
     pub run_id: String,
     pub trial_id: String,
+    pub schedule_idx: usize,
+    pub slot_commit_id: String,
+    pub attempt: usize,
+    pub row_seq: usize,
     pub baseline_id: String,
     pub workload_type: String,
     pub variant_id: String,
@@ -51,6 +55,10 @@ pub struct TrialRecord {
 pub struct MetricRow {
     pub run_id: String,
     pub trial_id: String,
+    pub schedule_idx: usize,
+    pub slot_commit_id: String,
+    pub attempt: usize,
+    pub row_seq: usize,
     pub variant_id: String,
     pub task_id: String,
     pub repl_idx: usize,
@@ -65,6 +73,10 @@ pub struct MetricRow {
 pub struct EventRow {
     pub run_id: String,
     pub trial_id: String,
+    pub schedule_idx: usize,
+    pub slot_commit_id: String,
+    pub attempt: usize,
+    pub row_seq: usize,
     pub variant_id: String,
     pub task_id: String,
     pub repl_idx: usize,
@@ -79,6 +91,10 @@ pub struct EventRow {
 pub struct VariantSnapshotRow {
     pub run_id: String,
     pub trial_id: String,
+    pub schedule_idx: usize,
+    pub slot_commit_id: String,
+    pub attempt: usize,
+    pub row_seq: usize,
     pub variant_id: String,
     pub baseline_id: String,
     pub task_id: String,
@@ -98,6 +114,7 @@ pub trait RunSink {
 }
 
 pub struct JsonlRunSink {
+    facts_dir: PathBuf,
     run_manifest_path: PathBuf,
     trials_writer: BufWriter<File>,
     metrics_writer: BufWriter<File>,
@@ -111,6 +128,7 @@ impl JsonlRunSink {
         fs::create_dir_all(&facts_dir)?;
 
         Ok(Self {
+            facts_dir: facts_dir.clone(),
             run_manifest_path: facts_dir.join(FACTS_RUN_MANIFEST_FILE),
             trials_writer: open_append(facts_dir.join(FACTS_TRIALS_FILE))?,
             metrics_writer: open_append(facts_dir.join(FACTS_METRICS_LONG_FILE))?,
@@ -156,6 +174,13 @@ impl RunSink for JsonlRunSink {
         self.metrics_writer.flush()?;
         self.events_writer.flush()?;
         self.variant_snapshots_writer.flush()?;
+        self.trials_writer.get_ref().sync_all()?;
+        self.metrics_writer.get_ref().sync_all()?;
+        self.events_writer.get_ref().sync_all()?;
+        self.variant_snapshots_writer.get_ref().sync_all()?;
+        if let Ok(dir) = File::open(&self.facts_dir) {
+            let _ = dir.sync_all();
+        }
         Ok(())
     }
 }
@@ -202,6 +227,10 @@ mod tests {
         sink.append_trial_record(&TrialRecord {
             run_id: "run_123".to_string(),
             trial_id: "trial_1".to_string(),
+            schedule_idx: 0,
+            slot_commit_id: "slot_test".to_string(),
+            attempt: 1,
+            row_seq: 0,
             baseline_id: "base".to_string(),
             workload_type: "agent_eval".to_string(),
             variant_id: "base".to_string(),
@@ -227,6 +256,10 @@ mod tests {
             MetricRow {
                 run_id: "run_123".to_string(),
                 trial_id: "trial_1".to_string(),
+                schedule_idx: 0,
+                slot_commit_id: "slot_test".to_string(),
+                attempt: 1,
+                row_seq: 0,
                 variant_id: "base".to_string(),
                 task_id: "task_1".to_string(),
                 repl_idx: 0,
@@ -238,6 +271,10 @@ mod tests {
             MetricRow {
                 run_id: "run_123".to_string(),
                 trial_id: "trial_1".to_string(),
+                schedule_idx: 0,
+                slot_commit_id: "slot_test".to_string(),
+                attempt: 1,
+                row_seq: 1,
                 variant_id: "base".to_string(),
                 task_id: "task_1".to_string(),
                 repl_idx: 0,
@@ -251,6 +288,10 @@ mod tests {
         sink.append_event_rows(&[EventRow {
             run_id: "run_123".to_string(),
             trial_id: "trial_1".to_string(),
+            schedule_idx: 0,
+            slot_commit_id: "slot_test".to_string(),
+            attempt: 1,
+            row_seq: 0,
             variant_id: "base".to_string(),
             task_id: "task_1".to_string(),
             repl_idx: 0,
@@ -263,6 +304,10 @@ mod tests {
         sink.append_variant_snapshot(&[VariantSnapshotRow {
             run_id: "run_123".to_string(),
             trial_id: "trial_1".to_string(),
+            schedule_idx: 0,
+            slot_commit_id: "slot_test".to_string(),
+            attempt: 1,
+            row_seq: 0,
             variant_id: "base".to_string(),
             baseline_id: "base".to_string(),
             task_id: "task_1".to_string(),
