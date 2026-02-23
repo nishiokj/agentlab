@@ -2,12 +2,9 @@ import assert from 'node:assert/strict';
 import test, { describe } from 'node:test';
 
 import {
-  BUILTIN_COMMAND_ADAPTER,
   ExperimentBuilder,
   ExperimentType,
   Metric,
-  PREBUILT_CODEX_ADAPTER,
-  PREBUILT_REX_JESUS_ADAPTER,
 } from '../src/experiment-builder.js';
 import type { DesignPolicies, MetricDef } from '../src/experiment-builder.js';
 
@@ -42,8 +39,7 @@ describe('ExperimentBuilder defaults', () => {
   });
 
   test('runtime defaults are set', () => {
-    assert.equal(spec.runtime.agent.mode, 'custom_image');
-    assert.deepEqual(spec.runtime.agent.custom_image?.entrypoint, ['node', './agent_loop.js', 'run']);
+    assert.deepEqual(spec.runtime.agent.command, ['node', './agent_loop.js', 'run']);
     assert.equal(spec.runtime.policy.timeout_ms, 600_000);
     assert.equal(spec.runtime.policy.sandbox.mode, 'local');
     assert.equal(spec.runtime.policy.network.mode, 'none');
@@ -64,7 +60,7 @@ describe('ExperimentBuilder validation', () => {
       (err: Error) => {
         assert.ok(err.message.includes('required fields not set'));
         assert.ok(err.message.includes('dataset path'));
-        assert.ok(err.message.includes('runtime.agent.custom_image.entrypoint'));
+        assert.ok(err.message.includes('runtime.agent.command'));
         return true;
       },
     );
@@ -104,59 +100,19 @@ describe('ExperimentBuilder validation', () => {
     assert.equal(spec.variant_plan.length, 1);
   });
 
-  test('build throws when adapter id/version are incomplete', () => {
-    assert.throws(
-      () => validBuilder().agentAdapter('prebuilt.codex_cli', '').build(),
-      (err: Error) => {
-        assert.ok(err.message.includes('runtime.agent.adapter.version'));
-        return true;
-      },
-    );
-    assert.throws(
-      () => validBuilder().agentAdapter('', 'v1').build(),
-      (err: Error) => {
-        assert.ok(err.message.includes('runtime.agent.adapter.id'));
-        return true;
-      },
-    );
-  });
 });
 
 describe('ExperimentBuilder runtime APIs', () => {
   test('agentLoop sets entrypoint', () => {
     const spec = validBuilder().agentLoop(['python', 'agent_loop.py']).build();
-    assert.deepEqual(spec.runtime.agent.custom_image?.entrypoint, ['python', 'agent_loop.py']);
+    assert.deepEqual(spec.runtime.agent.command, ['python', 'agent_loop.py']);
   });
 
   test('customAgentImage sets container mode + image', () => {
     const spec = validBuilder().customAgentImage('ghcr.io/acme/agent:latest', ['python', 'run.py']).build();
-    assert.equal(spec.runtime.agent.mode, 'custom_image');
-    assert.equal(spec.runtime.agent.custom_image?.image, 'ghcr.io/acme/agent:latest');
+    assert.deepEqual(spec.runtime.agent.command, ['python', 'run.py']);
+    assert.equal(spec.runtime.agent.image, 'ghcr.io/acme/agent:latest');
     assert.equal(spec.runtime.policy.sandbox.mode, 'container');
-    assert.equal(spec.runtime.policy.sandbox.image, 'ghcr.io/acme/agent:latest');
-  });
-
-  test('agentRef sets known_agent_ref and clears custom_image', () => {
-    const spec = validBuilder().agentRef('swe-agent', '1.2.3', { registry: 'local' }).build();
-    assert.equal(spec.runtime.agent.mode, 'known_agent_ref');
-    assert.equal(spec.runtime.agent.known_agent_ref?.id, 'swe-agent');
-    assert.equal(spec.runtime.agent.known_agent_ref?.version, '1.2.3');
-    assert.equal(spec.runtime.agent.known_agent_ref?.registry, 'local');
-    assert.equal(spec.runtime.agent.custom_image, undefined);
-  });
-
-  test('agent adapter helpers set prebuilt and builtin adapter refs', () => {
-    const prebuiltCodex = validBuilder().usePrebuiltCodexAdapter().build();
-    assert.equal(prebuiltCodex.runtime.agent.adapter?.id, PREBUILT_CODEX_ADAPTER.id);
-    assert.equal(prebuiltCodex.runtime.agent.adapter?.version, PREBUILT_CODEX_ADAPTER.version);
-
-    const prebuiltRex = validBuilder().usePrebuiltRexJesusAdapter('v2').build();
-    assert.equal(prebuiltRex.runtime.agent.adapter?.id, PREBUILT_REX_JESUS_ADAPTER.id);
-    assert.equal(prebuiltRex.runtime.agent.adapter?.version, 'v2');
-
-    const builtin = validBuilder().useBuiltinAdapter().build();
-    assert.equal(builtin.runtime.agent.adapter?.id, BUILTIN_COMMAND_ADAPTER.id);
-    assert.equal(builtin.runtime.agent.adapter?.version, BUILTIN_COMMAND_ADAPTER.version);
   });
 
   test('networkMode and timeoutMs are applied', () => {

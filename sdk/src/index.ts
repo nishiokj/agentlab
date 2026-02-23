@@ -1,11 +1,8 @@
 export { LabClient, LabRunnerError } from './client.js';
 export {
-  BUILTIN_COMMAND_ADAPTER,
   ExperimentBuilder,
   ExperimentType,
   Metric,
-  PREBUILT_CODEX_ADAPTER,
-  PREBUILT_REX_JESUS_ADAPTER,
 } from './experiment-builder.js';
 export {
   createOutcomeBoundary,
@@ -85,11 +82,7 @@ export type {
   DependencyAssetEntry,
   DesignPolicies,
   ExperimentSpec,
-  AgentRuntimeMode,
-  AgentAdapterRef,
-  AgentRuntimeOverrides,
-  KnownAgentRef,
-  CustomAgentImage,
+  AgentIoConfig,
   GuardrailDef,
   DependencyFileStagingEntry,
   MetricAggregate,

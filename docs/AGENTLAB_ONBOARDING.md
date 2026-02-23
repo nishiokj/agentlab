@@ -1,42 +1,48 @@
 # AgentLab Onboarding
 
-This repo was scaffolded with `lab init`.
+This repo is `runtime.agent`-first.
 
-## What You Just Got
+## Starter File
 
 - `experiment.yaml`
-- `tasks.jsonl`
 
 ## Mental Model
 
-AgentLab runs an agent runtime command for each task/variant/replication.
+For each task/variant/replication, runner:
 
-- The runner writes `trial_input.json` for a trial.
-- Your runtime reads `trial_input.json` and writes `result.json`.
-- AgentLab analyzes results and generates a report.
+1. materializes trial input files,
+2. executes one runtime command,
+3. reads `agent_result_v1`, and
+4. appends run facts/evidence.
 
-There are currently two CLIs:
-- Python `lab` (legacy/dev flows)
-- Rust `lab-cli` (primary runtime/runner path)
+Your runtime program should:
 
-In local (non-container) mode, the runtime command is executed with:
+1. read task/bindings/dependencies/policy inputs,
+2. run autonomously,
+3. write `agent_result_v1` to the output path.
 
-- CWD set to the trial output directory (`.../.lab/runs/<run_id>/trials/<trial_id>/`).
-- Env vars:
-  - `AGENTLAB_TRIAL_INPUT`
-  - `AGENTLAB_RESULT_PATH`
-  - `AGENTLAB_TRAJECTORY_PATH` (optional)
-  - task/bindings/dependencies/policy paths
-- Control is adapter-owned; runner persists active control metadata in `runtime/run_control.json`.
+## Runtime Contract
 
-## `tasks.jsonl`
+Use `runtime.agent` in `experiment.yaml`:
 
-`tasks.jsonl` is the dataset: one JSON object per line. The object is passed to the runtime as `trial_input.task`.
+- `runtime.agent.command` (required)
+- `runtime.agent.image` (required for container mode)
+- optional `runtime.agent.io.input_arg` / `output_arg`
+- optional `runtime.agent.env` / `env_from_host`
 
-## How To Try
+Runner env vars include:
 
-1. Update `experiment.yaml` to use lightweight `runtime.agent` fields only: `command` (string|string[]), `image` (for container mode), and optional `io.input_arg` / `io.output_arg` for your CLI flags.
-2. Implement your runtime command to read `trial_input.json` and write `result.json`.
-3. Run (Python): `lab run experiment.yaml`
-4. Run (Rust, containerized): `cargo run -p lab-cli -- run experiment.yaml --container`
-5. Open: `.lab/runs/<run_id>/report/index.html` (Python only for now)
+- `AGENTLAB_TASK_PATH`
+- `AGENTLAB_BINDINGS_PATH`
+- `AGENTLAB_DEPENDENCIES_PATH`
+- `AGENTLAB_POLICY_PATH`
+- `AGENTLAB_RESULT_PATH`
+- `AGENTLAB_TRAJECTORY_PATH`
+
+## Try It
+
+```bash
+cd rust
+cargo run -p lab-cli -- describe ../.lab/experiment.yaml
+cargo run -p lab-cli -- run ../.lab/experiment.yaml --executor local_docker
+```

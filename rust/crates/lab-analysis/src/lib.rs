@@ -116,15 +116,22 @@ fn duckdb_disabled_error(op: &str) -> anyhow::Error {
 #[cfg(feature = "duckdb_engine")]
 pub fn list_views(run_dir: &Path) -> Result<Vec<String>> {
     let context = load_run_context(run_dir)?;
-    materialize_run_duckdb(&context)?;
-    let conn = open_run_connection(&context)?;
-    let table = execute_select_query(
-        &conn,
-        "SELECT view_name AS table_name
-         FROM duckdb_views()
-         WHERE schema_name = 'main'
-         ORDER BY view_name",
-    )?;
+    let list_sql = "SELECT view_name AS table_name
+                    FROM duckdb_views()
+                    WHERE schema_name = 'main'
+                    ORDER BY view_name";
+    let table = match query_run_with_materialized_db(&context, list_sql) {
+        Ok(table) => table,
+        Err(err) if is_duckdb_lock_contention_error(&err) => {
+            query_run_with_ephemeral_db(&context, list_sql).with_context(|| {
+                format!(
+                    "DuckDB lock contention while listing views for {}. Falling back to in-memory view materialization.",
+                    run_dir.display()
+                )
+            })?
+        }
+        Err(err) => return Err(err),
+    };
     let mut out = Vec::new();
     for row in table.rows {
         if let Some(name) = row.first().and_then(Value::as_str) {
@@ -159,9 +166,18 @@ pub fn query_view(run_dir: &Path, view_name: &str, limit: usize) -> Result<Query
 pub fn query_run(run_dir: &Path, sql: &str) -> Result<QueryTable> {
     let normalized = validate_read_only_sql(sql)?;
     let context = load_run_context(run_dir)?;
-    materialize_run_duckdb(&context)?;
-    let conn = open_run_connection(&context)?;
-    execute_select_query(&conn, &normalized)
+    match query_run_with_materialized_db(&context, &normalized) {
+        Ok(table) => Ok(table),
+        Err(err) if is_duckdb_lock_contention_error(&err) => {
+            query_run_with_ephemeral_db(&context, &normalized).with_context(|| {
+                format!(
+                    "DuckDB lock contention for {}. Falling back to in-memory query execution.",
+                    run_dir.display()
+                )
+            })
+        }
+        Err(err) => Err(err),
+    }
 }
 
 #[cfg(not(feature = "duckdb_engine"))]
@@ -610,6 +626,38 @@ fn open_run_connection(context: &RunAnalysisContext) -> Result<Connection> {
         .with_context(|| format!("failed to open DuckDB {}", db_path.display()))?;
     load_json_extension(&conn)?;
     Ok(conn)
+}
+
+#[cfg(feature = "duckdb_engine")]
+fn query_run_with_materialized_db(context: &RunAnalysisContext, sql: &str) -> Result<QueryTable> {
+    materialize_run_duckdb(context)?;
+    let conn = open_run_connection(context)?;
+    execute_select_query(&conn, sql)
+}
+
+#[cfg(feature = "duckdb_engine")]
+fn query_run_with_ephemeral_db(context: &RunAnalysisContext, sql: &str) -> Result<QueryTable> {
+    ensure_dir(&context.facts_dir)?;
+    ensure_fact_files(&context.facts_dir)?;
+    let conn =
+        Connection::open_in_memory().context("failed to open in-memory DuckDB for fallback query")?;
+    load_json_extension(&conn)?;
+    let bundle_sql = load_view_bundle_sql(context.view_set)?;
+    let load_sql = build_load_sql_absolute(context, bundle_sql.as_deref());
+    conn.execute_batch(&load_sql)
+        .context("failed to materialize in-memory DuckDB fallback views")?;
+    execute_select_query(&conn, sql)
+}
+
+#[cfg(feature = "duckdb_engine")]
+fn is_duckdb_lock_contention_error(err: &anyhow::Error) -> bool {
+    let message = err.to_string().to_ascii_lowercase();
+    message.contains("lock")
+        && (message.contains("duckdb")
+            || message.contains("io error")
+            || message.contains("conflicting lock")
+            || message.contains("already open")
+            || message.contains("resource temporarily unavailable"))
 }
 
 #[cfg(feature = "duckdb_engine")]

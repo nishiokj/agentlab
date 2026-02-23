@@ -10,6 +10,7 @@ Contract:
 
 import argparse
 import json
+import os
 import sys
 import time
 
@@ -18,8 +19,10 @@ def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(description="Example evaluation harness")
     p.add_argument("--temperature", type=float, default=0.7)
     p.add_argument("--model", type=str, default="claude-3.5-sonnet")
-    p.add_argument("input_path", type=str, nargs="?", default="/in/task.json")
-    p.add_argument("output_path", type=str, nargs="?", default="/out/result.json")
+    p.add_argument("--input", dest="input_flag", type=str)
+    p.add_argument("--output", dest="output_flag", type=str)
+    p.add_argument("input_path", type=str, nargs="?", default=None)
+    p.add_argument("output_path", type=str, nargs="?", default=None)
     return p
 
 
@@ -42,13 +45,40 @@ def solve(task: dict, temperature: float, model: str) -> dict:
 
 def main() -> None:
     args = build_parser().parse_args()
+    input_path = (
+        args.input_flag
+        or args.input_path
+        or os.environ.get("AGENTLAB_TASK_PATH")
+        or "/in/task.json"
+    )
+    output_path = (
+        args.output_flag
+        or args.output_path
+        or os.environ.get("AGENTLAB_RESULT_PATH")
+        or "/out/result.json"
+    )
 
-    with open(args.input_path) as f:
+    model = args.model
+    temperature = args.temperature
+    bindings_path = os.environ.get("AGENTLAB_BINDINGS_PATH")
+    if bindings_path and os.path.exists(bindings_path):
+        with open(bindings_path, "r", encoding="utf-8") as f:
+            bindings = json.load(f)
+        if isinstance(bindings, dict):
+            if "model" in bindings and isinstance(bindings["model"], str):
+                model = bindings["model"]
+            if "temperature" in bindings:
+                try:
+                    temperature = float(bindings["temperature"])
+                except (TypeError, ValueError):
+                    pass
+
+    with open(input_path, "r", encoding="utf-8") as f:
         task = json.load(f)
 
-    result = solve(task, temperature=args.temperature, model=args.model)
+    result = solve(task, temperature=temperature, model=model)
 
-    with open(args.output_path, "w") as f:
+    with open(output_path, "w", encoding="utf-8") as f:
         json.dump(result, f, indent=2)
         f.write("\n")
 

@@ -188,6 +188,19 @@ enum Commands {
         #[arg(long)]
         csv: bool,
     },
+    #[command(about = "Live refresh for a view (defaults to run_progress)")]
+    ViewsLive {
+        run: String,
+        view: Option<String>,
+        #[arg(long, default_value_t = 2)]
+        interval_seconds: u64,
+        #[arg(long, default_value_t = 50)]
+        limit: usize,
+        #[arg(long)]
+        once: bool,
+        #[arg(long)]
+        no_clear: bool,
+    },
     Query {
         run: String,
         sql: String,
@@ -674,6 +687,45 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
                 println!("{}", name);
             }
         }
+        Commands::ViewsLive {
+            run,
+            view,
+            interval_seconds,
+            limit,
+            once,
+            no_clear,
+        } => {
+            let run_dir = resolve_run_dir_arg(&run)?;
+            let sleep_interval = Duration::from_secs(interval_seconds.max(1));
+            let resolved_view = view
+                .as_deref()
+                .map(normalize_view_name)
+                .unwrap_or_else(|| "run_progress".to_string());
+            let resolved_limit = limit.max(1);
+            loop {
+                let table = lab_analysis::query_view(&run_dir, &resolved_view, resolved_limit)?;
+                if !no_clear {
+                    print!("\x1B[2J\x1B[H");
+                    let _ = std::io::stdout().flush();
+                }
+                println!("run_dir: {}", run_dir.display());
+                println!("status: {}", read_run_status(&run_dir));
+                println!("updated_unix_s: {}", unix_now_seconds());
+                println!("view: {}", resolved_view);
+                println!("limit: {}", resolved_limit);
+                println!(
+                    "refresh_interval_seconds: {} (Ctrl-C to stop)",
+                    sleep_interval.as_secs()
+                );
+                println!();
+                print_query_table(&table);
+
+                if once {
+                    break;
+                }
+                std::thread::sleep(sleep_interval);
+            }
+        }
         Commands::Query {
             run,
             sql,
@@ -711,6 +763,7 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
             let sleep_interval = Duration::from_secs(interval_seconds.max(1));
             loop {
                 let table = build_live_scoreboard_table(&run_dir, metric_limit)?;
+                let variants = scoreboard_variant_ids(&table);
                 if !no_clear {
                     print!("\x1B[2J\x1B[H");
                     let _ = std::io::stdout().flush();
@@ -718,6 +771,11 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
                 println!("run_dir: {}", run_dir.display());
                 println!("status: {}", read_run_status(&run_dir));
                 println!("updated_unix_s: {}", unix_now_seconds());
+                if variants.is_empty() {
+                    println!("variants: (none yet)");
+                } else {
+                    println!("variants: {}", variants.join(", "));
+                }
                 println!(
                     "refresh_interval_seconds: {} (Ctrl-C to stop)",
                     sleep_interval.as_secs()
@@ -952,139 +1010,223 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
 fn init_profile_template(profile: InitProfileArg) -> &'static str {
     match profile {
         InitProfileArg::AgentEval => {
-            "version: \"1.0\"
+            "version: \"0.5\"
 experiment:
   id: my_eval
   name: My Agent Evaluation
-  profile: agent-eval
+  workload_type: agent_runtime
 dataset:
+  suite_id: local_suite
+  provider: local_jsonl
   path: tasks.jsonl
+  schema_version: task_jsonl_v1
+  split_id: dev
   limit: 50
 design:
+  sanitization_profile: hermetic_functional
   comparison: paired
   replications: 3
-  seed: 42
+  random_seed: 42
+  shuffle_tasks: true
+  max_concurrency: 1
 baseline:
   variant_id: control
+  bindings: {}
 variant_plan: []
 runtime:
-  image: my-harness:latest
-  command: [python, harness.py]
-  timeout_ms: 300000
-  network: none
-  resources:
-    cpus: 2
-    memory_mb: 2048
+  agent:
+    command: [python, harness.py]
+    image: my-harness:latest
+  policy:
+    timeout_ms: 300000
+    network:
+      mode: none
+      allowed_hosts: []
+    sandbox:
+      mode: container
+      resources:
+        cpu_count: 2
+        memory_mb: 2048
+validity:
+  fail_on_state_leak: true
+  fail_on_profile_invariant_violation: true
 "
         }
         InitProfileArg::AbTest => {
-            "version: \"1.0\"
+            "version: \"0.5\"
 experiment:
   id: my_ab_test
   name: Baseline vs Treatment
-  profile: ab-test
+  workload_type: agent_runtime
 dataset:
+  suite_id: local_suite
+  provider: local_jsonl
   path: tasks.jsonl
+  schema_version: task_jsonl_v1
+  split_id: dev
   limit: 100
 design:
+  sanitization_profile: hermetic_functional
   comparison: paired
   replications: 5
-  seed: 42
+  random_seed: 42
+  shuffle_tasks: true
+  max_concurrency: 1
 baseline:
   variant_id: control
+  bindings: {}
 variant_plan:
   - variant_id: treatment
-    args: [--model, claude-4]
+    bindings:
+      model: claude-4
 runtime:
-  image: my-harness:latest
-  command: [python, harness.py]
-  timeout_ms: 300000
-  network: none
-  resources:
-    cpus: 2
-    memory_mb: 2048
+  agent:
+    command: [python, harness.py]
+    image: my-harness:latest
+  policy:
+    timeout_ms: 300000
+    network:
+      mode: none
+      allowed_hosts: []
+    sandbox:
+      mode: container
+      resources:
+        cpu_count: 2
+        memory_mb: 2048
+validity:
+  fail_on_state_leak: true
+  fail_on_profile_invariant_violation: true
 "
         }
         InitProfileArg::Sweep => {
-            "version: \"1.0\"
+            "version: \"0.5\"
 experiment:
   id: my_sweep
   name: Parameter Sweep
-  profile: sweep
+  workload_type: agent_runtime
 dataset:
+  suite_id: local_suite
+  provider: local_jsonl
   path: tasks.jsonl
+  schema_version: task_jsonl_v1
+  split_id: dev
   limit: 100
 design:
+  sanitization_profile: hermetic_functional
   comparison: unpaired
   replications: 1
-  seed: 42
+  random_seed: 42
+  shuffle_tasks: true
+  max_concurrency: 1
 baseline:
   variant_id: control
+  bindings: {}
 variant_plan:
   - variant_id: t07
-    args: [--temperature, \"0.7\"]
+    bindings:
+      temperature: 0.7
   - variant_id: t09
-    args: [--temperature, \"0.9\"]
+    bindings:
+      temperature: 0.9
 runtime:
-  image: my-harness:latest
-  command: [python, harness.py]
-  timeout_ms: 300000
-  network: none
-  resources:
-    cpus: 2
-    memory_mb: 2048
+  agent:
+    command: [python, harness.py]
+    image: my-harness:latest
+  policy:
+    timeout_ms: 300000
+    network:
+      mode: none
+      allowed_hosts: []
+    sandbox:
+      mode: container
+      resources:
+        cpu_count: 2
+        memory_mb: 2048
+validity:
+  fail_on_state_leak: true
+  fail_on_profile_invariant_violation: true
 "
         }
         InitProfileArg::Regression => {
-            "version: \"1.0\"
+            "version: \"0.5\"
 experiment:
   id: my_regression
   name: Regression Tracking
-  profile: regression
+  workload_type: agent_runtime
 dataset:
+  suite_id: local_suite
+  provider: local_jsonl
   path: tasks.jsonl
+  schema_version: task_jsonl_v1
+  split_id: dev
   limit: 50
 design:
+  sanitization_profile: hermetic_functional
   comparison: paired
   replications: 3
-  seed: 42
+  random_seed: 42
+  shuffle_tasks: true
+  max_concurrency: 1
 baseline:
   variant_id: control
+  bindings: {}
 variant_plan: []
 runtime:
-  image: my-harness:latest
-  command: [python, harness.py]
-  timeout_ms: 300000
-  network: none
-  resources:
-    cpus: 2
-    memory_mb: 2048
+  agent:
+    command: [python, harness.py]
+    image: my-harness:latest
+  policy:
+    timeout_ms: 300000
+    network:
+      mode: none
+      allowed_hosts: []
+    sandbox:
+      mode: container
+      resources:
+        cpu_count: 2
+        memory_mb: 2048
+validity:
+  fail_on_state_leak: true
+  fail_on_profile_invariant_violation: true
 "
         }
         InitProfileArg::LocalDev => {
-            "version: \"1.0\"
+            "version: \"0.5\"
 experiment:
   id: my_local_dev
   name: Local Development
-  profile: local-dev
+  workload_type: agent_runtime
 dataset:
+  suite_id: local_suite
+  provider: local_jsonl
   path: tasks.jsonl
+  schema_version: task_jsonl_v1
+  split_id: dev
   limit: 10
 design:
+  sanitization_profile: hermetic_functional
   comparison: paired
   replications: 1
-  seed: 42
+  random_seed: 42
+  shuffle_tasks: true
+  max_concurrency: 1
 baseline:
   variant_id: control
+  bindings: {}
 variant_plan: []
 runtime:
-  image: my-harness:latest
-  command: [python, harness.py]
-  timeout_ms: 120000
-  network: full
-  resources:
-    cpus: 1
-    memory_mb: 1024
+  agent:
+    command: [python, harness.py]
+  policy:
+    timeout_ms: 120000
+    network:
+      mode: full
+      allowed_hosts: []
+    sandbox:
+      mode: local
+validity:
+  fail_on_state_leak: true
+  fail_on_profile_invariant_violation: true
 "
         }
     }
@@ -1474,6 +1616,23 @@ fn print_scoreboard_grouped_by_variant(table: &lab_analysis::QueryTable) {
         );
         println!();
     }
+}
+
+fn scoreboard_variant_ids(table: &lab_analysis::QueryTable) -> Vec<String> {
+    let Some(variant_col_idx) = table.columns.iter().position(|c| c == "variant_id") else {
+        return Vec::new();
+    };
+    let mut variants = BTreeSet::new();
+    for row in &table.rows {
+        let variant = row
+            .get(variant_col_idx)
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .unwrap_or("unknown");
+        variants.insert(variant.to_string());
+    }
+    variants.into_iter().collect()
 }
 
 /// Width-aware table printer for the scoreboard.

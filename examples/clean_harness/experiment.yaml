@@ -1,37 +1,60 @@
-version: "1.0"
+version: "0.5"
 experiment:
   id: my_eval
   name: My Evaluation
+  workload_type: agent_runtime
 
 dataset:
+  suite_id: local_suite
+  provider: local_jsonl
   path: tasks.jsonl
+  schema_version: task_jsonl_v1
+  split_id: dev
   limit: 50
 
 design:
+  sanitization_profile: hermetic_functional
   comparison: paired
   replications: 3
-  seed: 42
+  random_seed: 42
+  shuffle_tasks: true
+  max_concurrency: 1
 
 baseline:
   variant_id: control
+  bindings:
+    model: claude-3.5-sonnet
+    temperature: 0.7
 
 variant_plan:
   - variant_id: hot
-    args: [--temperature, "0.9"]
+    bindings:
+      temperature: 0.9
   - variant_id: new_model
     image: my-harness-v2:latest
-    args: [--model, claude-4]
+    bindings:
+      model: claude-4
   - variant_id: combined
     image: my-harness-v2:latest
-    args: [--temperature, "0.9", --model, claude-4]
-    env:
-      DEBUG: "1"
+    bindings:
+      model: claude-4
+      temperature: 0.9
 
 runtime:
-  image: my-harness:latest
-  command: [python, harness.py]
-  timeout_ms: 300000
-  network: none
-  resources:
-    cpus: 2
-    memory_mb: 2048
+  agent:
+    command: [python, harness.py]
+    image: my-harness:latest
+  policy:
+    timeout_ms: 300000
+    network:
+      mode: none
+      allowed_hosts: []
+    sandbox:
+      mode: container
+      resources:
+        cpu_count: 2
+        memory_mb: 2048
+
+validity:
+  fail_on_state_leak: true
+  fail_on_profile_invariant_violation: true
