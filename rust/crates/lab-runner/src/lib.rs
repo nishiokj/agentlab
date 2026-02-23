@@ -54,6 +54,13 @@ const DEFAULT_CONTAINER_CONTROL_PATH: &str = AGENTLAB_CONTROL_PATH;
 const DEFAULT_CLEAN_TASK_PATH: &str = HARNESS_TASK_PATH;
 const DEFAULT_CLEAN_RESULT_PATH: &str = HARNESS_RESULT_PATH;
 const AGENTLAB_ENV_TASK_IMAGE: &str = "AGENTLAB_TASK_IMAGE";
+const AGENTLAB_ENV_BENCHMARK_PREDICTION_PATH: &str = "AGENTLAB_BENCHMARK_PREDICTION_PATH";
+const AGENTLAB_ENV_BENCHMARK_SCORE_PATH: &str = "AGENTLAB_BENCHMARK_SCORE_PATH";
+const AGENTLAB_ENV_AGENT_EXIT_STATUS: &str = "AGENTLAB_AGENT_EXIT_STATUS";
+const BENCHMARK_PREDICTION_FILENAME: &str = "benchmark_prediction.json";
+const BENCHMARK_SCORE_FILENAME: &str = "benchmark_score.json";
+const BENCHMARK_GRADE_ERROR_FILENAME: &str = "benchmark_grade_error.txt";
+const BENCHMARK_GRADING_POLICY_EXIT_CODE: i32 = 125;
 const AGENTLAB_LOCAL_WORKER_MAX_IN_FLIGHT_ENV: &str = "AGENTLAB_LOCAL_WORKER_MAX_IN_FLIGHT";
 const AGENTLAB_REMOTE_PROTOCOL_RETRY_MAX_ATTEMPTS_ENV: &str =
     "AGENTLAB_REMOTE_PROTOCOL_RETRY_MAX_ATTEMPTS";
@@ -81,6 +88,10 @@ const REMOTE_PROTOCOL_STOP_TIMEOUT_MS_DEFAULT: u64 = 30_000;
 const REMOTE_BACKEND_QUARANTINED_PREFIX: &str = "remote worker backend quarantined:";
 const REMOTE_COMPLETION_SEQ_FALLBACK: u64 = 0;
 const CANONICAL_TRIAL_RESULT_FILENAME: &str = "result.json";
+const PARALLEL_WORKER_CONTROL_SCHEMA_V1: &str = "parallel_worker_control_v1";
+const PARALLEL_WORKER_CONTROL_RESPONSE_COMPLETED: &str = "completed";
+const PARALLEL_WORKER_CONTROL_RESPONSE_FAILED: &str = "failed";
+const KILL_RUN_WORKER_CONTROL_TIMEOUT_SECONDS: u64 = 30;
 const WORKSPACE_EVIDENCE_EXCLUDE_PREFIXES: &[&str] = &[
     "logs",
     ".haiku",
@@ -161,6 +172,8 @@ struct AdapterRunRequest<'a> {
     io_paths: &'a PreparedTrialIo,
     network_mode: &'a str,
     setup_command: Option<&'a str>,
+    benchmark_adapter: Option<&'a BenchmarkAdapterConfig>,
+    benchmark_grading_enabled: bool,
     run_id: &'a str,
 }
 
@@ -1903,6 +1916,98 @@ fn run_session_state_path(run_dir: &Path) -> PathBuf {
     run_dir.join("runtime").join("run_session_state.json")
 }
 
+fn parallel_worker_control_path(run_dir: &Path) -> PathBuf {
+    run_dir.join("runtime").join("parallel_worker_control.json")
+}
+
+fn load_parallel_worker_control_state(run_dir: &Path) -> Result<Option<ParallelWorkerControlState>> {
+    let path = parallel_worker_control_path(run_dir);
+    if !path.exists() {
+        return Ok(None);
+    }
+    let bytes = fs::read(path)?;
+    let state: ParallelWorkerControlState = serde_json::from_slice(&bytes)?;
+    Ok(Some(state))
+}
+
+fn write_parallel_worker_control_state(
+    run_dir: &Path,
+    state: &ParallelWorkerControlState,
+) -> Result<()> {
+    let payload = serde_json::to_value(state)?;
+    atomic_write_json_pretty(&parallel_worker_control_path(run_dir), &payload)
+}
+
+fn write_parallel_worker_control_request(
+    run_dir: &Path,
+    request: ParallelWorkerControlRequest,
+) -> Result<()> {
+    let state = ParallelWorkerControlState {
+        schema_version: PARALLEL_WORKER_CONTROL_SCHEMA_V1.to_string(),
+        request: Some(request),
+        response: None,
+        updated_at: Utc::now().to_rfc3339(),
+    };
+    write_parallel_worker_control_state(run_dir, &state)
+}
+
+fn write_parallel_worker_control_response(
+    run_dir: &Path,
+    response: ParallelWorkerControlResponse,
+) -> Result<()> {
+    let mut state = load_parallel_worker_control_state(run_dir)?.unwrap_or(ParallelWorkerControlState {
+        schema_version: PARALLEL_WORKER_CONTROL_SCHEMA_V1.to_string(),
+        request: None,
+        response: None,
+        updated_at: Utc::now().to_rfc3339(),
+    });
+    state.response = Some(response);
+    state.updated_at = Utc::now().to_rfc3339();
+    write_parallel_worker_control_state(run_dir, &state)
+}
+
+fn load_pending_parallel_worker_control_request(
+    run_dir: &Path,
+) -> Result<Option<ParallelWorkerControlRequest>> {
+    let Some(state) = load_parallel_worker_control_state(run_dir)? else {
+        return Ok(None);
+    };
+    let Some(request) = state.request else {
+        return Ok(None);
+    };
+    if let Some(response) = state.response {
+        if response.request_id == request.request_id {
+            return Ok(None);
+        }
+    }
+    Ok(Some(request))
+}
+
+fn wait_for_parallel_worker_control_response(
+    run_dir: &Path,
+    request_id: &str,
+    timeout: Duration,
+) -> Result<ParallelWorkerControlResponse> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(state) = load_parallel_worker_control_state(run_dir)? {
+            if let Some(response) = state.response {
+                if response.request_id == request_id {
+                    return Ok(response);
+                }
+            }
+        }
+        if Instant::now() >= deadline {
+            return Err(anyhow!(
+                "parallel worker control timeout: no response for request {} within {:?}",
+                request_id,
+                timeout
+            ));
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
 fn write_run_session_state(
     run_dir: &Path,
     run_id: &str,
@@ -1947,6 +2052,68 @@ struct RunControlPauseMetadata {
     label: String,
     requested_at: String,
     requested_by: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScheduleEngineOutcome {
+    Completed,
+    Paused,
+    Killed,
+    Interrupted,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum ParallelWorkerControlAction {
+    Pause,
+    Stop,
+}
+
+impl ParallelWorkerControlAction {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Pause => "pause",
+            Self::Stop => "stop",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct ParallelWorkerControlRequest {
+    request_id: String,
+    action: ParallelWorkerControlAction,
+    requested_at: String,
+    target_trial_ids: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct ParallelWorkerControlResponse {
+    request_id: String,
+    action: ParallelWorkerControlAction,
+    status: String,
+    processed_at: String,
+    processed_trial_ids: Vec<String>,
+    failed_trials: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    checkpoint_acked: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    stop_acked: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    message: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct ParallelWorkerControlState {
+    schema_version: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    request: Option<ParallelWorkerControlRequest>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    response: Option<ParallelWorkerControlResponse>,
+    updated_at: String,
 }
 
 fn active_adapter_payload_value(active_control: Option<&ActiveAdapterControl>) -> Value {
@@ -2137,6 +2304,10 @@ impl RunControlGuard {
         write_run_control_v2(&self.run_dir, &self.run_id, status, &[], None)?;
         self.done = true;
         Ok(())
+    }
+
+    fn disarm(&mut self) {
+        self.done = true;
     }
 }
 
@@ -2504,7 +2675,7 @@ pub fn continue_run(run_dir: &Path) -> Result<RunResult> {
         .next_trial_index
         .max(recovered_max_trial_index);
 
-    execute_schedule_engine(
+    let schedule_outcome = execute_schedule_engine(
         ScheduleEngineMode::ContinueRun,
         &run_dir,
         &run_id,
@@ -2536,6 +2707,13 @@ pub fn continue_run(run_dir: &Path) -> Result<RunResult> {
         execution.remote_token_env.as_deref(),
     )?;
     run_sink.flush()?;
+    if schedule_outcome != ScheduleEngineOutcome::Completed {
+        run_guard.disarm();
+        return Ok(RunResult {
+            run_dir: run_dir.to_path_buf(),
+            run_id,
+        });
+    }
 
     validate_jsonl_against_schema("evidence_record_v1.jsonschema", &evidence_records_path)?;
     validate_jsonl_against_schema("task_chain_state_v1.jsonschema", &task_chain_states_path)?;
@@ -2727,6 +2905,8 @@ pub fn replay_trial(run_dir: &Path, trial_id: &str, strict: bool) -> Result<Repl
         io_paths: &io_paths,
         network_mode: effective_network_mode.as_str(),
         setup_command: None,
+        benchmark_adapter: None,
+        benchmark_grading_enabled: false,
         run_id: &run_id,
     };
     let proc_result = adapter.run_trial(&run_request)?;
@@ -3006,6 +3186,8 @@ fn fork_trial_inner(
         io_paths: &io_paths,
         network_mode: effective_network_mode.as_str(),
         setup_command: None,
+        benchmark_adapter: None,
+        benchmark_grading_enabled: false,
         run_id: &run_id,
     };
     let proc_result = adapter.run_trial(&run_request)?;
@@ -3065,6 +3247,99 @@ fn fork_trial_inner(
     })
 }
 
+fn active_trials_use_worker_control_plane(
+    active_by_id: &HashMap<String, RunControlActiveTrial>,
+    target_trials: &[String],
+) -> bool {
+    !target_trials.is_empty()
+        && target_trials.iter().all(|trial_id| {
+            active_by_id
+                .get(trial_id)
+                .map(|active| {
+                    active.control.is_none() && active.worker_id != RUN_CONTROL_UNKNOWN_WORKER_ID
+                })
+                .unwrap_or(false)
+        })
+}
+
+fn next_parallel_worker_control_request_id(action: ParallelWorkerControlAction) -> String {
+    format!("{}_{}", action.as_str(), Utc::now().timestamp_micros())
+}
+
+fn request_parallel_worker_pause(
+    run_dir: &Path,
+    run_id: &str,
+    target_trials: &[String],
+    pause_label: &str,
+    timeout: Duration,
+) -> Result<PauseResult> {
+    let request_id = next_parallel_worker_control_request_id(ParallelWorkerControlAction::Pause);
+    write_parallel_worker_control_request(
+        run_dir,
+        ParallelWorkerControlRequest {
+            request_id: request_id.clone(),
+            action: ParallelWorkerControlAction::Pause,
+            requested_at: Utc::now().to_rfc3339(),
+            target_trial_ids: target_trials.to_vec(),
+            label: Some(pause_label.to_string()),
+            reason: None,
+        },
+    )?;
+    let response = wait_for_parallel_worker_control_response(run_dir, &request_id, timeout)?;
+    if response.status != PARALLEL_WORKER_CONTROL_RESPONSE_COMPLETED {
+        let detail = response
+            .message
+            .unwrap_or_else(|| response.failed_trials.join(" | "));
+        return Err(anyhow!("pause_partial_failure: {}", detail));
+    }
+    let trial_id = if target_trials.len() == 1 {
+        target_trials[0].clone()
+    } else {
+        "multi".to_string()
+    };
+    Ok(PauseResult {
+        run_id: run_id.to_string(),
+        trial_id,
+        label: pause_label.to_string(),
+        checkpoint_acked: response.checkpoint_acked.unwrap_or(false),
+        stop_acked: response.stop_acked.unwrap_or(false),
+    })
+}
+
+fn request_parallel_worker_stop(
+    run_dir: &Path,
+    run_id: &str,
+    previous_status: &str,
+    target_trials: &[String],
+    timeout: Duration,
+) -> Result<KillResult> {
+    let request_id = next_parallel_worker_control_request_id(ParallelWorkerControlAction::Stop);
+    write_parallel_worker_control_request(
+        run_dir,
+        ParallelWorkerControlRequest {
+            request_id: request_id.clone(),
+            action: ParallelWorkerControlAction::Stop,
+            requested_at: Utc::now().to_rfc3339(),
+            target_trial_ids: target_trials.to_vec(),
+            label: None,
+            reason: Some("killed_by_user".to_string()),
+        },
+    )?;
+    let response = wait_for_parallel_worker_control_response(run_dir, &request_id, timeout)?;
+    if response.status != PARALLEL_WORKER_CONTROL_RESPONSE_COMPLETED {
+        let detail = response
+            .message
+            .unwrap_or_else(|| response.failed_trials.join(" | "));
+        return Err(anyhow!("kill_partial_failure: {}", detail));
+    }
+    Ok(KillResult {
+        run_id: run_id.to_string(),
+        run_dir: run_dir.to_path_buf(),
+        previous_status: previous_status.to_string(),
+        killed_trials: target_trials.to_vec(),
+    })
+}
+
 pub fn pause_run(
     run_dir: &Path,
     trial_id: Option<&str>,
@@ -3111,12 +3386,6 @@ pub fn pause_run(
         active_trial_ids.clone()
     };
 
-    let resolved = load_json_file(&run_dir.join("resolved_experiment.json"))?;
-    let project_root = find_project_root(&run_dir)
-        .canonicalize()
-        .unwrap_or_else(|_| find_project_root(&run_dir));
-    let (variants, _) = load_run_variants(&run_dir, &resolved)?;
-
     let pause_label = label.unwrap_or("pause").to_string();
     let timeout = Duration::from_secs(timeout_seconds.max(1));
     let active_by_id: HashMap<String, RunControlActiveTrial> =
@@ -3124,6 +3393,16 @@ pub fn pause_run(
             .into_iter()
             .map(|entry| (entry.trial_id.clone(), entry))
             .collect();
+    if active_trials_use_worker_control_plane(&active_by_id, &target_trials) {
+        return request_parallel_worker_pause(&run_dir, &run_id, &target_trials, &pause_label, timeout);
+    }
+
+    let resolved = load_json_file(&run_dir.join("resolved_experiment.json"))?;
+    let project_root = find_project_root(&run_dir)
+        .canonicalize()
+        .unwrap_or_else(|_| find_project_root(&run_dir));
+    let (variants, _) = load_run_variants(&run_dir, &resolved)?;
+
     let mut paused_active_trials: Vec<RunControlActiveTrial> = Vec::new();
     let mut failures: Vec<String> = Vec::new();
     let mut checkpoint_acked_all = true;
@@ -3342,6 +3621,22 @@ pub fn kill_run(run_dir: &Path) -> Result<KillResult> {
         .to_string();
 
     let active_trial_ids = run_control_active_trial_ids(&run_control);
+    let active_by_id: HashMap<String, RunControlActiveTrial> =
+        run_control_active_trials(&run_control)
+            .into_iter()
+            .map(|entry| (entry.trial_id.clone(), entry))
+            .collect();
+    if status == "running" && active_trials_use_worker_control_plane(&active_by_id, &active_trial_ids)
+    {
+        return request_parallel_worker_stop(
+            &run_dir,
+            &run_id,
+            &status,
+            &active_trial_ids,
+            Duration::from_secs(KILL_RUN_WORKER_CONTROL_TIMEOUT_SECONDS),
+        );
+    }
+
     for trial_id in &active_trial_ids {
         let trial_dir = run_dir.join("trials").join(trial_id);
         if trial_dir.exists() {
@@ -4181,6 +4476,10 @@ struct TrialExecutionResult {
     #[serde(default)]
     deferred_chain_state_records: Vec<Value>,
     #[serde(default)]
+    deferred_benchmark_prediction_records: Vec<Value>,
+    #[serde(default)]
+    deferred_benchmark_score_records: Vec<Value>,
+    #[serde(default)]
     failure_classification: Option<String>,
 }
 
@@ -4196,6 +4495,8 @@ impl TrialExecutionResult {
             deferred_variant_snapshot_rows: Vec::new(),
             deferred_evidence_records: Vec::new(),
             deferred_chain_state_records: Vec::new(),
+            deferred_benchmark_prediction_records: Vec::new(),
+            deferred_benchmark_score_records: Vec::new(),
             failure_classification: None,
         }
     }
@@ -4265,6 +4566,34 @@ fn load_jsonl_value_rows(path: &Path) -> Result<Vec<Value>> {
     Ok(rows)
 }
 
+fn read_optional_json_value(path: &Path) -> Result<Option<Value>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let raw = fs::read_to_string(path)?;
+    if raw.trim().is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(serde_json::from_str::<Value>(&raw)?))
+}
+
+fn load_optional_json_record_with_schema(schema_name: &str, path: &Path) -> Result<Option<Value>> {
+    let Some(value) = read_optional_json_value(path)? else {
+        return Ok(None);
+    };
+    let schema = compile_schema(schema_name)?;
+    if let Err(errors) = schema.validate(&value) {
+        let msgs = errors.map(|e| e.to_string()).collect::<Vec<_>>().join("; ");
+        return Err(anyhow!(
+            "schema validation failed ({}) {}: {}",
+            schema_name,
+            path.display(),
+            msgs
+        ));
+    }
+    Ok(Some(value))
+}
+
 fn trial_index_from_trial_id(trial_id: &str) -> Option<usize> {
     trial_id
         .strip_prefix("trial_")
@@ -4325,6 +4654,13 @@ impl TrialExecutor {
             .and_then(|v| v.as_str())
             .map(|s| s.to_string())
             .unwrap_or_else(|| format!("task_{}", task_idx));
+        let benchmark_grading_enabled = benchmark_config.adapter.is_some()
+            && !is_clean_contract_experiment(trial_experiment)
+            && task_boundary
+                .task_payload
+                .pointer("/grading/enabled")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true);
         let effective_policy = resolve_effective_task_policy(
             policy_config,
             &benchmark_config.policy,
@@ -4336,7 +4672,6 @@ impl TrialExecutor {
             effective_policy.state_policy,
         );
         let chain_key = format!("{}::{}", variant.id, chain_label);
-        let chain_fs_key = sanitize_for_fs(&chain_key);
         let chain_step_index = chain_states
             .get(&chain_key)
             .map(|state| state.step_index + 1)
@@ -4344,6 +4679,7 @@ impl TrialExecutor {
 
         *trial_index += 1;
         let trial_id = format!("trial_{}", *trial_index);
+        let chain_fs_key = sanitize_for_fs(&chain_key);
         let trial_dir = trials_dir.join(&trial_id);
         ensure_dir(&trial_dir)?;
         write_trial_state(&trial_dir, &trial_id, "running", None, None, None)?;
@@ -4465,6 +4801,9 @@ impl TrialExecutor {
                 .and_then(|v| v.as_str())
                 == Some("1.0"),
         );
+        let benchmark_prediction_path = trial_paths.out.join(BENCHMARK_PREDICTION_FILENAME);
+        let benchmark_score_path = trial_paths.out.join(BENCHMARK_SCORE_FILENAME);
+        let benchmark_grade_error_path = trial_paths.out.join(BENCHMARK_GRADE_ERROR_FILENAME);
         let adapter = adapter_registry_entry(&agent_runtime.adapter_ref)?;
         let trial_evidence_dir = trial_dir.join("evidence");
         ensure_dir(&trial_evidence_dir)?;
@@ -4483,7 +4822,8 @@ impl TrialExecutor {
                     existing.chain_root_snapshot_path.clone(),
                 )
             } else {
-                let root_workspace = chains_dir.join("chain_root_workspace");
+                let root_workspace =
+                    chains_dir.join(chain_root_workspace_dir_name(trial_id.as_str()));
                 if root_workspace.exists() {
                     fs::remove_dir_all(&root_workspace)?;
                 }
@@ -4534,6 +4874,9 @@ impl TrialExecutor {
                 ScheduleEngineMode::FreshRun => behavior.setup_command.as_deref(),
                 ScheduleEngineMode::ContinueRun => None,
             };
+            let _ = fs::remove_file(&benchmark_prediction_path);
+            let _ = fs::remove_file(&benchmark_score_path);
+            let _ = fs::remove_file(&benchmark_grade_error_path);
 
             let run_request = AdapterRunRequest {
                 runtime_experiment: trial_experiment,
@@ -4547,6 +4890,8 @@ impl TrialExecutor {
                 io_paths: &io_paths,
                 network_mode: effective_network_mode,
                 setup_command,
+                benchmark_adapter: benchmark_config.adapter.as_ref(),
+                benchmark_grading_enabled,
                 run_id,
             };
             let proc_result = adapter.run_trial(&run_request)?;
@@ -4589,6 +4934,47 @@ impl TrialExecutor {
                 continue;
             }
             break;
+        }
+
+        let mut deferred_benchmark_prediction_records = Vec::new();
+        let mut deferred_benchmark_score_records = Vec::new();
+        let mut grade_error_reason: Option<String> = None;
+        if benchmark_grading_enabled {
+            match load_optional_json_record_with_schema(
+                "benchmark_prediction_record_v1.jsonschema",
+                &benchmark_prediction_path,
+            ) {
+                Ok(Some(row)) => deferred_benchmark_prediction_records.push(row),
+                Ok(None) => {}
+                Err(err) => {
+                    grade_error_reason = Some(format!("prediction_record_invalid: {}", err));
+                }
+            }
+            match load_optional_json_record_with_schema(
+                "benchmark_score_record_v1.jsonschema",
+                &benchmark_score_path,
+            ) {
+                Ok(Some(row)) => deferred_benchmark_score_records.push(row),
+                Ok(None) => {
+                    grade_error_reason = Some(format!(
+                        "score_record_missing: {}",
+                        benchmark_score_path.display()
+                    ));
+                }
+                Err(err) => {
+                    grade_error_reason = Some(format!("score_record_invalid: {}", err));
+                }
+            }
+            if grade_error_reason.is_none() && benchmark_grade_error_path.exists() {
+                let marker_reason = fs::read_to_string(&benchmark_grade_error_path)
+                    .unwrap_or_else(|_| "grade_error".to_string());
+                grade_error_reason = Some(marker_reason.trim().to_string());
+            }
+            if grade_error_reason.is_none()
+                && status == BENCHMARK_GRADING_POLICY_EXIT_CODE.to_string()
+            {
+                grade_error_reason = Some("grading_policy_exit".to_string());
+            }
         }
 
         let post_snapshot_manifest = collect_workspace_snapshot_manifest(&trial_paths.workspace)?;
@@ -4820,6 +5206,10 @@ impl TrialExecutor {
         let mut metrics = trial_output.get("metrics").cloned().unwrap_or(json!({}));
         if let Some(obj) = metrics.as_object_mut() {
             obj.insert("status_code".to_string(), json!(status.clone()));
+            if let Some(reason) = grade_error_reason.as_ref() {
+                obj.insert("grade_error".to_string(), json!(true));
+                obj.insert("grade_error_reason".to_string(), json!(reason));
+            }
         }
         let (primary_metric_name, primary_metric_value) =
             if let Some(obj) = trial_output.get("objective").and_then(|v| v.as_object()) {
@@ -4877,7 +5267,7 @@ impl TrialExecutor {
             task_id: task_id.clone(),
             repl_idx: repl,
             outcome: outcome.clone(),
-            success: outcome == "success",
+            success: outcome == "success" && grade_error_reason.is_none(),
             status_code: status.clone(),
             container_mode,
             integration_level: agent_runtime.integration_level.clone(),
@@ -4894,7 +5284,10 @@ impl TrialExecutor {
         run_sink.append_event_rows(&event_rows)?;
         run_sink.append_variant_snapshot(&variant_snapshot_rows)?;
 
-        let failure_classification = if status == "0" && outcome != "error" {
+        let failure_classification = if grade_error_reason.is_some() {
+            trial_guard.complete("failed", Some("grade_error"))?;
+            Some("grade_error".to_string())
+        } else if status == "0" && outcome != "error" {
             trial_guard.complete("completed", None)?;
             None
         } else if status != "0" {
@@ -4907,13 +5300,15 @@ impl TrialExecutor {
 
         apply_materialization_policy(&trial_dir, materialize_mode)?;
 
-        let slot_status = if status == "0" && outcome != "error" {
+        let slot_status = if grade_error_reason.is_none() && status == "0" && outcome != "error" {
             "completed"
         } else {
             "failed"
         };
         let mut result =
             TrialExecutionResult::minimal(trial_id, slot_status, Some(slot.variant_idx));
+        result.deferred_benchmark_prediction_records = deferred_benchmark_prediction_records;
+        result.deferred_benchmark_score_records = deferred_benchmark_score_records;
         result.failure_classification = failure_classification;
         Ok(result)
     }
@@ -4928,15 +5323,19 @@ impl RunCoordinator {
         schedule_idx: usize,
         run_sink: &mut dyn RunSink,
     ) -> Result<()> {
-        schedule_progress.completed_slots.push(SlotCompletion {
+        run_sink.flush()?;
+
+        let mut next_progress = schedule_progress.clone();
+        next_progress.completed_slots.push(SlotCompletion {
             schedule_index: schedule_idx,
             trial_id: String::new(),
             status: "skipped_pruned".to_string(),
         });
-        schedule_progress.next_schedule_index = schedule_idx + 1;
-        schedule_progress.updated_at = Utc::now().to_rfc3339();
-        write_schedule_progress(run_dir, schedule_progress)?;
-        run_sink.flush()
+        next_progress.next_schedule_index = schedule_idx + 1;
+        next_progress.updated_at = Utc::now().to_rfc3339();
+        write_schedule_progress(run_dir, &next_progress)?;
+        *schedule_progress = next_progress;
+        Ok(())
     }
 
     fn commit_trial_slot(
@@ -4944,6 +5343,8 @@ impl RunCoordinator {
         policy_config: &PolicyConfig,
         evidence_records_path: &Path,
         task_chain_states_path: &Path,
+        benchmark_predictions_path: &Path,
+        benchmark_scores_path: &Path,
         schedule_progress: &mut ScheduleProgress,
         schedule_idx: usize,
         trial_index: usize,
@@ -4958,39 +5359,56 @@ impl RunCoordinator {
         for record in &trial_result.deferred_chain_state_records {
             append_jsonl(task_chain_states_path, record)?;
         }
+        for row in &trial_result.deferred_benchmark_prediction_records {
+            append_jsonl(benchmark_predictions_path, row)?;
+        }
+        for row in &trial_result.deferred_benchmark_score_records {
+            append_jsonl(benchmark_scores_path, row)?;
+        }
         for row in &trial_result.deferred_trial_records {
             run_sink.append_trial_record(row)?;
         }
         run_sink.append_metric_rows(&trial_result.deferred_metric_rows)?;
         run_sink.append_event_rows(&trial_result.deferred_event_rows)?;
         run_sink.append_variant_snapshot(&trial_result.deferred_variant_snapshot_rows)?;
+        run_sink.flush()?;
 
+        let mut next_consecutive_failures = consecutive_failures.clone();
+        let mut next_pruned_variants = pruned_variants.clone();
         if let Some(variant_idx) = trial_result.variant_idx {
             if trial_result.slot_status == "completed" {
-                consecutive_failures.insert(variant_idx, 0);
+                next_consecutive_failures.insert(variant_idx, 0);
             } else {
-                *consecutive_failures.entry(variant_idx).or_default() += 1;
+                *next_consecutive_failures.entry(variant_idx).or_default() += 1;
             }
             if let Some(max_failures) = policy_config.pruning_max_consecutive_failures {
-                let count = consecutive_failures.get(&variant_idx).copied().unwrap_or(0);
+                let count = next_consecutive_failures
+                    .get(&variant_idx)
+                    .copied()
+                    .unwrap_or(0);
                 if count >= max_failures {
-                    pruned_variants.insert(variant_idx);
+                    next_pruned_variants.insert(variant_idx);
                 }
             }
         }
 
-        schedule_progress.completed_slots.push(SlotCompletion {
+        let mut next_progress = schedule_progress.clone();
+        next_progress.completed_slots.push(SlotCompletion {
             schedule_index: schedule_idx,
             trial_id: trial_result.trial_id.clone(),
             status: trial_result.slot_status.clone(),
         });
-        schedule_progress.next_schedule_index = schedule_idx + 1;
-        schedule_progress.next_trial_index = trial_index;
-        schedule_progress.pruned_variants = pruned_variants.iter().copied().collect();
-        schedule_progress.consecutive_failures = consecutive_failures.clone();
-        schedule_progress.updated_at = Utc::now().to_rfc3339();
-        write_schedule_progress(run_dir, schedule_progress)?;
-        run_sink.flush()
+        next_progress.next_schedule_index = schedule_idx + 1;
+        next_progress.next_trial_index = trial_index;
+        next_progress.pruned_variants = next_pruned_variants.iter().copied().collect();
+        next_progress.consecutive_failures = next_consecutive_failures.clone();
+        next_progress.updated_at = Utc::now().to_rfc3339();
+        write_schedule_progress(run_dir, &next_progress)?;
+
+        *schedule_progress = next_progress;
+        *consecutive_failures = next_consecutive_failures;
+        *pruned_variants = next_pruned_variants;
+        Ok(())
     }
 }
 
@@ -5078,6 +5496,8 @@ impl DeterministicCommitter {
         policy_config: &PolicyConfig,
         evidence_records_path: &Path,
         task_chain_states_path: &Path,
+        benchmark_predictions_path: &Path,
+        benchmark_scores_path: &Path,
         schedule_progress: &mut ScheduleProgress,
         trial_index: usize,
         pruned_variants: &mut HashSet<usize>,
@@ -5103,6 +5523,8 @@ impl DeterministicCommitter {
                         policy_config,
                         evidence_records_path,
                         task_chain_states_path,
+                        benchmark_predictions_path,
+                        benchmark_scores_path,
                         schedule_progress,
                         schedule_idx,
                         trial_index,
@@ -5168,6 +5590,250 @@ fn in_flight_active_trials(
         .collect();
     active.sort_by_key(|entry| entry.schedule_idx.unwrap_or(usize::MAX));
     active
+}
+
+fn remove_in_flight_tickets(
+    in_flight: &mut HashMap<String, InFlightDispatch>,
+    in_flight_by_variant: &mut BTreeMap<usize, usize>,
+    ticket_ids: &HashSet<String>,
+) {
+    for ticket_id in ticket_ids {
+        if let Some(removed) = in_flight.remove(ticket_id.as_str()) {
+            if let Some(count) = in_flight_by_variant.get_mut(&removed.variant_idx) {
+                if *count > 0 {
+                    *count -= 1;
+                }
+                if *count == 0 {
+                    in_flight_by_variant.remove(&removed.variant_idx);
+                }
+            }
+        }
+    }
+}
+
+fn process_parallel_worker_control_request(
+    run_dir: &Path,
+    run_id: &str,
+    backend: &dyn WorkerBackend,
+    in_flight: &mut HashMap<String, InFlightDispatch>,
+    in_flight_by_variant: &mut BTreeMap<usize, usize>,
+) -> Result<Option<ScheduleEngineOutcome>> {
+    let Some(request) = load_pending_parallel_worker_control_request(run_dir)? else {
+        return Ok(None);
+    };
+
+    let mut target_trial_ids = if request.target_trial_ids.is_empty() {
+        in_flight
+            .values()
+            .map(|entry| entry.trial_id.clone())
+            .collect::<Vec<_>>()
+    } else {
+        request.target_trial_ids.clone()
+    };
+    target_trial_ids.sort();
+    target_trial_ids.dedup();
+
+    let mut processed_trial_ids: Vec<String> = Vec::new();
+    let mut failed_trials: Vec<String> = Vec::new();
+    let mut removed_ticket_ids: HashSet<String> = HashSet::new();
+
+    match request.action {
+        ParallelWorkerControlAction::Pause => {
+            let pause_label = request.label.as_deref().unwrap_or("pause");
+            let mut paused_active_trials: Vec<RunControlActiveTrial> = Vec::new();
+            let mut checkpoint_acked_all = true;
+            let mut stop_acked_all = true;
+            if target_trial_ids.is_empty() {
+                failed_trials.push("pause_no_active_trial".to_string());
+            }
+
+            for trial_id in &target_trial_ids {
+                let maybe_dispatch = in_flight.iter().find_map(|(ticket_id, dispatch)| {
+                    if dispatch.trial_id == *trial_id {
+                        Some((ticket_id.clone(), dispatch.clone()))
+                    } else {
+                        None
+                    }
+                });
+                let Some((ticket_id, dispatch)) = maybe_dispatch else {
+                    failed_trials.push(format!("{}: pause_target_not_active", trial_id));
+                    continue;
+                };
+
+                let pause_ack = match backend.request_pause(&dispatch.worker_id, pause_label) {
+                    Ok(ack) => ack,
+                    Err(err) => {
+                        failed_trials.push(format!("{}: pause request failed ({})", trial_id, err));
+                        continue;
+                    }
+                };
+                checkpoint_acked_all &= pause_ack.accepted;
+                if let Err(err) =
+                    backend.request_stop(&dispatch.worker_id, format!("pause:{}", pause_label).as_str())
+                {
+                    failed_trials.push(format!("{}: pause stop request failed ({})", trial_id, err));
+                    stop_acked_all = false;
+                    continue;
+                }
+
+                let trial_dir = run_dir.join("trials").join(trial_id);
+                if let Err(err) = write_trial_state(
+                    &trial_dir,
+                    trial_id,
+                    "paused",
+                    Some(pause_label),
+                    Some(pause_label),
+                    Some("paused_by_user"),
+                ) {
+                    failed_trials.push(format!(
+                        "{}: failed to write trial_state ({})",
+                        trial_id, err
+                    ));
+                    stop_acked_all = false;
+                    continue;
+                }
+
+                paused_active_trials.push(RunControlActiveTrial {
+                    trial_id: dispatch.trial_id.clone(),
+                    worker_id: dispatch.worker_id.clone(),
+                    schedule_idx: Some(dispatch.schedule_idx),
+                    variant_id: Some(dispatch.variant_id.clone()),
+                    started_at: Some(dispatch.started_at.clone()),
+                    control: None,
+                });
+                removed_ticket_ids.insert(ticket_id);
+                processed_trial_ids.push(trial_id.clone());
+            }
+
+            remove_in_flight_tickets(in_flight, in_flight_by_variant, &removed_ticket_ids);
+            let pause_meta = RunControlPauseMetadata {
+                label: pause_label.to_string(),
+                requested_at: Utc::now().to_rfc3339(),
+                requested_by: Some("user".to_string()),
+            };
+            if failed_trials.is_empty() {
+                write_run_control_v2(run_dir, run_id, "paused", &paused_active_trials, Some(&pause_meta))?;
+                write_parallel_worker_control_response(
+                    run_dir,
+                    ParallelWorkerControlResponse {
+                        request_id: request.request_id,
+                        action: ParallelWorkerControlAction::Pause,
+                        status: PARALLEL_WORKER_CONTROL_RESPONSE_COMPLETED.to_string(),
+                        processed_at: Utc::now().to_rfc3339(),
+                        processed_trial_ids,
+                        failed_trials: Vec::new(),
+                        checkpoint_acked: Some(checkpoint_acked_all),
+                        stop_acked: Some(stop_acked_all),
+                        message: None,
+                    },
+                )?;
+                return Ok(Some(ScheduleEngineOutcome::Paused));
+            }
+
+            let survivors = in_flight_active_trials(in_flight);
+            write_run_control_v2(run_dir, run_id, "interrupted", &survivors, Some(&pause_meta))?;
+            let message = format!(
+                "pause request failed for {} of {} targeted trial(s): {}",
+                failed_trials.len(),
+                target_trial_ids.len(),
+                failed_trials.join(" | ")
+            );
+            write_parallel_worker_control_response(
+                run_dir,
+                ParallelWorkerControlResponse {
+                    request_id: request.request_id,
+                    action: ParallelWorkerControlAction::Pause,
+                    status: PARALLEL_WORKER_CONTROL_RESPONSE_FAILED.to_string(),
+                    processed_at: Utc::now().to_rfc3339(),
+                    processed_trial_ids,
+                    failed_trials,
+                    checkpoint_acked: Some(checkpoint_acked_all),
+                    stop_acked: Some(stop_acked_all),
+                    message: Some(message),
+                },
+            )?;
+            Ok(Some(ScheduleEngineOutcome::Interrupted))
+        }
+        ParallelWorkerControlAction::Stop => {
+            let stop_reason = request.reason.as_deref().unwrap_or("killed_by_user");
+
+            for trial_id in &target_trial_ids {
+                let maybe_dispatch = in_flight.iter().find_map(|(ticket_id, dispatch)| {
+                    if dispatch.trial_id == *trial_id {
+                        Some((ticket_id.clone(), dispatch.clone()))
+                    } else {
+                        None
+                    }
+                });
+                let Some((ticket_id, dispatch)) = maybe_dispatch else {
+                    failed_trials.push(format!("{}: kill_target_not_active", trial_id));
+                    continue;
+                };
+
+                if let Err(err) = backend.request_stop(&dispatch.worker_id, stop_reason) {
+                    failed_trials.push(format!("{}: stop request failed ({})", trial_id, err));
+                    continue;
+                }
+
+                let trial_dir = run_dir.join("trials").join(trial_id);
+                if let Err(err) =
+                    write_trial_state(&trial_dir, trial_id, "killed", None, None, Some("killed_by_user"))
+                {
+                    failed_trials.push(format!(
+                        "{}: failed to write trial_state ({})",
+                        trial_id, err
+                    ));
+                    continue;
+                }
+                removed_ticket_ids.insert(ticket_id);
+                processed_trial_ids.push(trial_id.clone());
+            }
+
+            remove_in_flight_tickets(in_flight, in_flight_by_variant, &removed_ticket_ids);
+            if failed_trials.is_empty() {
+                write_run_control_v2(run_dir, run_id, "killed", &[], None)?;
+                write_parallel_worker_control_response(
+                    run_dir,
+                    ParallelWorkerControlResponse {
+                        request_id: request.request_id,
+                        action: ParallelWorkerControlAction::Stop,
+                        status: PARALLEL_WORKER_CONTROL_RESPONSE_COMPLETED.to_string(),
+                        processed_at: Utc::now().to_rfc3339(),
+                        processed_trial_ids,
+                        failed_trials: Vec::new(),
+                        checkpoint_acked: None,
+                        stop_acked: Some(true),
+                        message: None,
+                    },
+                )?;
+                return Ok(Some(ScheduleEngineOutcome::Killed));
+            }
+
+            let survivors = in_flight_active_trials(in_flight);
+            write_run_control_v2(run_dir, run_id, "interrupted", &survivors, None)?;
+            let message = format!(
+                "stop request failed for {} of {} targeted trial(s): {}",
+                failed_trials.len(),
+                target_trial_ids.len(),
+                failed_trials.join(" | ")
+            );
+            write_parallel_worker_control_response(
+                run_dir,
+                ParallelWorkerControlResponse {
+                    request_id: request.request_id,
+                    action: ParallelWorkerControlAction::Stop,
+                    status: PARALLEL_WORKER_CONTROL_RESPONSE_FAILED.to_string(),
+                    processed_at: Utc::now().to_rfc3339(),
+                    processed_trial_ids,
+                    failed_trials,
+                    checkpoint_acked: None,
+                    stop_acked: Some(false),
+                    message: Some(message),
+                },
+            )?;
+            Ok(Some(ScheduleEngineOutcome::Interrupted))
+        }
+    }
 }
 
 fn decode_parallel_completion_result(
@@ -5325,7 +5991,11 @@ fn execute_schedule_engine_parallel(
     max_concurrency: usize,
     remote_endpoint: Option<&str>,
     remote_token_env: Option<&str>,
-) -> Result<()> {
+) -> Result<ScheduleEngineOutcome> {
+    let benchmark_dir = run_dir.join("benchmark");
+    let benchmark_predictions_path = benchmark_dir.join("predictions.jsonl");
+    let benchmark_scores_path = benchmark_dir.join("scores.jsonl");
+
     let any_remote_executor = variant_runtime_profiles
         .iter()
         .any(|profile| matches!(profile.executor_kind, ExecutorKind::Remote));
@@ -5417,6 +6087,8 @@ fn execute_schedule_engine_parallel(
         policy_config,
         evidence_records_path,
         task_chain_states_path,
+        &benchmark_predictions_path,
+        &benchmark_scores_path,
         schedule_progress,
         *trial_index,
         pruned_variants,
@@ -5432,6 +6104,16 @@ fn execute_schedule_engine_parallel(
     )?;
 
     while committer.next_commit_idx < schedule.len() || !in_flight.is_empty() {
+        if let Some(outcome) = process_parallel_worker_control_request(
+            run_dir,
+            run_id,
+            backend.as_ref(),
+            &mut in_flight,
+            &mut in_flight_by_variant,
+        )? {
+            return Ok(outcome);
+        }
+
         let mut made_progress = false;
         let mut dispatch_backpressured = false;
 
@@ -5516,6 +6198,8 @@ fn execute_schedule_engine_parallel(
             policy_config,
             evidence_records_path,
             task_chain_states_path,
+            &benchmark_predictions_path,
+            &benchmark_scores_path,
             schedule_progress,
             *trial_index,
             pruned_variants,
@@ -5580,6 +6264,8 @@ fn execute_schedule_engine_parallel(
             policy_config,
             evidence_records_path,
             task_chain_states_path,
+            &benchmark_predictions_path,
+            &benchmark_scores_path,
             schedule_progress,
             *trial_index,
             pruned_variants,
@@ -5593,6 +6279,8 @@ fn execute_schedule_engine_parallel(
         policy_config,
         evidence_records_path,
         task_chain_states_path,
+        &benchmark_predictions_path,
+        &benchmark_scores_path,
         schedule_progress,
         *trial_index,
         pruned_variants,
@@ -5606,7 +6294,7 @@ fn execute_schedule_engine_parallel(
         &in_flight_active_trials(&in_flight),
         None,
     )?;
-    Ok(())
+    Ok(ScheduleEngineOutcome::Completed)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -5640,7 +6328,7 @@ fn execute_schedule_engine(
     max_concurrency: usize,
     remote_endpoint: Option<&str>,
     remote_token_env: Option<&str>,
-) -> Result<()> {
+) -> Result<ScheduleEngineOutcome> {
     if !matches!(policy_config.state, StatePolicy::IsolatePerTrial) {
         return Err(anyhow!(
             "parallel worker hard cutover supports only isolate_per_trial state policy; got {:?}",
@@ -5809,7 +6497,7 @@ fn run_experiment_with_behavior(
     write_schedule_progress(&run_dir, &schedule_progress)?;
 
     let mut trial_index: usize = 0;
-    execute_schedule_engine(
+    let schedule_outcome = execute_schedule_engine(
         ScheduleEngineMode::FreshRun,
         &run_dir,
         &run_id,
@@ -5841,6 +6529,10 @@ fn run_experiment_with_behavior(
         execution.remote_token_env.as_deref(),
     )?;
     run_sink.flush()?;
+    if schedule_outcome != ScheduleEngineOutcome::Completed {
+        run_guard.disarm();
+        return Ok(RunResult { run_dir, run_id });
+    }
     validate_jsonl_against_schema("evidence_record_v1.jsonschema", &evidence_records_path)?;
     validate_jsonl_against_schema("task_chain_state_v1.jsonschema", &task_chain_states_path)?;
 
@@ -6541,13 +7233,98 @@ fn build_benchmark_summary(run_id: &str, manifest: &Value, score_rows: &[Value])
     }))
 }
 
+fn synthesize_benchmark_manifest_from_scores(score_rows: &[Value]) -> Option<Value> {
+    let first = score_rows.first()?;
+    let adapter_id = first
+        .pointer("/benchmark/adapter_id")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(|v| v.to_string())?;
+    let benchmark_name = first
+        .pointer("/benchmark/name")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(|v| v.to_string())?;
+    let benchmark_split = first
+        .pointer("/benchmark/split")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(|v| v.to_string())?;
+    let benchmark_version = first
+        .pointer("/benchmark/version")
+        .and_then(|v| v.as_str())
+        .map(|v| v.to_string());
+    let evaluator = first.pointer("/evaluator").cloned().unwrap_or_else(|| {
+        json!({
+            "name": "unknown",
+            "mode": "custom"
+        })
+    });
+
+    let mut benchmark = serde_json::Map::new();
+    benchmark.insert("name".to_string(), json!(benchmark_name));
+    benchmark.insert("split".to_string(), json!(benchmark_split));
+    if let Some(version) = benchmark_version {
+        benchmark.insert("version".to_string(), json!(version));
+    }
+
+    Some(json!({
+        "schema_version": "benchmark_adapter_manifest_v1",
+        "adapter_id": adapter_id,
+        "adapter_version": "unknown",
+        "benchmark": Value::Object(benchmark),
+        "execution_mode": "integrated_score",
+        "record_schemas": {
+            "prediction": "benchmark_prediction_record_v1",
+            "score": "benchmark_score_record_v1"
+        },
+        "evaluator": evaluator
+    }))
+}
+
+fn default_benchmark_manifest(adapter: &BenchmarkAdapterConfig, score_rows: &[Value]) -> Value {
+    if let Some(manifest) = adapter.manifest.clone() {
+        return manifest;
+    }
+    if let Some(manifest) = synthesize_benchmark_manifest_from_scores(score_rows) {
+        return manifest;
+    }
+    let fallback_adapter_id = adapter
+        .command
+        .first()
+        .map(|s| s.as_str())
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or("benchmark_adapter");
+    json!({
+        "schema_version": "benchmark_adapter_manifest_v1",
+        "adapter_id": fallback_adapter_id,
+        "adapter_version": "unknown",
+        "benchmark": {
+            "name": "unknown",
+            "split": "unknown"
+        },
+        "execution_mode": "integrated_score",
+        "record_schemas": {
+            "prediction": "benchmark_prediction_record_v1",
+            "score": "benchmark_score_record_v1"
+        },
+        "evaluator": {
+            "name": "unknown",
+            "mode": "custom"
+        }
+    })
+}
+
 fn process_benchmark_outputs(
-    project_root: &Path,
+    _project_root: &Path,
     run_dir: &Path,
     run_id: &str,
     adapter: &BenchmarkAdapterConfig,
-    evidence_records_path: &Path,
-    task_chain_states_path: &Path,
+    _evidence_records_path: &Path,
+    _task_chain_states_path: &Path,
 ) -> Result<PathBuf> {
     let benchmark_dir = run_dir.join("benchmark");
     ensure_dir(&benchmark_dir)?;
@@ -6556,70 +7333,26 @@ fn process_benchmark_outputs(
     let scores_path = benchmark_dir.join("scores.jsonl");
     let summary_path = benchmark_dir.join("summary.json");
 
-    if let Some(seed_manifest) = adapter.manifest.as_ref() {
-        atomic_write_json_pretty(&manifest_path, seed_manifest)?;
-    }
-
-    if adapter.command.is_empty() {
-        return Err(anyhow!("benchmark adapter command cannot be empty"));
-    }
-    let mut cmd = Command::new(&adapter.command[0]);
-    cmd.args(&adapter.command[1..]);
-    cmd.current_dir(project_root);
-    cmd.env("AGENTLAB_RUN_ID", run_id);
-    cmd.env("AGENTLAB_RUN_DIR", run_dir);
-    cmd.env("AGENTLAB_EVIDENCE_RECORDS_PATH", evidence_records_path);
-    cmd.env("AGENTLAB_TASK_CHAIN_STATES_PATH", task_chain_states_path);
-    cmd.env("AGENTLAB_BENCHMARK_DIR", &benchmark_dir);
-    cmd.env(
-        "AGENTLAB_BENCHMARK_TASKS_PATH",
-        benchmark_dir.join("tasks.jsonl"),
-    );
-    cmd.env(
-        "AGENTLAB_EVALUATOR_LOGS_DIR",
-        benchmark_dir.join("evaluator_logs"),
-    );
-    cmd.env("AGENTLAB_ADAPTER_MANIFEST_PATH", &manifest_path);
-    cmd.env("AGENTLAB_PREDICTIONS_PATH", &predictions_path);
-    cmd.env("AGENTLAB_SCORES_PATH", &scores_path);
-    cmd.env("AGENTLAB_BENCHMARK_SUMMARY_PATH", &summary_path);
-    cmd.stdin(Stdio::null());
-    cmd.stdout(Stdio::inherit());
-    cmd.stderr(Stdio::piped());
-    let status = cmd.status()?;
-    if !status.success() {
-        return Err(anyhow!(
-            "benchmark adapter command failed with status {}",
-            status
-        ));
-    }
-
-    if !manifest_path.exists() {
-        return Err(anyhow!(
-            "benchmark adapter did not produce adapter_manifest.json"
-        ));
-    }
     if !predictions_path.exists() {
-        return Err(anyhow!(
-            "benchmark adapter did not produce predictions.jsonl"
-        ));
+        atomic_write_bytes(&predictions_path, b"")?;
     }
     if !scores_path.exists() {
-        return Err(anyhow!("benchmark adapter did not produce scores.jsonl"));
+        atomic_write_bytes(&scores_path, b"")?;
     }
 
-    validate_json_file_against_schema("benchmark_adapter_manifest_v1.jsonschema", &manifest_path)?;
     validate_jsonl_against_schema(
         "benchmark_prediction_record_v1.jsonschema",
         &predictions_path,
     )?;
     validate_jsonl_against_schema("benchmark_score_record_v1.jsonschema", &scores_path)?;
-    if !summary_path.exists() {
-        let manifest = load_json_file(&manifest_path)?;
-        let scores = read_jsonl_records(&scores_path)?;
-        let summary = build_benchmark_summary(run_id, &manifest, &scores)?;
-        atomic_write_json_pretty(&summary_path, &summary)?;
-    }
+
+    let scores = read_jsonl_records(&scores_path)?;
+    let manifest = default_benchmark_manifest(adapter, &scores);
+    atomic_write_json_pretty(&manifest_path, &manifest)?;
+    validate_json_file_against_schema("benchmark_adapter_manifest_v1.jsonschema", &manifest_path)?;
+
+    let summary = build_benchmark_summary(run_id, &manifest, &scores)?;
+    atomic_write_json_pretty(&summary_path, &summary)?;
     validate_json_file_against_schema("benchmark_summary_v1.jsonschema", &summary_path)?;
 
     Ok(scores_path)
@@ -8550,6 +9283,10 @@ fn resolve_chain_label(task_payload: &Value, task_id: &str, state_policy: StateP
     }
 }
 
+fn chain_root_workspace_dir_name(trial_id: &str) -> String {
+    format!("chain_root_workspace_{}", sanitize_for_fs(trial_id))
+}
+
 fn rel_to_run_dir(path: &Path, run_dir: &Path) -> String {
     path.strip_prefix(run_dir)
         .unwrap_or(path)
@@ -8582,6 +9319,14 @@ fn resolve_trial_timeout_ms(
         .pointer("/policy/timeout_ms")
         .and_then(|v| v.as_u64())
         .or(invocation_default_timeout_ms)
+}
+
+fn output_peer_path(output_path: &str, file_name: &str) -> String {
+    let output = Path::new(output_path);
+    if let Some(parent) = output.parent() {
+        return parent.join(file_name).to_string_lossy().to_string();
+    }
+    file_name.to_string()
 }
 
 fn build_runtime_contract_env(
@@ -8640,6 +9385,14 @@ fn build_runtime_contract_env(
     if let Some(task_image) = task_image {
         env.insert(AGENTLAB_ENV_TASK_IMAGE.to_string(), task_image);
     }
+    env.insert(
+        AGENTLAB_ENV_BENCHMARK_PREDICTION_PATH.to_string(),
+        output_peer_path(&io.result_path, BENCHMARK_PREDICTION_FILENAME),
+    );
+    env.insert(
+        AGENTLAB_ENV_BENCHMARK_SCORE_PATH.to_string(),
+        output_peer_path(&io.result_path, BENCHMARK_SCORE_FILENAME),
+    );
     env.insert(AGENTLAB_ENV_REPL_IDX.to_string(), repl_idx.to_string());
     if let Some(timeout_ms) = timeout_ms {
         env.insert(AGENTLAB_ENV_TIMEOUT_MS.to_string(), timeout_ms.to_string());
@@ -8777,6 +9530,8 @@ impl AgentAdapter for PrebuiltCommandAdapter {
             io_paths: request.io_paths,
             network_mode: request.network_mode,
             setup_command: request.setup_command,
+            benchmark_adapter: request.benchmark_adapter,
+            benchmark_grading_enabled: request.benchmark_grading_enabled,
             run_id: request.run_id,
         };
         run_command_contract_trial(&prebuilt_request)
@@ -8801,6 +9556,24 @@ fn run_builtin_adapter_local(request: &AdapterRunRequest<'_>) -> Result<ProcessR
     run_adapter_process(cmd, &request.io_paths.output_host, None)
 }
 
+fn resolve_benchmark_grader_command(request: &AdapterRunRequest<'_>) -> Option<Vec<String>> {
+    if request.runtime.clean_contract_v1 || !request.benchmark_grading_enabled {
+        return None;
+    }
+    let adapter = request.benchmark_adapter?;
+    if adapter.command.is_empty() {
+        return None;
+    }
+    let mut render_env = request.runtime_overrides_env.clone();
+    for (key, value) in request.runtime_env {
+        render_env.insert(key.clone(), value.clone());
+    }
+    Some(apply_agentlab_template_to_command(
+        &adapter.command,
+        &render_env,
+    ))
+}
+
 fn run_builtin_adapter_container(request: &AdapterRunRequest<'_>) -> Result<ProcessRunResult> {
     let image = request
         .runtime
@@ -8812,6 +9585,7 @@ fn run_builtin_adapter_container(request: &AdapterRunRequest<'_>) -> Result<Proc
         return Err(anyhow!("allowlist_enforced not implemented in Rust runner"));
     }
     let command = resolve_runtime_agent_command(request)?;
+    let grader_command = resolve_benchmark_grader_command(request);
 
     let mut cmd = Command::new("docker");
     cmd.arg("run").arg("--rm");
@@ -8973,7 +9747,53 @@ fn run_builtin_adapter_container(request: &AdapterRunRequest<'_>) -> Result<Proc
             cmd.arg("-e").arg(format!("{}={}", key, value));
         }
     }
-    if let Some(setup) = request.setup_command {
+
+    if let Some(grader_command) = grader_command {
+        cmd.arg(image);
+        let setup_block = if let Some(setup) = request.setup_command {
+            format!("{}\nsetup_status=$?", setup)
+        } else {
+            "setup_status=0".to_string()
+        };
+        let grade_error_marker_path =
+            output_peer_path(&request.io_paths.result_path, BENCHMARK_GRADE_ERROR_FILENAME);
+        let wrapped = format!(
+            "set +e\n\
+             rm -f {marker}\n\
+             {setup}\n\
+             if [ \"$setup_status\" -ne 0 ]; then\n\
+               exit \"$setup_status\"\n\
+             fi\n\
+             {agent}\n\
+             agent_status=$?\n\
+             export {agent_exit_env}=\"$agent_status\"\n\
+             {grader}\n\
+             grader_status=$?\n\
+             if [ \"$grader_status\" -ne 0 ]; then\n\
+               printf '%s\\n' \"grader_command_failed:$grader_status\" > {marker}\n\
+             fi\n\
+             if [ ! -s \"${{{score_env}}}\" ]; then\n\
+               printf '%s\\n' \"score_record_missing\" >> {marker}\n\
+             fi\n\
+             if [ -s {marker} ]; then\n\
+               exit {grade_error_code}\n\
+             fi\n\
+             if [ \"$agent_status\" -ne 0 ]; then\n\
+               exit \"$agent_status\"\n\
+             fi\n\
+             exit 0",
+            marker = shell_quote(&grade_error_marker_path),
+            setup = setup_block,
+            agent = shell_join(&command),
+            agent_exit_env = AGENTLAB_ENV_AGENT_EXIT_STATUS,
+            grader = shell_join(&grader_command),
+            score_env = AGENTLAB_ENV_BENCHMARK_SCORE_PATH,
+            grade_error_code = BENCHMARK_GRADING_POLICY_EXIT_CODE,
+        );
+        cmd.arg("/bin/sh");
+        cmd.arg("-lc");
+        cmd.arg(wrapped);
+    } else if let Some(setup) = request.setup_command {
         cmd.arg(image);
         let wrapped = format!("{} && exec {}", setup, shell_join(&command));
         cmd.arg("/bin/sh");
@@ -11785,24 +12605,26 @@ mod tests {
         let task_chain_states_path = evidence_dir.join("task_chain_states.jsonl");
         fs::write(&evidence_records_path, "").expect("evidence records");
         fs::write(&task_chain_states_path, "").expect("task chain states");
+        let benchmark_dir = run_dir.join("benchmark");
+        ensure_dir(&benchmark_dir).expect("benchmark dir");
+        fs::write(
+            benchmark_dir.join("predictions.jsonl"),
+            r#"{"schema_version":"benchmark_prediction_record_v1","ids":{"run_id":"run_123","trial_id":"trial_1","variant_id":"base","task_id":"task_1","repl_idx":0},"benchmark":{"adapter_id":"demo_adapter","name":"demo_suite","split":"dev"},"prediction":{"kind":"json","value":{"patch":"diff --git"}}}
+"#,
+        )
+        .expect("predictions");
+        fs::write(
+            benchmark_dir.join("scores.jsonl"),
+            r#"{"schema_version":"benchmark_score_record_v1","ids":{"run_id":"run_123","trial_id":"trial_1","variant_id":"base","task_id":"task_1","repl_idx":0},"benchmark":{"adapter_id":"demo_adapter","name":"demo_suite","split":"dev"},"verdict":"pass","primary_metric_name":"resolved","primary_metric_value":1.0,"metrics":{"resolved":1.0},"evaluator":{"name":"demo_eval","mode":"custom"}}
+"#,
+        )
+        .expect("scores");
 
         let adapter = BenchmarkAdapterConfig {
-            command: vec![
-                "/bin/sh".to_string(),
-                "-c".to_string(),
-                r#"cat >"$AGENTLAB_ADAPTER_MANIFEST_PATH" <<'JSON'
-{"schema_version":"benchmark_adapter_manifest_v1","adapter_id":"demo_adapter","adapter_version":"1.0.0","benchmark":{"name":"demo_suite","split":"dev"},"execution_mode":"predict_then_score","record_schemas":{"prediction":"benchmark_prediction_record_v1","score":"benchmark_score_record_v1"},"evaluator":{"name":"demo_eval","mode":"custom"}}
-JSON
-cat >"$AGENTLAB_PREDICTIONS_PATH" <<'JSONL'
-{"schema_version":"benchmark_prediction_record_v1","ids":{"run_id":"run_123","trial_id":"trial_1","variant_id":"base","task_id":"task_1","repl_idx":0},"benchmark":{"adapter_id":"demo_adapter","name":"demo_suite","split":"dev"},"prediction":{"kind":"json","value":{"patch":"diff --git"}}}
-JSONL
-cat >"$AGENTLAB_SCORES_PATH" <<'JSONL'
-{"schema_version":"benchmark_score_record_v1","ids":{"run_id":"run_123","trial_id":"trial_1","variant_id":"base","task_id":"task_1","repl_idx":0},"benchmark":{"adapter_id":"demo_adapter","name":"demo_suite","split":"dev"},"verdict":"pass","primary_metric_name":"resolved","primary_metric_value":1.0,"metrics":{"resolved":1.0},"evaluator":{"name":"demo_eval","mode":"custom"}}
-JSONL
-"#
-                .to_string(),
-            ],
-            manifest: None,
+            command: vec!["adapter".to_string(), "unused".to_string()],
+            manifest: Some(json!(
+                {"schema_version":"benchmark_adapter_manifest_v1","adapter_id":"demo_adapter","adapter_version":"1.0.0","benchmark":{"name":"demo_suite","split":"dev"},"execution_mode":"predict_then_score","record_schemas":{"prediction":"benchmark_prediction_record_v1","score":"benchmark_score_record_v1"},"evaluator":{"name":"demo_eval","mode":"custom"}}
+            )),
         };
 
         let scores_path = process_benchmark_outputs(
@@ -11838,6 +12660,53 @@ JSONL
                 .and_then(|v| v.as_u64())
                 .unwrap_or(0),
             1
+        );
+    }
+
+    #[test]
+    fn process_benchmark_outputs_synthesizes_manifest_when_missing() {
+        let root = TempDirGuard::new("agentlab_benchmark_manifest_fallback");
+        let project_root = root.path.join("project");
+        let run_dir = root.path.join("run");
+        ensure_dir(&project_root).expect("project root");
+        ensure_dir(&run_dir).expect("run dir");
+
+        let evidence_dir = run_dir.join("evidence");
+        ensure_dir(&evidence_dir).expect("evidence dir");
+        let evidence_records_path = evidence_dir.join("evidence_records.jsonl");
+        let task_chain_states_path = evidence_dir.join("task_chain_states.jsonl");
+        fs::write(&evidence_records_path, "").expect("evidence records");
+        fs::write(&task_chain_states_path, "").expect("task chain states");
+        let benchmark_dir = run_dir.join("benchmark");
+        ensure_dir(&benchmark_dir).expect("benchmark dir");
+        fs::write(
+            benchmark_dir.join("scores.jsonl"),
+            r#"{"schema_version":"benchmark_score_record_v1","ids":{"run_id":"run_456","trial_id":"trial_9","variant_id":"base","task_id":"task_9","repl_idx":0},"benchmark":{"adapter_id":"fallback_adapter","name":"suite_x","split":"dev"},"verdict":"fail","primary_metric_name":"resolved","primary_metric_value":0.0,"metrics":{"resolved":0.0},"evaluator":{"name":"fallback_eval","mode":"custom"}}
+"#,
+        )
+        .expect("scores");
+
+        let adapter = BenchmarkAdapterConfig {
+            command: vec!["fallback_adapter".to_string()],
+            manifest: None,
+        };
+        process_benchmark_outputs(
+            &project_root,
+            &run_dir,
+            "run_456",
+            &adapter,
+            &evidence_records_path,
+            &task_chain_states_path,
+        )
+        .expect("benchmark processing should succeed");
+
+        let manifest = load_json_file(&benchmark_dir.join("adapter_manifest.json")).expect("manifest");
+        assert_eq!(
+            manifest
+                .pointer("/adapter_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or(""),
+            "fallback_adapter"
         );
     }
 
@@ -12885,6 +13754,8 @@ JSONL
         let policy_config = PolicyConfig::default();
         let evidence_records_path = run_dir.join("runtime").join("p3a_evidence.jsonl");
         let chain_state_path = run_dir.join("runtime").join("p3a_chain_state.jsonl");
+        let benchmark_predictions_path = run_dir.join("runtime").join("p3a_predictions.jsonl");
+        let benchmark_scores_path = run_dir.join("runtime").join("p3a_scores.jsonl");
         let mut pruned_variants: HashSet<usize> = HashSet::new();
         let mut consecutive_failures: BTreeMap<usize, usize> = BTreeMap::new();
 
@@ -12902,6 +13773,8 @@ JSONL
                     &policy_config,
                     &evidence_records_path,
                     &chain_state_path,
+                    &benchmark_predictions_path,
+                    &benchmark_scores_path,
                     &mut schedule_progress,
                     2,
                     &mut pruned_variants,
@@ -12926,6 +13799,8 @@ JSONL
                     &policy_config,
                     &evidence_records_path,
                     &chain_state_path,
+                    &benchmark_predictions_path,
+                    &benchmark_scores_path,
                     &mut schedule_progress,
                     2,
                     &mut pruned_variants,
@@ -13408,6 +14283,228 @@ JSONL
         );
     }
 
+    #[test]
+    fn p7_pause_run_routes_worker_control_when_active_adapter_is_absent() {
+        let (_root, run_dir) = create_run_dir("agentlab_p7_pause_worker_control", "run_1");
+        let active_trials = vec![RunControlActiveTrial {
+            trial_id: "trial_1".to_string(),
+            worker_id: "worker_parallel_1".to_string(),
+            schedule_idx: Some(0),
+            variant_id: Some("base".to_string()),
+            started_at: Some(Utc::now().to_rfc3339()),
+            control: None,
+        }];
+        write_run_control_v2(&run_dir, "run_1", "running", &active_trials, None).expect("control");
+
+        let responder_run_dir = run_dir.clone();
+        let responder = thread::spawn(move || {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while Instant::now() < deadline {
+                let Some(state) =
+                    load_parallel_worker_control_state(&responder_run_dir).expect("load state")
+                else {
+                    thread::sleep(Duration::from_millis(20));
+                    continue;
+                };
+                let Some(request) = state.request else {
+                    thread::sleep(Duration::from_millis(20));
+                    continue;
+                };
+                if request.action != ParallelWorkerControlAction::Pause {
+                    thread::sleep(Duration::from_millis(20));
+                    continue;
+                }
+                write_parallel_worker_control_response(
+                    &responder_run_dir,
+                    ParallelWorkerControlResponse {
+                        request_id: request.request_id,
+                        action: ParallelWorkerControlAction::Pause,
+                        status: PARALLEL_WORKER_CONTROL_RESPONSE_COMPLETED.to_string(),
+                        processed_at: Utc::now().to_rfc3339(),
+                        processed_trial_ids: vec!["trial_1".to_string()],
+                        failed_trials: Vec::new(),
+                        checkpoint_acked: Some(true),
+                        stop_acked: Some(true),
+                        message: None,
+                    },
+                )
+                .expect("write response");
+                return;
+            }
+            panic!("timed out waiting for pause control request");
+        });
+
+        let paused = pause_run(&run_dir, None, Some("worker_pause"), 2).expect("pause");
+        responder.join().expect("responder");
+        assert_eq!(paused.run_id, "run_1");
+        assert_eq!(paused.trial_id, "trial_1");
+        assert_eq!(paused.label, "worker_pause");
+        assert!(paused.checkpoint_acked);
+        assert!(paused.stop_acked);
+    }
+
+    #[test]
+    fn p7_scheduler_processes_worker_pause_request_via_backend() {
+        let (_root, run_dir) = create_run_dir("agentlab_p7_scheduler_pause_request", "run_1");
+        let trial_dir = seed_parent_trial(&run_dir, "trial_1", json!([]), "running", None);
+        let harness = Arc::new(FakeRemoteWorkerHarness::new());
+        let backend = RemoteWorkerBackend::new(harness.clone()).expect("backend");
+
+        let dispatch = worker_dispatch_fixture(0, "trial_1");
+        let ticket = backend.submit(dispatch.clone()).expect("submit");
+        let mut in_flight: HashMap<String, InFlightDispatch> = HashMap::new();
+        in_flight.insert(
+            ticket.ticket_id.clone(),
+            InFlightDispatch {
+                schedule_idx: dispatch.schedule_idx,
+                trial_id: dispatch.trial_id.clone(),
+                variant_idx: dispatch.slot.variant_idx,
+                variant_id: dispatch.variant_id.clone(),
+                worker_id: ticket.worker_id.clone(),
+                started_at: Utc::now().to_rfc3339(),
+            },
+        );
+        let mut in_flight_by_variant = BTreeMap::new();
+        in_flight_by_variant.insert(dispatch.slot.variant_idx, 1);
+        write_run_control_v2(&run_dir, "run_1", "running", &in_flight_active_trials(&in_flight), None)
+            .expect("run control");
+
+        write_parallel_worker_control_request(
+            &run_dir,
+            ParallelWorkerControlRequest {
+                request_id: "req_pause_1".to_string(),
+                action: ParallelWorkerControlAction::Pause,
+                requested_at: Utc::now().to_rfc3339(),
+                target_trial_ids: vec!["trial_1".to_string()],
+                label: Some("fanout_pause".to_string()),
+                reason: None,
+            },
+        )
+        .expect("request");
+
+        let outcome = process_parallel_worker_control_request(
+            &run_dir,
+            "run_1",
+            &backend,
+            &mut in_flight,
+            &mut in_flight_by_variant,
+        )
+        .expect("process request")
+        .expect("control outcome");
+        assert_eq!(outcome, ScheduleEngineOutcome::Paused);
+        assert!(in_flight.is_empty());
+
+        let pause_requests = harness.pause_requests().expect("pause requests");
+        assert_eq!(pause_requests.len(), 1);
+        assert_eq!(pause_requests[0].worker_id, ticket.worker_id);
+        let stop_requests = harness.stop_requests().expect("stop requests");
+        assert_eq!(stop_requests.len(), 1);
+        assert_eq!(stop_requests[0].worker_id, ticket.worker_id);
+
+        let run_control = load_json_file(&run_control_path(&run_dir)).expect("run control");
+        assert_eq!(
+            run_control
+                .pointer("/status")
+                .and_then(|v| v.as_str())
+                .unwrap_or(""),
+            "paused"
+        );
+        assert_eq!(
+            run_control
+                .pointer("/active_trials/trial_1/trial_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or(""),
+            "trial_1"
+        );
+        let trial_state = load_json_file(&trial_dir.join("trial_state.json")).expect("trial state");
+        assert_eq!(
+            trial_state
+                .pointer("/status")
+                .and_then(|v| v.as_str())
+                .unwrap_or(""),
+            "paused"
+        );
+    }
+
+    #[test]
+    fn p7_scheduler_processes_worker_stop_request_via_backend() {
+        let (_root, run_dir) = create_run_dir("agentlab_p7_scheduler_stop_request", "run_1");
+        let trial_dir = seed_parent_trial(&run_dir, "trial_1", json!([]), "running", None);
+        let harness = Arc::new(FakeRemoteWorkerHarness::new());
+        let backend = RemoteWorkerBackend::new(harness.clone()).expect("backend");
+
+        let dispatch = worker_dispatch_fixture(0, "trial_1");
+        let ticket = backend.submit(dispatch.clone()).expect("submit");
+        let mut in_flight: HashMap<String, InFlightDispatch> = HashMap::new();
+        in_flight.insert(
+            ticket.ticket_id.clone(),
+            InFlightDispatch {
+                schedule_idx: dispatch.schedule_idx,
+                trial_id: dispatch.trial_id.clone(),
+                variant_idx: dispatch.slot.variant_idx,
+                variant_id: dispatch.variant_id.clone(),
+                worker_id: ticket.worker_id.clone(),
+                started_at: Utc::now().to_rfc3339(),
+            },
+        );
+        let mut in_flight_by_variant = BTreeMap::new();
+        in_flight_by_variant.insert(dispatch.slot.variant_idx, 1);
+        write_run_control_v2(&run_dir, "run_1", "running", &in_flight_active_trials(&in_flight), None)
+            .expect("run control");
+
+        write_parallel_worker_control_request(
+            &run_dir,
+            ParallelWorkerControlRequest {
+                request_id: "req_stop_1".to_string(),
+                action: ParallelWorkerControlAction::Stop,
+                requested_at: Utc::now().to_rfc3339(),
+                target_trial_ids: vec!["trial_1".to_string()],
+                label: None,
+                reason: Some("killed_by_user".to_string()),
+            },
+        )
+        .expect("request");
+
+        let outcome = process_parallel_worker_control_request(
+            &run_dir,
+            "run_1",
+            &backend,
+            &mut in_flight,
+            &mut in_flight_by_variant,
+        )
+        .expect("process request")
+        .expect("control outcome");
+        assert_eq!(outcome, ScheduleEngineOutcome::Killed);
+        assert!(in_flight.is_empty());
+
+        let stop_requests = harness.stop_requests().expect("stop requests");
+        assert_eq!(stop_requests.len(), 1);
+        assert_eq!(stop_requests[0].worker_id, ticket.worker_id);
+
+        let run_control = load_json_file(&run_control_path(&run_dir)).expect("run control");
+        assert_eq!(
+            run_control
+                .pointer("/status")
+                .and_then(|v| v.as_str())
+                .unwrap_or(""),
+            "killed"
+        );
+        let active = run_control
+            .pointer("/active_trials")
+            .and_then(|v| v.as_object())
+            .cloned()
+            .unwrap_or_default();
+        assert!(active.is_empty(), "active trials should be empty after kill");
+        let trial_state = load_json_file(&trial_dir.join("trial_state.json")).expect("trial state");
+        assert_eq!(
+            trial_state
+                .pointer("/status")
+                .and_then(|v| v.as_str())
+                .unwrap_or(""),
+            "killed"
+        );
+    }
+
     fn p7_trial_result_with_trial_record(schedule_idx: usize) -> TrialExecutionResult {
         let trial_id = format!("trial_{}", schedule_idx + 1);
         let mut result = TrialExecutionResult::minimal(trial_id.clone(), "completed", Some(0));
@@ -13435,6 +14532,120 @@ JSONL
             has_hook_events: false,
         });
         result
+    }
+
+    struct FlushFailRunSink;
+
+    impl RunSink for FlushFailRunSink {
+        fn write_run_manifest(&mut self, _run: &RunManifestRecord) -> Result<()> {
+            Ok(())
+        }
+
+        fn append_trial_record(&mut self, _row: &TrialRecord) -> Result<()> {
+            Ok(())
+        }
+
+        fn append_metric_rows(&mut self, _rows: &[MetricRow]) -> Result<()> {
+            Ok(())
+        }
+
+        fn append_event_rows(&mut self, _rows: &[EventRow]) -> Result<()> {
+            Ok(())
+        }
+
+        fn append_variant_snapshot(&mut self, _rows: &[VariantSnapshotRow]) -> Result<()> {
+            Ok(())
+        }
+
+        fn flush(&mut self) -> Result<()> {
+            Err(anyhow::anyhow!("flush_failed"))
+        }
+    }
+
+    #[test]
+    fn p7_chain_root_workspace_is_trial_scoped() {
+        let a = chain_root_workspace_dir_name("trial_1");
+        let b = chain_root_workspace_dir_name("trial_2");
+        let c = chain_root_workspace_dir_name("trial/3");
+
+        assert_ne!(a, b);
+        assert!(a.starts_with("chain_root_workspace_"));
+        assert!(b.starts_with("chain_root_workspace_"));
+        assert!(
+            !c.contains('/'),
+            "trial-scoped chain root workspace path should be filesystem-safe"
+        );
+    }
+
+    #[test]
+    fn p7_commit_trial_slot_does_not_advance_progress_when_flush_fails() {
+        let (_root, run_dir) = create_run_dir("agentlab_p7_commit_flush_fail", "run_1");
+        ensure_dir(&run_dir.join("runtime")).expect("runtime dir");
+        let evidence_records_path = run_dir.join("runtime").join("p7_evidence.jsonl");
+        let chain_state_path = run_dir.join("runtime").join("p7_chain_state.jsonl");
+        let benchmark_predictions_path = run_dir.join("runtime").join("p7_predictions.jsonl");
+        let benchmark_scores_path = run_dir.join("runtime").join("p7_scores.jsonl");
+        fs::write(&evidence_records_path, "").expect("evidence rows");
+        fs::write(&chain_state_path, "").expect("chain rows");
+
+        let mut schedule_progress = ScheduleProgress {
+            schema_version: "schedule_progress_v1".to_string(),
+            run_id: "run_1".to_string(),
+            total_slots: 1,
+            next_schedule_index: 0,
+            next_trial_index: 0,
+            schedule: vec![TrialSlot {
+                variant_idx: 0,
+                task_idx: 0,
+                repl_idx: 0,
+            }],
+            completed_slots: Vec::new(),
+            pruned_variants: Vec::new(),
+            consecutive_failures: BTreeMap::new(),
+            use_container: false,
+            updated_at: "2026-02-22T00:00:00Z".to_string(),
+        };
+        write_schedule_progress(&run_dir, &schedule_progress).expect("progress");
+
+        let mut pruned_variants: HashSet<usize> = HashSet::new();
+        let mut consecutive_failures: BTreeMap<usize, usize> = BTreeMap::new();
+        let trial_result = TrialExecutionResult::minimal("trial_1".to_string(), "completed", Some(0));
+        let mut sink = FlushFailRunSink;
+        let err = RunCoordinator::commit_trial_slot(
+            &run_dir,
+            &PolicyConfig::default(),
+            &evidence_records_path,
+            &chain_state_path,
+            &benchmark_predictions_path,
+            &benchmark_scores_path,
+            &mut schedule_progress,
+            0,
+            1,
+            &mut pruned_variants,
+            &mut consecutive_failures,
+            &trial_result,
+            &mut sink,
+        )
+        .expect_err("flush failure should abort slot commit");
+        assert!(
+            err.to_string().contains("flush_failed"),
+            "unexpected error: {}",
+            err
+        );
+        assert_eq!(schedule_progress.next_schedule_index, 0);
+        assert!(
+            schedule_progress.completed_slots.is_empty(),
+            "slot should not be committed when sink flush fails"
+        );
+        assert!(pruned_variants.is_empty());
+        assert!(consecutive_failures.is_empty());
+
+        let persisted: ScheduleProgress = serde_json::from_slice(
+            &fs::read(schedule_progress_path(&run_dir)).expect("read persisted progress"),
+        )
+        .expect("deserialize persisted progress");
+        assert_eq!(persisted.next_schedule_index, 0);
+        assert!(persisted.completed_slots.is_empty());
     }
 
     fn p7_commit_trial_rows_for_arrival_order(
@@ -13465,6 +14676,8 @@ JSONL
         let policy_config = PolicyConfig::default();
         let evidence_records_path = run_dir.join("runtime").join("p7_evidence.jsonl");
         let chain_state_path = run_dir.join("runtime").join("p7_chain_state.jsonl");
+        let benchmark_predictions_path = run_dir.join("runtime").join("p7_predictions.jsonl");
+        let benchmark_scores_path = run_dir.join("runtime").join("p7_scores.jsonl");
         let mut pruned_variants: HashSet<usize> = HashSet::new();
         let mut consecutive_failures: BTreeMap<usize, usize> = BTreeMap::new();
         let mut run_sink = BufferedRunSink::default();
@@ -13484,6 +14697,8 @@ JSONL
                     &policy_config,
                     &evidence_records_path,
                     &chain_state_path,
+                    &benchmark_predictions_path,
+                    &benchmark_scores_path,
                     &mut schedule_progress,
                     slot_count,
                     &mut pruned_variants,
@@ -13498,6 +14713,8 @@ JSONL
                 &policy_config,
                 &evidence_records_path,
                 &chain_state_path,
+                &benchmark_predictions_path,
+                &benchmark_scores_path,
                 &mut schedule_progress,
                 slot_count,
                 &mut pruned_variants,

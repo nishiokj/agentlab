@@ -260,7 +260,7 @@ You can run from any shell directory if you pass the experiment path correctly.
 Resolution behavior:
 
 1. `dataset.path` resolves relative to the experiment file directory.
-2. `runtime.dependencies.file_staging[*].source_from_host` resolves relative to project root (parent of `.lab`) when relative.
+2. `runtime.dependencies.file_staging[*].source_from_host` resolves relative to the experiment file directory when relative.
 3. In container execution, `runtime.agent.command` tokens are treated as literal command tokens.
 4. In local-process execution, path-like tokens may be host-resolved for compatibility.
 

@@ -42,7 +42,6 @@ const builder = ExperimentBuilder.create('rex_ab', 'Rex Prompt A/B')
     'ghcr.io/acme/rex-agent@sha256:0123456789abcdef...',
     ['python', '-m', 'rex.run_trial'],
   )
-  .usePrebuiltRexJesusAdapter()
   .agentEnvFromHost(['OPENAI_API_KEY'])
 
   // Dependency boundary: stage host files into trial paths.
@@ -88,46 +87,14 @@ console.log(run.run.run_id);
 ## What You Need To Bring
 
 1. A dataset JSONL (`dataset.path`) with one JSON object per line.
-2. An agent runtime declaration:
-   - `runtime.agent.mode: known_agent_ref`, or
-   - `runtime.agent.mode: custom_image`.
-   - optional `runtime.agent.adapter` for explicit adapter identity.
+2. A runtime command (`runtime.agent.command`) and, for container execution, an image (`runtime.agent.image`).
 3. At least one baseline variant (`.baseline(...)`).
 4. Optional treatment variants (`.addVariant(...)`) and metrics (`.metric(...)`).
 5. Optional staged dependency files (`.dependencyFileStaging(...)`).
 
 You do not provide a control-plane protocol, runner socket wiring, or runner state handling.
 
-## Runtime Agent Modes
-
-### `known_agent_ref`
-
-Use this when the runner should resolve a pre-registered runtime by id/version.
-
-```ts
-builder.agentRef('rex_daemon', '1.2.0', { registry: 'internal' });
-```
-
-Runner resolves manifests from:
-
-1. `.lab/agents/<registry>/<id>/<version>.json` (if `registry` provided)
-2. `.lab/agents/<id>/<version>.json`
-
-Manifest shape:
-
-```json
-{
-  "image": "ghcr.io/acme/rex-agent@sha256:...",
-  "entrypoint": ["python", "-m", "rex.run_trial"],
-  "default_env": {
-    "PYTHONUNBUFFERED": "1"
-  }
-}
-```
-
-### `custom_image`
-
-Use this when you provide image + command directly.
+## Runtime Command
 
 ```ts
 builder.customAgentImage(
@@ -136,32 +103,13 @@ builder.customAgentImage(
 );
 ```
 
-### `adapter` (optional)
+You can set runtime command/env through:
 
-Use this when you want explicit runner adapter identity in metadata/control paths.
-
-```ts
-builder.usePrebuiltCodexAdapter();      // runtime.agent.adapter = prebuilt.codex_cli@v1
-builder.usePrebuiltRexJesusAdapter();   // runtime.agent.adapter = prebuilt.rex_jesus@v1
-builder.useBuiltinAdapter();            // runtime.agent.adapter = builtin.command_contract@v1
-```
-
-Or set custom adapter id/version directly:
-
-```ts
-builder.agentAdapter('my.custom.adapter', 'v7');
-```
-
-You can also set command/env through:
-
-1. `.agentLoop(command)` (sets `custom_image.entrypoint`)
+1. `.agentLoop(command)` (sets `runtime.agent.command`)
 2. `.agentArgs(args)`
 3. `.agentEnv(env)`
 4. `.agentEnvFromHost(keys)`
-5. `.agentAdapter(id, version?)`
-6. `.useBuiltinAdapter(version?)`
-7. `.usePrebuiltCodexAdapter(version?)`
-8. `.usePrebuiltRexJesusAdapter(version?)`
+5. `.agentIo(inputArg, outputArg)` (optional IO flag mapping)
 
 ## Command Semantics
 
@@ -182,7 +130,7 @@ Preferred API:
 
 Entry fields:
 
-1. `source_from_host`: host file path (supports `~`; relative paths resolve from project root, parent of `.lab`).
+1. `source_from_host`: host file path (supports `~`; relative paths resolve from the experiment file directory).
 2. `destination_path`: absolute path exposed in trial filesystem (usually under `/agentlab/deps/...`).
 3. `required` (optional, default true): if false, missing source is tolerated.
 
@@ -215,8 +163,6 @@ Runner sets these env vars for your command:
 10. `AGENTLAB_VARIANT_ID`
 11. `AGENTLAB_TASK_ID`
 12. `AGENTLAB_REPL_IDX`
-13. `AGENTLAB_PREBUILT_ADAPTER` (only for prebuilt adapters)
-14. `AGENTLAB_PREBUILT_ADAPTER_ID` (only for prebuilt adapters)
 
 Your loop should write `agent_result_v1` JSON to `AGENTLAB_RESULT_PATH`.
 
@@ -232,17 +178,14 @@ await client.run({ experiment: '.lab/experiment.yaml' });
 Resolution rules:
 
 1. `dataset.path` is resolved relative to the experiment file directory.
-2. `runtime.dependencies.*.source_from_host` is resolved relative to project root (parent of `.lab`) when relative.
-3. `known_agent_ref` manifests are resolved under that same project root (`.lab/agents/...`).
+2. `runtime.dependencies.*.source_from_host` is resolved relative to the experiment file directory when relative.
 
 ## ExperimentBuilder API (Primary)
 
 Required before `build()`:
 
 1. `.datasetJsonl(path, opts)`
-2. One runtime agent mode:
-   - `.agentRef(...)`, or
-   - `.agentLoop(...)` / `.customAgentImage(...)`
+2. `.agentLoop(...)` or `.customAgentImage(...)`
 
 Common optional setters:
 

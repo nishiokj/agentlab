@@ -259,42 +259,9 @@ export interface BenchmarkConfig {
   adapter?: BenchmarkAdapterConfig;
 }
 
-export type AgentRuntimeMode = 'known_agent_ref' | 'custom_image';
-export interface AgentAdapterRef {
-  id: string;
-  version: string;
-}
-
-export const BUILTIN_COMMAND_ADAPTER: AgentAdapterRef = {
-  id: 'builtin.command_contract',
-  version: 'v1',
-};
-
-export const PREBUILT_CODEX_ADAPTER: AgentAdapterRef = {
-  id: 'prebuilt.codex_cli',
-  version: 'v1',
-};
-
-export const PREBUILT_REX_JESUS_ADAPTER: AgentAdapterRef = {
-  id: 'prebuilt.rex_jesus',
-  version: 'v1',
-};
-
-export interface KnownAgentRef {
-  id: string;
-  version: string;
-  registry?: string;
-}
-
-export interface CustomAgentImage {
-  image?: string;
-  entrypoint: string[];
-}
-
-export interface AgentRuntimeOverrides {
-  args?: string[];
-  env?: Record<string, string>;
-  env_from_host?: string[];
+export interface AgentIoConfig {
+  input_arg?: string;
+  output_arg?: string;
 }
 
 function copyPolicies(p: DesignPolicies): DesignPolicies {
@@ -395,11 +362,11 @@ export interface ExperimentSpec {
   };
   runtime: {
     agent: {
-      mode: AgentRuntimeMode;
-      adapter?: AgentAdapterRef;
-      known_agent_ref?: KnownAgentRef;
-      custom_image?: CustomAgentImage;
-      overrides?: AgentRuntimeOverrides;
+      command: string[];
+      image?: string;
+      io?: AgentIoConfig;
+      env?: Record<string, string>;
+      env_from_host?: string[];
     };
     dependencies: {
       file_staging?: DependencyFileStagingEntry[];
@@ -494,15 +461,9 @@ export class ExperimentBuilder {
       variant_plan: [],
       runtime: {
         agent: {
-          mode: 'custom_image',
-          custom_image: {
-            entrypoint: [],
-          },
-          overrides: {
-            args: [],
-            env: {},
-            env_from_host: [],
-          },
+          command: [],
+          env: {},
+          env_from_host: [],
         },
         dependencies: {
           file_staging: [],
@@ -559,77 +520,25 @@ export class ExperimentBuilder {
     return this;
   }
 
-  private ensureAgentOverrides(): AgentRuntimeOverrides {
-    if (!this.spec.runtime.agent.overrides) {
-      this.spec.runtime.agent.overrides = {};
-    }
-    return this.spec.runtime.agent.overrides;
-  }
-
-  private ensureCustomImage(): CustomAgentImage {
-    if (!this.spec.runtime.agent.custom_image) {
-      this.spec.runtime.agent.custom_image = { entrypoint: [] };
-    }
-    return this.spec.runtime.agent.custom_image;
-  }
-
-  agentAdapter(id: string, version = 'v1'): this {
-    this.spec.runtime.agent.adapter = { id, version };
-    return this;
-  }
-
-  useBuiltinAdapter(version = 'v1'): this {
-    return this.agentAdapter(BUILTIN_COMMAND_ADAPTER.id, version);
-  }
-
-  usePrebuiltCodexAdapter(version = 'v1'): this {
-    return this.agentAdapter(PREBUILT_CODEX_ADAPTER.id, version);
-  }
-
-  usePrebuiltRexJesusAdapter(version = 'v1'): this {
-    return this.agentAdapter(PREBUILT_REX_JESUS_ADAPTER.id, version);
-  }
-
-  agentRef(id: string, version: string, options?: { registry?: string }): this {
-    this.spec.runtime.agent.mode = 'known_agent_ref';
-    this.spec.runtime.agent.known_agent_ref = {
-      id,
-      version,
-      registry: options?.registry,
-    };
-    this.spec.runtime.agent.custom_image = undefined;
-    return this;
-  }
-
-  customAgentImage(image: string, entrypoint: string[]): this {
-    this.spec.runtime.agent.mode = 'custom_image';
-    this.spec.runtime.agent.known_agent_ref = undefined;
-    this.spec.runtime.agent.custom_image = {
-      image,
-      entrypoint: [...entrypoint],
-    };
+  customAgentImage(image: string, command: string[]): this {
+    this.spec.runtime.agent.command = [...command];
+    this.spec.runtime.agent.image = image;
     this.spec.runtime.policy.sandbox.mode = 'container';
-    this.spec.runtime.policy.sandbox.image = image;
     return this;
   }
 
   agentLoop(command: string[]): this {
-    this.spec.runtime.agent.mode = 'custom_image';
-    this.spec.runtime.agent.known_agent_ref = undefined;
-    const custom = this.ensureCustomImage();
-    custom.entrypoint = [...command];
+    this.spec.runtime.agent.command = [...command];
     return this;
   }
 
   agentArgs(args: string[]): this {
-    const overrides = this.ensureAgentOverrides();
-    overrides.args = [...args];
+    this.spec.runtime.agent.command.push(...args);
     return this;
   }
 
   agentEnv(env: Record<string, string>): this {
-    const overrides = this.ensureAgentOverrides();
-    overrides.env = { ...env };
+    this.spec.runtime.agent.env = { ...env };
     return this;
   }
 
@@ -638,13 +547,20 @@ export class ExperimentBuilder {
   }
 
   agentEnvFromHost(keys: string[]): this {
-    const overrides = this.ensureAgentOverrides();
-    overrides.env_from_host = [...keys];
+    this.spec.runtime.agent.env_from_host = [...keys];
     return this;
   }
 
   agentLoopEnvFromHost(keys: string[]): this {
     return this.agentEnvFromHost(keys);
+  }
+
+  agentIo(inputArg: string, outputArg: string): this {
+    this.spec.runtime.agent.io = {
+      input_arg: inputArg,
+      output_arg: outputArg,
+    };
+    return this;
   }
 
   dependencyAssets(entries: DependencyAssetEntry[]): this {
@@ -794,11 +710,7 @@ export class ExperimentBuilder {
 
   sandboxImage(image: string): this {
     this.spec.runtime.policy.sandbox.mode = 'container';
-    this.spec.runtime.policy.sandbox.image = image;
-    if (this.spec.runtime.agent.mode === 'custom_image') {
-      const custom = this.ensureCustomImage();
-      custom.image = image;
-    }
+    this.spec.runtime.agent.image = image;
     return this;
   }
 
@@ -820,41 +732,18 @@ export class ExperimentBuilder {
     if (!this.spec.dataset.suite_id) missing.push('dataset suite_id (call .datasetJsonl() with suiteId)');
     if (!this.spec.dataset.split_id) missing.push('dataset split_id (call .datasetJsonl() with splitId)');
     if (this.spec.dataset.limit <= 0) missing.push('dataset limit (call .datasetJsonl() with limit > 0)');
-    if (!this.spec.runtime.agent.mode) {
-      missing.push('runtime agent mode (call .agentRef() or .agentLoop()/customAgentImage())');
-    } else if (this.spec.runtime.agent.mode === 'known_agent_ref') {
-      const known = this.spec.runtime.agent.known_agent_ref;
-      if (!known?.id || known.id.trim().length === 0) {
-        missing.push('runtime.agent.known_agent_ref.id (call .agentRef())');
-      }
-      if (!known?.version || known.version.trim().length === 0) {
-        missing.push('runtime.agent.known_agent_ref.version (call .agentRef())');
-      }
-    } else if (this.spec.runtime.agent.mode === 'custom_image') {
-      const entrypoint = this.spec.runtime.agent.custom_image?.entrypoint ?? [];
-      if (entrypoint.length === 0 || entrypoint.some((part) => part.trim().length === 0)) {
-        missing.push('runtime.agent.custom_image.entrypoint (call .agentLoop() or .customAgentImage())');
-      }
-    }
-    const adapterId = this.spec.runtime.agent.adapter?.id?.trim() ?? '';
-    const adapterVersion = this.spec.runtime.agent.adapter?.version?.trim() ?? '';
-    if (adapterId.length === 0 && adapterVersion.length > 0) {
-      missing.push('runtime.agent.adapter.id (call .agentAdapter() with a non-empty id)');
-    }
-    if (adapterVersion.length === 0 && adapterId.length > 0) {
-      missing.push('runtime.agent.adapter.version (call .agentAdapter() with a non-empty version)');
+    const command = this.spec.runtime.agent.command ?? [];
+    if (command.length === 0 || command.some((part) => part.trim().length === 0)) {
+      missing.push('runtime.agent.command (call .agentLoop() or .customAgentImage())');
     }
     if (this.spec.runtime.policy.timeout_ms <= 0) {
       missing.push('policy timeout_ms (call .timeoutMs() with > 0)');
     }
     if (this.spec.runtime.policy.sandbox.mode === 'container') {
-      const customImage = this.spec.runtime.agent.custom_image?.image;
-      const policyImage = this.spec.runtime.policy.sandbox.image;
-      const hasImage = this.spec.runtime.agent.mode === 'known_agent_ref'
-        || (!!customImage && customImage.trim().length > 0)
-        || (!!policyImage && policyImage.trim().length > 0);
+      const runtimeImage = this.spec.runtime.agent.image;
+      const hasImage = !!runtimeImage && runtimeImage.trim().length > 0;
       if (!hasImage) {
-        missing.push('container image (call .customAgentImage(), .sandboxImage(), or use .agentRef())');
+        missing.push('runtime.agent.image (call .customAgentImage() or .sandboxImage())');
       }
     }
     if (missing.length > 0) {
