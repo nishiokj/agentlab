@@ -3,7 +3,7 @@
 Status: Implemented through Phase 3 scaffolding v0.2  
 Date: 2026-02-23  
 Owner: AgentLab Runtime/Benchmark Integrations  
-Scope: `/Users/jevinnishioka/Desktop/Experiments` as integration source, `/Users/jevinnishioka/Desktop/jesus` as experiment consumer
+Scope: AgentLab repository as integration source, consumer experiment repo as experiment consumer
 
 ## 1) Objective
 
@@ -64,7 +64,7 @@ Add a Harbor benchmark adapter command that:
 
 ## 5) Repo Ownership Split
 
-### 5.1 `/Experiments` (reusable integration layer)
+### 5.1 AgentLab repo (reusable integration layer)
 
 Place here:
 
@@ -77,7 +77,7 @@ Place here:
 
 Rule: code here must be repo-agnostic and reusable across consumer repos.
 
-### 5.2 `/jesus` (consumer/runtime layer)
+### 5.2 Consumer repo (consumer/runtime layer)
 
 Place here:
 
@@ -196,7 +196,7 @@ Optional for Harbor task images:
 3. Risk: dependency leakage into core runner.
    1. Mitigation: command boundary only; no Rust/SDK Harbor deps.
 4. Risk: brittle local path assumptions across repos.
-   1. Mitigation: strict `/Experiments` reusable code vs `/jesus` runtime config split.
+   1. Mitigation: strict AgentLab reusable code vs consumer repo runtime config split.
 
 ## 13) Open Decisions
 
@@ -206,7 +206,7 @@ Optional for Harbor task images:
 
 ## 14) Recommendation
 
-Proceed with first-class Harbor integration as a boundary plugin in `/Experiments` now.
+Proceed with first-class Harbor integration as a boundary plugin in the AgentLab repo now.
 
 This gives:
 

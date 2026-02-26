@@ -1,6 +1,6 @@
 # Harbor Phase 1 Runbook
 
-This runbook covers the implemented Phase 1 path in `/Users/jevinnishioka/Desktop/Experiments`.
+This runbook covers the implemented Phase 1 path in the AgentLab repository.
 
 ## Files Added
 
