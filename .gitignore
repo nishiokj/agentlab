@@ -19,3 +19,23 @@ logs/
 .vscode/
 *.swp
 *.swo
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.eggs/
+build/
+dist/
+.venv/
+*.egg
+
+# Benchmark
+runs/*/
+!runs/.gitkeep
+reports/*/
+!reports/.gitkeep
+.pytest_cache/
+.coverage
+htmlcov/
