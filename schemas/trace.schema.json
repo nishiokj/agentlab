@@ -1,0 +1,93 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "trace.schema.json",
+  "title": "Benchmark Trace Record",
+  "description": "Schema for a single record in trace.jsonl. One record per tool call or lifecycle event.",
+  "type": "object",
+  "required": [
+    "run_id",
+    "task_id",
+    "phase",
+    "event_type",
+    "ts_start",
+    "ts_end",
+    "duration_ms"
+  ],
+  "properties": {
+    "run_id": {
+      "type": "string",
+      "description": "Unique identifier for this run"
+    },
+    "task_id": {
+      "type": "string",
+      "pattern": "^TASK[0-9]{3}$",
+      "description": "Task identifier"
+    },
+    "phase": {
+      "type": "string",
+      "enum": ["agent", "grader", "validation"],
+      "description": "Which phase produced this record"
+    },
+    "event_type": {
+      "type": "string",
+      "enum": [
+        "tool_call",
+        "phase_start",
+        "phase_end",
+        "timeout",
+        "error",
+        "patch_applied",
+        "policy_check"
+      ],
+      "description": "Type of event"
+    },
+    "ts_start": {
+      "type": "string",
+      "format": "date-time",
+      "description": "ISO 8601 timestamp of event start"
+    },
+    "ts_end": {
+      "type": "string",
+      "format": "date-time",
+      "description": "ISO 8601 timestamp of event end"
+    },
+    "duration_ms": {
+      "type": "number",
+      "minimum": 0,
+      "description": "Duration in milliseconds"
+    },
+    "tool_name": {
+      "type": ["string", "null"],
+      "enum": ["search", "list_dir", "read_file", "apply_patch", "run", null],
+      "description": "Tool name if event_type is tool_call"
+    },
+    "input": {
+      "type": ["object", "null"],
+      "description": "Tool input parameters (redacted if sensitive)"
+    },
+    "output_summary": {
+      "type": ["string", "null"],
+      "maxLength": 4096,
+      "description": "Truncated summary of tool output"
+    },
+    "exit_code": {
+      "type": ["integer", "null"],
+      "description": "Exit code for run tool or subprocess"
+    },
+    "error_type": {
+      "type": ["string", "null"],
+      "description": "Error classification if applicable"
+    },
+    "error_message": {
+      "type": ["string", "null"],
+      "maxLength": 2048,
+      "description": "Error message if applicable"
+    },
+    "workspace_relpaths_touched": {
+      "type": ["array", "null"],
+      "items": { "type": "string" },
+      "description": "Workspace-relative paths affected by this event"
+    }
+  },
+  "additionalProperties": false
+}

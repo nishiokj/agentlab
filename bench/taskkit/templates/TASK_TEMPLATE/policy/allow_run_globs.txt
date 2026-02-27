@@ -1,0 +1,5 @@
+# Commands the agent may run
+# One command basename per line
+python
+python3
+pytest

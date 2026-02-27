@@ -1,0 +1,127 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "task.schema.json",
+  "title": "Benchmark Task",
+  "description": "Schema for a benchmark task definition (task.yaml converted to JSON).",
+  "type": "object",
+  "required": [
+    "task_id",
+    "repo_id",
+    "repo_snapshot",
+    "baseline_injection_patch",
+    "public_command",
+    "hidden_command",
+    "time_limits",
+    "determinism_env",
+    "patch_policy"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "task_id": {
+      "type": "string",
+      "pattern": "^TASK[0-9]{3}$",
+      "description": "Unique task identifier, e.g. TASK001"
+    },
+    "repo_id": {
+      "type": "string",
+      "enum": ["click", "rich", "jinja2"],
+      "description": "Target repository identifier"
+    },
+    "repo_snapshot": {
+      "type": "string",
+      "description": "Path to repo snapshot archive relative to repos/"
+    },
+    "baseline_injection_patch": {
+      "type": "string",
+      "description": "Path to the injection patch file relative to task directory"
+    },
+    "public_command": {
+      "type": "string",
+      "description": "Shell command to run public reproduction test"
+    },
+    "hidden_command": {
+      "type": "string",
+      "description": "Shell command to run hidden test suite (benchmark-owned runner)"
+    },
+    "time_limits": {
+      "type": "object",
+      "required": ["agent_timeout", "grade_timeout", "hidden_timeout", "public_timeout"],
+      "additionalProperties": false,
+      "properties": {
+        "agent_timeout": {
+          "type": "integer",
+          "minimum": 60,
+          "maximum": 3600,
+          "description": "Agent phase wall-clock cap in seconds"
+        },
+        "grade_timeout": {
+          "type": "integer",
+          "minimum": 30,
+          "maximum": 600,
+          "description": "Total grading phase cap in seconds"
+        },
+        "hidden_timeout": {
+          "type": "integer",
+          "minimum": 10,
+          "maximum": 300,
+          "description": "Hidden suite execution cap in seconds"
+        },
+        "public_timeout": {
+          "type": "integer",
+          "minimum": 5,
+          "maximum": 120,
+          "description": "Public repro execution cap in seconds"
+        }
+      }
+    },
+    "determinism_env": {
+      "type": "object",
+      "required": ["PYTHONHASHSEED", "TZ", "LC_ALL", "LANG"],
+      "properties": {
+        "PYTHONHASHSEED": { "type": "string" },
+        "TZ": { "type": "string" },
+        "LC_ALL": { "type": "string" },
+        "LANG": { "type": "string" },
+        "SOURCE_DATE_EPOCH": { "type": "string" },
+        "PYTEST_DISABLE_PLUGIN_AUTOLOAD": { "type": "string" }
+      },
+      "additionalProperties": { "type": "string" }
+    },
+    "patch_policy": {
+      "type": "object",
+      "required": ["allow_edit_globs", "deny_edit_globs"],
+      "additionalProperties": false,
+      "properties": {
+        "allow_edit_globs": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Glob patterns for files the agent MAY edit"
+        },
+        "deny_edit_globs": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Glob patterns for files the agent must NOT edit"
+        },
+        "allow_run_globs": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "Glob patterns for commands the agent may run"
+        }
+      }
+    },
+    "description": {
+      "type": "string",
+      "description": "Brief human-readable description of what the task tests"
+    },
+    "difficulty": {
+      "type": "string",
+      "enum": ["easy", "medium", "hard"],
+      "description": "Estimated difficulty level"
+    },
+    "tags": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Tags for categorization (e.g. parsing, validation, CLI)"
+    }
+  }
+}

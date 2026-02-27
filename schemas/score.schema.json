@@ -1,0 +1,116 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "score.schema.json",
+  "title": "Benchmark Score",
+  "description": "Schema for score.json produced by the grader.",
+  "type": "object",
+  "required": [
+    "run_id",
+    "task_id",
+    "public_pass",
+    "hidden_pass",
+    "policy_pass",
+    "overall_pass",
+    "failure_label",
+    "metrics"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "run_id": {
+      "type": "string",
+      "description": "Unique identifier for this run"
+    },
+    "task_id": {
+      "type": "string",
+      "pattern": "^TASK[0-9]{3}$",
+      "description": "Task identifier"
+    },
+    "public_pass": {
+      "type": "boolean",
+      "description": "Whether public reproduction test passed"
+    },
+    "hidden_pass": {
+      "type": "boolean",
+      "description": "Whether hidden test suite passed"
+    },
+    "policy_pass": {
+      "type": "boolean",
+      "description": "Whether patch policy was respected"
+    },
+    "overall_pass": {
+      "type": "boolean",
+      "description": "True only if public_pass AND hidden_pass AND policy_pass"
+    },
+    "failure_label": {
+      "type": ["string", "null"],
+      "enum": [
+        null,
+        "AGENT_TIMEOUT",
+        "AGENT_ERROR",
+        "NO_PATCH",
+        "PATCH_APPLY_FAIL",
+        "POLICY_VIOLATION",
+        "PUBLIC_FAIL",
+        "HIDDEN_FAIL",
+        "HIDDEN_TIMEOUT",
+        "HIDDEN_ERROR",
+        "GRADER_ERROR"
+      ],
+      "description": "Primary failure classification (null if overall_pass is true)"
+    },
+    "metrics": {
+      "type": "object",
+      "required": ["tool_calls", "wall_clock_s", "patch"],
+      "additionalProperties": false,
+      "properties": {
+        "tool_calls": {
+          "type": "integer",
+          "minimum": 0,
+          "description": "Total number of tool calls in the agent phase"
+        },
+        "wall_clock_s": {
+          "type": "number",
+          "minimum": 0,
+          "description": "Total agent phase wall-clock time in seconds"
+        },
+        "patch": {
+          "type": "object",
+          "required": ["files_changed", "lines_added", "lines_removed"],
+          "additionalProperties": false,
+          "properties": {
+            "files_changed": { "type": "integer", "minimum": 0 },
+            "lines_added": { "type": "integer", "minimum": 0 },
+            "lines_removed": { "type": "integer", "minimum": 0 }
+          }
+        },
+        "token_usage": {
+          "type": ["object", "null"],
+          "description": "Optional token usage from agent_metrics.json",
+          "properties": {
+            "prompt_tokens": { "type": "integer", "minimum": 0 },
+            "completion_tokens": { "type": "integer", "minimum": 0 },
+            "total_tokens": { "type": "integer", "minimum": 0 }
+          }
+        },
+        "coverage": {
+          "type": ["object", "null"],
+          "description": "Optional coverage data",
+          "properties": {
+            "line_rate": { "type": "number", "minimum": 0, "maximum": 1 },
+            "branch_rate": { "type": ["number", "null"], "minimum": 0, "maximum": 1 }
+          }
+        },
+        "hidden_cases_total": {
+          "type": ["integer", "null"],
+          "minimum": 0,
+          "description": "Total hidden test cases"
+        },
+        "hidden_cases_passed": {
+          "type": ["integer", "null"],
+          "minimum": 0,
+          "description": "Hidden test cases passed"
+        }
+      }
+    }
+  }
+}

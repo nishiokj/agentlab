@@ -1,0 +1,33 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "bench"
+version = "0.1.0"
+description = "Deterministic offline benchmark for coding agents"
+requires-python = ">=3.11,<3.12"
+license = {text = "MIT"}
+dependencies = [
+    "click>=8.1,<9",
+    "pyyaml>=6.0,<7",
+    "jsonschema>=4.20,<5",
+    "pydantic>=2.5,<3",
+    "uvicorn>=0.24,<1",
+    "starlette>=0.33,<1",
+    "httpx>=0.25,<1",
+    "zstandard>=0.22,<1",
+]
+
+[project.scripts]
+bench = "bench.cli:main"
+
+[tool.setuptools.packages.find]
+include = ["bench*"]
+
+[tool.pytest.ini_options]
+testpaths = ["bench/tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+addopts = "-q --tb=short"
