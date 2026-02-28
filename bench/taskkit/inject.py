@@ -7,11 +7,11 @@ from __future__ import annotations
 
 import hashlib
 import subprocess
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from bench.runner.patch_policy import PatchPolicy
-from bench.tools.patch import parse_patch_files
+from bench.taskkit.patch_utils import parse_patch_files
 
 
 def validate_injection_patch(
@@ -50,7 +50,13 @@ def validate_injection_patch(
     return errors
 
 
-def get_injection_manifest(patch_path: Path) -> dict[str, Any]:
+def get_injection_manifest(
+    patch_path: Path,
+    source_snapshot_id: str | None = None,
+    tree_hash_before: str | None = None,
+    tree_hash_after: str | None = None,
+    created_at: str | None = None,
+) -> dict[str, Any]:
     """Get a manifest of files changed by an injection patch."""
     patch_text = patch_path.read_text()
     files = parse_patch_files(patch_text)
@@ -58,6 +64,10 @@ def get_injection_manifest(patch_path: Path) -> dict[str, Any]:
         "patch_file": str(patch_path),
         "files_changed": files,
         "patch_hash": hashlib.sha256(patch_text.encode()).hexdigest(),
+        "source_snapshot_id": source_snapshot_id,
+        "created_at": created_at or datetime.now(timezone.utc).isoformat(),
+        "tree_hash_before": tree_hash_before,
+        "tree_hash_after": tree_hash_after,
     }
 
 
@@ -71,6 +81,8 @@ def apply_injection(
     """
     patch_text = patch_path.read_text()
     files = parse_patch_files(patch_text)
+
+    tree_hash_before = compute_workspace_tree_hash(workspace)
 
     result = subprocess.run(
         ["git", "apply", "--verbose", "-"],
@@ -93,11 +105,15 @@ def apply_injection(
         )
         success = result2.returncode == 0
 
+    tree_hash_after = compute_workspace_tree_hash(workspace) if success else tree_hash_before
+
     return {
         "success": success,
         "files_changed": files,
         "patch_hash": hashlib.sha256(patch_text.encode()).hexdigest(),
         "error": result.stderr if not success else None,
+        "tree_hash_before": tree_hash_before,
+        "tree_hash_after": tree_hash_after,
     }
 
 

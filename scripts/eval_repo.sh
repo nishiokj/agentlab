@@ -31,7 +31,7 @@ echo "=== Repository Evaluation: $REPO ==="
 echo ""
 
 # Check if repo dir exists
-REPO_DIR="$SCRIPT_DIR/../repos/$REPO"
+REPO_DIR="$SCRIPT_DIR/../bench/benchmark/repos/$REPO"
 if [ -d "$REPO_DIR" ]; then
     echo "[OK] Repo directory exists: $REPO_DIR"
     if [ -f "$REPO_DIR/src.tar.zst" ]; then

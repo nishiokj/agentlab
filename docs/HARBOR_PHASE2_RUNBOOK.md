@@ -14,14 +14,14 @@ For compatibility monitoring lanes, see `docs/HARBOR_PHASE3_RUNBOOK.md`.
    2. `.lab/experiments/terminal_bench2_harbor_smoke.yaml`
    3. `scripts/harbor/smoke_terminal_bench2_harbor.sh`
 3. Strict adapter error taxonomy:
-   1. `scripts/harbor/harbor_benchmark_adapter.py`
+   1. `adapters/harbor/harbor_benchmark_adapter.py`
 
 ## Per-Task Image Dataset Build
 
 Use `--require-task-image` to fail fast when any task does not define `task.image`:
 
 ```bash
-python3 scripts/harbor/export_harbor_to_agentlab_jsonl.py \
+python3 adapters/harbor/export_harbor_to_agentlab_jsonl.py \
   --tasks-root /path/to/harbor/tasks \
   --output .lab/experiments/data/terminal_bench2_harbor.task_boundary_v2.jsonl \
   --require-task-image
@@ -30,7 +30,7 @@ python3 scripts/harbor/export_harbor_to_agentlab_jsonl.py \
 If your Harbor tasks are missing image fields and you want a default:
 
 ```bash
-python3 scripts/harbor/export_harbor_to_agentlab_jsonl.py \
+python3 adapters/harbor/export_harbor_to_agentlab_jsonl.py \
   --tasks-root /path/to/harbor/tasks \
   --output .lab/experiments/data/terminal_bench2_harbor.task_boundary_v2.jsonl \
   --default-task-image python:3.11-slim

@@ -2,13 +2,13 @@
 
 ## Overview
 
-Each task is a self-contained bundle under `tasks/v0/TASK###/` that defines
+Each task is a self-contained bundle under `bench/benchmark/tasks/v0/TASK###/` that defines
 a coding challenge for agents to solve.
 
 ## Task Bundle Structure
 
 ```
-tasks/v0/TASK001/
+bench/benchmark/tasks/v0/TASK001/
   task.yaml              # Task metadata and configuration
   issue.md               # Issue description (what the agent sees)
   public/
@@ -97,7 +97,7 @@ At least 80% of mutant failures should be assertion/test mismatches
 
 ```bash
 # Validate your task
-python -m bench.cli validate-task tasks/v0/TASK001
+python -m bench.cli validate-task bench/benchmark/tasks/v0/TASK001
 
 # Check the full suite
 python -m bench.cli validate-suite v0

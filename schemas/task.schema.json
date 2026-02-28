@@ -24,7 +24,6 @@
     },
     "repo_id": {
       "type": "string",
-      "enum": ["click", "rich", "jinja2"],
       "description": "Target repository identifier"
     },
     "repo_snapshot": {

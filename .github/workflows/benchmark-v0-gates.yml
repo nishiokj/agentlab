@@ -1,0 +1,35 @@
+name: benchmark-v0-gates
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - 'bench/**'
+      - 'schemas/**'
+      - 'bench/benchmark/tasks/**'
+      - '.github/workflows/benchmark-v0-gates.yml'
+
+jobs:
+  schema-validation:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install deps
+        run: pip install -r requirements.txt
+      - name: Validate schemas
+        run: python -m bench.cli validate-schemas
+
+  strict-task-validation:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install deps
+        run: pip install -r requirements.txt
+      - name: Validate suite strict
+        run: python -m bench.cli validate-suite v0 --repeat 2 --check-determinism --strict

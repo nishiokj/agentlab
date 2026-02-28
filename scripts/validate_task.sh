@@ -6,7 +6,7 @@ ROOT_DIR="$(dirname "$SCRIPT_DIR")"
 
 if [ $# -lt 1 ]; then
     echo "Usage: $0 <task_path>"
-    echo "Example: $0 tasks/v0/TASK001"
+    echo "Example: $0 bench/benchmark/tasks/v0/TASK001"
     exit 1
 fi
 

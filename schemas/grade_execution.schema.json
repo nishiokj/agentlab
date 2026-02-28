@@ -1,0 +1,41 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "grade_execution.schema.json",
+  "title": "Grade Execution",
+  "type": "object",
+  "required": [
+    "run_id",
+    "task_id",
+    "fresh_grader_workspace",
+    "injection_applied",
+    "patch_apply",
+    "hidden_runner"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "run_id": {"type": "string"},
+    "task_id": {"type": "string"},
+    "fresh_grader_workspace": {"type": "boolean"},
+    "injection_applied": {"type": "boolean"},
+    "patch_apply": {
+      "type": "object",
+      "required": ["attempted", "success"],
+      "additionalProperties": true,
+      "properties": {
+        "attempted": {"type": "boolean"},
+        "success": {"type": "boolean"}
+      }
+    },
+    "hidden_runner": {
+      "type": "object",
+      "required": ["attempted", "executed"],
+      "additionalProperties": true,
+      "properties": {
+        "attempted": {"type": "boolean"},
+        "executed": {"type": "boolean"}
+      }
+    },
+    "agent_workspace_manifest": {"type": ["string", "null"]},
+    "grader_workspace_manifest": {"type": ["string", "null"]}
+  }
+}

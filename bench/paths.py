@@ -15,14 +15,14 @@ SCORE_SCHEMA = BENCH_ROOT / "schemas" / "score.schema.json"
 DOCKERFILES_DIR = BENCH_ROOT / "bench" / "docker"
 
 # Repos
-REPOS_DIR = BENCH_ROOT / "repos"
+REPOS_DIR = BENCH_ROOT / "bench" / "benchmark" / "repos"
 
 # Tasks
-TASKS_DIR = BENCH_ROOT / "tasks"
+TASKS_DIR = BENCH_ROOT / "bench" / "benchmark" / "tasks"
 
 # Runs / Reports
-RUNS_DIR = BENCH_ROOT / "runs"
-REPORTS_DIR = BENCH_ROOT / "reports"
+RUNS_DIR = BENCH_ROOT / "bench" / "benchmark" / "runs"
+REPORTS_DIR = BENCH_ROOT / "bench" / "benchmark" / "reports"
 
 # Benchmark harness paths that agents must NOT modify
 HARNESS_DENY_PATTERNS = [

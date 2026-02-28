@@ -8,6 +8,14 @@ Primary design goals:
 2. Opinionated experimental design.
 3. Runner-owned execution and fact persistence with analysis-owned aggregation.
 
+## Repository Layout
+
+- `bench/benchmark/`: in-house benchmark namespace (task sets, frozen repos,
+  and minimal placeholders for generated outputs).
+- `bench/taskkit/`: task generation/import/validation/admission implementation.
+- `adapters/`: external benchmark adapters (Harbor, SWE-bench).
+- `bench/integration/agentlab/`: in-house bench bridge adapter for AgentLab.
+
 ## Runtime Model (Hard Cut)
 
 AgentLab is now `runtime.agent`-first and does not support legacy harness runtime config in new specs.

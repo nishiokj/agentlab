@@ -103,11 +103,11 @@ echo "running Harbor unit tests"
 
 echo "running Harbor script syntax checks"
 PYTHONPYCACHEPREFIX="${VENV_DIR}/pycache" "${VENV_PY}" -m py_compile \
-  scripts/harbor/export_harbor_to_agentlab_jsonl.py \
-  scripts/harbor/harbor_benchmark_adapter.py \
-  scripts/harbor/check_harbor_adapter_compat.py
+  adapters/harbor/export_harbor_to_agentlab_jsonl.py \
+  adapters/harbor/harbor_benchmark_adapter.py \
+  adapters/harbor/check_harbor_adapter_compat.py
 
-PROBE_CMD=("${VENV_PY}" scripts/harbor/check_harbor_adapter_compat.py --python-bin "${VENV_PY}")
+PROBE_CMD=("${VENV_PY}" adapters/harbor/check_harbor_adapter_compat.py --python-bin "${VENV_PY}")
 if [[ "${REQUIRE_EVALUATOR_CMD}" == "1" ]]; then
   PROBE_CMD+=(--require-evaluator-cmd --expect-external-evaluator)
 fi

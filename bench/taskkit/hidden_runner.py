@@ -8,12 +8,28 @@ from __future__ import annotations
 
 import json
 import subprocess
+import sys
 import time
 from dataclasses import dataclass, field, asdict
 from pathlib import Path
 from typing import Any
 
 from bench.taskkit.determinism import enforce_determinism_env, stable_json
+
+
+def _as_non_negative_float(value: Any) -> float:
+    """Convert a value to a non-negative float."""
+    if isinstance(value, bool):
+        return 0.0
+    if isinstance(value, (int, float)):
+        return float(value) if value >= 0 else 0.0
+    if isinstance(value, str):
+        try:
+            parsed = float(value)
+            return parsed if parsed >= 0 else 0.0
+        except ValueError:
+            return 0.0
+    return 0.0
 
 
 @dataclass
@@ -87,7 +103,7 @@ def run_hidden_suite(
     start = time.monotonic()
     try:
         proc = subprocess.run(
-            ["python", str(runner_py), str(workspace), str(cases_jsonl)],
+            [sys.executable, str(runner_py), str(workspace), str(cases_jsonl)],
             capture_output=True,
             text=True,
             timeout=timeout,
@@ -111,12 +127,14 @@ def run_hidden_suite(
             continue
         try:
             record = json.loads(line)
+            if not isinstance(record, dict):
+                continue
             case_results.append(CaseResult(
                 case_id=record.get("case_id", "unknown"),
-                passed=record.get("passed", False),
+                passed=bool(record.get("passed", False)),
                 error_type=record.get("error_type"),
                 error_message=record.get("error_message"),
-                duration_ms=record.get("duration_ms", 0),
+                duration_ms=_as_non_negative_float(record.get("duration_ms", 0)),
                 output_summary=record.get("output_summary", "")[:512],
             ))
         except json.JSONDecodeError:

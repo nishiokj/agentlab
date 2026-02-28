@@ -1,4 +1,4 @@
-.PHONY: bootstrap lint test test-cov build-images validate-schemas clean help
+.PHONY: bootstrap lint test validate-schemas clean help
 
 PYTHON ?= python3
 VENV ?= .venv
@@ -16,18 +16,13 @@ bootstrap: ## Create venv and install dependencies
 	$(PIP) install -r requirements.txt
 	$(PIP) install -e .
 
-lint: ## Run linters
+lint: ## Run basic syntax checks
 	$(VENV)/bin/python -m py_compile bench/cli.py
 	@echo "Lint OK"
 
 test: ## Run unit tests
-	$(PYTEST) bench/tests/ -q --tb=short
-
-test-cov: ## Run tests with coverage
-	$(PYTEST) bench/tests/ --cov=bench --cov-report=term-missing -q
-
-build-images: ## Build Docker images
-	bash scripts/build_images.sh
+	@$(PYTEST) -q --tb=short; status=$$?; \
+	if [ $$status -ne 0 ] && [ $$status -ne 5 ]; then exit $$status; fi
 
 validate-schemas: ## Validate all JSON schemas
 	$(BENCH) validate-schemas

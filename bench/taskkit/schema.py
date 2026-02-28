@@ -1,4 +1,4 @@
-"""Schema validation utilities for task, trace, and score."""
+"""Schema validation utilities for benchmark artifacts."""
 
 from __future__ import annotations
 
@@ -49,12 +49,16 @@ def validate_all_schemas(schemas_dir: Path) -> list[str]:
     Returns a list of error messages (empty if all valid).
     """
     errors: list[str] = []
-    expected = ["task.schema.json", "trace.schema.json", "score.schema.json"]
-    for name in expected:
-        path = schemas_dir / name
-        if not path.exists():
-            errors.append(f"Missing schema file: {path}")
-            continue
+    schema_paths = sorted(
+        p for p in schemas_dir.iterdir()
+        if p.is_file() and (
+            p.name.endswith(".schema.json") or p.name.endswith(".jsonschema")
+        )
+    )
+    if not schema_paths:
+        return [f"No schema files found in {schemas_dir}"]
+    for path in schema_paths:
+        name = path.name
         try:
             schema = json.loads(path.read_text())
         except json.JSONDecodeError as e:
@@ -67,6 +71,31 @@ def validate_all_schemas(schemas_dir: Path) -> list[str]:
         except jsonschema.SchemaError as e:
             errors.append(f"Invalid schema {name}: {e.message}")
     return errors
+
+
+def validate_with_schema_file(
+    data: dict[str, Any],
+    schema_path: Path,
+) -> list[str]:
+    """Validate data with a schema path and return validation errors."""
+    schema = load_schema(schema_path)
+    return validate_json(data, schema)
+
+
+def validate_and_write_json(
+    data: dict[str, Any],
+    schema_path: Path,
+    out_path: Path,
+) -> None:
+    """Validate JSON data against schema and write deterministically."""
+    errors = validate_with_schema_file(data, schema_path)
+    if errors:
+        raise ValueError(
+            f"Schema validation failed for {out_path} using {schema_path.name}: "
+            + "; ".join(errors)
+        )
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(json.dumps(data, indent=2, sort_keys=True))
 
 
 def load_task_yaml(task_dir: Path) -> dict[str, Any]:

@@ -11,6 +11,7 @@ class BenchConfig:
     """Immutable benchmark configuration resolved from the repo root."""
 
     root: Path
+    benchmark_dir: Path = field(init=False)
     bench_dir: Path = field(init=False)
     schemas_dir: Path = field(init=False)
     repos_dir: Path = field(init=False)
@@ -21,11 +22,12 @@ class BenchConfig:
 
     def __post_init__(self) -> None:
         object.__setattr__(self, "bench_dir", self.root / "bench")
+        object.__setattr__(self, "benchmark_dir", self.bench_dir / "benchmark")
         object.__setattr__(self, "schemas_dir", self.root / "schemas")
-        object.__setattr__(self, "repos_dir", self.root / "repos")
-        object.__setattr__(self, "tasks_dir", self.root / "tasks")
-        object.__setattr__(self, "runs_dir", self.root / "runs")
-        object.__setattr__(self, "reports_dir", self.root / "reports")
+        object.__setattr__(self, "repos_dir", self.benchmark_dir / "repos")
+        object.__setattr__(self, "tasks_dir", self.benchmark_dir / "tasks")
+        object.__setattr__(self, "runs_dir", self.benchmark_dir / "runs")
+        object.__setattr__(self, "reports_dir", self.benchmark_dir / "reports")
         object.__setattr__(self, "scripts_dir", self.root / "scripts")
 
     @classmethod

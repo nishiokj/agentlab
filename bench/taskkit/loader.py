@@ -204,11 +204,18 @@ def prepare_grader_workspace(
     if hidden_src.is_dir():
         shutil.copytree(hidden_src, hidden_dst, dirs_exist_ok=True)
 
+    # 5. Copy public artifacts for public_command execution during grading.
+    public_src = task_dir / "public"
+    public_dst = workspace / ".bench_public"
+    if public_src.is_dir():
+        shutil.copytree(public_src, public_dst, dirs_exist_ok=True)
+
     manifest = {
         "task_id": task_data["task_id"],
         "repo_id": task_data["repo_id"],
         "workspace": str(workspace),
         "hidden_dir": str(hidden_dst) if hidden_dst.exists() else None,
+        "public_dir": str(public_dst) if public_dst.exists() else None,
         "agent_patch": str(agent_patch_path) if agent_patch_path else None,
         "includes_hidden": True,
         "includes_private": False,

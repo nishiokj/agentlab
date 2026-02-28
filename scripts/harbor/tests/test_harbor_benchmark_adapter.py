@@ -6,13 +6,8 @@ import json
 import os
 import sys
 import unittest
-from pathlib import Path
 
-SCRIPT_DIR = Path(__file__).resolve().parents[1]
-if str(SCRIPT_DIR) not in sys.path:
-    sys.path.insert(0, str(SCRIPT_DIR))
-
-import harbor_benchmark_adapter as adapter
+from adapters.harbor import harbor_benchmark_adapter as adapter
 
 
 class HarborBenchmarkAdapterTests(unittest.TestCase):

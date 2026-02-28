@@ -32,10 +32,25 @@ dist/
 *.egg
 
 # Benchmark
-runs/*/
-!runs/.gitkeep
-reports/*/
-!reports/.gitkeep
+bench/benchmark/runs/*/
+!bench/benchmark/runs/.gitkeep
+bench/benchmark/reports/*/
+!bench/benchmark/reports/.gitkeep
+bench/benchmark/mutants/
+bench/artifacts/
+bench/benchmark/repos/**/src.tar.*
+bench/benchmark/repos/**/src.zip
+
+# Private generated benchmark assets
+bench/benchmark/tasks/
+bench/taskkit/admission.py
+bench/taskkit/casegen.py
+bench/taskkit/determinism.py
+bench/taskkit/importer.py
+bench/taskkit/mutant_library/
+bench/taskkit/mutants.py
+bench/taskkit/templates/
+bench/taskkit/validate_task.py
 .pytest_cache/
 .coverage
 htmlcov/

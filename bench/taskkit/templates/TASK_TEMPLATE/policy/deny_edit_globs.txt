@@ -1,3 +1,0 @@
-# Glob patterns for files the agent must NOT edit
-# One pattern per line (in addition to default harness deny list)
-tests/conftest.py

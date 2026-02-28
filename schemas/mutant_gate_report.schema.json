@@ -1,0 +1,43 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "mutant_gate_report.schema.json",
+  "title": "Mutant Gate Report",
+  "type": "object",
+  "required": [
+    "mutants_total",
+    "mutants_killed",
+    "passed",
+    "results",
+    "strategy_diversity_ok"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "task_id": {"type": "string"},
+    "mutants_total": {"type": "integer", "minimum": 0},
+    "mutants_killed": {"type": "integer", "minimum": 0},
+    "unkilled_list": {
+      "type": "array",
+      "items": {"type": "string"}
+    },
+    "passed": {"type": "boolean"},
+    "strategy_diversity_ok": {"type": "boolean"},
+    "strategy_categories": {
+      "type": "array",
+      "items": {"type": "string"}
+    },
+    "min_strategy_categories": {"type": "integer", "minimum": 1},
+    "results": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["mutant_id", "patch_file", "killed"],
+        "additionalProperties": true,
+        "properties": {
+          "mutant_id": {"type": "string"},
+          "patch_file": {"type": "string"},
+          "killed": {"type": "boolean"}
+        }
+      }
+    }
+  }
+}
