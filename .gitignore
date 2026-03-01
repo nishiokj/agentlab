@@ -10,6 +10,7 @@ dist/
 logs/
 .watcher/
 .haiku/
+rust/vendor/libduckdb-sys-0.10.2/duckdb/
 
 # OS
 .DS_Store

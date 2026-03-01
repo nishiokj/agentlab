@@ -1,325 +1,147 @@
 # AgentLab
 
-AgentLab is an experiment runner for agent-runtime workloads. It executes trials in isolated environments, injects dependencies and policy, and produces append-only fact streams plus evidence artifacts for scoring and analysis.
+AgentLab runs controlled agent-runtime experiments.
+It executes one runtime command per trial, enforces policy, and writes append-only facts.
 
-Primary design goals:
+## Public API (What Is Stable)
 
-1. Isolation by default.
-2. Opinionated experimental design.
-3. Runner-owned execution and fact persistence with analysis-owned aggregation.
+Treat only these as stable:
 
-## Repository Layout
+1. Schemas in `schemas/*.jsonschema`.
+2. CLI behavior exposed by `lab-cli --help`.
+3. Run directory contracts under `.lab/runs/<run_id>/`.
 
-- `bench/benchmark/`: in-house benchmark namespace (task sets, frozen repos,
-  and minimal placeholders for generated outputs).
-- `bench/taskkit/`: task generation/import/validation/admission implementation.
-- `adapters/`: external benchmark adapters (Harbor, SWE-bench).
-- `bench/integration/agentlab/`: in-house bench bridge adapter for AgentLab.
+Everything else is internal implementation detail and may change without notice.
 
-## Runtime Model (Hard Cut)
+## Canonical Primitives
 
-AgentLab is now `runtime.agent`-first and does not support legacy harness runtime config in new specs.
+Use these names consistently in docs, code comments, and UX.
 
-- Use `runtime.agent`, `runtime.dependencies`, and `runtime.policy`.
-- Do not use `runtime.harness` (rejected by the runner).
-- Runner invokes one command per trial.
-- Runner owns sandboxing/network/timeouts/dependency staging.
+| Primitive | Definition | Owner |
+| --- | --- | --- |
+| `Experiment` | Declarative config: dataset + design + runtime + policy. | User |
+| `Task` | One dataset row (`task_jsonl_v1`). | Dataset provider |
+| `Variant` | Bindings/image override applied across tasks. | Experiment design |
+| `Trial` | `Task x Variant x Replication` execution unit. | Runner |
+| `Runtime` | The single command invocation contract (`runtime.agent`). | Runtime author |
+| `Policy` | Timeout/network/sandbox limits enforced by runner. | Runner config |
+| `Result` | Agent-written `agent_result_v1` output for one trial. | Runtime |
+| `Facts` | Runner-written immutable JSONL records. | Runner |
+| `Views` | Analysis-derived query surfaces over facts. | Analysis layer |
 
-Source of truth:
+## Boundary Rules (Hard)
 
-1. Runtime/data contracts: `schemas/*.jsonschema`
-2. Runtime enforcement and lifecycle: `rust/crates/lab-runner/src/lib.rs`
+1. Runner executes exactly one runtime command per trial.
+2. Runtime does not own scheduler state, dispatch, or run control.
+3. Runner enforces policy; runtime cannot override policy at execution time.
+4. Runner appends immutable facts; analysis computes aggregates and live views.
+5. Benchmark-specific logic stays in adapters, not runner core.
 
-## Boundaries
+### Not Public
 
-The active boundaries are:
+The following are intentionally not public primitives:
 
-1. Task boundary: dataset row -> `task_boundary_v1` payload.
-2. Agent runtime boundary: one command invocation with fixed mounts/env contract.
-3. Dependency boundary: file staging + service descriptors exposed to the trial.
-4. Policy boundary: timeout/network/sandbox enforced by runner.
-5. Analysis boundary: runner appends immutable fact rows; analysis derives aggregates/views on demand.
+- Internal Rust symbols/functions.
+- Worker/coordinator internals.
+- In-memory state machine structure.
+- Patch-spec and migration doc internals.
 
-Removed as first-class public boundaries:
-
-1. Harness boundary.
-2. Control-plane protocol boundary.
-3. Cross-trial runtime state boundary for agent execution.
-
-## Where Experiment State Machine Is Handled
-
-The experiment and trial lifecycle state machine is runner-owned inside:
-
-- `rust/crates/lab-runner/src/lib.rs`
-
-Key state files emitted by the runner:
-
-- Run-level: `.lab/runs/<run_id>/runtime/run_control.json`
-- Trial-level: `.lab/runs/<run_id>/trials/<trial_id>/trial_state.json`
-
-The scheduler/execution loop is in `run_experiment_with_behavior(...)` in the same file.
-
-## Task vs Variant in the New Model
-
-Variants are still defined at experiment design level (`baseline` + `variant_plan`), not embedded in dataset rows.
-
-At trial materialization time, the runner bundles task + variant + policy into `agent_task_v1`:
-
-- `task`: problem/question payload from dataset row.
-- `bindings`: selected variant bindings for that trial.
-- `dependencies`: services declared for the trial.
-- `policy`: timeout/network/sandbox policy for that trial.
-
-This means the trial payload contains both task semantics and variant semantics, while ownership remains clean:
-
-1. Dataset owns task rows.
-2. Design owns variants.
-3. Runner composes both into per-trial `agent_task_v1`.
-
-## Resolved Experiment Shape (v0.5)
+## Minimal Experiment Shape
 
 ```yaml
-version: '0.5'
+version: "0.5"
 experiment:
-  id: swebench_agent_runtime
-  name: SWE-bench Agent Runtime
+  id: exp_local
   workload_type: agent_runtime
 
 dataset:
-  path: ./data/tasks.boundary.jsonl
   provider: local_jsonl
-  suite_id: swebench_lite_curated
+  path: tasks.jsonl
   schema_version: task_jsonl_v1
-  split_id: test
-  limit: 50
 
 design:
-  sanitization_profile: hermetic_functional
   comparison: paired
   replications: 1
-  random_seed: 42
-  shuffle_tasks: true
   max_concurrency: 1
 
 baseline:
-  variant_id: control
-  image: ghcr.io/org/agent-runtime-control@sha256:...
-  bindings:
-    model: gpt-4o-mini
+  variant_id: base
+  bindings: {}
 
-variant_plan:
-  - variant_id: treatment
-    image: ghcr.io/org/agent-runtime-treatment@sha256:...
-    bindings:
-      model: gpt-4.1
+variant_plan: []
 
 runtime:
   agent:
-    command: ["rex"] # required: single runtime command
-    image: ghcr.io/org/agent-runtime@sha256:... # required for container mode; variant image can override
-    io: # optional: defaults shown
-      input_arg: --input
-      output_arg: --output
-
-  dependencies:
-    file_staging:
-      - source_from_host: ./deps/sqlite/main.db
-        destination_path: /agentlab/deps/sqlite/main.db
-        required: true
-      - source_from_host: ./deps/ast/index.tar.zst
-        destination_path: /agentlab/deps/ast/index.tar.zst
-        required: false
-    services:
-      - id: sqlite-main
-        kind: sqlite
-        path: /agentlab/deps/sqlite/main.db
-      - id: ast-index
-        kind: filesystem
-        path: /agentlab/deps/ast
-
+    command: ["python", "./examples/clean_harness/harness.py"]
+    image: python:3.11-slim
+    io:
+      input_arg: "{path}"
+      output_arg: "{path}"
   policy:
     timeout_ms: 600000
     network:
       mode: none
-      allowed_hosts: []
     sandbox:
       mode: container
-      root_read_only: true
-      hardening:
-        no_new_privileges: true
-        drop_all_caps: true
-      resources:
-        cpu_count: 4
-        memory_mb: 8192
-
-  telemetry:
-    trajectory_path: /agentlab/out/trajectory.jsonl
-    causal_extraction: event_envelope_v1
-
-validity:
-  fail_on_state_leak: true
-  fail_on_profile_invariant_violation: true
 ```
 
-## Agent Runtime Contract
+## Runtime Contract
 
-Runner mounts (container mode):
+Runner provides input/output paths via env vars:
 
-1. `/agentlab/in` (ro)
-2. `/agentlab/out` (rw)
-3. `/agentlab/state` (rw, runner metadata/state)
-4. `/agentlab/workspace` (rw)
-5. `/agentlab/deps` (rw/ro based on staging/policy)
+- `AGENTLAB_TASK_PATH`
+- `AGENTLAB_BINDINGS_PATH`
+- `AGENTLAB_DEPENDENCIES_PATH`
+- `AGENTLAB_POLICY_PATH`
+- `AGENTLAB_RESULT_PATH`
+- `AGENTLAB_TRAJECTORY_PATH`
 
-Runner env vars provided to the runtime command:
+Runtime requirements per trial:
 
-1. `AGENTLAB_TASK_PATH`
-2. `AGENTLAB_BINDINGS_PATH`
-3. `AGENTLAB_DEPENDENCIES_PATH`
-4. `AGENTLAB_POLICY_PATH`
-5. `AGENTLAB_RESULT_PATH`
-6. `AGENTLAB_TRAJECTORY_PATH`
-7. `AGENTLAB_TIMEOUT_MS`
-8. `AGENTLAB_RUN_ID`
-9. `AGENTLAB_TRIAL_ID`
-10. `AGENTLAB_VARIANT_ID`
-11. `AGENTLAB_TASK_ID`
-12. `AGENTLAB_REPL_IDX`
-
-Not part of this contract:
-
-1. No required control-plane handshake.
-2. No required control socket/file protocol for successful trial completion.
-3. No runner-managed cross-trial chain state semantics for agent execution.
-
-## Minimal Runtime Program
-
-Your program should:
-
-1. Read task/bindings/dependencies/policy from env-provided paths.
+1. Read task/bindings/dependencies/policy from provided paths.
 2. Execute autonomously.
-3. Write `agent_result_v1` to `AGENTLAB_RESULT_PATH`.
+3. Write `agent_result_v1` JSON to `AGENTLAB_RESULT_PATH`.
 4. Optionally append trajectory events to `AGENTLAB_TRAJECTORY_PATH`.
 
-```python
-import json
-import os
+Container mounts:
 
-task = json.load(open(os.environ["AGENTLAB_TASK_PATH"], "r", encoding="utf-8"))
-bindings = json.load(open(os.environ["AGENTLAB_BINDINGS_PATH"], "r", encoding="utf-8"))
-deps = json.load(open(os.environ["AGENTLAB_DEPENDENCIES_PATH"], "r", encoding="utf-8"))
-policy = json.load(open(os.environ["AGENTLAB_POLICY_PATH"], "r", encoding="utf-8"))
+- `/agentlab/in` (ro)
+- `/agentlab/out` (rw)
+- `/agentlab/state` (rw)
+- `/agentlab/workspace` (rw)
+- `/agentlab/deps` (ro/rw based on policy and staging)
 
-# ... run your runtime command ...
+## 5-Minute Quickstart
 
-result = {
-    "schema_version": "agent_result_v1",
-    "ids": {
-        "run_id": os.environ["AGENTLAB_RUN_ID"],
-        "trial_id": os.environ["AGENTLAB_TRIAL_ID"],
-        "variant_id": os.environ["AGENTLAB_VARIANT_ID"],
-        "task_id": os.environ["AGENTLAB_TASK_ID"],
-        "repl_idx": int(os.environ["AGENTLAB_REPL_IDX"]),
-    },
-    "outcome": "success",
-    "answer": {"message": "done"},
-    "metrics": {"latency_ms": 1234},
-}
-
-with open(os.environ["AGENTLAB_RESULT_PATH"], "w", encoding="utf-8") as f:
-    json.dump(result, f)
-```
-
-## What You Need To Bring
-
-Minimum inputs for a runnable experiment:
-
-1. Dataset rows (`dataset.path`).
-2. Agent runtime (`runtime.agent.command` and optional `runtime.agent.io` flags).
-3. Container image (`runtime.agent.image` for baseline/default, optionally overridden per variant via `baseline.image` and `variant_plan[].image`).
-4. Baseline variant bindings (plus optional treatments).
-5. Policy (`timeout`, `network`, `sandbox`).
-6. Optional staged dependency files/services for sqlite, AST indexes, or other local state.
-
-## Runtime Source of Truth
-
-`runtime.agent` is intentionally small:
-
-1. `runtime.agent.command` is the only runtime command the runner invokes.
-2. `runtime.agent.image` is the default container image.
-3. `baseline.image` and `variant_plan[].image` can override image per variant.
-4. `runtime.agent.io.input_arg` / `output_arg` define how runner-appended file paths are passed to your command.
-
-The command is executed by runner inside that runtime context. It is not a host-side path lookup API.
-
-Runner automatically appends the resolved trial input/output paths to your command using these IO arg settings.
-
-For reproducible frozen agents:
-
-1. Build agent image with runtime + code.
-2. Pin image by digest (`image@sha256:...`).
-3. Set `runtime.agent.image` to that digest and optionally override per variant.
-4. Stage large mutable inputs (sqlite/db/index files) via `runtime.dependencies.file_staging`.
-
-## Path and CWD Semantics
-
-You can run from any shell directory if you pass the experiment path correctly.
-
-Resolution behavior:
-
-1. `dataset.path` resolves relative to the experiment file directory.
-2. `runtime.dependencies.file_staging[*].source_from_host` resolves relative to the experiment file directory when relative.
-3. In container execution, `runtime.agent.command` tokens are treated as literal command tokens.
-4. In local-process execution, path-like tokens may be host-resolved for compatibility.
-
-## CLI Quick Start
-
-Build:
+From repo root (`/Users/jevinnishioka/Desktop/Experiments`):
 
 ```bash
-cd rust
-cargo build -p lab-cli --release
+# build CLI
+cargo build --manifest-path rust/Cargo.toml -p lab-cli --release
+
+# check runner crate
+cargo check --manifest-path rust/Cargo.toml -p lab-runner
+
+# initialize local config
+rust/target/release/lab-cli init
+
+# validate environment + resolved plan
+rust/target/release/lab-cli preflight .lab/experiment.yaml
+rust/target/release/lab-cli describe .lab/experiment.yaml --json
+
+# run with Docker
+rust/target/release/lab-cli run .lab/experiment.yaml --executor local_docker
+
+# fallback without Docker
+rust/target/release/lab-cli run .lab/experiment.yaml --executor local_process
 ```
 
-Enable DuckDB query layer (`views`, `query`, `trend`, `scoreboard`):
+Notes:
 
-```bash
-cd rust
-cargo build -p lab-cli --release --features lab-analysis/duckdb_engine
-```
+1. If `preflight` reports `container_ready=false`, use `local_process` or start Docker.
+2. If `local_process` fails with `No such file or directory (os error 2)` and command is `python`, switch to `python3` in your experiment.
 
-Initialize config:
-
-```bash
-./target/release/lab-cli init
-```
-
-Validate and inspect resolved plan:
-
-```bash
-./target/release/lab-cli describe .lab/experiment.yaml
-```
-
-Run:
-
-```bash
-./target/release/lab-cli run .lab/experiment.yaml
-```
-
-Machine-readable mode:
-
-```bash
-./target/release/lab-cli describe .lab/experiment.yaml --json
-./target/release/lab-cli run .lab/experiment.yaml --json
-```
-
-Live scoreboard (task rows grouped per variant):
-
-```bash
-./target/release/lab-cli scoreboard <run_id> --interval-seconds 2
-```
-
-## Run Artifacts
+## Run Outputs (Contract-Level)
 
 Run root:
 
@@ -327,53 +149,29 @@ Run root:
 .lab/runs/<run_id>/
 ```
 
-Important paths:
+Key outputs:
 
-1. `resolved_experiment.json`
-2. `evidence/evidence_records.jsonl`
-3. `evidence/task_chain_states.jsonl`
-4. `benchmark/predictions.jsonl`
-5. `benchmark/scores.jsonl`
-6. `benchmark/summary.json`
-7. `facts/run_manifest.json`
-8. `facts/trials.jsonl`
-9. `facts/metrics_long.jsonl`
-10. `facts/events.jsonl`
-11. `facts/variant_snapshots.jsonl`
-12. `analysis/agentlab.duckdb` (optional materialized DB; generated by analysis layer)
+- `resolved_experiment.json`
+- `runtime/run_control.json`
+- `trials/<trial_id>/trial_state.json`
+- `trials/<trial_id>/out/result.json`
+- `trials/<trial_id>/result.json`
+- `facts/run_manifest.json`
+- `facts/trials.jsonl`
+- `facts/events.jsonl`
+- `facts/metrics_long.jsonl`
 
-Per trial:
+## Repository Pointers
 
-1. `trials/<trial_id>/trial_input.json` (runner input envelope)
-2. `trials/<trial_id>/in/task.json`
-3. `trials/<trial_id>/in/bindings.json`
-4. `trials/<trial_id>/in/dependencies.json`
-5. `trials/<trial_id>/in/policy.json`
-6. `trials/<trial_id>/out/result.json` (agent-written contract file)
-7. `trials/<trial_id>/result.json` (runner-canonicalized output)
-8. `trials/<trial_id>/out/trajectory.jsonl` (if emitted)
-9. `trials/<trial_id>/workspace/`
-10. `trials/<trial_id>/deps/`
-11. `trials/<trial_id>/trial_state.json`
+- `rust/crates/lab-cli/`: CLI surface.
+- `rust/crates/lab-runner/`: execution engine.
+- `schemas/`: contract source of truth.
+- `adapters/`: benchmark adapters.
+- `bench/`: task tooling + integration bridge.
 
-## Scaling Status
+## Deep-Dive Docs
 
-Current status:
+- `docs/AGENTLAB_ONBOARDING.md`: hands-on onboarding flow.
+- `docs/ARCHITECTURE.md`: boundary diagrams and architecture.
+- `docs/USAGE.md`: benchmark task tooling usage.
 
-1. Worker-based parallel coordinator is the only production schedule engine path.
-2. Scheduler enforces `design.max_concurrency` with bounded in-flight dispatch.
-3. `run_control_v2.active_trials` is the authoritative multi-flight control surface.
-4. Out-of-order worker completions commit deterministically by `schedule_idx`.
-5. `run` and `continue` both execute through the same coordinator loop.
-
-See full details in:
-
-- `docs/PATCH_SPEC_PARALLEL_WORKER_HARD_CUTOVER.md`
-- `docs/PARALLEL_WORKER_P0_P1_COMPLETION.md`
-
-## Notes
-
-1. If your agent needs sqlite indices, AST stores, or similar assets, use `runtime.dependencies.file_staging` + `runtime.dependencies.services`.
-2. For reproducibility in container mode, pin `runtime.agent.image` (and per-variant `baseline.image` / `variant_plan[].image`) by digest (`image@sha256:...`).
-3. Keep runtime YAML minimal: command + image + policy; package dependencies/env/runtime setup inside the image.
-4. Keep agent runtime implementations stateless across trials; each trial should be self-sufficient and isolated.

@@ -42,7 +42,16 @@ Runner env vars include:
 ## Try It
 
 ```bash
-cd rust
-cargo run -p lab-cli -- describe ../.lab/experiment.yaml
-cargo run -p lab-cli -- run ../.lab/experiment.yaml --executor local_docker
+# from repository root
+cargo build --manifest-path rust/Cargo.toml -p lab-cli --release
+rust/target/release/lab-cli preflight .lab/experiment.yaml
+rust/target/release/lab-cli describe .lab/experiment.yaml --json
+
+# docker path
+rust/target/release/lab-cli run .lab/experiment.yaml --executor local_docker --json
+
+# fallback when Docker is unavailable
+rust/target/release/lab-cli run .lab/experiment.yaml --executor local_process --json
 ```
+
+If local-process execution fails with `No such file or directory (os error 2)` and your experiment uses `python`, switch the command to `python3` in `.lab/experiment.yaml`.
