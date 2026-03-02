@@ -18,12 +18,10 @@ use lab_core::{
 use lab_hooks::{load_manifest, validate_hooks};
 use lab_provenance::{default_attestation, write_attestation};
 use lab_schemas::compile_schema;
-use reqwest::blocking::Client as HttpClient;
-use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use serde_json::Value;
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::env;
 use std::fs;
 use std::io::Write;
@@ -62,31 +60,8 @@ const BENCHMARK_SCORE_FILENAME: &str = "benchmark_score.json";
 const BENCHMARK_GRADE_ERROR_FILENAME: &str = "benchmark_grade_error.txt";
 const BENCHMARK_GRADING_POLICY_EXIT_CODE: i32 = 125;
 const AGENTLAB_LOCAL_WORKER_MAX_IN_FLIGHT_ENV: &str = "AGENTLAB_LOCAL_WORKER_MAX_IN_FLIGHT";
-const AGENTLAB_REMOTE_PROTOCOL_RETRY_MAX_ATTEMPTS_ENV: &str =
-    "AGENTLAB_REMOTE_PROTOCOL_RETRY_MAX_ATTEMPTS";
-const AGENTLAB_REMOTE_PROTOCOL_RETRY_BASE_BACKOFF_MS_ENV: &str =
-    "AGENTLAB_REMOTE_PROTOCOL_RETRY_BASE_BACKOFF_MS";
-const AGENTLAB_REMOTE_PROTOCOL_CONNECT_TIMEOUT_MS_ENV: &str =
-    "AGENTLAB_REMOTE_PROTOCOL_CONNECT_TIMEOUT_MS";
-const AGENTLAB_REMOTE_PROTOCOL_SUBMIT_TIMEOUT_MS_ENV: &str =
-    "AGENTLAB_REMOTE_PROTOCOL_SUBMIT_TIMEOUT_MS";
-const AGENTLAB_REMOTE_PROTOCOL_POLL_TIMEOUT_GRACE_MS_ENV: &str =
-    "AGENTLAB_REMOTE_PROTOCOL_POLL_TIMEOUT_GRACE_MS";
-const AGENTLAB_REMOTE_PROTOCOL_PAUSE_TIMEOUT_MS_ENV: &str =
-    "AGENTLAB_REMOTE_PROTOCOL_PAUSE_TIMEOUT_MS";
-const AGENTLAB_REMOTE_PROTOCOL_STOP_TIMEOUT_MS_ENV: &str =
-    "AGENTLAB_REMOTE_PROTOCOL_STOP_TIMEOUT_MS";
 const LOCAL_WORKER_CAPACITY_ERROR_PREFIX: &str = "local worker backend at capacity:";
 const LOCAL_WORKER_MAX_COMPLETIONS_PER_POLL: usize = 256;
-const REMOTE_PROTOCOL_RETRY_MAX_ATTEMPTS_DEFAULT: usize = 3;
-const REMOTE_PROTOCOL_RETRY_BASE_BACKOFF_MS_DEFAULT: u64 = 20;
-const REMOTE_PROTOCOL_CONNECT_TIMEOUT_MS_DEFAULT: u64 = 5_000;
-const REMOTE_PROTOCOL_SUBMIT_TIMEOUT_MS_DEFAULT: u64 = 30_000;
-const REMOTE_PROTOCOL_POLL_TIMEOUT_GRACE_MS_DEFAULT: u64 = 1_000;
-const REMOTE_PROTOCOL_PAUSE_TIMEOUT_MS_DEFAULT: u64 = 30_000;
-const REMOTE_PROTOCOL_STOP_TIMEOUT_MS_DEFAULT: u64 = 30_000;
-const REMOTE_BACKEND_QUARANTINED_PREFIX: &str = "remote worker backend quarantined:";
-const REMOTE_COMPLETION_SEQ_FALLBACK: u64 = 0;
 const CANONICAL_TRIAL_RESULT_FILENAME: &str = "result.json";
 const PARALLEL_WORKER_CONTROL_SCHEMA_V1: &str = "parallel_worker_control_v1";
 const PARALLEL_WORKER_CONTROL_RESPONSE_COMPLETED: &str = "completed";
@@ -331,188 +306,6 @@ fn resolve_local_worker_max_in_flight(
     (effective_max_in_flight, None)
 }
 
-fn parse_optional_positive_usize_env(name: &str) -> Result<Option<usize>> {
-    match env::var(name) {
-        Ok(raw) => {
-            let trimmed = raw.trim();
-            if trimmed.is_empty() {
-                return Ok(None);
-            }
-            let parsed = trimmed.parse::<usize>().map_err(|_| {
-                anyhow!(
-                    "{} must be a positive integer when set (got: {})",
-                    name,
-                    raw
-                )
-            })?;
-            if parsed == 0 {
-                return Err(anyhow!("{} must be > 0 when set", name));
-            }
-            Ok(Some(parsed))
-        }
-        Err(env::VarError::NotPresent) => Ok(None),
-        Err(err) => Err(anyhow!("failed reading {}: {}", name, err)),
-    }
-}
-
-fn parse_optional_positive_u64_env(name: &str) -> Result<Option<u64>> {
-    match env::var(name) {
-        Ok(raw) => {
-            let trimmed = raw.trim();
-            if trimmed.is_empty() {
-                return Ok(None);
-            }
-            let parsed = trimmed.parse::<u64>().map_err(|_| {
-                anyhow!(
-                    "{} must be a positive integer when set (got: {})",
-                    name,
-                    raw
-                )
-            })?;
-            if parsed == 0 {
-                return Err(anyhow!("{} must be > 0 when set", name));
-            }
-            Ok(Some(parsed))
-        }
-        Err(env::VarError::NotPresent) => Ok(None),
-        Err(err) => Err(anyhow!("failed reading {}: {}", name, err)),
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-struct RemoteRetrySettings {
-    max_attempts: usize,
-    base_backoff_ms: u64,
-}
-
-impl Default for RemoteRetrySettings {
-    fn default() -> Self {
-        Self {
-            max_attempts: REMOTE_PROTOCOL_RETRY_MAX_ATTEMPTS_DEFAULT,
-            base_backoff_ms: REMOTE_PROTOCOL_RETRY_BASE_BACKOFF_MS_DEFAULT,
-        }
-    }
-}
-
-fn resolve_remote_retry_settings_from_env() -> Result<RemoteRetrySettings> {
-    let mut settings = RemoteRetrySettings::default();
-    if let Some(max_attempts) =
-        parse_optional_positive_usize_env(AGENTLAB_REMOTE_PROTOCOL_RETRY_MAX_ATTEMPTS_ENV)?
-    {
-        settings.max_attempts = max_attempts;
-    }
-    if let Some(base_backoff_ms) =
-        parse_optional_positive_u64_env(AGENTLAB_REMOTE_PROTOCOL_RETRY_BASE_BACKOFF_MS_ENV)?
-    {
-        settings.base_backoff_ms = base_backoff_ms;
-    }
-    Ok(settings)
-}
-
-#[derive(Debug, Clone, Copy)]
-struct RemoteProtocolTimeoutSettings {
-    connect_timeout_ms: u64,
-    submit_timeout_ms: u64,
-    poll_timeout_grace_ms: u64,
-    pause_timeout_ms: u64,
-    stop_timeout_ms: u64,
-}
-
-impl Default for RemoteProtocolTimeoutSettings {
-    fn default() -> Self {
-        Self {
-            connect_timeout_ms: REMOTE_PROTOCOL_CONNECT_TIMEOUT_MS_DEFAULT,
-            submit_timeout_ms: REMOTE_PROTOCOL_SUBMIT_TIMEOUT_MS_DEFAULT,
-            poll_timeout_grace_ms: REMOTE_PROTOCOL_POLL_TIMEOUT_GRACE_MS_DEFAULT,
-            pause_timeout_ms: REMOTE_PROTOCOL_PAUSE_TIMEOUT_MS_DEFAULT,
-            stop_timeout_ms: REMOTE_PROTOCOL_STOP_TIMEOUT_MS_DEFAULT,
-        }
-    }
-}
-
-fn resolve_remote_protocol_timeout_settings_from_env() -> Result<RemoteProtocolTimeoutSettings> {
-    let mut settings = RemoteProtocolTimeoutSettings::default();
-    if let Some(connect_timeout_ms) =
-        parse_optional_positive_u64_env(AGENTLAB_REMOTE_PROTOCOL_CONNECT_TIMEOUT_MS_ENV)?
-    {
-        settings.connect_timeout_ms = connect_timeout_ms;
-    }
-    if let Some(submit_timeout_ms) =
-        parse_optional_positive_u64_env(AGENTLAB_REMOTE_PROTOCOL_SUBMIT_TIMEOUT_MS_ENV)?
-    {
-        settings.submit_timeout_ms = submit_timeout_ms;
-    }
-    if let Some(poll_timeout_grace_ms) =
-        parse_optional_positive_u64_env(AGENTLAB_REMOTE_PROTOCOL_POLL_TIMEOUT_GRACE_MS_ENV)?
-    {
-        settings.poll_timeout_grace_ms = poll_timeout_grace_ms;
-    }
-    if let Some(pause_timeout_ms) =
-        parse_optional_positive_u64_env(AGENTLAB_REMOTE_PROTOCOL_PAUSE_TIMEOUT_MS_ENV)?
-    {
-        settings.pause_timeout_ms = pause_timeout_ms;
-    }
-    if let Some(stop_timeout_ms) =
-        parse_optional_positive_u64_env(AGENTLAB_REMOTE_PROTOCOL_STOP_TIMEOUT_MS_ENV)?
-    {
-        settings.stop_timeout_ms = stop_timeout_ms;
-    }
-    Ok(settings)
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RemoteProtocolErrorKind {
-    Retryable,
-    Fatal,
-}
-
-#[derive(Debug)]
-struct RemoteProtocolError {
-    kind: RemoteProtocolErrorKind,
-    message: String,
-}
-
-impl RemoteProtocolError {
-    fn retryable(message: impl Into<String>) -> Self {
-        Self {
-            kind: RemoteProtocolErrorKind::Retryable,
-            message: message.into(),
-        }
-    }
-
-    fn fatal(message: impl Into<String>) -> Self {
-        Self {
-            kind: RemoteProtocolErrorKind::Fatal,
-            message: message.into(),
-        }
-    }
-
-    fn is_retryable(&self) -> bool {
-        self.kind == RemoteProtocolErrorKind::Retryable
-    }
-}
-
-impl std::fmt::Display for RemoteProtocolError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.message)
-    }
-}
-
-impl std::error::Error for RemoteProtocolError {}
-
-fn is_retryable_remote_http_status(status: u16) -> bool {
-    matches!(status, 408 | 425 | 429 | 500 | 502 | 503 | 504)
-}
-
-fn truncate_remote_error_body(raw: &str) -> String {
-    const MAX_ERROR_BODY_CHARS: usize = 512;
-    let normalized = raw.replace('\n', " ");
-    if normalized.chars().count() <= MAX_ERROR_BODY_CHARS {
-        return normalized;
-    }
-    normalized.chars().take(MAX_ERROR_BODY_CHARS).collect()
-}
-
 #[allow(dead_code)]
 impl LocalThreadWorkerBackend {
     fn new(max_in_flight: usize, executor: Arc<LocalTrialExecutor>) -> Result<Self> {
@@ -639,7 +432,7 @@ impl WorkerBackend for LocalThreadWorkerBackend {
         let ticket_for_worker = ticket.clone();
         let executor = self.inner.executor.clone();
         let completions_tx = self.inner.completions_tx.clone();
-        thread::Builder::new()
+        let spawn_result = thread::Builder::new()
             .name(format!("agentlab-{}", ticket_for_worker.ticket_id))
             .spawn(move || {
                 let completion = match executor(dispatch_for_worker.clone()) {
@@ -655,8 +448,15 @@ impl WorkerBackend for LocalThreadWorkerBackend {
                     ),
                 };
                 let _ = completions_tx.send(completion);
-            })
-            .map_err(|e| anyhow!("failed to spawn local worker thread: {}", e))?;
+            });
+        if let Err(err) = spawn_result {
+            // Best-effort rollback of ticket bookkeeping so failed spawn attempts do not
+            // permanently consume local worker capacity.
+            if let Ok(mut state) = self.inner.state.lock() {
+                state.in_flight_by_ticket.remove(ticket.ticket_id.as_str());
+            }
+            return Err(anyhow!("failed to spawn local worker thread: {}", err));
+        }
 
         Ok(ticket)
     }
@@ -736,854 +536,6 @@ impl WorkerBackend for LocalThreadWorkerBackend {
                 )
             })?;
         Ok(())
-    }
-}
-
-const REMOTE_SUBMIT_SCHEMA_V1: &str = "remote_worker_submit_v1";
-const REMOTE_POLL_SCHEMA_V1: &str = "remote_worker_poll_v1";
-const REMOTE_PAUSE_SCHEMA_V1: &str = "remote_worker_pause_v1";
-const REMOTE_STOP_SCHEMA_V1: &str = "remote_worker_stop_v1";
-const REMOTE_SUBMIT_PATH_V1: &str = "v1/worker/submit";
-const REMOTE_POLL_PATH_V1: &str = "v1/worker/poll";
-const REMOTE_PAUSE_PATH_V1: &str = "v1/worker/pause";
-const REMOTE_STOP_PATH_V1: &str = "v1/worker/stop";
-
-#[allow(dead_code)]
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-struct RemoteSubmitRequest {
-    schema_version: String,
-    dispatch: TrialDispatch,
-}
-
-#[allow(dead_code)]
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-struct RemoteSubmitResponse {
-    schema_version: String,
-    ticket: WorkerTicket,
-}
-
-#[allow(dead_code)]
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-struct RemotePollRequest {
-    schema_version: String,
-    timeout_ms: u64,
-}
-
-#[allow(dead_code)]
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-struct RemotePollResponse {
-    schema_version: String,
-    completions: Vec<TrialCompletion>,
-}
-
-#[allow(dead_code)]
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-struct RemotePauseRequest {
-    schema_version: String,
-    worker_id: String,
-    label: String,
-}
-
-#[allow(dead_code)]
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-struct RemotePauseResponse {
-    schema_version: String,
-    ack: WorkerPauseAck,
-}
-
-#[allow(dead_code)]
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-struct RemoteStopRequest {
-    schema_version: String,
-    worker_id: String,
-    reason: String,
-}
-
-#[allow(dead_code)]
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-struct RemoteStopResponse {
-    schema_version: String,
-    accepted: bool,
-}
-
-#[allow(dead_code)]
-trait RemoteWorkerProtocol: Send + Sync {
-    fn submit(&self, request: RemoteSubmitRequest) -> Result<RemoteSubmitResponse>;
-    fn poll(&self, request: RemotePollRequest) -> Result<RemotePollResponse>;
-    fn pause(&self, request: RemotePauseRequest) -> Result<RemotePauseResponse>;
-    fn stop(&self, request: RemoteStopRequest) -> Result<RemoteStopResponse>;
-}
-
-#[derive(Clone)]
-struct HttpRemoteWorkerProtocol {
-    endpoint: String,
-    bearer_token: Option<String>,
-    client: HttpClient,
-    timeouts: RemoteProtocolTimeoutSettings,
-}
-
-impl HttpRemoteWorkerProtocol {
-    fn new(endpoint: &str, bearer_token: Option<String>) -> Result<Self> {
-        let endpoint = endpoint.trim().to_string();
-        if endpoint.is_empty() {
-            return Err(anyhow!("remote worker endpoint must not be empty"));
-        }
-        let timeouts = resolve_remote_protocol_timeout_settings_from_env()?;
-        let client = HttpClient::builder()
-            .connect_timeout(Duration::from_millis(timeouts.connect_timeout_ms))
-            .build()?;
-        Ok(Self {
-            endpoint,
-            bearer_token,
-            client,
-            timeouts,
-        })
-    }
-
-    fn url_for_path(&self, path: &str) -> String {
-        format!(
-            "{}/{}",
-            self.endpoint.trim_end_matches('/'),
-            path.trim_start_matches('/')
-        )
-    }
-
-    fn post_json<Req, Resp>(
-        &self,
-        path: &str,
-        request: &Req,
-        timeout: Option<Duration>,
-    ) -> Result<Resp>
-    where
-        Req: Serialize + ?Sized,
-        Resp: DeserializeOwned,
-    {
-        let url = self.url_for_path(path);
-        let mut builder = self.client.post(&url);
-        if let Some(token) = self.bearer_token.as_ref() {
-            builder = builder.bearer_auth(token);
-        }
-        if let Some(timeout) = timeout {
-            builder = builder.timeout(timeout);
-        }
-        let response = builder.json(request).send().map_err(|err| {
-            let detail = format!("remote worker http POST {} transport error: {}", url, err);
-            let classified = if err.is_timeout() || err.is_connect() || err.is_request() {
-                RemoteProtocolError::retryable(detail)
-            } else {
-                RemoteProtocolError::fatal(detail)
-            };
-            anyhow!(classified)
-        })?;
-        let status = response.status();
-        if !status.is_success() {
-            let code = status.as_u16();
-            let body = response
-                .text()
-                .map(|value| truncate_remote_error_body(&value))
-                .unwrap_or_else(|_| "<response body unavailable>".to_string());
-            let detail = format!(
-                "remote worker http POST {} failed: status={} body={}",
-                url, code, body
-            );
-            let classified = if is_retryable_remote_http_status(code) {
-                RemoteProtocolError::retryable(detail)
-            } else {
-                RemoteProtocolError::fatal(detail)
-            };
-            return Err(anyhow!(classified));
-        }
-        response.json::<Resp>().map_err(|err| {
-            let detail = format!(
-                "remote worker http POST {} returned invalid JSON payload: {}",
-                url, err
-            );
-            anyhow!(RemoteProtocolError::fatal(detail))
-        })
-    }
-}
-
-impl RemoteWorkerProtocol for HttpRemoteWorkerProtocol {
-    fn submit(&self, request: RemoteSubmitRequest) -> Result<RemoteSubmitResponse> {
-        self.post_json(
-            REMOTE_SUBMIT_PATH_V1,
-            &request,
-            Some(Duration::from_millis(self.timeouts.submit_timeout_ms)),
-        )
-    }
-
-    fn poll(&self, request: RemotePollRequest) -> Result<RemotePollResponse> {
-        let timeout = Duration::from_millis(
-            request
-                .timeout_ms
-                .saturating_add(self.timeouts.poll_timeout_grace_ms),
-        );
-        self.post_json(REMOTE_POLL_PATH_V1, &request, Some(timeout))
-    }
-
-    fn pause(&self, request: RemotePauseRequest) -> Result<RemotePauseResponse> {
-        self.post_json(
-            REMOTE_PAUSE_PATH_V1,
-            &request,
-            Some(Duration::from_millis(self.timeouts.pause_timeout_ms)),
-        )
-    }
-
-    fn stop(&self, request: RemoteStopRequest) -> Result<RemoteStopResponse> {
-        self.post_json(
-            REMOTE_STOP_PATH_V1,
-            &request,
-            Some(Duration::from_millis(self.timeouts.stop_timeout_ms)),
-        )
-    }
-}
-
-#[allow(dead_code)]
-#[derive(Clone)]
-struct RemoteWorkerBackend {
-    protocol: Arc<dyn RemoteWorkerProtocol>,
-    state: Arc<Mutex<RemoteWorkerBackendState>>,
-    retry_settings: RemoteRetrySettings,
-}
-
-#[derive(Default)]
-struct RemoteWorkerBackendState {
-    submitted_tickets: HashMap<String, RemoteSubmissionRecord>,
-    active_tickets_by_worker: HashMap<String, HashSet<String>>,
-    completion_key_by_ticket: HashMap<String, RemoteCompletionDedupKey>,
-    quarantined_reason: Option<String>,
-}
-
-#[derive(Debug, Clone)]
-struct RemoteSubmissionRecord {
-    run_id: String,
-    trial_id: String,
-    schedule_idx: usize,
-    worker_id: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct RemoteCompletionDedupKey {
-    run_id: String,
-    schedule_idx: usize,
-    trial_id: String,
-    worker_id: String,
-    completion_seq: u64,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum RemoteCompletionValidation {
-    Deliver,
-    Duplicate,
-}
-
-#[allow(dead_code)]
-impl RemoteWorkerBackend {
-    fn new(protocol: Arc<dyn RemoteWorkerProtocol>) -> Result<Self> {
-        Ok(Self {
-            protocol,
-            state: Arc::new(Mutex::new(RemoteWorkerBackendState::default())),
-            retry_settings: resolve_remote_retry_settings_from_env()?,
-        })
-    }
-
-    fn ensure_available(&self) -> Result<()> {
-        let state = self
-            .state
-            .lock()
-            .map_err(|_| anyhow!("remote worker backend state lock poisoned"))?;
-        if let Some(reason) = state.quarantined_reason.as_deref() {
-            return Err(anyhow!("{} {}", REMOTE_BACKEND_QUARANTINED_PREFIX, reason));
-        }
-        Ok(())
-    }
-
-    fn quarantined_error(reason: &str) -> anyhow::Error {
-        anyhow!("{} {}", REMOTE_BACKEND_QUARANTINED_PREFIX, reason)
-    }
-
-    fn protocol_fault(&self, detail: impl AsRef<str>) -> anyhow::Error {
-        let reason = format!("remote worker backend protocol fault: {}", detail.as_ref());
-        match self.state.lock() {
-            Ok(mut state) => {
-                if state.quarantined_reason.is_none() {
-                    state.quarantined_reason = Some(reason);
-                }
-                let quarantined_reason = state
-                    .quarantined_reason
-                    .as_deref()
-                    .unwrap_or("protocol fault");
-                Self::quarantined_error(quarantined_reason)
-            }
-            Err(_) => Self::quarantined_error("state lock poisoned while setting quarantine"),
-        }
-    }
-
-    fn remove_active_submission_for_ticket(
-        state: &mut RemoteWorkerBackendState,
-        ticket_id: &str,
-    ) -> Option<RemoteSubmissionRecord> {
-        let submission = state.submitted_tickets.remove(ticket_id)?;
-        if let Some(ticket_ids) = state
-            .active_tickets_by_worker
-            .get_mut(submission.worker_id.as_str())
-        {
-            ticket_ids.remove(ticket_id);
-            if ticket_ids.is_empty() {
-                state
-                    .active_tickets_by_worker
-                    .remove(submission.worker_id.as_str());
-            }
-        }
-        Some(submission)
-    }
-
-    fn active_submissions_for_worker(
-        &self,
-        worker_id: &str,
-        op_name: &str,
-    ) -> Result<Vec<RemoteSubmissionRecord>> {
-        let mut state = self
-            .state
-            .lock()
-            .map_err(|_| anyhow!("remote worker backend state lock poisoned"))?;
-        if let Some(reason) = state.quarantined_reason.as_deref() {
-            return Err(Self::quarantined_error(reason));
-        }
-
-        let Some(ticket_ids) = state.active_tickets_by_worker.get(worker_id).cloned() else {
-            return Err(anyhow!(
-                "remote worker backend {} failed: unknown active worker {}",
-                op_name,
-                worker_id
-            ));
-        };
-
-        let mut active_submissions = Vec::new();
-        let mut stale_ticket_ids = Vec::new();
-        for ticket_id in ticket_ids {
-            if let Some(submission) = state.submitted_tickets.get(ticket_id.as_str()).cloned() {
-                active_submissions.push(submission);
-            } else {
-                stale_ticket_ids.push(ticket_id);
-            }
-        }
-
-        if !stale_ticket_ids.is_empty() {
-            if let Some(active_tickets) = state.active_tickets_by_worker.get_mut(worker_id) {
-                for stale_ticket_id in stale_ticket_ids {
-                    active_tickets.remove(stale_ticket_id.as_str());
-                }
-                if active_tickets.is_empty() {
-                    state.active_tickets_by_worker.remove(worker_id);
-                }
-            }
-        }
-
-        if active_submissions.is_empty() {
-            return Err(anyhow!(
-                "remote worker backend {} failed: unknown active worker {}",
-                op_name,
-                worker_id
-            ));
-        }
-
-        Ok(active_submissions)
-    }
-
-    fn remember_submission(&self, dispatch: &TrialDispatch, ticket: &WorkerTicket) -> Result<()> {
-        let mut state = self
-            .state
-            .lock()
-            .map_err(|_| anyhow!("remote worker backend state lock poisoned"))?;
-        if let Some(reason) = state.quarantined_reason.as_deref() {
-            return Err(Self::quarantined_error(reason));
-        }
-        if ticket.ticket_id.trim().is_empty() {
-            drop(state);
-            return Err(self.protocol_fault("submit returned empty ticket_id"));
-        }
-        if ticket.worker_id.trim().is_empty() {
-            drop(state);
-            return Err(self.protocol_fault(format!(
-                "submit returned empty worker_id for ticket {}",
-                ticket.ticket_id
-            )));
-        }
-        if state
-            .submitted_tickets
-            .contains_key(ticket.ticket_id.as_str())
-            || state
-                .completion_key_by_ticket
-                .contains_key(ticket.ticket_id.as_str())
-        {
-            drop(state);
-            return Err(self.protocol_fault(format!("duplicate ticket_id {}", ticket.ticket_id)));
-        }
-        state.submitted_tickets.insert(
-            ticket.ticket_id.clone(),
-            RemoteSubmissionRecord {
-                run_id: dispatch.run_id.clone(),
-                trial_id: dispatch.trial_id.clone(),
-                schedule_idx: dispatch.schedule_idx,
-                worker_id: ticket.worker_id.clone(),
-            },
-        );
-        state
-            .active_tickets_by_worker
-            .entry(ticket.worker_id.clone())
-            .or_default()
-            .insert(ticket.ticket_id.clone());
-        Ok(())
-    }
-
-    fn completion_seq_for_dedupe(completion: &TrialCompletion) -> u64 {
-        completion
-            .completion_seq
-            .unwrap_or(REMOTE_COMPLETION_SEQ_FALLBACK)
-    }
-
-    fn completion_key(
-        submission: &RemoteSubmissionRecord,
-        completion_seq: u64,
-    ) -> RemoteCompletionDedupKey {
-        RemoteCompletionDedupKey {
-            run_id: submission.run_id.clone(),
-            schedule_idx: submission.schedule_idx,
-            trial_id: submission.trial_id.clone(),
-            worker_id: submission.worker_id.clone(),
-            completion_seq,
-        }
-    }
-
-    fn validate_and_consume_completion(
-        &self,
-        completion: &TrialCompletion,
-    ) -> Result<RemoteCompletionValidation> {
-        let mut state = self
-            .state
-            .lock()
-            .map_err(|_| anyhow!("remote worker backend state lock poisoned"))?;
-        if let Some(reason) = state.quarantined_reason.as_deref() {
-            return Err(Self::quarantined_error(reason));
-        }
-
-        let completion_seq = Self::completion_seq_for_dedupe(completion);
-        let ticket_id = completion.ticket.ticket_id.as_str();
-
-        if let Some(submission) = state.submitted_tickets.get(ticket_id).cloned() {
-            if completion.ticket.worker_id != submission.worker_id {
-                drop(state);
-                return Err(self.protocol_fault(format!(
-                    "completion worker_id {} did not match submitted worker_id {} for ticket {}",
-                    completion.ticket.worker_id, submission.worker_id, completion.ticket.ticket_id
-                )));
-            }
-            if completion.ticket.trial_id != submission.trial_id {
-                drop(state);
-                return Err(self.protocol_fault(format!(
-                    "completion trial_id {} did not match submitted trial_id {} for ticket {}",
-                    completion.ticket.trial_id, submission.trial_id, completion.ticket.ticket_id
-                )));
-            }
-            if completion.schedule_idx != submission.schedule_idx {
-                drop(state);
-                return Err(self.protocol_fault(format!(
-                    "completion schedule_idx {} did not match submitted schedule_idx {} for ticket {}",
-                    completion.schedule_idx, submission.schedule_idx, completion.ticket.ticket_id
-                )));
-            }
-            Self::remove_active_submission_for_ticket(&mut state, ticket_id);
-            state.completion_key_by_ticket.insert(
-                completion.ticket.ticket_id.clone(),
-                Self::completion_key(&submission, completion_seq),
-            );
-            return Ok(RemoteCompletionValidation::Deliver);
-        }
-
-        if let Some(existing) = state.completion_key_by_ticket.get(ticket_id).cloned() {
-            let duplicate = completion.ticket.trial_id == existing.trial_id
-                && completion.ticket.worker_id == existing.worker_id
-                && completion.schedule_idx == existing.schedule_idx
-                && completion_seq == existing.completion_seq;
-            if duplicate {
-                return Ok(RemoteCompletionValidation::Duplicate);
-            }
-            drop(state);
-            return Err(self.protocol_fault(format!(
-                "conflicting duplicate completion for ticket {} (expected trial_id={}, worker_id={}, schedule_idx={}, completion_seq={}, got trial_id={}, worker_id={}, schedule_idx={}, completion_seq={})",
-                completion.ticket.ticket_id,
-                existing.trial_id,
-                existing.worker_id,
-                existing.schedule_idx,
-                existing.completion_seq,
-                completion.ticket.trial_id,
-                completion.ticket.worker_id,
-                completion.schedule_idx,
-                completion_seq
-            )));
-        }
-
-        drop(state);
-        Err(self.protocol_fault(format!(
-            "completion for unknown ticket {}",
-            completion.ticket.ticket_id
-        )))
-    }
-
-    fn is_retryable_protocol_error(err: &anyhow::Error) -> bool {
-        for cause in err.chain() {
-            if let Some(protocol_error) = cause.downcast_ref::<RemoteProtocolError>() {
-                return protocol_error.is_retryable();
-            }
-        }
-        let message = err.to_string().to_ascii_lowercase();
-        if message.contains("timeout")
-            || message.contains("timed out")
-            || message.contains("connection reset")
-            || message.contains("connection refused")
-            || message.contains("connection aborted")
-            || message.contains("connection closed")
-            || message.contains("temporarily unavailable")
-            || message.contains("broken pipe")
-        {
-            return true;
-        }
-        message.contains(" 429 ")
-            || message.contains("status=429")
-            || message.contains("status 429")
-            || message.contains(" 408 ")
-            || message.contains("status=408")
-            || message.contains("status 408")
-            || message.contains(" 500 ")
-            || message.contains("status=500")
-            || message.contains("status 500")
-            || message.contains(" 502 ")
-            || message.contains("status=502")
-            || message.contains("status 502")
-            || message.contains(" 503 ")
-            || message.contains("status=503")
-            || message.contains("status 503")
-            || message.contains(" 504 ")
-            || message.contains("status=504")
-            || message.contains("status 504")
-    }
-
-    fn retry_backoff_delay(&self, attempt: usize) -> Duration {
-        let shift = attempt.saturating_sub(1).min(8) as u32;
-        let multiplier = 1u64 << shift;
-        Duration::from_millis(
-            self.retry_settings
-                .base_backoff_ms
-                .saturating_mul(multiplier),
-        )
-    }
-
-    fn call_protocol_with_retry<T>(
-        &self,
-        op_name: &str,
-        mut op: impl FnMut() -> Result<T>,
-    ) -> Result<T> {
-        let attempts = self.retry_settings.max_attempts.max(1);
-        for attempt in 1..=attempts {
-            match op() {
-                Ok(value) => return Ok(value),
-                Err(err) => {
-                    let retryable = Self::is_retryable_protocol_error(&err);
-                    if retryable && attempt < attempts {
-                        thread::sleep(self.retry_backoff_delay(attempt));
-                        continue;
-                    }
-                    if retryable {
-                        return Err(anyhow!(
-                            "remote worker backend {} request failed after {} attempts: {}",
-                            op_name,
-                            attempt,
-                            err
-                        ));
-                    }
-                    return Err(err);
-                }
-            }
-        }
-        unreachable!("attempt loop always returns");
-    }
-}
-
-impl WorkerBackend for RemoteWorkerBackend {
-    fn submit(&self, dispatch: TrialDispatch) -> Result<WorkerTicket> {
-        self.ensure_available()?;
-        let request = RemoteSubmitRequest {
-            schema_version: REMOTE_SUBMIT_SCHEMA_V1.to_string(),
-            dispatch: dispatch.clone(),
-        };
-        let response =
-            self.call_protocol_with_retry("submit", || self.protocol.submit(request.clone()))?;
-        if response.schema_version != REMOTE_SUBMIT_SCHEMA_V1 {
-            return Err(self.protocol_fault(format!(
-                "submit schema_version {} did not match {}",
-                response.schema_version, REMOTE_SUBMIT_SCHEMA_V1
-            )));
-        }
-        if response.ticket.trial_id != dispatch.trial_id {
-            return Err(self.protocol_fault(format!(
-                "returned ticket trial_id {} did not match dispatch trial_id {}",
-                response.ticket.trial_id, dispatch.trial_id
-            )));
-        }
-        self.remember_submission(&dispatch, &response.ticket)?;
-        Ok(response.ticket)
-    }
-
-    fn poll_completions(&self, timeout: Duration) -> Result<Vec<TrialCompletion>> {
-        self.ensure_available()?;
-        let timeout_ms = timeout.as_millis().min(u128::from(u64::MAX)) as u64;
-        let request = RemotePollRequest {
-            schema_version: REMOTE_POLL_SCHEMA_V1.to_string(),
-            timeout_ms,
-        };
-        let response =
-            self.call_protocol_with_retry("poll", || self.protocol.poll(request.clone()))?;
-        if response.schema_version != REMOTE_POLL_SCHEMA_V1 {
-            return Err(self.protocol_fault(format!(
-                "poll schema_version {} did not match {}",
-                response.schema_version, REMOTE_POLL_SCHEMA_V1
-            )));
-        }
-        let mut accepted = Vec::with_capacity(response.completions.len());
-        for completion in response.completions {
-            match self.validate_and_consume_completion(&completion)? {
-                RemoteCompletionValidation::Deliver => accepted.push(completion),
-                RemoteCompletionValidation::Duplicate => {}
-            }
-        }
-        Ok(accepted)
-    }
-
-    fn request_pause(&self, worker_id: &str, label: &str) -> Result<WorkerPauseAck> {
-        self.ensure_available()?;
-        let active_submissions = self.active_submissions_for_worker(worker_id, "pause")?;
-        let request = RemotePauseRequest {
-            schema_version: REMOTE_PAUSE_SCHEMA_V1.to_string(),
-            worker_id: worker_id.to_string(),
-            label: label.to_string(),
-        };
-        let response =
-            self.call_protocol_with_retry("pause", || self.protocol.pause(request.clone()))?;
-        if response.schema_version != REMOTE_PAUSE_SCHEMA_V1 {
-            return Err(self.protocol_fault(format!(
-                "pause schema_version {} did not match {}",
-                response.schema_version, REMOTE_PAUSE_SCHEMA_V1
-            )));
-        }
-        if response.ack.worker_id != worker_id {
-            return Err(self.protocol_fault(format!(
-                "pause ack worker_id {} did not match request worker_id {}",
-                response.ack.worker_id, worker_id
-            )));
-        }
-        if response.ack.label != label {
-            return Err(self.protocol_fault(format!(
-                "pause ack label {} did not match request label {}",
-                response.ack.label, label
-            )));
-        }
-        if !response.ack.accepted {
-            return Err(anyhow!(
-                "remote worker backend pause rejected for worker {}",
-                worker_id
-            ));
-        }
-        let expected_trials: HashSet<String> = active_submissions
-            .iter()
-            .map(|entry| entry.trial_id.clone())
-            .collect();
-        if !expected_trials.contains(response.ack.trial_id.as_str()) {
-            let mut expected_trials_sorted: Vec<String> = expected_trials.into_iter().collect();
-            expected_trials_sorted.sort();
-            return Err(self.protocol_fault(format!(
-                "pause ack trial_id {} did not match active trial(s) [{}] for worker {}",
-                response.ack.trial_id,
-                expected_trials_sorted.join(","),
-                worker_id
-            )));
-        }
-        Ok(response.ack)
-    }
-
-    fn request_stop(&self, worker_id: &str, reason: &str) -> Result<()> {
-        self.ensure_available()?;
-        let _active_submissions = self.active_submissions_for_worker(worker_id, "stop")?;
-        let request = RemoteStopRequest {
-            schema_version: REMOTE_STOP_SCHEMA_V1.to_string(),
-            worker_id: worker_id.to_string(),
-            reason: reason.to_string(),
-        };
-        let response =
-            self.call_protocol_with_retry("stop", || self.protocol.stop(request.clone()))?;
-        if response.schema_version != REMOTE_STOP_SCHEMA_V1 {
-            return Err(self.protocol_fault(format!(
-                "stop schema_version {} did not match {}",
-                response.schema_version, REMOTE_STOP_SCHEMA_V1
-            )));
-        }
-        if !response.accepted {
-            return Err(anyhow!(
-                "remote worker backend stop rejected for worker {}",
-                worker_id
-            ));
-        }
-        Ok(())
-    }
-}
-
-#[allow(dead_code)]
-#[derive(Clone, Default)]
-struct FakeRemoteWorkerHarness {
-    state: Arc<Mutex<FakeRemoteWorkerState>>,
-}
-
-#[derive(Default)]
-struct FakeRemoteWorkerState {
-    ticket_seq: u64,
-    worker_by_ticket: HashMap<String, String>,
-    trial_by_worker: HashMap<String, String>,
-    submit_requests: Vec<RemoteSubmitRequest>,
-    poll_requests: Vec<RemotePollRequest>,
-    pause_requests: Vec<RemotePauseRequest>,
-    stop_requests: Vec<RemoteStopRequest>,
-    queued_completions: VecDeque<TrialCompletion>,
-}
-
-#[allow(dead_code)]
-impl FakeRemoteWorkerHarness {
-    fn new() -> Self {
-        Self::default()
-    }
-
-    fn enqueue_completion(&self, completion: TrialCompletion) -> Result<()> {
-        let mut state = self
-            .state
-            .lock()
-            .map_err(|_| anyhow!("fake remote harness state lock poisoned"))?;
-        state.queued_completions.push_back(completion);
-        Ok(())
-    }
-
-    fn submit_requests(&self) -> Result<Vec<RemoteSubmitRequest>> {
-        let state = self
-            .state
-            .lock()
-            .map_err(|_| anyhow!("fake remote harness state lock poisoned"))?;
-        Ok(state.submit_requests.clone())
-    }
-
-    fn poll_requests(&self) -> Result<Vec<RemotePollRequest>> {
-        let state = self
-            .state
-            .lock()
-            .map_err(|_| anyhow!("fake remote harness state lock poisoned"))?;
-        Ok(state.poll_requests.clone())
-    }
-
-    fn pause_requests(&self) -> Result<Vec<RemotePauseRequest>> {
-        let state = self
-            .state
-            .lock()
-            .map_err(|_| anyhow!("fake remote harness state lock poisoned"))?;
-        Ok(state.pause_requests.clone())
-    }
-
-    fn stop_requests(&self) -> Result<Vec<RemoteStopRequest>> {
-        let state = self
-            .state
-            .lock()
-            .map_err(|_| anyhow!("fake remote harness state lock poisoned"))?;
-        Ok(state.stop_requests.clone())
-    }
-}
-
-impl RemoteWorkerProtocol for FakeRemoteWorkerHarness {
-    fn submit(&self, request: RemoteSubmitRequest) -> Result<RemoteSubmitResponse> {
-        let mut state = self
-            .state
-            .lock()
-            .map_err(|_| anyhow!("fake remote harness state lock poisoned"))?;
-        state.ticket_seq += 1;
-        state.submit_requests.push(request.clone());
-        let worker_id = format!("fake.remote.worker.{}", state.ticket_seq);
-        let ticket_id = format!("fake.remote.ticket.{}", state.ticket_seq);
-        state
-            .worker_by_ticket
-            .insert(ticket_id.clone(), worker_id.clone());
-        state
-            .trial_by_worker
-            .insert(worker_id.clone(), request.dispatch.trial_id.clone());
-        Ok(RemoteSubmitResponse {
-            schema_version: REMOTE_SUBMIT_SCHEMA_V1.to_string(),
-            ticket: WorkerTicket {
-                worker_id,
-                ticket_id,
-                trial_id: request.dispatch.trial_id,
-            },
-        })
-    }
-
-    fn poll(&self, request: RemotePollRequest) -> Result<RemotePollResponse> {
-        let mut state = self
-            .state
-            .lock()
-            .map_err(|_| anyhow!("fake remote harness state lock poisoned"))?;
-        state.poll_requests.push(request);
-        let mut completions = Vec::new();
-        while let Some(completion) = state.queued_completions.pop_front() {
-            completions.push(completion);
-        }
-        Ok(RemotePollResponse {
-            schema_version: REMOTE_POLL_SCHEMA_V1.to_string(),
-            completions,
-        })
-    }
-
-    fn pause(&self, request: RemotePauseRequest) -> Result<RemotePauseResponse> {
-        let mut state = self
-            .state
-            .lock()
-            .map_err(|_| anyhow!("fake remote harness state lock poisoned"))?;
-        state.pause_requests.push(request.clone());
-        let trial_id = state
-            .trial_by_worker
-            .get(request.worker_id.as_str())
-            .cloned()
-            .unwrap_or_else(|| "unknown_trial".to_string());
-        let accepted = state
-            .trial_by_worker
-            .contains_key(request.worker_id.as_str());
-        Ok(RemotePauseResponse {
-            schema_version: REMOTE_PAUSE_SCHEMA_V1.to_string(),
-            ack: WorkerPauseAck {
-                worker_id: request.worker_id,
-                trial_id,
-                label: request.label,
-                accepted,
-            },
-        })
-    }
-
-    fn stop(&self, request: RemoteStopRequest) -> Result<RemoteStopResponse> {
-        let mut state = self
-            .state
-            .lock()
-            .map_err(|_| anyhow!("fake remote harness state lock poisoned"))?;
-        state.stop_requests.push(request.clone());
-        let accepted = state
-            .trial_by_worker
-            .remove(request.worker_id.as_str())
-            .is_some();
-        Ok(RemoteStopResponse {
-            schema_version: REMOTE_STOP_SCHEMA_V1.to_string(),
-            accepted,
-        })
     }
 }
 
@@ -2257,22 +1209,6 @@ fn normalize_execution_options(execution: &RunExecutionOptions) -> RunExecutionO
         remote_endpoint: execution.remote_endpoint.clone(),
         remote_token_env: execution.remote_token_env.clone(),
     }
-}
-
-fn resolve_remote_bearer_token(token_env: Option<&str>) -> Result<Option<String>> {
-    let name = token_env
-        .map(str::trim)
-        .filter(|value| !value.is_empty() && !value.eq_ignore_ascii_case("unset"));
-    let Some(name) = name else {
-        return Ok(None);
-    };
-    let value = std::env::var(name).map_err(|_| {
-        anyhow!(
-            "remote executor token env var '{}' is not set in current process environment",
-            name
-        )
-    })?;
-    Ok(Some(value))
 }
 
 fn atomic_write_bytes(path: &Path, bytes: &[u8]) -> Result<()> {
@@ -3104,8 +2040,6 @@ pub fn continue_run(run_dir: &Path) -> Result<RunResult> {
         &baseline_id,
         &mut run_sink,
         max_concurrency,
-        execution.remote_endpoint.as_deref(),
-        execution.remote_token_env.as_deref(),
     )?;
     run_sink.flush()?;
     if schedule_outcome != ScheduleEngineOutcome::Completed {
@@ -6925,58 +5859,61 @@ fn execute_parallel_worker_trial(
     let mut local_chain_states: BTreeMap<String, ChainRuntimeState> = BTreeMap::new();
     let mut buffered_sink = BufferedRunSink::default();
     let artifact_store = ArtifactStore::new(context.run_dir.join("artifacts"));
+    let execution = (|| -> Result<TrialCompletion> {
+        let mut trial_result = TrialExecutor::execute_slot(
+            context.mode,
+            &context.run_dir,
+            &context.run_id,
+            &context.workload_type,
+            &context.project_root,
+            &context.dataset_path,
+            &context.variants,
+            &context.tasks,
+            dispatch.schedule_idx,
+            &dispatch.slot,
+            &context.policy_config,
+            &context.benchmark_config,
+            &context.variant_runtime_profiles,
+            &context.behavior,
+            context.materialize_mode,
+            &context.task_boundary_policy,
+            &context.trials_dir,
+            &context.evidence_dir,
+            &payload_evidence,
+            &payload_chain,
+            &artifact_store,
+            &mut local_trial_index,
+            &mut local_chain_states,
+            &context.baseline_id,
+            &mut buffered_sink,
+        )?;
+        trial_result.variant_idx = Some(dispatch.slot.variant_idx);
+        trial_result.deferred_trial_records = buffered_sink.trial_records;
+        trial_result.deferred_metric_rows = buffered_sink.metric_rows;
+        trial_result.deferred_event_rows = buffered_sink.event_rows;
+        trial_result.deferred_variant_snapshot_rows = buffered_sink.variant_snapshot_rows;
+        trial_result.deferred_evidence_records = load_jsonl_value_rows(&payload_evidence)?;
+        trial_result.deferred_chain_state_records = load_jsonl_value_rows(&payload_chain)?;
 
-    let mut trial_result = TrialExecutor::execute_slot(
-        context.mode,
-        &context.run_dir,
-        &context.run_id,
-        &context.workload_type,
-        &context.project_root,
-        &context.dataset_path,
-        &context.variants,
-        &context.tasks,
-        dispatch.schedule_idx,
-        &dispatch.slot,
-        &context.policy_config,
-        &context.benchmark_config,
-        &context.variant_runtime_profiles,
-        &context.behavior,
-        context.materialize_mode,
-        &context.task_boundary_policy,
-        &context.trials_dir,
-        &context.evidence_dir,
-        &payload_evidence,
-        &payload_chain,
-        &artifact_store,
-        &mut local_trial_index,
-        &mut local_chain_states,
-        &context.baseline_id,
-        &mut buffered_sink,
-    )?;
-    trial_result.variant_idx = Some(dispatch.slot.variant_idx);
-    trial_result.deferred_trial_records = buffered_sink.trial_records;
-    trial_result.deferred_metric_rows = buffered_sink.metric_rows;
-    trial_result.deferred_event_rows = buffered_sink.event_rows;
-    trial_result.deferred_variant_snapshot_rows = buffered_sink.variant_snapshot_rows;
-    trial_result.deferred_evidence_records = load_jsonl_value_rows(&payload_evidence)?;
-    trial_result.deferred_chain_state_records = load_jsonl_value_rows(&payload_chain)?;
+        Ok(TrialCompletion {
+            ticket: WorkerTicket {
+                worker_id: String::new(),
+                ticket_id: String::new(),
+                trial_id: dispatch.trial_id.clone(),
+            },
+            schedule_idx: dispatch.schedule_idx,
+            completion_seq: None,
+            terminal_status: trial_result.slot_status.clone(),
+            classification: "trial_execution_result".to_string(),
+            artifacts: serde_json::to_value(trial_result)?,
+            metrics: json!({}),
+            runtime_summary: json!({}),
+        })
+    })();
 
+    // Always attempt to cleanup worker payload materialization, including error paths.
     let _ = fs::remove_dir_all(&payload_dir);
-
-    Ok(TrialCompletion {
-        ticket: WorkerTicket {
-            worker_id: String::new(),
-            ticket_id: String::new(),
-            trial_id: dispatch.trial_id.clone(),
-        },
-        schedule_idx: dispatch.schedule_idx,
-        completion_seq: None,
-        terminal_status: trial_result.slot_status.clone(),
-        classification: "trial_execution_result".to_string(),
-        artifacts: serde_json::to_value(trial_result)?,
-        metrics: json!({}),
-        runtime_summary: json!({}),
-    })
+    execution
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -7008,8 +5945,6 @@ fn execute_schedule_engine_parallel(
     baseline_id: &str,
     run_sink: &mut dyn RunSink,
     max_concurrency: usize,
-    remote_endpoint: Option<&str>,
-    remote_token_env: Option<&str>,
 ) -> Result<ScheduleEngineOutcome> {
     let benchmark_dir = run_dir.join("benchmark");
     let benchmark_predictions_path = benchmark_dir.join("predictions.jsonl");
@@ -7018,56 +5953,40 @@ fn execute_schedule_engine_parallel(
     let any_remote_executor = variant_runtime_profiles
         .iter()
         .any(|profile| matches!(profile.executor_kind, ExecutorKind::Remote));
-    let all_remote_executor = any_remote_executor
-        && variant_runtime_profiles
-            .iter()
-            .all(|profile| matches!(profile.executor_kind, ExecutorKind::Remote));
-    if any_remote_executor && !all_remote_executor {
+    if any_remote_executor {
         return Err(anyhow!(
-            "parallel worker engine does not support mixed local and remote executor kinds in one run"
+            "executor_kind='remote' is no longer supported; use local_process or local_docker"
         ));
     }
     let requested_dispatch_capacity = max_concurrency.max(1);
-    let mut dispatch_capacity = requested_dispatch_capacity;
-    let backend: Box<dyn WorkerBackend> = if all_remote_executor {
-        let endpoint = remote_endpoint
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .ok_or_else(|| anyhow!("remote executor requires --remote-endpoint"))?;
-        let bearer_token = resolve_remote_bearer_token(remote_token_env)?;
-        let protocol = Arc::new(HttpRemoteWorkerProtocol::new(endpoint, bearer_token)?);
-        Box::new(RemoteWorkerBackend::new(protocol)?)
-    } else {
-        let worker_context = Arc::new(ParallelWorkerExecutionContext {
-            mode,
-            run_dir: run_dir.to_path_buf(),
-            run_id: run_id.to_string(),
-            workload_type: workload_type.to_string(),
-            project_root: project_root.to_path_buf(),
-            dataset_path: dataset_path.to_path_buf(),
-            variants: variants.to_vec(),
-            tasks: tasks.to_vec(),
-            policy_config: policy_config.clone(),
-            benchmark_config: benchmark_config.clone(),
-            variant_runtime_profiles: variant_runtime_profiles.to_vec(),
-            behavior: behavior.clone(),
-            materialize_mode,
-            task_boundary_policy: task_boundary_policy.clone(),
-            trials_dir: trials_dir.to_path_buf(),
-            evidence_dir: evidence_dir.to_path_buf(),
-            baseline_id: baseline_id.to_string(),
-        });
-        let executor_context = worker_context.clone();
-        let executor: Arc<LocalTrialExecutor> = Arc::new(move |dispatch: TrialDispatch| {
-            execute_parallel_worker_trial(executor_context.as_ref(), dispatch)
-        });
-        let local_backend = LocalThreadWorkerBackend::new(requested_dispatch_capacity, executor)?;
-        if let Some(warning) = local_backend.capacity_warning() {
-            eprintln!("{}", warning);
-        }
-        dispatch_capacity = local_backend.effective_max_in_flight();
-        Box::new(local_backend)
-    };
+    let worker_context = Arc::new(ParallelWorkerExecutionContext {
+        mode,
+        run_dir: run_dir.to_path_buf(),
+        run_id: run_id.to_string(),
+        workload_type: workload_type.to_string(),
+        project_root: project_root.to_path_buf(),
+        dataset_path: dataset_path.to_path_buf(),
+        variants: variants.to_vec(),
+        tasks: tasks.to_vec(),
+        policy_config: policy_config.clone(),
+        benchmark_config: benchmark_config.clone(),
+        variant_runtime_profiles: variant_runtime_profiles.to_vec(),
+        behavior: behavior.clone(),
+        materialize_mode,
+        task_boundary_policy: task_boundary_policy.clone(),
+        trials_dir: trials_dir.to_path_buf(),
+        evidence_dir: evidence_dir.to_path_buf(),
+        baseline_id: baseline_id.to_string(),
+    });
+    let executor_context = worker_context.clone();
+    let executor: Arc<LocalTrialExecutor> =
+        Arc::new(move |dispatch: TrialDispatch| execute_parallel_worker_trial(executor_context.as_ref(), dispatch));
+    let local_backend = LocalThreadWorkerBackend::new(requested_dispatch_capacity, executor)?;
+    if let Some(warning) = local_backend.capacity_warning() {
+        eprintln!("{}", warning);
+    }
+    let dispatch_capacity = local_backend.effective_max_in_flight();
+    let backend: Box<dyn WorkerBackend> = Box::new(local_backend);
 
     let journal_records = load_slot_commit_records(run_dir)?;
     let mut committer = DeterministicCommitter::from_progress(schedule_progress, &journal_records);
@@ -7346,8 +6265,6 @@ fn execute_schedule_engine(
     baseline_id: &str,
     run_sink: &mut dyn RunSink,
     max_concurrency: usize,
-    remote_endpoint: Option<&str>,
-    remote_token_env: Option<&str>,
 ) -> Result<ScheduleEngineOutcome> {
     if !matches!(policy_config.state, StatePolicy::IsolatePerTrial) {
         return Err(anyhow!(
@@ -7383,8 +6300,6 @@ fn execute_schedule_engine(
         baseline_id,
         run_sink,
         max_concurrency,
-        remote_endpoint,
-        remote_token_env,
     )
 }
 
@@ -7583,8 +6498,6 @@ fn run_experiment_with_behavior(
         &baseline_id,
         &mut run_sink,
         max_concurrency,
-        execution.remote_endpoint.as_deref(),
-        execution.remote_token_env.as_deref(),
     )?;
     run_sink.flush()?;
     if schedule_outcome != ScheduleEngineOutcome::Completed {
@@ -8093,98 +7006,6 @@ fn collect_preflight_checks(
     ));
     checks.extend(check_dependency_files_exist(json_value, exp_dir));
     checks
-}
-
-#[cfg(test)]
-fn check_probe_trial_input(
-    json_value: &Value,
-    tasks: &[Value],
-    baseline_variant: &Variant,
-    agent_runtime: &AgentRuntimeConfig,
-    is_clean: bool,
-) -> PreflightCheck {
-    let name = "probe_trial_input";
-    let first_task = match tasks.first() {
-        Some(t) => t,
-        None => {
-            return PreflightCheck {
-                name,
-                passed: false,
-                severity: PreflightSeverity::Error,
-                message: "dataset is empty — no tasks to validate".to_string(),
-            };
-        }
-    };
-
-    let task_boundary = match parse_task_boundary_from_dataset_task(first_task) {
-        Ok(tb) => tb,
-        Err(e) => {
-            return PreflightCheck {
-                name,
-                passed: false,
-                severity: PreflightSeverity::Error,
-                message: format!("failed to parse task boundary for first task: {}", e),
-            };
-        }
-    };
-
-    let probe_input = build_agent_task(
-        json_value,
-        "preflight_probe",
-        "preflight_trial_0",
-        baseline_variant,
-        0,
-        0,
-        &task_boundary,
-        agent_runtime,
-    );
-
-    if is_clean {
-        return PreflightCheck {
-            name,
-            passed: true,
-            severity: PreflightSeverity::Error,
-            message: "clean_contract_v1 — task payload returned as-is, no schema validation needed"
-                .to_string(),
-        };
-    }
-
-    let schema = match compile_schema("agent_task_v1.jsonschema") {
-        Ok(s) => s,
-        Err(e) => {
-            return PreflightCheck {
-                name,
-                passed: false,
-                severity: PreflightSeverity::Error,
-                message: format!("failed to load agent_task_v1 schema: {}", e),
-            };
-        }
-    };
-
-    let validation_errors: Vec<String> = schema
-        .validate(&probe_input)
-        .err()
-        .map(|errors| errors.map(|e| e.to_string()).collect())
-        .unwrap_or_default();
-
-    if validation_errors.is_empty() {
-        PreflightCheck {
-            name,
-            passed: true,
-            severity: PreflightSeverity::Error,
-            message: "probe trial input passes agent_task_v1 schema".to_string(),
-        }
-    } else {
-        PreflightCheck {
-            name,
-            passed: false,
-            severity: PreflightSeverity::Error,
-            message: format!(
-                "probe trial input fails agent_task_v1 schema: {}",
-                validation_errors.join("; ")
-            ),
-        }
-    }
 }
 
 fn check_dataset_task_ids(
@@ -13656,116 +12477,6 @@ mod tests {
     }
 
     #[test]
-    fn resolve_remote_bearer_token_reads_env_when_present() {
-        let key = "AGENTLAB_TEST_REMOTE_TOKEN";
-        let previous = env::var(key).ok();
-        env::set_var(key, "token_123");
-        let token = resolve_remote_bearer_token(Some(key)).expect("token resolution");
-        assert_eq!(token.as_deref(), Some("token_123"));
-        if let Some(previous) = previous {
-            env::set_var(key, previous);
-        } else {
-            env::remove_var(key);
-        }
-    }
-
-    #[test]
-    fn resolve_remote_bearer_token_skips_unset_and_errors_for_missing_env() {
-        assert!(resolve_remote_bearer_token(Some("unset"))
-            .expect("unset should be treated as no-token")
-            .is_none());
-        let key = "AGENTLAB_TEST_REMOTE_TOKEN_MISSING";
-        let previous = env::var(key).ok();
-        env::remove_var(key);
-        let err = resolve_remote_bearer_token(Some(key)).expect_err("missing env should fail");
-        assert!(
-            err.to_string().contains("is not set"),
-            "unexpected error: {}",
-            err
-        );
-        if let Some(previous) = previous {
-            env::set_var(key, previous);
-        }
-    }
-
-    #[test]
-    fn remote_retry_settings_apply_env_overrides() {
-        let attempts_key = AGENTLAB_REMOTE_PROTOCOL_RETRY_MAX_ATTEMPTS_ENV;
-        let backoff_key = AGENTLAB_REMOTE_PROTOCOL_RETRY_BASE_BACKOFF_MS_ENV;
-        let attempts_prev = env::var(attempts_key).ok();
-        let backoff_prev = env::var(backoff_key).ok();
-
-        env::set_var(attempts_key, "5");
-        env::set_var(backoff_key, "75");
-        let settings = resolve_remote_retry_settings_from_env().expect("settings");
-        assert_eq!(settings.max_attempts, 5);
-        assert_eq!(settings.base_backoff_ms, 75);
-
-        if let Some(value) = attempts_prev {
-            env::set_var(attempts_key, value);
-        } else {
-            env::remove_var(attempts_key);
-        }
-        if let Some(value) = backoff_prev {
-            env::set_var(backoff_key, value);
-        } else {
-            env::remove_var(backoff_key);
-        }
-    }
-
-    #[test]
-    fn remote_protocol_timeout_settings_apply_env_overrides() {
-        let connect_key = AGENTLAB_REMOTE_PROTOCOL_CONNECT_TIMEOUT_MS_ENV;
-        let submit_key = AGENTLAB_REMOTE_PROTOCOL_SUBMIT_TIMEOUT_MS_ENV;
-        let poll_grace_key = AGENTLAB_REMOTE_PROTOCOL_POLL_TIMEOUT_GRACE_MS_ENV;
-        let pause_key = AGENTLAB_REMOTE_PROTOCOL_PAUSE_TIMEOUT_MS_ENV;
-        let stop_key = AGENTLAB_REMOTE_PROTOCOL_STOP_TIMEOUT_MS_ENV;
-        let connect_prev = env::var(connect_key).ok();
-        let submit_prev = env::var(submit_key).ok();
-        let poll_grace_prev = env::var(poll_grace_key).ok();
-        let pause_prev = env::var(pause_key).ok();
-        let stop_prev = env::var(stop_key).ok();
-
-        env::set_var(connect_key, "2500");
-        env::set_var(submit_key, "45000");
-        env::set_var(poll_grace_key, "1500");
-        env::set_var(pause_key, "12000");
-        env::set_var(stop_key, "16000");
-        let settings = resolve_remote_protocol_timeout_settings_from_env().expect("settings");
-        assert_eq!(settings.connect_timeout_ms, 2500);
-        assert_eq!(settings.submit_timeout_ms, 45000);
-        assert_eq!(settings.poll_timeout_grace_ms, 1500);
-        assert_eq!(settings.pause_timeout_ms, 12000);
-        assert_eq!(settings.stop_timeout_ms, 16000);
-
-        if let Some(value) = connect_prev {
-            env::set_var(connect_key, value);
-        } else {
-            env::remove_var(connect_key);
-        }
-        if let Some(value) = submit_prev {
-            env::set_var(submit_key, value);
-        } else {
-            env::remove_var(submit_key);
-        }
-        if let Some(value) = poll_grace_prev {
-            env::set_var(poll_grace_key, value);
-        } else {
-            env::remove_var(poll_grace_key);
-        }
-        if let Some(value) = pause_prev {
-            env::set_var(pause_key, value);
-        } else {
-            env::remove_var(pause_key);
-        }
-        if let Some(value) = stop_prev {
-            env::set_var(stop_key, value);
-        } else {
-            env::remove_var(stop_key);
-        }
-    }
-
-    #[test]
     fn continue_run_accepts_paused_and_interrupted_terminal_statuses() {
         for status in ["paused", "interrupted"] {
             let (_root, run_dir) = create_run_dir("agentlab_continue_statuses", "run_1");
@@ -15635,17 +14346,6 @@ mod tests {
         }
     }
 
-    fn worker_completion_fixture_with_seq(
-        ticket: &WorkerTicket,
-        schedule_idx: usize,
-        classification: &str,
-        completion_seq: u64,
-    ) -> TrialCompletion {
-        let mut completion = worker_completion_fixture(ticket, schedule_idx, classification);
-        completion.completion_seq = Some(completion_seq);
-        completion
-    }
-
     #[derive(Debug, Deserialize)]
     struct P2EDeterminismFixture {
         schema_version: String,
@@ -15902,6 +14602,71 @@ mod tests {
     }
 
     #[test]
+    fn p5b_local_worker_high_churn_drains_in_flight_bookkeeping() {
+        let executor: Arc<LocalTrialExecutor> = Arc::new(|dispatch| {
+            Ok(TrialCompletion {
+                ticket: WorkerTicket {
+                    worker_id: "ignored".to_string(),
+                    ticket_id: "ignored".to_string(),
+                    trial_id: dispatch.trial_id.clone(),
+                },
+                schedule_idx: dispatch.schedule_idx,
+                completion_seq: None,
+                terminal_status: "succeeded".to_string(),
+                classification: "ok".to_string(),
+                artifacts: json!({}),
+                metrics: json!({}),
+                runtime_summary: json!({}),
+            })
+        });
+        let lanes = 8usize;
+        let batches = 25usize;
+        let backend = LocalThreadWorkerBackend::new_with_ceiling(lanes, executor, Some(lanes))
+            .expect("backend");
+
+        for batch_idx in 0..batches {
+            let mut expected_ticket_ids: HashSet<String> = HashSet::new();
+            for lane_idx in 0..lanes {
+                let schedule_idx = batch_idx * lanes + lane_idx;
+                let dispatch =
+                    worker_dispatch_fixture(schedule_idx, &format!("trial_churn_{}", schedule_idx));
+                let ticket = backend.submit(dispatch).expect("submit");
+                expected_ticket_ids.insert(ticket.ticket_id);
+            }
+
+            let mut seen = 0usize;
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while seen < lanes {
+                assert!(
+                    Instant::now() < deadline,
+                    "timed out draining local churn batch {}",
+                    batch_idx
+                );
+                let completions = backend
+                    .poll_completions(Duration::from_millis(50))
+                    .expect("poll");
+                if completions.is_empty() {
+                    continue;
+                }
+                for completion in completions {
+                    assert!(
+                        expected_ticket_ids.remove(completion.ticket.ticket_id.as_str()),
+                        "unexpected completion ticket {}",
+                        completion.ticket.ticket_id
+                    );
+                    seen += 1;
+                }
+            }
+
+            let state = backend.inner.state.lock().expect("state lock");
+            assert!(
+                state.in_flight_by_ticket.is_empty(),
+                "local in-flight ticket state should drain after each churn batch"
+            );
+        }
+    }
+
+    #[test]
     fn p2c_local_thread_worker_backend_ticket_map_drives_pause_and_stop() {
         let executor: Arc<LocalTrialExecutor> = Arc::new(|dispatch| {
             thread::sleep(Duration::from_millis(120));
@@ -15947,380 +14712,6 @@ mod tests {
         let _ = backend
             .poll_completions(Duration::from_secs(2))
             .expect("drain completion");
-    }
-
-    #[test]
-    fn p2d_remote_backend_fake_harness_round_trips_protocol_contract() {
-        let harness = Arc::new(FakeRemoteWorkerHarness::new());
-        let backend = RemoteWorkerBackend::new(harness.clone()).expect("remote backend");
-        let dispatch = worker_dispatch_fixture(7, "trial_remote_1");
-        let ticket = backend.submit(dispatch.clone()).expect("submit");
-
-        let pause = backend
-            .request_pause(&ticket.worker_id, "checkpoint_1")
-            .expect("pause");
-        assert!(pause.accepted);
-        assert_eq!(pause.worker_id, ticket.worker_id);
-        assert_eq!(pause.trial_id, ticket.trial_id);
-
-        backend
-            .request_stop(&ticket.worker_id, "done")
-            .expect("stop");
-
-        harness
-            .enqueue_completion(worker_completion_fixture(
-                &ticket,
-                dispatch.schedule_idx,
-                "remote_ok",
-            ))
-            .expect("enqueue completion");
-
-        let completions = backend
-            .poll_completions(Duration::from_millis(250))
-            .expect("poll");
-        assert_eq!(completions.len(), 1);
-        assert_eq!(completions[0].ticket.ticket_id, ticket.ticket_id);
-        assert_eq!(completions[0].classification, "remote_ok");
-
-        let submit_requests = harness.submit_requests().expect("submit requests");
-        assert_eq!(submit_requests.len(), 1);
-        assert_eq!(submit_requests[0].schema_version, REMOTE_SUBMIT_SCHEMA_V1);
-        assert_eq!(submit_requests[0].dispatch.trial_id, dispatch.trial_id);
-
-        let poll_requests = harness.poll_requests().expect("poll requests");
-        assert_eq!(poll_requests.len(), 1);
-        assert_eq!(poll_requests[0].schema_version, REMOTE_POLL_SCHEMA_V1);
-        assert_eq!(poll_requests[0].timeout_ms, 250);
-
-        let pause_requests = harness.pause_requests().expect("pause requests");
-        assert_eq!(pause_requests.len(), 1);
-        assert_eq!(pause_requests[0].schema_version, REMOTE_PAUSE_SCHEMA_V1);
-        let stop_requests = harness.stop_requests().expect("stop requests");
-        assert_eq!(stop_requests.len(), 1);
-        assert_eq!(stop_requests[0].schema_version, REMOTE_STOP_SCHEMA_V1);
-    }
-
-    #[test]
-    fn p2d_remote_backend_pause_and_stop_require_active_worker() {
-        let harness = Arc::new(FakeRemoteWorkerHarness::new());
-        let backend = RemoteWorkerBackend::new(harness).expect("remote backend");
-        let pause_err = backend
-            .request_pause("unknown.worker", "checkpoint")
-            .expect_err("pause should reject unknown worker");
-        assert!(
-            pause_err.to_string().contains("unknown active worker"),
-            "unexpected pause error: {}",
-            pause_err
-        );
-        let stop_err = backend
-            .request_stop("unknown.worker", "stop")
-            .expect_err("stop should reject unknown worker");
-        assert!(
-            stop_err.to_string().contains("unknown active worker"),
-            "unexpected stop error: {}",
-            stop_err
-        );
-    }
-
-    #[test]
-    fn p2d_remote_backend_rejects_mismatched_completion_contracts() {
-        let harness = Arc::new(FakeRemoteWorkerHarness::new());
-        let backend = RemoteWorkerBackend::new(harness.clone()).expect("remote backend");
-        let dispatch = worker_dispatch_fixture(9, "trial_remote_contract");
-        let ticket = backend.submit(dispatch.clone()).expect("submit");
-
-        let mut mismatched = worker_completion_fixture(&ticket, dispatch.schedule_idx, "bad");
-        mismatched.ticket.trial_id = "wrong_trial".to_string();
-        harness
-            .enqueue_completion(mismatched)
-            .expect("enqueue bad completion");
-        let err = backend
-            .poll_completions(Duration::from_millis(1))
-            .expect_err("mismatch should fail");
-        assert!(
-            err.to_string().contains(REMOTE_BACKEND_QUARANTINED_PREFIX),
-            "unexpected error: {}",
-            err
-        );
-        assert!(
-            err.to_string().contains("did not match submitted trial_id"),
-            "unexpected error: {}",
-            err
-        );
-
-        let err = backend
-            .submit(worker_dispatch_fixture(10, "trial_after_fault"))
-            .expect_err("quarantined backend should reject subsequent submissions");
-        assert!(
-            err.to_string().contains(REMOTE_BACKEND_QUARANTINED_PREFIX),
-            "unexpected error: {}",
-            err
-        );
-    }
-
-    #[test]
-    fn p2d_remote_backend_rejects_mismatched_completion_worker_id() {
-        let harness = Arc::new(FakeRemoteWorkerHarness::new());
-        let backend = RemoteWorkerBackend::new(harness.clone()).expect("remote backend");
-        let dispatch = worker_dispatch_fixture(13, "trial_remote_worker_mismatch");
-        let ticket = backend.submit(dispatch.clone()).expect("submit");
-
-        let mut mismatched = worker_completion_fixture(&ticket, dispatch.schedule_idx, "bad");
-        mismatched.ticket.worker_id = "wrong.worker".to_string();
-        harness
-            .enqueue_completion(mismatched)
-            .expect("enqueue bad completion");
-        let err = backend
-            .poll_completions(Duration::from_millis(1))
-            .expect_err("mismatch should fail");
-        assert!(
-            err.to_string().contains(REMOTE_BACKEND_QUARANTINED_PREFIX),
-            "unexpected error: {}",
-            err
-        );
-        assert!(
-            err.to_string()
-                .contains("did not match submitted worker_id"),
-            "unexpected error: {}",
-            err
-        );
-    }
-
-    #[test]
-    fn p2d_remote_backend_dedupes_duplicate_delivery_by_completion_seq() {
-        let harness = Arc::new(FakeRemoteWorkerHarness::new());
-        let backend = RemoteWorkerBackend::new(harness.clone()).expect("remote backend");
-        let dispatch = worker_dispatch_fixture(11, "trial_remote_dupe");
-        let ticket = backend.submit(dispatch.clone()).expect("submit");
-
-        harness
-            .enqueue_completion(worker_completion_fixture_with_seq(
-                &ticket,
-                dispatch.schedule_idx,
-                "remote_ok",
-                7,
-            ))
-            .expect("enqueue completion A");
-        harness
-            .enqueue_completion(worker_completion_fixture_with_seq(
-                &ticket,
-                dispatch.schedule_idx,
-                "remote_ok",
-                7,
-            ))
-            .expect("enqueue duplicate completion A");
-
-        let completions = backend
-            .poll_completions(Duration::from_millis(1))
-            .expect("poll completions");
-        assert_eq!(completions.len(), 1);
-        assert_eq!(completions[0].ticket.ticket_id, ticket.ticket_id);
-        assert_eq!(completions[0].completion_seq, Some(7));
-
-        let trailing = backend
-            .poll_completions(Duration::from_millis(1))
-            .expect("trailing poll");
-        assert!(
-            trailing.is_empty(),
-            "duplicate completion should be dropped instead of redelivered"
-        );
-    }
-
-    #[test]
-    fn p2d_remote_backend_retries_retryable_submit_errors() {
-        #[derive(Clone)]
-        struct RetryableSubmitProtocol {
-            submit_attempts: Arc<AtomicUsize>,
-        }
-
-        impl RetryableSubmitProtocol {
-            fn new() -> Self {
-                Self {
-                    submit_attempts: Arc::new(AtomicUsize::new(0)),
-                }
-            }
-        }
-
-        impl RemoteWorkerProtocol for RetryableSubmitProtocol {
-            fn submit(&self, request: RemoteSubmitRequest) -> Result<RemoteSubmitResponse> {
-                let attempt = self.submit_attempts.fetch_add(1, Ordering::SeqCst) + 1;
-                if attempt < 3 {
-                    return Err(anyhow!(
-                        "remote worker http POST http://127.0.0.1:7777/v1/worker/submit failed: 503 service unavailable"
-                    ));
-                }
-                Ok(RemoteSubmitResponse {
-                    schema_version: REMOTE_SUBMIT_SCHEMA_V1.to_string(),
-                    ticket: WorkerTicket {
-                        worker_id: "retry.worker.1".to_string(),
-                        ticket_id: "retry.ticket.1".to_string(),
-                        trial_id: request.dispatch.trial_id,
-                    },
-                })
-            }
-
-            fn poll(&self, _request: RemotePollRequest) -> Result<RemotePollResponse> {
-                Ok(RemotePollResponse {
-                    schema_version: REMOTE_POLL_SCHEMA_V1.to_string(),
-                    completions: Vec::new(),
-                })
-            }
-
-            fn pause(&self, request: RemotePauseRequest) -> Result<RemotePauseResponse> {
-                Ok(RemotePauseResponse {
-                    schema_version: REMOTE_PAUSE_SCHEMA_V1.to_string(),
-                    ack: WorkerPauseAck {
-                        worker_id: request.worker_id,
-                        trial_id: "trial_x".to_string(),
-                        label: request.label,
-                        accepted: true,
-                    },
-                })
-            }
-
-            fn stop(&self, _request: RemoteStopRequest) -> Result<RemoteStopResponse> {
-                Ok(RemoteStopResponse {
-                    schema_version: REMOTE_STOP_SCHEMA_V1.to_string(),
-                    accepted: true,
-                })
-            }
-        }
-
-        let protocol = RetryableSubmitProtocol::new();
-        let attempts = protocol.submit_attempts.clone();
-        let backend = RemoteWorkerBackend::new(Arc::new(protocol)).expect("remote backend");
-        let dispatch = worker_dispatch_fixture(12, "trial_remote_retry");
-        let ticket = backend
-            .submit(dispatch.clone())
-            .expect("submit should retry");
-        assert_eq!(ticket.ticket_id, "retry.ticket.1");
-        assert_eq!(ticket.trial_id, dispatch.trial_id);
-        assert_eq!(attempts.load(Ordering::SeqCst), 3);
-    }
-
-    #[test]
-    fn p2d_remote_backend_retries_typed_retryable_submit_errors() {
-        #[derive(Clone)]
-        struct TypedRetryableSubmitProtocol {
-            submit_attempts: Arc<AtomicUsize>,
-        }
-
-        impl TypedRetryableSubmitProtocol {
-            fn new() -> Self {
-                Self {
-                    submit_attempts: Arc::new(AtomicUsize::new(0)),
-                }
-            }
-        }
-
-        impl RemoteWorkerProtocol for TypedRetryableSubmitProtocol {
-            fn submit(&self, request: RemoteSubmitRequest) -> Result<RemoteSubmitResponse> {
-                let attempt = self.submit_attempts.fetch_add(1, Ordering::SeqCst) + 1;
-                if attempt < 2 {
-                    return Err(anyhow!(RemoteProtocolError::retryable(
-                        "synthetic retryable transport fault"
-                    )));
-                }
-                Ok(RemoteSubmitResponse {
-                    schema_version: REMOTE_SUBMIT_SCHEMA_V1.to_string(),
-                    ticket: WorkerTicket {
-                        worker_id: "typed.retry.worker.1".to_string(),
-                        ticket_id: "typed.retry.ticket.1".to_string(),
-                        trial_id: request.dispatch.trial_id,
-                    },
-                })
-            }
-
-            fn poll(&self, _request: RemotePollRequest) -> Result<RemotePollResponse> {
-                Ok(RemotePollResponse {
-                    schema_version: REMOTE_POLL_SCHEMA_V1.to_string(),
-                    completions: Vec::new(),
-                })
-            }
-
-            fn pause(&self, request: RemotePauseRequest) -> Result<RemotePauseResponse> {
-                Ok(RemotePauseResponse {
-                    schema_version: REMOTE_PAUSE_SCHEMA_V1.to_string(),
-                    ack: WorkerPauseAck {
-                        worker_id: request.worker_id,
-                        trial_id: "trial_x".to_string(),
-                        label: request.label,
-                        accepted: true,
-                    },
-                })
-            }
-
-            fn stop(&self, _request: RemoteStopRequest) -> Result<RemoteStopResponse> {
-                Ok(RemoteStopResponse {
-                    schema_version: REMOTE_STOP_SCHEMA_V1.to_string(),
-                    accepted: true,
-                })
-            }
-        }
-
-        let protocol = TypedRetryableSubmitProtocol::new();
-        let attempts = protocol.submit_attempts.clone();
-        let backend = RemoteWorkerBackend::new(Arc::new(protocol)).expect("remote backend");
-        let dispatch = worker_dispatch_fixture(14, "trial_remote_retry_typed");
-        let ticket = backend.submit(dispatch).expect("submit should retry");
-        assert_eq!(ticket.ticket_id, "typed.retry.ticket.1");
-        assert_eq!(attempts.load(Ordering::SeqCst), 2);
-    }
-
-    #[test]
-    fn p2d_remote_backend_rejects_schema_version_mismatch() {
-        #[derive(Clone)]
-        struct BadSchemaProtocol;
-        impl RemoteWorkerProtocol for BadSchemaProtocol {
-            fn submit(&self, request: RemoteSubmitRequest) -> Result<RemoteSubmitResponse> {
-                Ok(RemoteSubmitResponse {
-                    schema_version: "remote_worker_submit_v0".to_string(),
-                    ticket: WorkerTicket {
-                        worker_id: "w1".to_string(),
-                        ticket_id: "t1".to_string(),
-                        trial_id: request.dispatch.trial_id,
-                    },
-                })
-            }
-
-            fn poll(&self, _request: RemotePollRequest) -> Result<RemotePollResponse> {
-                Ok(RemotePollResponse {
-                    schema_version: REMOTE_POLL_SCHEMA_V1.to_string(),
-                    completions: Vec::new(),
-                })
-            }
-
-            fn pause(&self, request: RemotePauseRequest) -> Result<RemotePauseResponse> {
-                Ok(RemotePauseResponse {
-                    schema_version: REMOTE_PAUSE_SCHEMA_V1.to_string(),
-                    ack: WorkerPauseAck {
-                        worker_id: request.worker_id,
-                        trial_id: "trial_x".to_string(),
-                        label: request.label,
-                        accepted: true,
-                    },
-                })
-            }
-
-            fn stop(&self, _request: RemoteStopRequest) -> Result<RemoteStopResponse> {
-                Ok(RemoteStopResponse {
-                    schema_version: REMOTE_STOP_SCHEMA_V1.to_string(),
-                    accepted: true,
-                })
-            }
-        }
-
-        let backend =
-            RemoteWorkerBackend::new(Arc::new(BadSchemaProtocol)).expect("remote backend");
-        let dispatch = worker_dispatch_fixture(3, "trial_schema");
-        let err = backend
-            .submit(dispatch)
-            .expect_err("schema mismatch should fail");
-        assert!(
-            err.to_string().contains("submit schema_version"),
-            "unexpected error: {}",
-            err
-        );
     }
 
     #[test]
@@ -16742,8 +15133,6 @@ mod tests {
             "base",
             &mut run_sink,
             2,
-            None,
-            None,
         )
         .expect("parallel engine should no-op cleanly");
 
@@ -16848,8 +15237,6 @@ mod tests {
             "base",
             &mut run_sink,
             1,
-            None,
-            None,
         )
         .expect("parallel recovery handling");
 
@@ -17081,183 +15468,6 @@ mod tests {
         assert_eq!(paused.label, "worker_pause");
         assert!(paused.checkpoint_acked);
         assert!(paused.stop_acked);
-    }
-
-    #[test]
-    fn p7_scheduler_processes_worker_pause_request_via_backend() {
-        let (_root, run_dir) = create_run_dir("agentlab_p7_scheduler_pause_request", "run_1");
-        let trial_dir = seed_parent_trial(&run_dir, "trial_1", json!([]), "running", None);
-        let harness = Arc::new(FakeRemoteWorkerHarness::new());
-        let backend = RemoteWorkerBackend::new(harness.clone()).expect("backend");
-
-        let dispatch = worker_dispatch_fixture(0, "trial_1");
-        let ticket = backend.submit(dispatch.clone()).expect("submit");
-        let mut in_flight: HashMap<String, InFlightDispatch> = HashMap::new();
-        in_flight.insert(
-            ticket.ticket_id.clone(),
-            InFlightDispatch {
-                schedule_idx: dispatch.schedule_idx,
-                trial_id: dispatch.trial_id.clone(),
-                variant_idx: dispatch.slot.variant_idx,
-                variant_id: dispatch.variant_id.clone(),
-                worker_id: ticket.worker_id.clone(),
-                started_at: Utc::now().to_rfc3339(),
-            },
-        );
-        let mut in_flight_by_variant = BTreeMap::new();
-        in_flight_by_variant.insert(dispatch.slot.variant_idx, 1);
-        write_run_control_v2(
-            &run_dir,
-            "run_1",
-            "running",
-            &in_flight_active_trials(&in_flight),
-            None,
-        )
-        .expect("run control");
-
-        write_parallel_worker_control_request(
-            &run_dir,
-            ParallelWorkerControlRequest {
-                request_id: "req_pause_1".to_string(),
-                action: ParallelWorkerControlAction::Pause,
-                requested_at: Utc::now().to_rfc3339(),
-                target_trial_ids: vec!["trial_1".to_string()],
-                label: Some("fanout_pause".to_string()),
-                reason: None,
-            },
-        )
-        .expect("request");
-
-        let outcome = process_parallel_worker_control_request(
-            &run_dir,
-            "run_1",
-            &backend,
-            &mut in_flight,
-            &mut in_flight_by_variant,
-        )
-        .expect("process request")
-        .expect("control outcome");
-        assert_eq!(outcome, ScheduleEngineOutcome::Paused);
-        assert!(in_flight.is_empty());
-
-        let pause_requests = harness.pause_requests().expect("pause requests");
-        assert_eq!(pause_requests.len(), 1);
-        assert_eq!(pause_requests[0].worker_id, ticket.worker_id);
-        let stop_requests = harness.stop_requests().expect("stop requests");
-        assert_eq!(stop_requests.len(), 1);
-        assert_eq!(stop_requests[0].worker_id, ticket.worker_id);
-
-        let run_control = load_json_file(&run_control_path(&run_dir)).expect("run control");
-        assert_eq!(
-            run_control
-                .pointer("/status")
-                .and_then(|v| v.as_str())
-                .unwrap_or(""),
-            "paused"
-        );
-        assert_eq!(
-            run_control
-                .pointer("/active_trials/trial_1/trial_id")
-                .and_then(|v| v.as_str())
-                .unwrap_or(""),
-            "trial_1"
-        );
-        let trial_state = load_json_file(&trial_dir.join("trial_state.json")).expect("trial state");
-        assert_eq!(
-            trial_state
-                .pointer("/status")
-                .and_then(|v| v.as_str())
-                .unwrap_or(""),
-            "paused"
-        );
-    }
-
-    #[test]
-    fn p7_scheduler_processes_worker_stop_request_via_backend() {
-        let (_root, run_dir) = create_run_dir("agentlab_p7_scheduler_stop_request", "run_1");
-        let trial_dir = seed_parent_trial(&run_dir, "trial_1", json!([]), "running", None);
-        let harness = Arc::new(FakeRemoteWorkerHarness::new());
-        let backend = RemoteWorkerBackend::new(harness.clone()).expect("backend");
-
-        let dispatch = worker_dispatch_fixture(0, "trial_1");
-        let ticket = backend.submit(dispatch.clone()).expect("submit");
-        let mut in_flight: HashMap<String, InFlightDispatch> = HashMap::new();
-        in_flight.insert(
-            ticket.ticket_id.clone(),
-            InFlightDispatch {
-                schedule_idx: dispatch.schedule_idx,
-                trial_id: dispatch.trial_id.clone(),
-                variant_idx: dispatch.slot.variant_idx,
-                variant_id: dispatch.variant_id.clone(),
-                worker_id: ticket.worker_id.clone(),
-                started_at: Utc::now().to_rfc3339(),
-            },
-        );
-        let mut in_flight_by_variant = BTreeMap::new();
-        in_flight_by_variant.insert(dispatch.slot.variant_idx, 1);
-        write_run_control_v2(
-            &run_dir,
-            "run_1",
-            "running",
-            &in_flight_active_trials(&in_flight),
-            None,
-        )
-        .expect("run control");
-
-        write_parallel_worker_control_request(
-            &run_dir,
-            ParallelWorkerControlRequest {
-                request_id: "req_stop_1".to_string(),
-                action: ParallelWorkerControlAction::Stop,
-                requested_at: Utc::now().to_rfc3339(),
-                target_trial_ids: vec!["trial_1".to_string()],
-                label: None,
-                reason: Some("killed_by_user".to_string()),
-            },
-        )
-        .expect("request");
-
-        let outcome = process_parallel_worker_control_request(
-            &run_dir,
-            "run_1",
-            &backend,
-            &mut in_flight,
-            &mut in_flight_by_variant,
-        )
-        .expect("process request")
-        .expect("control outcome");
-        assert_eq!(outcome, ScheduleEngineOutcome::Killed);
-        assert!(in_flight.is_empty());
-
-        let stop_requests = harness.stop_requests().expect("stop requests");
-        assert_eq!(stop_requests.len(), 1);
-        assert_eq!(stop_requests[0].worker_id, ticket.worker_id);
-
-        let run_control = load_json_file(&run_control_path(&run_dir)).expect("run control");
-        assert_eq!(
-            run_control
-                .pointer("/status")
-                .and_then(|v| v.as_str())
-                .unwrap_or(""),
-            "killed"
-        );
-        let active = run_control
-            .pointer("/active_trials")
-            .and_then(|v| v.as_object())
-            .cloned()
-            .unwrap_or_default();
-        assert!(
-            active.is_empty(),
-            "active trials should be empty after kill"
-        );
-        let trial_state = load_json_file(&trial_dir.join("trial_state.json")).expect("trial state");
-        assert_eq!(
-            trial_state
-                .pointer("/status")
-                .and_then(|v| v.as_str())
-                .unwrap_or(""),
-            "killed"
-        );
     }
 
     fn p7_trial_result_with_trial_record(schedule_idx: usize) -> TrialExecutionResult {
@@ -17666,8 +15876,6 @@ mod tests {
             "base",
             &mut run_sink,
             4,
-            None,
-            None,
         )
         .expect_err("non-isolate policy should be rejected by hard cutover release gate");
         assert!(
@@ -18399,471 +16607,4 @@ mod tests {
         assert!(config.concurrency.require_chain_lease);
     }
 
-    // -----------------------------------------------------------------------
-    // Preflight check unit tests
-    // -----------------------------------------------------------------------
-
-    fn test_agent_runtime() -> AgentRuntimeConfig {
-        AgentRuntimeConfig {
-            adapter_ref: AgentAdapterRef::default(),
-            command_raw: vec!["echo".to_string()],
-            container_image: Some("test:latest".to_string()),
-            image_source: ImageSource::Global,
-            agent_artifact: None,
-            io: AgentRuntimeIoConfig {
-                input_arg: "--input".to_string(),
-                output_arg: "--output".to_string(),
-            },
-            clean_contract_v1: false,
-            integration_level: "cli_basic".to_string(),
-            launch_mode: AgentLaunchMode::File,
-            env: BTreeMap::new(),
-            env_from_host: Vec::new(),
-            trajectory_path: None,
-            causal_extraction: None,
-            default_timeout_ms: Some(600000),
-            tracing_mode: None,
-            force_container: false,
-            dependency_file_staging: Vec::new(),
-            dependency_services: Vec::new(),
-        }
-    }
-
-    fn test_variant() -> Variant {
-        Variant {
-            id: "baseline".to_string(),
-            bindings: json!({}),
-            args: Vec::new(),
-            env: BTreeMap::new(),
-            image: None,
-            runtime_overrides: None,
-        }
-    }
-
-    fn test_runtime_profile(
-        runtime: AgentRuntimeConfig,
-        container_mode: bool,
-        executor_kind: ExecutorKind,
-    ) -> VariantRuntimeProfile {
-        VariantRuntimeProfile {
-            experiment: json!({}),
-            variant_args: Vec::new(),
-            agent_runtime: runtime,
-            agent_runtime_env: BTreeMap::new(),
-            invocation_source: "test".to_string(),
-            invocation_default_timeout_ms: None,
-            executor_kind,
-            container_mode,
-            configured_network_mode: "none".to_string(),
-            effective_network_mode: "none".to_string(),
-        }
-    }
-
-    #[test]
-    fn preflight_dataset_task_ids_missing_id_errors() {
-        let tasks = vec![
-            json!({"prompt": "do something"}),
-            json!({"id": "task_2", "prompt": "ok"}),
-        ];
-        let benchmark_config = BenchmarkConfig::default();
-        let checks = check_dataset_task_ids(&tasks, &benchmark_config);
-        let error_check = checks.iter().find(|c| !c.passed).unwrap();
-        assert!(error_check.message.contains("missing 'id'"));
-        assert!(error_check.message.contains("1"));
-    }
-
-    #[test]
-    fn preflight_dataset_task_ids_duplicate_errors() {
-        let tasks = vec![
-            json!({"id": "dup_id", "prompt": "a"}),
-            json!({"id": "dup_id", "prompt": "b"}),
-            json!({"id": "unique", "prompt": "c"}),
-        ];
-        let benchmark_config = BenchmarkConfig::default();
-        let checks = check_dataset_task_ids(&tasks, &benchmark_config);
-        let dup_check = checks.iter().find(|c| !c.passed).unwrap();
-        assert!(dup_check.message.contains("duplicate task IDs"));
-        assert!(dup_check.message.contains("dup_id"));
-    }
-
-    #[test]
-    fn preflight_dataset_task_ids_all_unique_passes() {
-        let tasks = vec![
-            json!({"id": "t1", "prompt": "a"}),
-            json!({"id": "t2", "prompt": "b"}),
-        ];
-        let benchmark_config = BenchmarkConfig::default();
-        let checks = check_dataset_task_ids(&tasks, &benchmark_config);
-        assert!(checks.iter().all(|c| c.passed));
-    }
-
-    #[test]
-    fn preflight_dataset_task_ids_grading_disabled_warning() {
-        let tasks = vec![json!({"id": "t1", "grading": {"enabled": false}})];
-        let benchmark_config = BenchmarkConfig {
-            adapter: Some(BenchmarkAdapterConfig {
-                command: vec!["grader".to_string()],
-                manifest: None,
-            }),
-            ..BenchmarkConfig::default()
-        };
-        let checks = check_dataset_task_ids(&tasks, &benchmark_config);
-        let warn = checks
-            .iter()
-            .find(|c| matches!(c.severity, PreflightSeverity::Warning))
-            .unwrap();
-        assert!(warn.message.contains("grading.enabled=false"));
-    }
-
-    #[test]
-    fn preflight_probe_trial_input_empty_dataset_errors() {
-        let tasks: Vec<Value> = vec![];
-        let variant = test_variant();
-        let runtime = test_agent_runtime();
-        let json_value = json!({
-            "version": "0.5",
-            "runtime": {"policy": {"timeout_ms": 600000}}
-        });
-        let check = check_probe_trial_input(&json_value, &tasks, &variant, &runtime, false);
-        assert!(!check.passed);
-        assert!(check.message.contains("dataset is empty"));
-    }
-
-    #[test]
-    fn preflight_probe_trial_input_valid_passes() {
-        let tasks = vec![json!({"id": "t1", "prompt": "hello"})];
-        let variant = test_variant();
-        let runtime = test_agent_runtime();
-        let json_value = json!({
-            "version": "0.5",
-            "runtime": {
-                "policy": {
-                    "timeout_ms": 600000,
-                    "network": {
-                        "mode": "none",
-                        "allowed_hosts": []
-                    },
-                    "sandbox": {
-                        "mode": "container"
-                    }
-                }
-            }
-        });
-        let check = check_probe_trial_input(&json_value, &tasks, &variant, &runtime, false);
-        assert!(check.passed, "expected pass but got: {}", check.message);
-    }
-
-    #[test]
-    fn preflight_collect_per_task_images_scans_all_tasks() {
-        let tasks = vec![
-            json!({
-                "schema_version": "task_boundary_v2",
-                "task": {"id": "t1", "image": "img/a:latest"}
-            }),
-            json!({
-                "schema_version": "task_boundary_v2",
-                "task": {"id": "t2", "image": "img/b:latest"}
-            }),
-            json!({
-                "schema_version": "task_boundary_v2",
-                "task": {"id": "t3", "image": "img/a:latest"}
-            }),
-            json!({"id": "t4"}),
-        ];
-        let scan = collect_per_task_images_for_preflight(&tasks);
-        assert!(scan.parse_errors.is_empty());
-        assert_eq!(
-            scan.unique_images,
-            vec!["img/a:latest".to_string(), "img/b:latest".to_string()]
-        );
-        assert_eq!(scan.missing_task_ids, vec!["t4".to_string()]);
-    }
-
-    #[test]
-    fn preflight_collect_per_task_images_records_parse_errors() {
-        let tasks = vec![
-            json!({
-                "schema_version": "task_boundary_v2",
-                "task": {"id": "ok", "image": "img/a:latest"}
-            }),
-            json!({
-                "schema_version": "task_boundary_v2",
-                "task": {"id": "bad", "image": ""}
-            }),
-        ];
-        let scan = collect_per_task_images_for_preflight(&tasks);
-        assert_eq!(scan.unique_images, vec!["img/a:latest".to_string()]);
-        assert!(scan.missing_task_ids.is_empty());
-        assert_eq!(scan.parse_errors.len(), 1);
-        assert!(scan.parse_errors[0].contains("line 2"));
-    }
-
-    #[test]
-    fn preflight_dependency_files_required_missing_errors() {
-        let tmp = TempDirGuard::new("preflight_deps");
-        let json_value = json!({
-            "runtime": {
-                "dependencies": {
-                    "file_staging": [{
-                        "source_from_host": tmp.path.join("nonexistent.txt").to_string_lossy().to_string(),
-                        "destination_path": "/data/file.txt",
-                        "required": true
-                    }]
-                }
-            }
-        });
-        let checks = check_dependency_files_exist(&json_value, &tmp.path);
-        let err = checks.iter().find(|c| !c.passed).unwrap();
-        assert!(err.message.contains("required file missing"));
-    }
-
-    #[test]
-    fn preflight_dependency_files_optional_missing_warns() {
-        let tmp = TempDirGuard::new("preflight_deps_opt");
-        let json_value = json!({
-            "runtime": {
-                "dependencies": {
-                    "file_staging": [{
-                        "source_from_host": tmp.path.join("nonexistent.txt").to_string_lossy().to_string(),
-                        "destination_path": "/data/file.txt",
-                        "required": false
-                    }]
-                }
-            }
-        });
-        let checks = check_dependency_files_exist(&json_value, &tmp.path);
-        let warn = checks
-            .iter()
-            .find(|c| matches!(c.severity, PreflightSeverity::Warning))
-            .unwrap();
-        assert!(warn.message.contains("optional file missing"));
-        assert!(warn.passed);
-    }
-
-    #[test]
-    fn preflight_dependency_files_required_exists_passes() {
-        let tmp = TempDirGuard::new("preflight_deps_ok");
-        let file_path = tmp.path.join("data.bin");
-        fs::write(&file_path, b"content").unwrap();
-        let json_value = json!({
-            "runtime": {
-                "dependencies": {
-                    "file_staging": [{
-                        "source_from_host": file_path.to_string_lossy().to_string(),
-                        "destination_path": "/data/file.txt",
-                        "required": true
-                    }]
-                }
-            }
-        });
-        let checks = check_dependency_files_exist(&json_value, &tmp.path);
-        assert!(checks.iter().all(|c| c.passed));
-    }
-
-    #[test]
-    fn preflight_benchmark_grader_no_adapter_passes() {
-        let benchmark_config = BenchmarkConfig::default();
-        let runtime = test_agent_runtime();
-        let profile = test_runtime_profile(runtime, true, ExecutorKind::LocalDocker);
-        let check = check_benchmark_grader_reachable(&benchmark_config, &profile, &[], false);
-        assert!(check.passed);
-        assert!(check.message.contains("no benchmark adapter"));
-    }
-
-    #[test]
-    fn preflight_benchmark_grader_clean_contract_warns() {
-        let benchmark_config = BenchmarkConfig {
-            adapter: Some(BenchmarkAdapterConfig {
-                command: vec!["grader".to_string()],
-                manifest: None,
-            }),
-            ..BenchmarkConfig::default()
-        };
-        let runtime = test_agent_runtime();
-        let profile = test_runtime_profile(runtime, true, ExecutorKind::LocalDocker);
-        let check = check_benchmark_grader_reachable(&benchmark_config, &profile, &[], true);
-        assert!(check.passed);
-        assert!(matches!(check.severity, PreflightSeverity::Warning));
-        assert!(check.message.contains("clean_contract_v1"));
-    }
-
-    #[test]
-    fn preflight_benchmark_grader_local_mode_warns() {
-        let benchmark_config = BenchmarkConfig {
-            adapter: Some(BenchmarkAdapterConfig {
-                command: vec!["grader".to_string()],
-                manifest: None,
-            }),
-            ..BenchmarkConfig::default()
-        };
-        let mut runtime = test_agent_runtime();
-        runtime.container_image = None;
-        let mut profile = test_runtime_profile(runtime, false, ExecutorKind::LocalProcess);
-        profile.configured_network_mode = "full".to_string();
-        profile.effective_network_mode = "full".to_string();
-        let check = check_benchmark_grader_reachable(&benchmark_config, &profile, &[], false);
-        assert!(check.passed);
-        assert!(matches!(check.severity, PreflightSeverity::Warning));
-        assert!(check.message.contains("local process mode"));
-    }
-
-    #[test]
-    fn preflight_benchmark_grader_per_task_mode_requires_task_images() {
-        let benchmark_config = BenchmarkConfig {
-            adapter: Some(BenchmarkAdapterConfig {
-                command: vec!["grader".to_string()],
-                manifest: None,
-            }),
-            ..BenchmarkConfig::default()
-        };
-        let mut runtime = test_agent_runtime();
-        runtime.image_source = ImageSource::PerTask;
-        runtime.container_image = None;
-        let profile = test_runtime_profile(runtime, true, ExecutorKind::LocalDocker);
-        let tasks = vec![json!({"id": "t1"})];
-        let check = check_benchmark_grader_reachable(&benchmark_config, &profile, &tasks, false);
-        assert!(!check.passed);
-        assert!(check
-            .message
-            .contains("tasks missing task.image in per-task mode"));
-    }
-
-    #[test]
-    fn preflight_container_ready_local_mode_skips() {
-        let mut runtime = test_agent_runtime();
-        runtime.container_image = None;
-        let mut profile = test_runtime_profile(runtime, false, ExecutorKind::LocalProcess);
-        profile.configured_network_mode = "full".to_string();
-        profile.effective_network_mode = "full".to_string();
-        let tasks = vec![json!({"id": "t1"})];
-        let checks = check_container_ready(&profile, &tasks);
-        assert_eq!(checks.len(), 1);
-        assert!(checks[0].passed);
-        assert!(checks[0].message.contains("Docker checks skipped"));
-    }
-
-    #[test]
-    fn preflight_variant_grouped_checks_avoid_duplicate_local_container_checks() {
-        let mut runtime_a = test_agent_runtime();
-        runtime_a.container_image = None;
-        let mut runtime_b = test_agent_runtime();
-        runtime_b.container_image = None;
-        let mut profile_a = test_runtime_profile(runtime_a, false, ExecutorKind::LocalProcess);
-        profile_a.configured_network_mode = "full".to_string();
-        profile_a.effective_network_mode = "full".to_string();
-        let mut profile_b = test_runtime_profile(runtime_b, false, ExecutorKind::LocalProcess);
-        profile_b.configured_network_mode = "full".to_string();
-        profile_b.effective_network_mode = "full".to_string();
-
-        let variants = vec![
-            Variant {
-                id: "base".to_string(),
-                bindings: json!({}),
-                args: Vec::new(),
-                env: BTreeMap::new(),
-                image: None,
-                runtime_overrides: None,
-            },
-            Variant {
-                id: "treatment".to_string(),
-                bindings: json!({}),
-                args: Vec::new(),
-                env: BTreeMap::new(),
-                image: None,
-                runtime_overrides: None,
-            },
-        ];
-        let checks = check_container_ready_for_variants(
-            &variants,
-            &[profile_a, profile_b],
-            &[json!({"id": "t1"})],
-        );
-        assert_eq!(checks.len(), 1);
-        assert!(checks[0].passed);
-        assert!(checks[0].message.contains("variants [base, treatment]"));
-    }
-
-    #[test]
-    fn preflight_variant_grouped_benchmark_no_adapter_reports_once() {
-        let benchmark_config = BenchmarkConfig::default();
-        let profile_a = test_runtime_profile(test_agent_runtime(), true, ExecutorKind::LocalDocker);
-        let profile_b = test_runtime_profile(test_agent_runtime(), true, ExecutorKind::LocalDocker);
-        let variants = vec![
-            Variant {
-                id: "base".to_string(),
-                bindings: json!({}),
-                args: Vec::new(),
-                env: BTreeMap::new(),
-                image: None,
-                runtime_overrides: None,
-            },
-            Variant {
-                id: "treatment".to_string(),
-                bindings: json!({}),
-                args: Vec::new(),
-                env: BTreeMap::new(),
-                image: None,
-                runtime_overrides: None,
-            },
-        ];
-        let checks = check_benchmark_grader_reachable_for_variants(
-            &benchmark_config,
-            &variants,
-            &[profile_a, profile_b],
-            &[],
-            false,
-        );
-        assert_eq!(checks.len(), 1);
-        assert!(checks[0].passed);
-        assert!(checks[0].message.contains("no benchmark adapter"));
-    }
-
-    #[test]
-    fn preflight_report_display_formats_all_checks() {
-        let report = PreflightReport {
-            passed: false,
-            checks: vec![
-                PreflightCheck {
-                    name: "test_pass",
-                    passed: true,
-                    severity: PreflightSeverity::Error,
-                    message: "ok".to_string(),
-                },
-                PreflightCheck {
-                    name: "test_fail",
-                    passed: false,
-                    severity: PreflightSeverity::Error,
-                    message: "broken".to_string(),
-                },
-                PreflightCheck {
-                    name: "test_warn",
-                    passed: false,
-                    severity: PreflightSeverity::Warning,
-                    message: "heads up".to_string(),
-                },
-            ],
-        };
-        let output = format!("{}", report);
-        assert!(output.contains("[PASS] test_pass: ok"));
-        assert!(output.contains("[FAIL] test_fail: broken"));
-        assert!(output.contains("[WARN] test_warn: heads up"));
-    }
-
-    #[test]
-    fn preflight_dataset_task_ids_boundary_format() {
-        let tasks = vec![
-            json!({
-                "schema_version": "task_boundary_v1",
-                "task": {"id": "boundary_task_1", "prompt": "hello"}
-            }),
-            json!({
-                "schema_version": "task_boundary_v1",
-                "task": {"id": "boundary_task_2", "prompt": "world"}
-            }),
-        ];
-        let benchmark_config = BenchmarkConfig::default();
-        let checks = check_dataset_task_ids(&tasks, &benchmark_config);
-        assert!(checks.iter().all(|c| c.passed));
-        assert!(checks[0].message.contains("2 tasks have unique IDs"));
-    }
 }
