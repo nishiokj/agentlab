@@ -1,3 +1,0 @@
-# Glob patterns for files the agent may edit
-# One pattern per line
-src/**/*.py

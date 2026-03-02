@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "injection_manifest.schema.json",
+  "title": "Injection Manifest",
+  "type": "object",
+  "required": [
+    "patch_file",
+    "files_changed",
+    "patch_hash"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "patch_file": {"type": "string"},
+    "files_changed": {"type": "array", "items": {"type": "string"}},
+    "patch_hash": {"type": "string"},
+    "source_snapshot_id": {"type": ["string", "null"]},
+    "created_at": {"type": ["string", "null"], "format": "date-time"},
+    "tree_hash_before": {"type": ["string", "null"]},
+    "tree_hash_after": {"type": ["string", "null"]}
+  }
+}

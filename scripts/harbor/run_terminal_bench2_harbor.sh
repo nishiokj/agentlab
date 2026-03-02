@@ -35,7 +35,7 @@ fi
 if [[ "${build_dataset}" -eq 1 ]]; then
   EXPORT_CMD=(
     "${PYTHON_BIN}"
-    scripts/harbor/export_harbor_to_agentlab_jsonl.py
+    adapters/harbor/export_harbor_to_agentlab_jsonl.py
     --output
     "${DATASET_PATH}"
   )

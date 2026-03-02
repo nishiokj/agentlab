@@ -1,0 +1,36 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "suite_determinism_audit.schema.json",
+  "title": "Suite Determinism Audit",
+  "type": "object",
+  "required": [
+    "suite",
+    "repeat",
+    "check_determinism",
+    "run_hashes",
+    "hashes_equal"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "suite": {"type": "string"},
+    "repeat": {"type": "integer", "minimum": 1},
+    "check_determinism": {"type": "boolean"},
+    "run_hashes": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["run_index", "normalized_hash"],
+        "properties": {
+          "run_index": {"type": "integer", "minimum": 1},
+          "normalized_hash": {"type": "string"}
+        },
+        "additionalProperties": true
+      }
+    },
+    "hashes_equal": {"type": "boolean"},
+    "mismatches": {
+      "type": "array",
+      "items": {"type": "object", "additionalProperties": true}
+    }
+  }
+}

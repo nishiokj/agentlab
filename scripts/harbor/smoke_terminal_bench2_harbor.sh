@@ -28,7 +28,7 @@ export HARBOR_EVALUATOR_CMD="${HARBOR_EVALUATOR_CMD:-}"
 export HARBOR_EVALUATOR_CMD_JSON="${HARBOR_EVALUATOR_CMD_JSON:-}"
 
 echo "building smoke dataset: ${SMOKE_DATASET}"
-"${PYTHON_BIN}" scripts/harbor/export_harbor_to_agentlab_jsonl.py \
+"${PYTHON_BIN}" adapters/harbor/export_harbor_to_agentlab_jsonl.py \
   --tasks-root "${TASKS_ROOT}" \
   --output "${SMOKE_DATASET}" \
   --require-task-image \

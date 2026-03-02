@@ -1,0 +1,33 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "task_validation_report.schema.json",
+  "title": "Task Validation Report",
+  "type": "object",
+  "required": [
+    "task_id",
+    "task_dir",
+    "strict",
+    "valid",
+    "checks"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "task_id": {"type": "string"},
+    "task_dir": {"type": "string"},
+    "strict": {"type": "boolean"},
+    "valid": {"type": "boolean"},
+    "schema_version": {"type": "string"},
+    "generated_at": {"type": "string", "format": "date-time"},
+    "checks": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "required": ["passed"],
+        "properties": {
+          "passed": {"type": "boolean"}
+        },
+        "additionalProperties": true
+      }
+    }
+  }
+}

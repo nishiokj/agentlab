@@ -1,0 +1,24 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "policy_check_report.schema.json",
+  "title": "Policy Check Report",
+  "type": "object",
+  "required": [
+    "run_id",
+    "task_id",
+    "passed",
+    "patch_files",
+    "file_violations",
+    "command_violations"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "run_id": {"type": "string"},
+    "task_id": {"type": "string"},
+    "passed": {"type": "boolean"},
+    "patch_files": {"type": "array", "items": {"type": "string"}},
+    "file_violations": {"type": "array", "items": {"type": "string"}},
+    "command_violations": {"type": "array", "items": {"type": "string"}},
+    "matched_rules": {"type": "array", "items": {"type": "string"}}
+  }
+}

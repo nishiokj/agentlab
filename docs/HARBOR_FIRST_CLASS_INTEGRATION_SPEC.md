@@ -68,8 +68,8 @@ Add a Harbor benchmark adapter command that:
 
 Place here:
 
-1. `scripts/harbor/export_harbor_to_agentlab_jsonl.py`
-2. `scripts/harbor/harbor_benchmark_adapter.py`
+1. `adapters/harbor/export_harbor_to_agentlab_jsonl.py`
+2. `adapters/harbor/harbor_benchmark_adapter.py`
 3. `scripts/harbor/tests/*`
 4. `scripts/harbor/requirements-harbor.txt` (or equivalent optional dependency manifest)
 5. `docs/HARBOR_FIRST_CLASS_INTEGRATION_SPEC.md`

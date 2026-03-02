@@ -1,0 +1,71 @@
+name: PR Review Dispatch
+
+on:
+  workflow_dispatch:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pr-review-dispatch-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  dispatch:
+    name: Dispatch PR Review Event
+    if: github.event.pull_request.draft == false
+    runs-on: ubuntu-latest
+    steps:
+      - name: Validate webhook URL config
+        env:
+          WEBHOOK_URL: ${{ vars.PR_REVIEW_WEBHOOK_URL }}
+        run: |
+          if [[ -z "$WEBHOOK_URL" ]]; then
+            echo "::error::Missing repository variable PR_REVIEW_WEBHOOK_URL"
+            echo "Set it to your endpoint, e.g. https://<host>/webhooks/github"
+            exit 1
+          fi
+
+      - name: Dispatch pull_request payload to reviewer service
+        env:
+          WEBHOOK_URL: ${{ vars.PR_REVIEW_WEBHOOK_URL }}
+          WEBHOOK_SECRET: ${{ secrets.PR_REVIEW_WEBHOOK_SECRET }}
+          EVENT_NAME: ${{ github.event_name }}
+          EVENT_PATH: ${{ github.event_path }}
+        run: |
+          set -euo pipefail
+
+          body="$(cat "$EVENT_PATH")"
+          sig_header=""
+
+          if [[ -n "${WEBHOOK_SECRET:-}" ]]; then
+            digest=$(printf '%s' "$body" | openssl dgst -sha256 -hmac "$WEBHOOK_SECRET" -hex | awk '{print $2}')
+            sig_header="sha256=$digest"
+          fi
+
+          response_file=$(mktemp)
+
+          if [[ -n "$sig_header" ]]; then
+            status=$(curl -sS -o "$response_file" -w "%{http_code}" \
+              -H "content-type: application/json" \
+              -H "x-github-event: $EVENT_NAME" \
+              -H "x-hub-signature-256: $sig_header" \
+              --data "$body" \
+              "$WEBHOOK_URL")
+          else
+            status=$(curl -sS -o "$response_file" -w "%{http_code}" \
+              -H "content-type: application/json" \
+              -H "x-github-event: $EVENT_NAME" \
+              --data "$body" \
+              "$WEBHOOK_URL")
+          fi
+
+          echo "HTTP status: $status"
+          cat "$response_file"
+
+          if [[ "$status" -lt 200 || "$status" -ge 300 ]]; then
+            echo "::error::PR review dispatch failed with HTTP $status"
+            exit 1
+          fi

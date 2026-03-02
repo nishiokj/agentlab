@@ -4,8 +4,8 @@ This runbook covers the implemented Phase 1 path in `/Users/jevinnishioka/Deskto
 
 ## Files Added
 
-1. `scripts/harbor/export_harbor_to_agentlab_jsonl.py`
-2. `scripts/harbor/harbor_benchmark_adapter.py`
+1. `adapters/harbor/export_harbor_to_agentlab_jsonl.py`
+2. `adapters/harbor/harbor_benchmark_adapter.py`
 3. `scripts/harbor/run_terminal_bench2_harbor.sh`
 4. `.lab/experiments/terminal_bench2_harbor.yaml`
 5. `scripts/harbor/tests/test_export_harbor_to_agentlab_jsonl.py`
@@ -16,7 +16,7 @@ This runbook covers the implemented Phase 1 path in `/Users/jevinnishioka/Deskto
 1. Build mapped dataset from Harbor task directories:
 
 ```bash
-python3 scripts/harbor/export_harbor_to_agentlab_jsonl.py \
+python3 adapters/harbor/export_harbor_to_agentlab_jsonl.py \
   --tasks-root /path/to/harbor/tasks \
   --output .lab/experiments/data/terminal_bench2_harbor.task_boundary_v2.jsonl
 ```
@@ -39,7 +39,7 @@ scripts/harbor/run_terminal_bench2_harbor.sh
 You can build from a Harbor registry JSON/JSONL:
 
 ```bash
-python3 scripts/harbor/export_harbor_to_agentlab_jsonl.py \
+python3 adapters/harbor/export_harbor_to_agentlab_jsonl.py \
   --registry-json /path/to/registry.jsonl \
   --registry-root /path/to/tasks/root \
   --output .lab/experiments/data/terminal_bench2_harbor.task_boundary_v2.jsonl

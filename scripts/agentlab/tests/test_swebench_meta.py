@@ -3,16 +3,10 @@
 from __future__ import annotations
 
 import os
-import sys
 import unittest
-from pathlib import Path
 
-SCRIPT_DIR = Path(__file__).resolve().parents[1]
-if str(SCRIPT_DIR) not in sys.path:
-    sys.path.insert(0, str(SCRIPT_DIR))
-
-import swebench_official_benchmark_adapter as official_adapter
-import swebench_task_container_grader as task_grader
+from adapters.swebench import swebench_official_benchmark_adapter as official_adapter
+from adapters.swebench import swebench_task_container_grader as task_grader
 
 
 class ExtractSwebenchMetaTests(unittest.TestCase):

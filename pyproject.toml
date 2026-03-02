@@ -13,9 +13,6 @@ dependencies = [
     "pyyaml>=6.0,<7",
     "jsonschema>=4.20,<5",
     "pydantic>=2.5,<3",
-    "uvicorn>=0.24,<1",
-    "starlette>=0.33,<1",
-    "httpx>=0.25,<1",
     "zstandard>=0.22,<1",
 ]
 
@@ -23,10 +20,10 @@ dependencies = [
 bench = "bench.cli:main"
 
 [tool.setuptools.packages.find]
-include = ["bench*"]
+include = ["bench*", "adapters*"]
 
 [tool.pytest.ini_options]
-testpaths = ["bench/tests"]
+testpaths = ["bench"]
 python_files = ["test_*.py"]
 python_classes = ["Test*"]
 python_functions = ["test_*"]

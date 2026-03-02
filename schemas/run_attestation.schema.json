@@ -1,0 +1,37 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "run_attestation.schema.json",
+  "title": "Run Attestation",
+  "type": "object",
+  "required": [
+    "run_id",
+    "task_id",
+    "strict",
+    "network_mode",
+    "containerized",
+    "mounts"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "run_id": {"type": "string"},
+    "task_id": {"type": "string"},
+    "strict": {"type": "boolean"},
+    "network_mode": {"type": "string"},
+    "containerized": {"type": "boolean"},
+    "container_image": {"type": ["string", "null"]},
+    "mounts": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["host_path", "container_path", "mode"],
+        "properties": {
+          "host_path": {"type": "string"},
+          "container_path": {"type": "string"},
+          "mode": {"type": "string", "enum": ["ro", "rw"]}
+        },
+        "additionalProperties": false
+      }
+    },
+    "workspace_manifest": {"type": ["string", "null"]}
+  }
+}

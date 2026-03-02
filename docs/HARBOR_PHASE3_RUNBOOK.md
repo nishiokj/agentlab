@@ -11,7 +11,7 @@ This runbook covers compatibility monitoring additions for Harbor integration.
 2. Lane runner:
    1. `scripts/harbor/run_harbor_phase3_lane.sh`
 3. Adapter/evaluator compatibility probe:
-   1. `scripts/harbor/check_harbor_adapter_compat.py`
+   1. `adapters/harbor/check_harbor_adapter_compat.py`
 4. Split dependency manifests:
    1. `scripts/harbor/requirements-harbor-pinned.txt`
    2. `scripts/harbor/requirements-harbor-canary.txt`

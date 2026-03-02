@@ -46,6 +46,7 @@
       "enum": [
         null,
         "AGENT_TIMEOUT",
+        "AGENT_ENV_ERROR",
         "AGENT_ERROR",
         "NO_PATCH",
         "PATCH_APPLY_FAIL",
