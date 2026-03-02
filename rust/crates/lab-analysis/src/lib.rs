@@ -691,14 +691,11 @@ GROUP BY run_id, variant_id, event_type;
 
 CREATE OR REPLACE VIEW variant_summary AS
 SELECT
-    min(baseline_id) AS baseline_id,
     variant_id,
-    count(*)::DOUBLE AS total,
-    avg(CASE WHEN outcome = 'success' THEN 1.0 ELSE 0.0 END) AS success_rate,
+    count(*)::BIGINT AS n_trials,
+    round(avg(CASE WHEN outcome = 'success' THEN 1.0 ELSE 0.0 END), 4) AS success_rate,
     first(primary_metric_name) AS primary_metric_name,
-    avg(try_cast(primary_metric_value AS DOUBLE)) AS primary_metric_mean,
-    NULL AS event_counts,
-    first(bindings) AS bindings
+    round(avg(try_cast(primary_metric_value AS DOUBLE)), 4) AS primary_metric_mean
 FROM trials
 GROUP BY variant_id;
 

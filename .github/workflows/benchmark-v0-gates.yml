@@ -5,6 +5,10 @@ on:
   pull_request:
     paths:
       - 'bench/**'
+      - 'bench/integration/**'
+      - 'rust/**'
+      - 'adapters/**'
+      - 'scripts/**'
       - 'schemas/**'
       - 'bench/benchmark/tasks/**'
       - '.github/workflows/benchmark-v0-gates.yml'
@@ -33,3 +37,38 @@ jobs:
         run: pip install -r requirements.txt
       - name: Validate suite strict
         run: python -m bench.cli validate-suite v0 --repeat 2 --check-determinism --strict
+
+  runner-unit-contracts:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Runner unit contracts
+        run: cargo test --manifest-path rust/Cargo.toml -p lab-runner
+
+  adapter-schema-contracts:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - name: Install deps
+        run: pip install -r requirements.txt
+      - name: Adapter schema contracts
+        run: |
+          python -m pytest \
+            scripts/harbor/tests/test_harbor_benchmark_adapter.py \
+            scripts/harbor/tests/test_check_harbor_adapter_compat.py \
+            bench/integration/agentlab/test_bench_benchmark_adapter.py
+
+  runner-docker-integration:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Runner Docker integration (artifact unpack + continue/recover)
+        run: |
+          cargo test --manifest-path rust/Cargo.toml -p lab-runner inv04_artifact_unpack_succeeds_with_container_fs_constraints
+          cargo test --manifest-path rust/Cargo.toml -p lab-runner inv06_recover_then_continue_succeeds_with_minimal_env
+          cargo test --manifest-path rust/Cargo.toml -p lab-runner inv06_continue_handles_relative_and_absolute_dataset_paths

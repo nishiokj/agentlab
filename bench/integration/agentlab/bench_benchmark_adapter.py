@@ -53,6 +53,23 @@ def _env_int(name: str, fallback: int = 0) -> int:
         return fallback
 
 
+def _env_int_min(name: str, fallback: int, minimum: int) -> int:
+    parsed = _env_int(name, fallback)
+    if parsed < minimum:
+        return fallback
+    return parsed
+
+
+def _identity_fields() -> dict[str, Any]:
+    slot_commit_id = os.environ.get("AGENTLAB_SLOT_COMMIT_ID", "").strip() or "slot_pending"
+    return {
+        "schedule_idx": _env_int_min("AGENTLAB_SCHEDULE_IDX", 0, 0),
+        "slot_commit_id": slot_commit_id,
+        "attempt": _env_int_min("AGENTLAB_ATTEMPT", 1, 1),
+        "row_seq": _env_int_min("AGENTLAB_ROW_SEQ", 0, 0),
+    }
+
+
 def _repo_root() -> Path:
     return REPO_ROOT
 
@@ -189,7 +206,7 @@ def _prediction_record(task_payload: Any, patch_text: str | None) -> dict[str, A
     else:
         prediction = {"kind": "text", "value": ""}
 
-    return {
+    payload = {
         "schema_version": "benchmark_prediction_record_v1",
         "ids": _ids(task_payload),
         "benchmark": _extract_benchmark_spec(task_payload),
@@ -200,6 +217,8 @@ def _prediction_record(task_payload: Any, patch_text: str | None) -> dict[str, A
             }
         },
     }
+    payload.update(_identity_fields())
+    return payload
 
 
 def _verdict_from_score(score: dict[str, Any] | None) -> str:
@@ -263,6 +282,7 @@ def _score_record(
             "message": error_message,
         }
 
+    payload.update(_identity_fields())
     return payload
 
 

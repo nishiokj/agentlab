@@ -19,8 +19,6 @@ enum ExecutorArg {
     LocalDocker,
     #[value(name = "local_process")]
     LocalProcess,
-    #[value(name = "remote")]
-    Remote,
 }
 
 impl From<ExecutorArg> for lab_runner::ExecutorKind {
@@ -28,7 +26,6 @@ impl From<ExecutorArg> for lab_runner::ExecutorKind {
         match value {
             ExecutorArg::LocalDocker => lab_runner::ExecutorKind::LocalDocker,
             ExecutorArg::LocalProcess => lab_runner::ExecutorKind::LocalProcess,
-            ExecutorArg::Remote => lab_runner::ExecutorKind::Remote,
         }
     }
 }
@@ -80,10 +77,6 @@ enum Commands {
         executor: Option<ExecutorArg>,
         #[arg(long, value_enum)]
         materialize: Option<MaterializeArg>,
-        #[arg(long)]
-        remote_endpoint: Option<String>,
-        #[arg(long)]
-        remote_token_env: Option<String>,
         #[arg(long)]
         overrides: Option<PathBuf>,
         #[arg(long)]
@@ -337,8 +330,6 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
             container,
             executor,
             materialize,
-            remote_endpoint,
-            remote_token_env,
             overrides,
             json,
         } => {
@@ -347,8 +338,6 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
             let execution = lab_runner::RunExecutionOptions {
                 executor: executor.map(Into::into),
                 materialize: materialize.map(Into::into),
-                remote_endpoint,
-                remote_token_env,
             };
             let result = lab_runner::run_experiment_with_options_and_overrides(
                 &experiment,
@@ -367,8 +356,6 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
                     "container": container,
                     "executor": execution.executor.map(|e| e.as_str()),
                     "materialize": execution.materialize.map(|m| m.as_str()),
-                    "remote_endpoint": execution.remote_endpoint,
-                    "remote_token_env": execution.remote_token_env,
                     "post_run_stats": post_run
                 })));
             }
@@ -808,27 +795,43 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
         } => {
             let run_dir = resolve_run_dir_arg(&run)?;
             let sleep_interval = Duration::from_secs(interval_seconds.max(1));
+            let meta = read_scoreboard_metadata(&run_dir);
             loop {
                 let table = build_live_scoreboard_table(&run_dir, metric_limit)?;
                 let variants = scoreboard_variant_ids(&table);
+                let variant_bindings = fetch_variant_bindings(&run_dir);
                 if !no_clear {
                     print!("\x1B[2J\x1B[H");
                     let _ = std::io::stdout().flush();
                 }
-                println!("run_dir: {}", run_dir.display());
-                println!("status: {}", read_run_status(&run_dir));
-                println!("updated_unix_s: {}", unix_now_seconds());
-                if variants.is_empty() {
-                    println!("variants: (none yet)");
-                } else {
+                // Compact metadata header
+                let run_id = run_dir
+                    .file_name()
+                    .and_then(|v| v.to_str())
+                    .unwrap_or("?");
+                print!("run: {}  status: {}", run_id, read_run_status(&run_dir));
+                if !meta.experiment_id.is_empty() {
+                    print!("  experiment: {}", meta.experiment_id);
+                }
+                println!();
+                if !meta.baseline_id.is_empty() {
+                    print!("baseline: {}", meta.baseline_id);
+                    if !meta.comparison.is_empty() {
+                        print!("  comparison: {}", meta.comparison);
+                    }
+                    println!();
+                }
+                if !variants.is_empty() {
                     println!("variants: {}", variants.join(", "));
                 }
-                println!(
-                    "refresh_interval_seconds: {} (Ctrl-C to stop)",
-                    sleep_interval.as_secs()
-                );
+                if !once {
+                    println!(
+                        "refresh: {}s (Ctrl-C to stop)",
+                        sleep_interval.as_secs()
+                    );
+                }
                 println!();
-                print_scoreboard_grouped_by_variant(&table);
+                print_scoreboard_grouped_by_variant(&table, &variant_bindings);
 
                 if once {
                     break;
@@ -1557,11 +1560,102 @@ fn resolve_project_root(start: &Path) -> PathBuf {
     start.to_path_buf()
 }
 
+struct ScoreboardMeta {
+    experiment_id: String,
+    baseline_id: String,
+    comparison: String,
+}
+
+fn read_scoreboard_metadata(run_dir: &Path) -> ScoreboardMeta {
+    let path = run_dir.join("resolved_experiment.json");
+    let resolved = match std::fs::read_to_string(&path)
+        .ok()
+        .and_then(|raw| serde_json::from_str::<Value>(&raw).ok())
+    {
+        Some(v) => v,
+        None => {
+            return ScoreboardMeta {
+                experiment_id: String::new(),
+                baseline_id: String::new(),
+                comparison: String::new(),
+            }
+        }
+    };
+
+    let experiment_id = resolved
+        .pointer("/id")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let baseline_id = resolved
+        .pointer("/baseline/variant_id")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let comparison = resolved
+        .pointer("/design/policies/comparison")
+        .and_then(Value::as_str)
+        .or_else(|| resolved.pointer("/design/comparison").and_then(Value::as_str))
+        .unwrap_or("")
+        .to_string();
+
+    ScoreboardMeta {
+        experiment_id,
+        baseline_id,
+        comparison,
+    }
+}
+
+/// Fetch per-variant bindings as a compact display string.
+/// Returns a map of variant_id → "key1=val1, key2=val2" (empty string if no bindings).
+fn fetch_variant_bindings(run_dir: &Path) -> BTreeMap<String, String> {
+    let sql = "SELECT variant_id, first(bindings) AS bindings FROM trials GROUP BY variant_id";
+    let table = match lab_analysis::query_run(run_dir, sql) {
+        Ok(t) => t,
+        Err(_) => return BTreeMap::new(),
+    };
+    let mut out = BTreeMap::new();
+    for row in &table.rows {
+        let variant = row
+            .first()
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let bindings_val = row.get(1).cloned().unwrap_or(Value::Null);
+        let compact = match &bindings_val {
+            Value::Object(map) => map
+                .iter()
+                .map(|(k, v)| {
+                    let val_str = match v {
+                        Value::String(s) => s.clone(),
+                        other => other.to_string(),
+                    };
+                    format!("{}={}", k, truncate_cell(&val_str, 24))
+                })
+                .collect::<Vec<_>>()
+                .join(", "),
+            Value::Null => String::new(),
+            other => {
+                let s = other.to_string();
+                if s == "null" {
+                    String::new()
+                } else {
+                    truncate_cell(&s, 60).to_string()
+                }
+            }
+        };
+        if !variant.is_empty() {
+            out.insert(variant, compact);
+        }
+    }
+    out
+}
+
 fn build_live_scoreboard_table(
     run_dir: &Path,
     metric_limit: usize,
 ) -> Result<lab_analysis::QueryTable> {
-    let limit = metric_limit.max(1).min(32);
+    let limit = metric_limit.clamp(1, 32);
     let metric_names = fetch_scoreboard_metric_names(run_dir, limit)?;
     let sql = build_scoreboard_sql(&metric_names);
     lab_analysis::query_run(run_dir, &sql)
@@ -1682,7 +1776,10 @@ fn terminal_width() -> usize {
     120
 }
 
-fn print_scoreboard_grouped_by_variant(table: &lab_analysis::QueryTable) {
+fn print_scoreboard_grouped_by_variant(
+    table: &lab_analysis::QueryTable,
+    variant_bindings: &BTreeMap<String, String>,
+) {
     let term_w = terminal_width();
 
     let Some(variant_col_idx) = table.columns.iter().position(|c| c == "variant_id") else {
@@ -1724,12 +1821,18 @@ fn print_scoreboard_grouped_by_variant(table: &lab_analysis::QueryTable) {
         return;
     }
 
-    for (variant, rows) in per_variant {
-        println!("== variant: {} ==", variant);
+    for (variant, rows) in &per_variant {
+        let bindings_str = variant_bindings
+            .get(variant.as_str())
+            .filter(|b| !b.is_empty());
+        match bindings_str {
+            Some(b) => println!("== {} ({}) ==", variant, b),
+            None => println!("== {} ==", variant),
+        }
         print_scoreboard_table(
             &lab_analysis::QueryTable {
                 columns: columns.clone(),
-                rows,
+                rows: rows.clone(),
             },
             term_w,
         );
@@ -1918,7 +2021,7 @@ fn cap_widths(natural: &[usize], budget: usize) -> Vec<usize> {
     let mut lo = min_w;
     let mut hi = *natural.iter().max().unwrap_or(&budget);
     while lo < hi {
-        let mid = (lo + hi + 1) / 2;
+        let mid = (lo + hi).div_ceil(2);
         let used: usize = natural.iter().map(|&w| w.min(mid)).sum();
         if used <= budget {
             lo = mid;
@@ -2011,79 +2114,88 @@ fn query_table_to_json(table: &lab_analysis::QueryTable) -> Value {
     })
 }
 
+/// Detect columns where every row has the same value.
+/// Returns a filtered table (constant columns removed) and the elided (name, value) pairs.
+fn elide_constant_columns(
+    table: &lab_analysis::QueryTable,
+) -> (lab_analysis::QueryTable, Vec<(String, String)>) {
+    if table.rows.len() <= 1 || table.columns.len() <= 1 {
+        return (table.clone(), Vec::new());
+    }
+
+    let mut elided = Vec::new();
+    let mut keep_indices = Vec::new();
+
+    for (col_idx, col_name) in table.columns.iter().enumerate() {
+        let first_val = table
+            .rows
+            .first()
+            .and_then(|row| row.get(col_idx))
+            .cloned()
+            .unwrap_or(Value::Null);
+
+        let all_same = table
+            .rows
+            .iter()
+            .all(|row| row.get(col_idx).cloned().unwrap_or(Value::Null) == first_val);
+
+        if all_same {
+            elided.push((col_name.clone(), render_json_cell(&first_val)));
+        } else {
+            keep_indices.push(col_idx);
+        }
+    }
+
+    if elided.is_empty() {
+        return (table.clone(), Vec::new());
+    }
+
+    let new_columns: Vec<String> = keep_indices
+        .iter()
+        .map(|&idx| table.columns[idx].clone())
+        .collect();
+    let new_rows: Vec<Vec<Value>> = table
+        .rows
+        .iter()
+        .map(|row| {
+            keep_indices
+                .iter()
+                .map(|&idx| row.get(idx).cloned().unwrap_or(Value::Null))
+                .collect()
+        })
+        .collect();
+
+    (
+        lab_analysis::QueryTable {
+            columns: new_columns,
+            rows: new_rows,
+        },
+        elided,
+    )
+}
+
 fn print_query_table(table: &lab_analysis::QueryTable) {
     if table.columns.is_empty() {
         println!("(ok)");
         return;
     }
 
-    let rendered_rows: Vec<Vec<String>> = table
-        .rows
-        .iter()
-        .map(|row| row.iter().map(render_json_cell).collect::<Vec<String>>())
-        .collect();
+    let (filtered, elided) = elide_constant_columns(table);
 
-    let numeric_cols: Vec<bool> = (0..table.columns.len())
-        .map(|col_idx| {
-            let mut has_number = false;
-            for row in &table.rows {
-                match row.get(col_idx) {
-                    Some(Value::Number(_)) => has_number = true,
-                    Some(Value::Null) => {}
-                    _ => return false,
-                }
-            }
-            has_number
-        })
-        .collect();
-
-    let mut widths: Vec<usize> = table.columns.iter().map(|c| c.chars().count()).collect();
-    for row in &rendered_rows {
-        for (idx, cell) in row.iter().enumerate() {
-            if idx < widths.len() {
-                widths[idx] = widths[idx].max(cell.chars().count()).min(80);
-            }
-        }
-    }
-
-    let header = table
-        .columns
-        .iter()
-        .enumerate()
-        .map(|(idx, col)| {
-            pad_cell(
-                col,
-                widths[idx],
-                numeric_cols.get(idx).copied().unwrap_or(false),
-            )
-        })
-        .collect::<Vec<_>>()
-        .join(" | ");
-    println!("{}", header);
-    let separator = widths
-        .iter()
-        .map(|w| "-".repeat(*w))
-        .collect::<Vec<_>>()
-        .join("-+-");
-    println!("{}", separator);
-
-    for row in rendered_rows {
-        let line = row
+    if !elided.is_empty() {
+        let meta_parts: Vec<String> = elided
             .iter()
-            .enumerate()
-            .map(|(idx, cell)| {
-                let ra = numeric_cols.get(idx).copied().unwrap_or(false);
-                if idx < widths.len() {
-                    pad_cell(&truncate_cell(cell, widths[idx]), widths[idx], ra)
-                } else {
-                    cell.clone()
-                }
+            .map(|(k, v)| {
+                let display_v = truncate_cell(v, 40);
+                format!("{}={}", k, display_v)
             })
-            .collect::<Vec<_>>()
-            .join(" | ");
-        println!("{}", line);
+            .collect();
+        println!("{}", meta_parts.join("  "));
+        println!();
     }
-    println!("({} rows)", table.rows.len());
+
+    let term_w = terminal_width();
+    print_scoreboard_table(&filtered, term_w);
 }
 
 fn csv_escape(value: &str) -> String {

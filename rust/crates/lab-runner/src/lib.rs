@@ -32,7 +32,7 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -58,8 +58,12 @@ const AGENTLAB_ENV_AGENT_EXIT_STATUS: &str = "AGENTLAB_AGENT_EXIT_STATUS";
 const BENCHMARK_PREDICTION_FILENAME: &str = "benchmark_prediction.json";
 const BENCHMARK_SCORE_FILENAME: &str = "benchmark_score.json";
 const BENCHMARK_GRADE_ERROR_FILENAME: &str = "benchmark_grade_error.txt";
+const AGENT_ARTIFACT_UNPACK_COMMAND: &str =
+    "tar --warning=no-unknown-keyword --no-same-owner --no-same-permissions -xzf /opt/agent.tar.gz -C /opt/agent && rm -f /opt/agent.tar.gz";
 const BENCHMARK_GRADING_POLICY_EXIT_CODE: i32 = 125;
 const AGENTLAB_LOCAL_WORKER_MAX_IN_FLIGHT_ENV: &str = "AGENTLAB_LOCAL_WORKER_MAX_IN_FLIGHT";
+const AGENTLAB_MIN_FREE_BYTES_ENV: &str = "AGENTLAB_MIN_FREE_BYTES";
+const DEFAULT_MIN_FREE_BYTES: u64 = 20 * 1024 * 1024 * 1024;
 const LOCAL_WORKER_CAPACITY_ERROR_PREFIX: &str = "local worker backend at capacity:";
 const LOCAL_WORKER_MAX_COMPLETIONS_PER_POLL: usize = 256;
 const CANONICAL_TRIAL_RESULT_FILENAME: &str = "result.json";
@@ -1153,7 +1157,6 @@ pub struct RunBehavior {
 pub enum ExecutorKind {
     LocalDocker,
     LocalProcess,
-    Remote,
 }
 
 impl ExecutorKind {
@@ -1161,7 +1164,6 @@ impl ExecutorKind {
         match self {
             Self::LocalDocker => "local_docker",
             Self::LocalProcess => "local_process",
-            Self::Remote => "remote",
         }
     }
 }
@@ -1190,8 +1192,6 @@ impl MaterializationMode {
 pub struct RunExecutionOptions {
     pub executor: Option<ExecutorKind>,
     pub materialize: Option<MaterializationMode>,
-    pub remote_endpoint: Option<String>,
-    pub remote_token_env: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1206,8 +1206,6 @@ fn normalize_execution_options(execution: &RunExecutionOptions) -> RunExecutionO
     RunExecutionOptions {
         executor: execution.executor,
         materialize: Some(execution.materialize.unwrap_or(MaterializationMode::Full)),
-        remote_endpoint: execution.remote_endpoint.clone(),
-        remote_token_env: execution.remote_token_env.clone(),
     }
 }
 
@@ -1484,39 +1482,18 @@ fn run_control_active_trials_payload(
 }
 
 fn run_control_active_trial_ids(run_control: &Value) -> Vec<String> {
-    let mut ids: Vec<String> = Vec::new();
-    if let Some(active_trials) = run_control
+    run_control
         .pointer("/active_trials")
         .and_then(|v| v.as_object())
-    {
-        for (trial_id, entry) in active_trials {
-            let candidate = entry
-                .pointer("/trial_id")
-                .and_then(|v| v.as_str())
-                .unwrap_or(trial_id);
-            if !ids.iter().any(|existing| existing == candidate) {
-                ids.push(candidate.to_string());
-            }
-        }
-    }
-    ids
+        .map(|active_trials| active_trials.keys().cloned().collect())
+        .unwrap_or_default()
 }
 
 fn run_control_active_adapter_for_trial(run_control: &Value, trial_id: &str) -> Option<Value> {
     let active_trials = run_control
         .pointer("/active_trials")
         .and_then(|v| v.as_object())?;
-    let entry = active_trials.iter().find_map(|(key, value)| {
-        let candidate = value
-            .pointer("/trial_id")
-            .and_then(|v| v.as_str())
-            .unwrap_or(key.as_str());
-        if candidate == trial_id {
-            Some(value)
-        } else {
-            None
-        }
-    })?;
+    let entry = active_trials.get(trial_id)?;
     let control = entry.pointer("/control")?;
     if control.is_null() {
         None
@@ -1531,12 +1508,7 @@ fn run_control_active_trials(run_control: &Value) -> Vec<RunControlActiveTrial> 
         .pointer("/active_trials")
         .and_then(|v| v.as_object())
     {
-        for (trial_id_key, entry) in entries {
-            let trial_id = entry
-                .pointer("/trial_id")
-                .and_then(|v| v.as_str())
-                .unwrap_or(trial_id_key)
-                .to_string();
+        for (trial_id, entry) in entries {
             let worker_id = entry
                 .pointer("/worker_id")
                 .and_then(|v| v.as_str())
@@ -1560,7 +1532,7 @@ fn run_control_active_trials(run_control: &Value) -> Vec<RunControlActiveTrial> 
                 .and_then(|value| if value.is_null() { None } else { Some(value) })
                 .and_then(|value| serde_json::from_value::<ActiveAdapterControl>(value).ok());
             active.push(RunControlActiveTrial {
-                trial_id,
+                trial_id: trial_id.to_string(),
                 worker_id,
                 schedule_idx,
                 variant_id,
@@ -4564,20 +4536,27 @@ impl TrialExecutor {
         let patch_incremental_ref = artifact_store.put_file(&patch_incremental_path)?;
         let patch_cumulative_ref = artifact_store.put_file(&patch_cumulative_path)?;
 
-        let post_workspace_snapshot_dir = chains_dir.join(format!(
-            "step_{:06}_{}_workspace",
-            chain_step_index,
-            sanitize_for_fs(&trial_id)
-        ));
-        if post_workspace_snapshot_dir.exists() {
-            fs::remove_dir_all(&post_workspace_snapshot_dir)?;
+        let mut latest_snapshot_path = chain_states
+            .get(&chain_key)
+            .map(|state| state.latest_snapshot_path.clone())
+            .unwrap_or_else(|| chain_root_snapshot_path.clone());
+        if !workspace_diff_is_empty(&diff_incremental) {
+            let post_workspace_snapshot_dir = chains_dir.join(format!(
+                "step_{:06}_{}_workspace",
+                chain_step_index,
+                sanitize_for_fs(&trial_id)
+            ));
+            if post_workspace_snapshot_dir.exists() {
+                fs::remove_dir_all(&post_workspace_snapshot_dir)?;
+            }
+            ensure_dir(&post_workspace_snapshot_dir)?;
+            copy_dir_filtered(
+                &trial_paths.workspace,
+                &post_workspace_snapshot_dir,
+                WORKSPACE_EVIDENCE_EXCLUDE_PREFIXES,
+            )?;
+            latest_snapshot_path = post_workspace_snapshot_dir;
         }
-        ensure_dir(&post_workspace_snapshot_dir)?;
-        copy_dir_filtered(
-            &trial_paths.workspace,
-            &post_workspace_snapshot_dir,
-            WORKSPACE_EVIDENCE_EXCLUDE_PREFIXES,
-        )?;
 
         if !matches!(effective_policy.state_policy, StatePolicy::IsolatePerTrial) {
             chain_states.insert(
@@ -4586,7 +4565,7 @@ impl TrialExecutor {
                     chain_root_snapshot_ref: chain_root_snapshot_ref.clone(),
                     chain_root_snapshot_path: chain_root_snapshot_path.clone(),
                     latest_snapshot_ref: post_snapshot_ref.clone(),
-                    latest_snapshot_path: post_workspace_snapshot_dir.clone(),
+                    latest_snapshot_path,
                     step_index: chain_step_index,
                 },
             );
@@ -5325,7 +5304,7 @@ impl RunCoordinator {
 #[derive(Debug, Clone)]
 enum PendingSlotCommit {
     SkippedPruned,
-    Trial(TrialExecutionResult),
+    Trial(Box<TrialExecutionResult>),
 }
 
 struct DeterministicCommitter {
@@ -5377,7 +5356,7 @@ impl DeterministicCommitter {
     }
 
     fn enqueue_trial(&mut self, schedule_idx: usize, result: TrialExecutionResult) -> Result<bool> {
-        self.enqueue(schedule_idx, PendingSlotCommit::Trial(result))
+        self.enqueue(schedule_idx, PendingSlotCommit::Trial(Box::new(result)))
     }
 
     fn enqueue(&mut self, schedule_idx: usize, pending: PendingSlotCommit) -> Result<bool> {
@@ -5950,14 +5929,6 @@ fn execute_schedule_engine_parallel(
     let benchmark_predictions_path = benchmark_dir.join("predictions.jsonl");
     let benchmark_scores_path = benchmark_dir.join("scores.jsonl");
 
-    let any_remote_executor = variant_runtime_profiles
-        .iter()
-        .any(|profile| matches!(profile.executor_kind, ExecutorKind::Remote));
-    if any_remote_executor {
-        return Err(anyhow!(
-            "executor_kind='remote' is no longer supported; use local_process or local_docker"
-        ));
-    }
     let requested_dispatch_capacity = max_concurrency.max(1);
     let worker_context = Arc::new(ParallelWorkerExecutionContext {
         mode,
@@ -5979,8 +5950,9 @@ fn execute_schedule_engine_parallel(
         baseline_id: baseline_id.to_string(),
     });
     let executor_context = worker_context.clone();
-    let executor: Arc<LocalTrialExecutor> =
-        Arc::new(move |dispatch: TrialDispatch| execute_parallel_worker_trial(executor_context.as_ref(), dispatch));
+    let executor: Arc<LocalTrialExecutor> = Arc::new(move |dispatch: TrialDispatch| {
+        execute_parallel_worker_trial(executor_context.as_ref(), dispatch)
+    });
     let local_backend = LocalThreadWorkerBackend::new(requested_dispatch_capacity, executor)?;
     if let Some(warning) = local_backend.capacity_warning() {
         eprintln!("{}", warning);
@@ -6396,6 +6368,7 @@ fn run_experiment_with_behavior(
         let checks = collect_preflight_checks(
             &json_value,
             &exp_dir,
+            &run_dir,
             &tasks,
             &benchmark_config,
             &variants,
@@ -6411,11 +6384,8 @@ fn run_experiment_with_behavior(
 
         // Print warnings even when passing
         for check in &preflight.checks {
-            if !check.passed && matches!(check.severity, PreflightSeverity::Warning) {
-                eprintln!("[WARN] {}: {}", check.name, check.message);
-            } else if check.passed
-                && matches!(check.severity, PreflightSeverity::Warning)
-                && check.message.contains("will be")
+            if matches!(check.severity, PreflightSeverity::Warning)
+                && (!check.passed || check.message.contains("will be"))
             {
                 eprintln!("[WARN] {}: {}", check.name, check.message);
             }
@@ -6757,6 +6727,7 @@ pub fn preflight_experiment(path: &Path, overrides_path: Option<&Path>) -> Resul
     let checks = collect_preflight_checks(
         &json_value,
         &exp_dir,
+        &exp_dir,
         &tasks,
         &benchmark_config,
         &variants,
@@ -6960,9 +6931,341 @@ fn collect_per_task_images_for_preflight(tasks: &[Value]) -> PerTaskImageScanRes
     result
 }
 
+fn resolve_min_free_bytes() -> Result<u64> {
+    match env::var(AGENTLAB_MIN_FREE_BYTES_ENV) {
+        Ok(raw) => {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                return Err(anyhow!(
+                    "{} must be a positive integer when set",
+                    AGENTLAB_MIN_FREE_BYTES_ENV
+                ));
+            }
+            let parsed = trimmed.parse::<u64>().map_err(|_| {
+                anyhow!(
+                    "{} must be a positive integer when set (got: {})",
+                    AGENTLAB_MIN_FREE_BYTES_ENV,
+                    raw
+                )
+            })?;
+            if parsed == 0 {
+                return Err(anyhow!(
+                    "{} must be > 0 when set",
+                    AGENTLAB_MIN_FREE_BYTES_ENV
+                ));
+            }
+            Ok(parsed)
+        }
+        Err(env::VarError::NotPresent) => Ok(DEFAULT_MIN_FREE_BYTES),
+        Err(err) => Err(anyhow!(
+            "failed reading {}: {}",
+            AGENTLAB_MIN_FREE_BYTES_ENV,
+            err
+        )),
+    }
+}
+
+fn free_bytes_for_path(path: &Path) -> Result<u64> {
+    let probe = path.to_string_lossy().to_string();
+    let out = Command::new("df").args(["-Pk", probe.as_str()]).output()?;
+    if !out.status.success() {
+        return Err(anyhow!(
+            "df -Pk {} failed: {}",
+            probe,
+            output_error_detail(&out)
+        ));
+    }
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let line = stdout
+        .lines()
+        .rev()
+        .find(|candidate| {
+            let trimmed = candidate.trim();
+            !trimmed.is_empty() && !trimmed.starts_with("Filesystem")
+        })
+        .ok_or_else(|| anyhow!("unable to parse df output for {}", probe))?;
+    let fields = line.split_whitespace().collect::<Vec<_>>();
+    if fields.len() < 4 {
+        return Err(anyhow!(
+            "unable to parse df output for {} (expected >=4 columns): {}",
+            probe,
+            line
+        ));
+    }
+    let available_kb = fields[3].parse::<u64>().map_err(|_| {
+        anyhow!(
+            "unable to parse available blocks from df output for {}: {}",
+            probe,
+            line
+        )
+    })?;
+    Ok(available_kb.saturating_mul(1024))
+}
+
+fn check_disk_headroom_with_threshold(probe_path: &Path, min_free_bytes: u64) -> PreflightCheck {
+    let name = "disk_headroom";
+    let available = match free_bytes_for_path(probe_path) {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            return PreflightCheck {
+                name,
+                passed: false,
+                severity: PreflightSeverity::Error,
+                message: format!(
+                    "failed to determine free disk bytes at '{}': {}",
+                    probe_path.display(),
+                    err
+                ),
+            }
+        }
+    };
+    if available < min_free_bytes {
+        return PreflightCheck {
+            name,
+            passed: false,
+            severity: PreflightSeverity::Error,
+            message: format!(
+                "insufficient free disk bytes at '{}': required={} available={}",
+                probe_path.display(),
+                min_free_bytes,
+                available
+            ),
+        };
+    }
+    PreflightCheck {
+        name,
+        passed: true,
+        severity: PreflightSeverity::Error,
+        message: format!(
+            "disk headroom ok at '{}': required={} available={}",
+            probe_path.display(),
+            min_free_bytes,
+            available
+        ),
+    }
+}
+
+fn check_disk_headroom(probe_path: &Path) -> PreflightCheck {
+    let name = "disk_headroom";
+    match resolve_min_free_bytes() {
+        Ok(min_free_bytes) => check_disk_headroom_with_threshold(probe_path, min_free_bytes),
+        Err(err) => PreflightCheck {
+            name,
+            passed: false,
+            severity: PreflightSeverity::Error,
+            message: err.to_string(),
+        },
+    }
+}
+
+fn parse_provider_env_mapping_value(
+    value: Option<&Value>,
+    field_name: &str,
+) -> Result<BTreeMap<String, String>> {
+    let mut mapping = BTreeMap::new();
+    let Some(raw) = value else {
+        return Ok(mapping);
+    };
+    match raw {
+        Value::Object(obj) => {
+            for (provider, env_name_raw) in obj {
+                let provider_trimmed = provider.trim();
+                if provider_trimmed.is_empty() {
+                    return Err(anyhow!("{} contains an empty provider key", field_name));
+                }
+                let env_name = env_name_raw
+                    .as_str()
+                    .ok_or_else(|| anyhow!("{}['{}'] must be a string", field_name, provider))?
+                    .trim()
+                    .to_string();
+                if env_name.is_empty() {
+                    return Err(anyhow!(
+                        "{}['{}'] must be a non-empty env var name",
+                        field_name,
+                        provider
+                    ));
+                }
+                mapping.insert(provider_trimmed.to_string(), env_name);
+            }
+        }
+        Value::Array(items) => {
+            for (idx, item) in items.iter().enumerate() {
+                let token = item
+                    .as_str()
+                    .ok_or_else(|| anyhow!("{}[{}] must be a string", field_name, idx))?
+                    .trim();
+                if token.is_empty() {
+                    return Err(anyhow!("{}[{}] must not be empty", field_name, idx));
+                }
+                let (provider, env_name) = token.split_once('=').ok_or_else(|| {
+                    anyhow!(
+                        "{}[{}] must use provider=ENV format (got '{}')",
+                        field_name,
+                        idx,
+                        token
+                    )
+                })?;
+                if provider.trim().is_empty() || env_name.trim().is_empty() {
+                    return Err(anyhow!(
+                        "{}[{}] must use non-empty provider and env var names",
+                        field_name,
+                        idx
+                    ));
+                }
+                mapping.insert(provider.trim().to_string(), env_name.trim().to_string());
+            }
+        }
+        _ => {
+            return Err(anyhow!(
+                "{} must be an object<string,string> or string[]",
+                field_name
+            ))
+        }
+    }
+    Ok(mapping)
+}
+
+fn resolve_provider_env_mapping(json_value: &Value) -> Result<BTreeMap<String, String>> {
+    let mut mapping = BTreeMap::new();
+    for (pointer, field_name) in [
+        (
+            "/runtime/policy/provider_env",
+            "runtime.policy.provider_env",
+        ),
+        (
+            "/runtime/policy/provider_env_map",
+            "runtime.policy.provider_env_map",
+        ),
+    ] {
+        let next = parse_provider_env_mapping_value(json_value.pointer(pointer), field_name)?;
+        mapping.extend(next);
+    }
+    Ok(mapping)
+}
+
+fn check_provider_model_wiring(
+    json_value: &Value,
+    variants: &[Variant],
+    variant_runtime_profiles: &[VariantRuntimeProfile],
+) -> PreflightCheck {
+    let name = "provider_model_wiring";
+    if variants.len() != variant_runtime_profiles.len() {
+        return PreflightCheck {
+            name,
+            passed: false,
+            severity: PreflightSeverity::Error,
+            message: format!(
+                "variant/runtime profile mismatch: variants={} runtime_profiles={}",
+                variants.len(),
+                variant_runtime_profiles.len()
+            ),
+        };
+    }
+
+    let mut bindings = Vec::new();
+    for (idx, variant) in variants.iter().enumerate() {
+        let Some(raw_provider) = variant
+            .bindings
+            .get("model_provider")
+            .and_then(Value::as_str)
+            .map(str::trim)
+        else {
+            continue;
+        };
+        if raw_provider.is_empty() {
+            return PreflightCheck {
+                name,
+                passed: false,
+                severity: PreflightSeverity::Error,
+                message: format!(
+                    "variant '{}' has an empty bindings.model_provider",
+                    variant.id
+                ),
+            };
+        }
+        bindings.push((idx, variant.id.clone(), raw_provider.to_string()));
+    }
+
+    if bindings.is_empty() {
+        return PreflightCheck {
+            name,
+            passed: true,
+            severity: PreflightSeverity::Warning,
+            message: "no bindings.model_provider values found across variants".to_string(),
+        };
+    }
+
+    let mapping = match resolve_provider_env_mapping(json_value) {
+        Ok(mapping) => mapping,
+        Err(err) => {
+            return PreflightCheck {
+                name,
+                passed: false,
+                severity: PreflightSeverity::Error,
+                message: err.to_string(),
+            }
+        }
+    };
+
+    let mut missing_provider_mapping = Vec::new();
+    let mut missing_provider_env = Vec::new();
+    for (idx, variant_id, provider) in bindings {
+        let Some(env_name) = mapping.get(&provider) else {
+            missing_provider_mapping.push(format!("{} (variant '{}')", provider, variant_id));
+            continue;
+        };
+        let has_env = variant_runtime_profiles
+            .get(idx)
+            .and_then(|profile| profile.agent_runtime_env.get(env_name))
+            .map(|value| !value.trim().is_empty())
+            .unwrap_or(false);
+        if !has_env {
+            missing_provider_env.push(format!(
+                "{} requires env '{}' (variant '{}')",
+                provider, env_name, variant_id
+            ));
+        }
+    }
+
+    if !missing_provider_mapping.is_empty() {
+        return PreflightCheck {
+            name,
+            passed: true,
+            severity: PreflightSeverity::Warning,
+            message: format!(
+                "unmapped bindings.model_provider values (file auth or local model?): {}",
+                format_preview(&missing_provider_mapping, 4)
+            ),
+        };
+    }
+    if !missing_provider_env.is_empty() {
+        return PreflightCheck {
+            name,
+            passed: true,
+            severity: PreflightSeverity::Warning,
+            message: format!(
+                "provider env vars missing from resolved runtime env: {}",
+                format_preview(&missing_provider_env, 4)
+            ),
+        };
+    }
+
+    let providers = mapping.keys().cloned().collect::<Vec<_>>();
+    PreflightCheck {
+        name,
+        passed: true,
+        severity: PreflightSeverity::Error,
+        message: format!(
+            "all model_provider bindings resolved via provider env mapping (providers: {})",
+            format_preview(&providers, 5)
+        ),
+    }
+}
+
 fn collect_preflight_checks(
     json_value: &Value,
     exp_dir: &Path,
+    disk_probe_path: &Path,
     tasks: &[Value],
     benchmark_config: &BenchmarkConfig,
     variants: &[Variant],
@@ -6992,6 +7295,12 @@ fn collect_preflight_checks(
     // Structural checks (probe_trial_input, dataset_task_ids) are now
     // validated at build time in build_swebench_curated_ab_experiment.mjs.
     // Only machine-state-dependent checks remain here.
+    checks.push(check_disk_headroom(disk_probe_path));
+    checks.push(check_provider_model_wiring(
+        json_value,
+        variants,
+        variant_runtime_profiles,
+    ));
     checks.extend(check_benchmark_grader_reachable_for_variants(
         benchmark_config,
         variants,
@@ -7590,17 +7899,9 @@ struct ChainRuntimeState {
     step_index: usize,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 struct TaskBoundaryPolicy {
     require_workspace_materialization: bool,
-}
-
-impl Default for TaskBoundaryPolicy {
-    fn default() -> Self {
-        Self {
-            require_workspace_materialization: false,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -8323,24 +8624,16 @@ fn schedule_progress_path(run_dir: &Path) -> PathBuf {
 fn load_schedule_progress(run_dir: &Path) -> Result<ScheduleProgress> {
     let path = schedule_progress_path(run_dir);
     let bytes = fs::read(&path)?;
-    let value: Value = serde_json::from_slice(&bytes)?;
-    let schema_version = value
-        .get("schema_version")
-        .and_then(Value::as_str)
-        .unwrap_or("schedule_progress_v1")
-        .to_string();
-    let mut progress: ScheduleProgress = serde_json::from_value(value)?;
-    match schema_version.as_str() {
-        "schedule_progress_v1" | "schedule_progress_v2" => {
-            normalize_schedule_progress(&mut progress);
-            Ok(progress)
-        }
-        other => Err(anyhow!(
+    let mut progress: ScheduleProgress = serde_json::from_slice(&bytes)?;
+    if progress.schema_version != "schedule_progress_v2" {
+        return Err(anyhow!(
             "unsupported schedule_progress schema_version '{}' in {}",
-            other,
+            progress.schema_version,
             path.display()
-        )),
+        ));
     }
+    normalize_schedule_progress(&mut progress);
+    Ok(progress)
 }
 
 fn write_schedule_progress(run_dir: &Path, progress: &ScheduleProgress) -> Result<()> {
@@ -8382,10 +8675,7 @@ fn write_resolved_variants(run_dir: &Path, baseline_id: &str, variants: &[Varian
         variants: variants.to_vec(),
     };
     let value = serde_json::to_value(&manifest)?;
-    atomic_write_json_pretty(&resolved_variants_path(run_dir), &value)?;
-    let digest = canonical_json_digest(&value);
-    atomic_write_bytes(&run_dir.join("resolved_variants.digest"), digest.as_bytes())?;
-    Ok(())
+    atomic_write_json_pretty(&resolved_variants_path(run_dir), &value)
 }
 
 fn write_resolved_schedule(run_dir: &Path, schedule: &[TrialSlot]) -> Result<()> {
@@ -8396,10 +8686,7 @@ fn write_resolved_schedule(run_dir: &Path, schedule: &[TrialSlot]) -> Result<()>
         schedule: schedule.to_vec(),
     };
     let value = serde_json::to_value(&manifest)?;
-    atomic_write_json_pretty(&resolved_schedule_path(run_dir), &value)?;
-    let digest = canonical_json_digest(&value);
-    atomic_write_bytes(&run_dir.join("resolved_schedule.digest"), digest.as_bytes())?;
-    Ok(())
+    atomic_write_json_pretty(&resolved_schedule_path(run_dir), &value)
 }
 
 fn load_run_variants(run_dir: &Path, experiment: &Value) -> Result<(Vec<Variant>, String)> {
@@ -9962,7 +10249,7 @@ fn resolve_variant_runtime_profile(
         ));
     }
 
-    let executor_kind = execution.executor.unwrap_or_else(|| {
+    let executor_kind = execution.executor.unwrap_or({
         if use_container || agent_runtime.force_container {
             ExecutorKind::LocalDocker
         } else {
@@ -10228,9 +10515,35 @@ fn append_jsonl(path: &Path, value: &Value) -> Result<()> {
 }
 
 fn is_workspace_evidence_excluded(rel: &Path) -> bool {
-    WORKSPACE_EVIDENCE_EXCLUDE_PREFIXES
+    if WORKSPACE_EVIDENCE_EXCLUDE_PREFIXES
         .iter()
         .any(|prefix| rel.starts_with(prefix))
+    {
+        return true;
+    }
+
+    for component in rel.components() {
+        let std::path::Component::Normal(name) = component else {
+            continue;
+        };
+        let name = name.to_string_lossy();
+        if name == "node_modules"
+            || name == ".git"
+            || name == ".pnpm-store"
+            || name == ".yarn"
+            || name == "__pycache__"
+            || name == ".pytest_cache"
+            || name == ".mypy_cache"
+            || name == ".ruff_cache"
+            || name == "target"
+            || name == ".DS_Store"
+            || name.starts_with("._")
+        {
+            return true;
+        }
+    }
+
+    false
 }
 
 fn collect_workspace_snapshot_manifest(workspace: &Path) -> Result<Value> {
@@ -10330,6 +10643,14 @@ fn derive_patch_from_diff(diff: &Value) -> Value {
         "added": diff.get("added").cloned().unwrap_or(json!([])),
         "removed": diff.get("removed").cloned().unwrap_or(json!([])),
         "modified": diff.get("modified").cloned().unwrap_or(json!([])),
+    })
+}
+
+fn workspace_diff_is_empty(diff: &Value) -> bool {
+    ["added", "removed", "modified"].iter().all(|field| {
+        diff.get(field)
+            .and_then(Value::as_array)
+            .map_or(true, Vec::is_empty)
     })
 }
 
@@ -10666,12 +10987,10 @@ fn run_builtin_adapter_container(request: &AdapterRunRequest<'_>) -> Result<Proc
     let image = resolve_container_image(request)?;
     ensure_container_image_ready(&image)?;
     let workspace = resolve_container_workspace(request);
-    if request.runtime.image_source == ImageSource::PerTask {
-        if request.agent_artifact.is_none() {
-            return Err(anyhow!(
-                "runtime.agent.artifact is required when runtime.agent.image_source='per_task'"
-            ));
-        }
+    if request.runtime.image_source == ImageSource::PerTask && request.agent_artifact.is_none() {
+        return Err(anyhow!(
+            "runtime.agent.artifact is required when runtime.agent.image_source='per_task'"
+        ));
     }
 
     if let Some(artifact) = request.agent_artifact {
@@ -10707,7 +11026,7 @@ fn resolve_container_workspace<'a>(request: &'a AdapterRunRequest<'_>) -> Option
     } else {
         None
     };
-    per_task_workspace.or_else(|| {
+    per_task_workspace.or({
         if request.runtime.clean_contract_v1 {
             None
         } else {
@@ -11030,6 +11349,104 @@ fn ensure_container_image_ready(image: &str) -> Result<()> {
     ))
 }
 
+fn agent_artifact_cache_lock() -> &'static Mutex<()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(()))
+}
+
+fn resolve_agent_artifact_mount_dir(artifact: &Path) -> Result<PathBuf> {
+    if artifact.is_dir() {
+        return Ok(fs::canonicalize(artifact).unwrap_or_else(|_| artifact.to_path_buf()));
+    }
+    if !artifact.exists() {
+        return Err(anyhow!(
+            "runtime.agent.artifact not found: {}",
+            artifact.display()
+        ));
+    }
+    if !artifact.is_file() {
+        return Err(anyhow!(
+            "runtime.agent.artifact must be a file or directory: {}",
+            artifact.display()
+        ));
+    }
+    let artifact_path = fs::canonicalize(artifact).unwrap_or_else(|_| artifact.to_path_buf());
+    let artifact_name = artifact_path
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default();
+    let tar_flag = if artifact_name.ends_with(".tar.gz") || artifact_name.ends_with(".tgz") {
+        "-xzf"
+    } else if artifact_name.ends_with(".tar") {
+        "-xf"
+    } else {
+        return Err(anyhow!(
+            "runtime.agent.artifact '{}' must be a directory or .tar/.tar.gz archive",
+            artifact_path.display()
+        ));
+    };
+
+    let digest = sha256_file(&artifact_path)?;
+    let cache_root = artifact_path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .join(".agentlab_artifact_cache");
+    ensure_dir(&cache_root)?;
+    let unpacked_dir = cache_root.join(&digest);
+    let ready_marker = unpacked_dir.join(".agentlab_ready");
+    if ready_marker.exists() {
+        return Ok(unpacked_dir);
+    }
+
+    let _guard = agent_artifact_cache_lock()
+        .lock()
+        .map_err(|_| anyhow!("agent artifact cache lock poisoned"))?;
+    if ready_marker.exists() {
+        return Ok(unpacked_dir);
+    }
+
+    if unpacked_dir.exists() {
+        fs::remove_dir_all(&unpacked_dir)?;
+    }
+    let staging_dir = cache_root.join(format!(
+        "{}.tmp.{}.{}",
+        digest,
+        std::process::id(),
+        Utc::now().timestamp_micros()
+    ));
+    if staging_dir.exists() {
+        let _ = fs::remove_dir_all(&staging_dir);
+    }
+    ensure_dir(&staging_dir)?;
+    let unpack_out = Command::new("tar")
+        .args([
+            tar_flag,
+            artifact_path.to_string_lossy().as_ref(),
+            "-C",
+            staging_dir.to_string_lossy().as_ref(),
+        ])
+        .output()?;
+    if !unpack_out.status.success() {
+        let _ = fs::remove_dir_all(&staging_dir);
+        return Err(anyhow!(
+            "failed to unpack runtime.agent.artifact {}: {}",
+            artifact_path.display(),
+            output_error_detail(&unpack_out),
+        ));
+    }
+    if let Err(err) = fs::rename(&staging_dir, &unpacked_dir) {
+        let _ = fs::remove_dir_all(&staging_dir);
+        return Err(anyhow!(
+            "failed to finalize unpacked runtime.agent.artifact {} into {}: {}",
+            artifact_path.display(),
+            unpacked_dir.display(),
+            err
+        ));
+    }
+    fs::write(&ready_marker, digest.as_bytes())?;
+    Ok(unpacked_dir)
+}
+
 fn seed_workspace_from_task_image(
     image: &str,
     source_workspace: &str,
@@ -11084,6 +11501,19 @@ fn run_injected_container(
         ));
     }
 
+    if let Ok(artifact_mount_dir) = resolve_agent_artifact_mount_dir(artifact) {
+        let command = resolve_runtime_agent_command(request)?;
+        let grader_command = resolve_benchmark_grader_command(request);
+        let mut cmd = Command::new("docker");
+        cmd.arg("run").arg("--rm").args(["--pull", "never"]);
+        append_container_sandbox_args(&mut cmd, request, workspace);
+        cmd.args(["-v", &format!("{}:/opt/agent:ro", artifact_mount_dir.display())]);
+        append_container_env_args(&mut cmd, request, workspace);
+        cmd.arg(image);
+        append_container_entrypoint(&mut cmd, request, &command, grader_command);
+        return run_adapter_process(cmd, &request.io_paths.output_host, None);
+    }
+
     let command = resolve_runtime_agent_command(request)?;
     let grader_command = resolve_benchmark_grader_command(request);
 
@@ -11108,17 +11538,22 @@ fn run_injected_container(
     start.args(["start", &container_id]);
     run_checked_command(start, "docker start failed")?;
 
+    let mut prepare_agent_dir = Command::new("docker");
+    prepare_agent_dir.args(["exec", &container_id, "/bin/sh", "-lc"]);
+    prepare_agent_dir.arg("mkdir -p /opt/agent");
+    run_checked_command(prepare_agent_dir, "docker exec prepare agent dir failed")?;
+
+    // `/tmp` is mounted as tmpfs in sandbox mode; docker cp to tmpfs paths can
+    // report success while the file is absent at exec time.
     let mut copy = Command::new("docker");
     copy.arg("cp");
     copy.arg(artifact);
-    copy.arg(format!("{}:/tmp/agent.tar.gz", container_id));
+    copy.arg(format!("{}:/opt/agent.tar.gz", container_id));
     run_checked_command(copy, "docker cp failed")?;
 
     let mut unpack = Command::new("docker");
     unpack.args(["exec", &container_id, "/bin/sh", "-lc"]);
-    unpack.arg(
-        "mkdir -p /opt/agent && tar xzf /tmp/agent.tar.gz -C /opt/agent && rm -f /tmp/agent.tar.gz",
-    );
+    unpack.arg(AGENT_ARTIFACT_UNPACK_COMMAND);
     run_checked_command(unpack, "docker exec artifact unpack failed")?;
 
     let mut exec = Command::new("docker");
@@ -11318,10 +11753,9 @@ fn run_adapter_process(
 
     let mut child = cmd.spawn()?;
     if let Some(path) = start_response_path {
-        wait_for_file(path, Duration::from_secs(10)).map_err(|err| {
+        wait_for_file(path, Duration::from_secs(10)).inspect_err(|_| {
             let _ = child.kill();
             let _ = child.wait();
-            err
         })?;
     }
     let output = child.wait_with_output()?;
@@ -11747,7 +12181,7 @@ fn write_state_inventory(
             }
         },
         "agent_runtime_identity": {
-            "name": agent_runtime.command_raw.get(0).cloned().unwrap_or("unknown".to_string()),
+            "name": agent_runtime.command_raw.first().cloned().unwrap_or("unknown".to_string()),
             "exec_digest": exec_digest,
             "entry_command": agent_runtime.command_raw.clone(),
             "invocation_source": invocation_source,
@@ -11952,7 +12386,13 @@ fn copy_dir_filtered(src: &Path, dst: &Path, exclude: &[&str]) -> Result<()> {
         if rel.as_os_str().is_empty() {
             return true; // root entry
         }
-        !exclude.iter().any(|ex| rel.starts_with(ex))
+        if exclude.iter().any(|ex| rel.starts_with(ex)) {
+            return false;
+        }
+        if is_workspace_evidence_excluded(rel) {
+            return false;
+        }
+        true
     });
     for entry in walker {
         let entry = entry?;
@@ -12459,8 +12899,6 @@ mod tests {
         let execution = RunExecutionOptions {
             executor: Some(ExecutorKind::LocalProcess),
             materialize: None,
-            remote_endpoint: None,
-            remote_token_env: Some("TOKEN".to_string()),
         };
         write_run_session_state(&run_dir, "run_1", &behavior, &execution).expect("write state");
         let state = load_run_session_state(&run_dir).expect("load state");
@@ -12473,7 +12911,6 @@ mod tests {
         );
         assert_eq!(state.execution.executor, Some(ExecutorKind::LocalProcess));
         assert_eq!(state.execution.materialize, Some(MaterializationMode::Full));
-        assert_eq!(state.execution.remote_token_env.as_deref(), Some("TOKEN"));
     }
 
     #[test]
@@ -16607,4 +17044,533 @@ mod tests {
         assert!(config.concurrency.require_chain_lease);
     }
 
+    #[test]
+    fn inv02_timeout_policy_propagates_to_runtime_env() {
+        let io = PreparedTrialIo {
+            output_host: PathBuf::from("/tmp/out.json"),
+            events_host: PathBuf::from("/tmp/events.jsonl"),
+            task_path: AGENTLAB_TASK_PATH.to_string(),
+            bindings_path: AGENTLAB_BINDINGS_PATH.to_string(),
+            dependencies_path: AGENTLAB_DEPENDENCIES_PATH.to_string(),
+            policy_path: AGENTLAB_POLICY_PATH.to_string(),
+            result_path: AGENTLAB_RESULT_PATH.to_string(),
+            trajectory_path: AGENTLAB_TRAJECTORY_PATH.to_string(),
+        };
+        let input = json!({
+            "ids": {
+                "trial_id": "trial_1",
+                "variant_id": "base",
+                "task_id": "task_1",
+                "repl_idx": 0
+            },
+            "policy": {
+                "timeout_ms": 456000
+            }
+        });
+        let timeout_ms = resolve_trial_timeout_ms(&input, Some(111000));
+        let env = build_runtime_contract_env("run_1", &input, &io, timeout_ms, false);
+        assert_eq!(
+            env.get(AGENTLAB_ENV_TIMEOUT_MS).map(String::as_str),
+            Some("456000")
+        );
+    }
+
+    #[test]
+    fn inv02_timeout_template_in_command_is_rendered() {
+        let command = vec![
+            "rex".to_string(),
+            "run".to_string(),
+            "--timeout-ms".to_string(),
+            "${AGENTLAB_TIMEOUT_MS}".to_string(),
+        ];
+        let mut env = BTreeMap::new();
+        env.insert("AGENTLAB_TIMEOUT_MS".to_string(), "123000".to_string());
+        let rendered = apply_agentlab_template_to_command(&command, &env);
+        assert_eq!(rendered[3], "123000");
+        assert!(
+            rendered
+                .iter()
+                .all(|token| !token.contains("${AGENTLAB_TIMEOUT_MS}")),
+            "timeout placeholder should be fully rendered"
+        );
+    }
+
+    #[test]
+    fn inv03_preflight_fails_below_min_disk_headroom() {
+        let check = check_disk_headroom_with_threshold(Path::new("."), u64::MAX);
+        assert!(
+            !check.passed,
+            "disk check should fail when threshold is too high"
+        );
+        assert!(check.message.contains("required="));
+        assert!(check.message.contains("available="));
+    }
+
+    #[test]
+    fn inv03_preflight_passes_at_or_above_min_disk_headroom() {
+        let check = check_disk_headroom_with_threshold(Path::new("."), 1);
+        assert!(check.passed, "disk check should pass for tiny threshold");
+    }
+
+    fn inv07_spec_with_provider_env(
+        provider_env: Value,
+        runtime_env: Value,
+        exp_dir: &Path,
+    ) -> (Value, Vec<Variant>, Vec<VariantRuntimeProfile>) {
+        let spec = json!({
+            "version": "0.3",
+            "experiment": { "id": "e", "name": "n", "workload_type": "agent_harness" },
+            "dataset": { "path": "tasks.jsonl", "provider": "local_jsonl", "suite_id": "s", "schema_version": "v1", "split_id": "dev", "limit": 1 },
+            "design": { "sanitization_profile": "hermetic_functional", "comparison": "paired", "replications": 1, "random_seed": 1, "shuffle_tasks": false, "max_concurrency": 1 },
+            "baseline": { "variant_id": "base", "bindings": { "model_provider": "openai" } },
+            "variant_plan": [
+                { "variant_id": "alt", "bindings": { "model_provider": "openai" } }
+            ],
+            "runtime": {
+                "agent": {
+                    "command": ["sh", "-lc", "echo ok"],
+                    "env": runtime_env
+                },
+                "policy": {
+                    "timeout_ms": 600000,
+                    "sandbox": { "mode": "local" },
+                    "network": { "mode": "none", "allowed_hosts": [] },
+                    "provider_env": provider_env
+                }
+            }
+        });
+        let (variants, _) = resolve_variant_plan(&spec).expect("variant plan");
+        let mut profiles = Vec::new();
+        for variant in &variants {
+            profiles.push(
+                resolve_variant_runtime_profile(
+                    &spec,
+                    variant,
+                    exp_dir,
+                    false,
+                    &RunBehavior::default(),
+                    &RunExecutionOptions::default(),
+                )
+                .expect("runtime profile"),
+            );
+        }
+        (spec, variants, profiles)
+    }
+
+    #[test]
+    fn inv07_preflight_warns_for_unmapped_model_provider() {
+        let root = TempDirGuard::new("agentlab_inv07_unmapped_provider");
+        let exp_dir = root.path.join("exp");
+        ensure_dir(&exp_dir).expect("exp dir");
+        fs::write(exp_dir.join("tasks.jsonl"), "{\"id\":\"task_1\"}\n").expect("dataset");
+        let (spec, variants, profiles) = inv07_spec_with_provider_env(
+            json!({"anthropic":"ANTHROPIC_API_KEY"}),
+            json!({}),
+            &exp_dir,
+        );
+        let check = check_provider_model_wiring(&spec, &variants, &profiles);
+        assert!(
+            check.passed,
+            "unmapped provider should warn, not fail (file auth / local models)"
+        );
+        assert!(check.message.contains("unmapped"));
+    }
+
+    #[test]
+    fn inv07_preflight_warns_when_provider_env_var_missing() {
+        let root = TempDirGuard::new("agentlab_inv07_missing_provider_env");
+        let exp_dir = root.path.join("exp");
+        ensure_dir(&exp_dir).expect("exp dir");
+        fs::write(exp_dir.join("tasks.jsonl"), "{\"id\":\"task_1\"}\n").expect("dataset");
+        let (spec, variants, profiles) =
+            inv07_spec_with_provider_env(json!({"openai":"OPENAI_API_KEY"}), json!({}), &exp_dir);
+        let check = check_provider_model_wiring(&spec, &variants, &profiles);
+        assert!(
+            check.passed,
+            "missing provider env var should warn, not fail"
+        );
+        assert!(check.message.contains("OPENAI_API_KEY"));
+    }
+
+    #[test]
+    fn inv07_preflight_passes_for_valid_provider_bindings() {
+        let root = TempDirGuard::new("agentlab_inv07_valid_provider_env");
+        let exp_dir = root.path.join("exp");
+        ensure_dir(&exp_dir).expect("exp dir");
+        fs::write(exp_dir.join("tasks.jsonl"), "{\"id\":\"task_1\"}\n").expect("dataset");
+        let (spec, variants, profiles) = inv07_spec_with_provider_env(
+            json!({"openai":"OPENAI_API_KEY"}),
+            json!({"OPENAI_API_KEY":"test-token"}),
+            &exp_dir,
+        );
+        let check = check_provider_model_wiring(&spec, &variants, &profiles);
+        assert!(
+            check.passed,
+            "valid provider env wiring should pass preflight"
+        );
+    }
+
+    fn inv06_write_resolved_experiment(
+        run_dir: &Path,
+        dataset_path: &str,
+        run_id: &str,
+        run_status: &str,
+    ) -> Value {
+        let resolved = json!({
+            "version": "0.3",
+            "experiment": { "id": "e", "name": "n", "workload_type": "agent_harness" },
+            "dataset": { "path": dataset_path, "provider": "local_jsonl", "suite_id": "s", "schema_version": "v1", "split_id": "dev", "limit": 1 },
+            "design": { "sanitization_profile": "hermetic_functional", "comparison": "paired", "replications": 1, "random_seed": 1, "shuffle_tasks": false, "max_concurrency": 1 },
+            "baseline": { "variant_id": "base", "bindings": {} },
+            "runtime": {
+                "agent": {
+                    "command": [
+                        "/bin/sh",
+                        "-lc",
+                        "printf '%s' '{\"schema_version\":\"agent_result_v1\",\"outcome\":\"success\",\"checkpoints\":[]}'"
+                    ],
+                    "io": { "input_arg": "--input", "output_arg": "--output" }
+                },
+                "policy": {
+                    "timeout_ms": 600000,
+                    "sandbox": { "mode": "local" },
+                    "network": { "mode": "none", "allowed_hosts": [] }
+                }
+            }
+        });
+        atomic_write_json_pretty(&run_dir.join("resolved_experiment.json"), &resolved)
+            .expect("resolved experiment");
+        let (variants, baseline_id) = resolve_variant_plan(&resolved).expect("variant plan");
+        write_resolved_variants(run_dir, &baseline_id, &variants).expect("write variants");
+        write_run_control_v2(run_dir, run_id, run_status, &[], None).expect("run control");
+        write_run_session_state(
+            run_dir,
+            run_id,
+            &RunBehavior::default(),
+            &RunExecutionOptions::default(),
+        )
+        .expect("run session");
+        let schedule = build_trial_schedule(1, 1, 1, parse_policies(&resolved).scheduling, 1);
+        let progress = ScheduleProgress {
+            schema_version: "schedule_progress_v1".to_string(),
+            run_id: run_id.to_string(),
+            total_slots: schedule.len(),
+            next_schedule_index: 0,
+            next_trial_index: 0,
+            schedule,
+            completed_slots: Vec::new(),
+            pruned_variants: Vec::new(),
+            consecutive_failures: BTreeMap::new(),
+            use_container: false,
+            updated_at: Utc::now().to_rfc3339(),
+        };
+        write_schedule_progress(run_dir, &progress).expect("schedule progress");
+        resolved
+    }
+
+    #[test]
+    fn inv06_recover_then_continue_succeeds_with_minimal_env() {
+        let (_root, run_dir) = create_run_dir("agentlab_inv06_recover_continue", "run_1");
+        let dataset_path = run_dir.join("tasks.jsonl");
+        fs::write(&dataset_path, "{\"id\":\"task_1\"}\n").expect("dataset");
+        inv06_write_resolved_experiment(&run_dir, "tasks.jsonl", "run_1", "running");
+        write_schedule_progress(
+            &run_dir,
+            &ScheduleProgress {
+                schema_version: "schedule_progress_v1".to_string(),
+                run_id: "run_1".to_string(),
+                total_slots: 0,
+                next_schedule_index: 0,
+                next_trial_index: 0,
+                schedule: Vec::new(),
+                completed_slots: Vec::new(),
+                pruned_variants: Vec::new(),
+                consecutive_failures: BTreeMap::new(),
+                use_container: false,
+                updated_at: Utc::now().to_rfc3339(),
+            },
+        )
+        .expect("schedule progress");
+
+        let trial_dir = seed_parent_trial(&run_dir, "trial_1", json!([]), "running", None);
+        let active = vec![RunControlActiveTrial {
+            trial_id: "trial_1".to_string(),
+            worker_id: "worker_1".to_string(),
+            schedule_idx: Some(0),
+            variant_id: Some("base".to_string()),
+            started_at: Some(Utc::now().to_rfc3339()),
+            control: Some(active_control_for_trial(&trial_dir)),
+        }];
+        write_run_control_v2(&run_dir, "run_1", "running", &active, None).expect("run control");
+
+        let recovered = recover_run(&run_dir, true).expect("recover");
+        assert_eq!(recovered.recovered_status, "interrupted");
+
+        let continue_err =
+            continue_run(&run_dir).expect_err("continue should reach deterministic terminal guard");
+        assert!(
+            continue_err.to_string().contains("nothing to continue"),
+            "unexpected continue error: {}",
+            continue_err
+        );
+    }
+
+    #[test]
+    fn inv06_continue_handles_relative_and_absolute_dataset_paths() {
+        let root = TempDirGuard::new("agentlab_inv06_dataset_paths");
+        let exp_dir = root.path.join("exp");
+        ensure_dir(&exp_dir).expect("exp");
+        let abs_dataset = root.path.join("dataset_abs.jsonl");
+        fs::write(&abs_dataset, "{\"id\":\"task_1\"}\n").expect("abs dataset");
+
+        for use_absolute in [false, true] {
+            let dataset_path = if use_absolute {
+                abs_dataset.to_string_lossy().to_string()
+            } else {
+                "tasks.jsonl".to_string()
+            };
+            let spec = json!({
+                "dataset": { "path": dataset_path }
+            });
+            let resolved = resolve_dataset_path(&spec, &exp_dir).expect("dataset path");
+            let expected = if use_absolute {
+                abs_dataset.clone()
+            } else {
+                exp_dir.join("tasks.jsonl")
+            };
+            assert_eq!(
+                resolved, expected,
+                "dataset mode absolute={} should resolve correctly",
+                use_absolute
+            );
+        }
+    }
+
+    #[test]
+    fn inv05_workspace_diff_empty_detector_matches_snapshot_diff() {
+        let snapshot_a = json!({
+            "files": [
+                { "path": "a.txt", "digest": "1111", "size_bytes": 1 }
+            ]
+        });
+        let snapshot_b = json!({
+            "files": [
+                { "path": "a.txt", "digest": "1111", "size_bytes": 1 }
+            ]
+        });
+        let snapshot_c = json!({
+            "files": [
+                { "path": "a.txt", "digest": "2222", "size_bytes": 1 }
+            ]
+        });
+
+        let unchanged = diff_workspace_snapshots(&snapshot_a, &snapshot_b);
+        assert!(
+            workspace_diff_is_empty(&unchanged),
+            "diff should be empty for identical snapshots"
+        );
+
+        let changed = diff_workspace_snapshots(&snapshot_a, &snapshot_c);
+        assert!(
+            !workspace_diff_is_empty(&changed),
+            "diff should be non-empty when file digests change"
+        );
+    }
+
+    #[test]
+    fn inv05_workspace_evidence_exclusions_apply_to_snapshot_and_copy() {
+        let root = TempDirGuard::new("agentlab_inv05_workspace_exclusions");
+        let workspace = root.path.join("workspace");
+        ensure_dir(&workspace).expect("workspace");
+        ensure_dir(&workspace.join("node_modules").join("pkg")).expect("node_modules");
+        ensure_dir(&workspace.join("src")).expect("src");
+        fs::write(workspace.join("src").join("keep.txt"), "keep").expect("keep file");
+        fs::write(
+            workspace.join("node_modules").join("pkg").join("drop.txt"),
+            "drop",
+        )
+        .expect("excluded file");
+        fs::write(workspace.join(".DS_Store"), "junk").expect("metadata");
+
+        let snapshot = collect_workspace_snapshot_manifest(&workspace).expect("snapshot");
+        let files = snapshot
+            .pointer("/files")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let file_paths = files
+            .iter()
+            .filter_map(|row| row.get("path").and_then(Value::as_str))
+            .collect::<Vec<_>>();
+        assert!(
+            file_paths.iter().any(|path| *path == "src/keep.txt"),
+            "included file should be present in snapshot"
+        );
+        assert!(
+            file_paths.iter().all(|path| !path.contains("node_modules")),
+            "excluded directories should not appear in snapshot"
+        );
+
+        let copied = root.path.join("copied");
+        copy_dir_filtered(&workspace, &copied, &[]).expect("copy workspace");
+        assert!(copied.join("src").join("keep.txt").exists());
+        assert!(!copied.join("node_modules").exists());
+    }
+
+    #[test]
+    fn inv05_large_workspace_exclusion_guard_completes_within_budget() {
+        let root = TempDirGuard::new("agentlab_inv05_workspace_budget");
+        let workspace = root.path.join("workspace");
+        ensure_dir(&workspace).expect("workspace");
+        ensure_dir(&workspace.join("src")).expect("src");
+        ensure_dir(&workspace.join("node_modules").join("pkg")).expect("node_modules");
+        fs::write(workspace.join("src").join("keep.txt"), "keep").expect("keep");
+        for idx in 0..3000 {
+            fs::write(
+                workspace
+                    .join("node_modules")
+                    .join("pkg")
+                    .join(format!("file_{}.txt", idx)),
+                "x",
+            )
+            .expect("excluded file");
+        }
+
+        let started = Instant::now();
+        let snapshot = collect_workspace_snapshot_manifest(&workspace).expect("snapshot");
+        let copied = root.path.join("copied");
+        copy_dir_filtered(&workspace, &copied, &[]).expect("copy");
+        let elapsed = started.elapsed();
+        assert!(
+            elapsed < Duration::from_secs(20),
+            "workspace exclusion guard exceeded budget: {:?}",
+            elapsed
+        );
+        let file_count = snapshot
+            .pointer("/file_count")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
+        assert_eq!(file_count, 1, "excluded files should not bloat snapshot");
+    }
+
+    #[test]
+    fn inv04_agent_artifact_mount_cache_unpacks_tar_once() {
+        let root = TempDirGuard::new("agentlab_inv04_artifact_mount_cache");
+        let artifact_src = root.path.join("artifact_src");
+        ensure_dir(&artifact_src).expect("artifact src");
+        fs::write(artifact_src.join("agent.txt"), "agent payload").expect("artifact payload");
+        let artifact_tar = root.path.join("agent-runtime.tar.gz");
+        let tar_status = Command::new("tar")
+            .args([
+                "-czf",
+                artifact_tar.to_string_lossy().as_ref(),
+                "-C",
+                artifact_src.to_string_lossy().as_ref(),
+                ".",
+            ])
+            .status()
+            .expect("create tar");
+        assert!(tar_status.success(), "failed to create artifact tarball");
+
+        let first_mount = resolve_agent_artifact_mount_dir(&artifact_tar).expect("first unpack");
+        assert!(
+            first_mount.join("agent.txt").exists(),
+            "unpacked artifact payload missing"
+        );
+
+        let second_mount =
+            resolve_agent_artifact_mount_dir(&artifact_tar).expect("second unpack should be cached");
+        assert_eq!(
+            first_mount, second_mount,
+            "artifact mount path should be stable across repeated calls"
+        );
+        assert!(
+            second_mount.join(".agentlab_ready").exists(),
+            "cached artifact should include ready marker"
+        );
+    }
+
+    #[test]
+    fn inv04_artifact_unpack_succeeds_with_container_fs_constraints() {
+        let docker_ok = Command::new("docker")
+            .arg("info")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false);
+        if !docker_ok {
+            eprintln!("skipping inv04 test: docker daemon unavailable");
+            return;
+        }
+
+        ensure_container_image_ready("alpine:3.20").expect("alpine image");
+        let root = TempDirGuard::new("agentlab_inv04_artifact_unpack");
+        let artifact_dir = root.path.join("artifact");
+        ensure_dir(&artifact_dir).expect("artifact dir");
+        fs::write(artifact_dir.join("agent.txt"), "agent payload").expect("artifact payload");
+        let artifact_tar = root.path.join("agent.tar.gz");
+        let tar_status = Command::new("tar")
+            .args([
+                "-czf",
+                artifact_tar.to_string_lossy().as_ref(),
+                "-C",
+                artifact_dir.to_string_lossy().as_ref(),
+                ".",
+            ])
+            .status()
+            .expect("create tar");
+        assert!(tar_status.success(), "failed to create artifact tarball");
+
+        let mut create = Command::new("docker");
+        create.args(["create", "alpine:3.20", "tail", "-f", "/dev/null"]);
+        let create_out = run_checked_command(create, "docker create").expect("create container");
+        let container_id = String::from_utf8_lossy(&create_out.stdout)
+            .trim()
+            .to_string();
+        assert!(!container_id.is_empty(), "container id should not be empty");
+        let _cleanup = ContainerCleanupGuard {
+            container_id: container_id.clone(),
+        };
+
+        let mut start = Command::new("docker");
+        start.args(["start", &container_id]);
+        run_checked_command(start, "docker start").expect("start container");
+
+        let mut prepare = Command::new("docker");
+        prepare.args([
+            "exec",
+            &container_id,
+            "/bin/sh",
+            "-lc",
+            "mkdir -p /opt/agent",
+        ]);
+        run_checked_command(prepare, "docker prepare").expect("prepare /opt/agent");
+
+        let mut copy = Command::new("docker");
+        copy.arg("cp");
+        copy.arg(&artifact_tar);
+        copy.arg(format!("{}:/opt/agent.tar.gz", container_id));
+        run_checked_command(copy, "docker cp").expect("copy artifact");
+
+        let mut unpack = Command::new("docker");
+        unpack.args([
+            "exec",
+            &container_id,
+            "/bin/sh",
+            "-lc",
+            AGENT_ARTIFACT_UNPACK_COMMAND,
+        ]);
+        run_checked_command(unpack, "docker unpack").expect("unpack artifact");
+
+        let mut verify = Command::new("docker");
+        verify.args([
+            "exec",
+            &container_id,
+            "/bin/sh",
+            "-lc",
+            "test -f /opt/agent/agent.txt",
+        ]);
+        run_checked_command(verify, "docker verify").expect("verify unpacked artifact");
+    }
 }

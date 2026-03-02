@@ -6,8 +6,13 @@ import json
 import os
 import sys
 import unittest
+from pathlib import Path
 
 from adapters.harbor import harbor_benchmark_adapter as adapter
+from bench.taskkit.schema import validate_with_schema_file
+
+REPO_ROOT = Path(__file__).resolve().parents[3]
+SCHEMAS_DIR = REPO_ROOT / "schemas"
 
 
 class HarborBenchmarkAdapterTests(unittest.TestCase):
@@ -36,12 +41,20 @@ class HarborBenchmarkAdapterTests(unittest.TestCase):
             "AGENTLAB_VARIANT_ID",
             "AGENTLAB_TASK_ID",
             "AGENTLAB_REPL_IDX",
+            "AGENTLAB_SCHEDULE_IDX",
+            "AGENTLAB_SLOT_COMMIT_ID",
+            "AGENTLAB_ATTEMPT",
+            "AGENTLAB_ROW_SEQ",
             "AGENTLAB_AGENT_EXIT_STATUS",
             "HARBOR_EVALUATOR_CMD_JSON",
             "HARBOR_EVALUATOR_CMD",
         ]
 
-    def test_fallback_records_match_schema_shape(self) -> None:
+    def _assert_schema_valid(self, payload: dict[str, object], schema_file: str) -> None:
+        errors = validate_with_schema_file(payload, SCHEMAS_DIR / schema_file)
+        self.assertEqual(errors, [], f"schema validation errors: {errors}")
+
+    def test_inv01_fallback_records_match_schema_shape(self) -> None:
         os.environ["AGENTLAB_AGENT_EXIT_STATUS"] = "0"
         task = {
             "id": "tb2_task_1",
@@ -56,17 +69,28 @@ class HarborBenchmarkAdapterTests(unittest.TestCase):
         prediction = adapter.build_prediction_record(task, result, None)
         score = adapter.build_score_record(task, result, None)
 
-        self.assertEqual(prediction["schema_version"], "benchmark_prediction_record_v1")
         self.assertEqual(prediction["ids"]["trial_id"], "trial_1")
         self.assertEqual(prediction["benchmark"]["adapter_id"], "harbor_tb2")
         self.assertEqual(prediction["prediction"]["kind"], "patch")
+        self.assertGreaterEqual(prediction["schedule_idx"], 0)
+        self.assertTrue(prediction["slot_commit_id"])
+        self.assertGreaterEqual(prediction["attempt"], 1)
+        self.assertGreaterEqual(prediction["row_seq"], 0)
+        self._assert_schema_valid(
+            prediction,
+            "benchmark_prediction_record_v1.jsonschema",
+        )
 
-        self.assertEqual(score["schema_version"], "benchmark_score_record_v1")
         self.assertEqual(score["verdict"], "pass")
         self.assertEqual(score["primary_metric_name"], "resolved")
         self.assertEqual(score["primary_metric_value"], 1.0)
         self.assertEqual(score["metrics"]["resolved"], 1.0)
         self.assertIn("evaluator", score)
+        self.assertGreaterEqual(score["schedule_idx"], 0)
+        self.assertTrue(score["slot_commit_id"])
+        self.assertGreaterEqual(score["attempt"], 1)
+        self.assertGreaterEqual(score["row_seq"], 0)
+        self._assert_schema_valid(score, "benchmark_score_record_v1.jsonschema")
 
     def test_external_evaluator_output_is_used(self) -> None:
         payload = {

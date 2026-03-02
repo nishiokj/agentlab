@@ -67,6 +67,23 @@ def _env_int(name: str, fallback: int = 0) -> int:
         return fallback
 
 
+def _env_int_min(name: str, fallback: int, minimum: int) -> int:
+    parsed = _env_int(name, fallback)
+    if parsed < minimum:
+        return fallback
+    return parsed
+
+
+def _identity_fields() -> dict[str, Any]:
+    slot_commit_id = os.environ.get("AGENTLAB_SLOT_COMMIT_ID", "").strip() or "slot_pending"
+    return {
+        "schedule_idx": _env_int_min("AGENTLAB_SCHEDULE_IDX", 0, 0),
+        "slot_commit_id": slot_commit_id,
+        "attempt": _env_int_min("AGENTLAB_ATTEMPT", 1, 1),
+        "row_seq": _env_int_min("AGENTLAB_ROW_SEQ", 0, 0),
+    }
+
+
 def _task_id(task_payload: Any) -> str:
     if isinstance(task_payload, dict):
         candidate = task_payload.get("id")
@@ -256,7 +273,7 @@ def build_prediction_record(
         prediction = _extract_prediction(agent_result)
 
     mode = "external" if evaluation is not None else "fallback"
-    return {
+    payload = {
         "schema_version": "benchmark_prediction_record_v1",
         "ids": _ids(task_payload),
         "benchmark": _extract_benchmark_spec(task_payload),
@@ -267,6 +284,8 @@ def build_prediction_record(
             }
         },
     }
+    payload.update(_identity_fields())
+    return payload
 
 
 def build_score_record(task_payload: Any, agent_result: Any, evaluation: dict[str, Any] | None) -> dict[str, Any]:
@@ -305,7 +324,7 @@ def build_score_record(task_payload: Any, agent_result: Any, evaluation: dict[st
         metrics[primary_metric_name] = primary_metric_value
 
     mode = "external" if evaluation is not None else "fallback"
-    return {
+    payload = {
         "schema_version": "benchmark_score_record_v1",
         "ids": _ids(task_payload),
         "benchmark": _extract_benchmark_spec(task_payload),
@@ -320,6 +339,8 @@ def build_score_record(task_payload: Any, agent_result: Any, evaluation: dict[st
             }
         },
     }
+    payload.update(_identity_fields())
+    return payload
 
 
 def main() -> int:
