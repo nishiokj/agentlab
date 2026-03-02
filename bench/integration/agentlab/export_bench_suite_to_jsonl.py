@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Export bench task bundles as AgentLab task-boundary JSONL."""
+"""Export bench task bundles as AgentLab task_boundary_v2 JSONL."""
 
 from __future__ import annotations
 
@@ -13,6 +13,8 @@ import yaml
 DEFAULT_SUITE = "v0"
 DEFAULT_SPLIT = "test"
 DEFAULT_BENCHMARK_NAME = "bench"
+TASK_BOUNDARY_SCHEMA_VERSION = "task_boundary_v2"
+DEFAULT_TASK_WORKSPACE = "/workspace"
 
 
 def _repo_root() -> Path:
@@ -36,6 +38,42 @@ def _load_task_yaml(task_dir: Path) -> dict[str, Any]:
     return payload
 
 
+def _candidate_string(value: Any) -> str | None:
+    if isinstance(value, str):
+        trimmed = value.strip()
+        if trimmed:
+            return trimmed
+    return None
+
+
+def _per_task_image_name(base_image: str, task_id: str) -> str:
+    base = base_image.split(":")[0]
+    return f"{base}-{task_id.lower()}:latest"
+
+
+def _resolve_task_image(
+    task_yaml: dict[str, Any],
+    base_image: str | None,
+    task_id: str,
+) -> str | None:
+    explicit = _candidate_string(task_yaml.get("image"))
+    if explicit:
+        return explicit
+    if base_image:
+        return _per_task_image_name(base_image, task_id)
+    return None
+
+
+def _resolve_task_workspace(
+    task_yaml: dict[str, Any],
+    default_task_workspace: str | None,
+    task_image: str | None,
+) -> str | None:
+    if task_image is None:
+        return None
+    return _candidate_string(task_yaml.get("workspace")) or default_task_workspace
+
+
 def _build_task_row(
     root: Path,
     suite: str,
@@ -43,9 +81,22 @@ def _build_task_row(
     benchmark_name: str,
     adapter_id: str,
     task_dir: Path,
+    base_image: str | None,
+    default_task_workspace: str | None,
 ) -> dict[str, Any]:
     task_yaml = _load_task_yaml(task_dir)
     task_id = task_dir.name
+    task_image = _resolve_task_image(
+        task_yaml=task_yaml,
+        base_image=base_image,
+        task_id=task_id,
+    )
+    task_workspace = _resolve_task_workspace(
+        task_yaml=task_yaml,
+        default_task_workspace=default_task_workspace,
+        task_image=task_image,
+    )
+
     task_payload: dict[str, Any] = {
         "id": task_id,
         "repo_id": task_yaml.get("repo_id"),
@@ -64,6 +115,11 @@ def _build_task_row(
         },
     }
 
+    if task_image:
+        task_payload["image"] = task_image
+        if task_workspace:
+            task_payload["workspace"] = task_workspace
+
     public_command = task_yaml.get("public_command")
     if isinstance(public_command, str) and public_command.strip():
         task_payload["public_command"] = public_command.strip()
@@ -73,7 +129,7 @@ def _build_task_row(
         task_payload["hidden_command"] = hidden_command.strip()
 
     row: dict[str, Any] = {
-        "schema_version": "task_boundary_v1",
+        "schema_version": TASK_BOUNDARY_SCHEMA_VERSION,
         "task": task_payload,
         "workspace_files": [],
         "mount_references": [],
@@ -112,7 +168,20 @@ def main() -> int:
     parser.add_argument(
         "--output",
         default=None,
-        help="Output JSONL path (default: data/bench_<suite>_task_boundary_v1.jsonl)",
+        help="Output JSONL path (default: data/bench_<suite>.task_boundary_v2.jsonl)",
+    )
+    parser.add_argument(
+        "--image",
+        default=None,
+        help=(
+            "Base Docker image for container mode. Per-task images are derived "
+            "as {base}-{task_id}:latest. Enables task_boundary_v2 output."
+        ),
+    )
+    parser.add_argument(
+        "--workspace",
+        default=DEFAULT_TASK_WORKSPACE,
+        help=f"In-container workspace path (default: {DEFAULT_TASK_WORKSPACE})",
     )
     parser.add_argument(
         "--limit",
@@ -127,12 +196,16 @@ def main() -> int:
     if not suite_dir.exists():
         raise FileNotFoundError(f"suite directory not found: {suite_dir}")
 
+    schema_tag = TASK_BOUNDARY_SCHEMA_VERSION
+    base_image = _candidate_string(args.image)
+    default_task_workspace = _candidate_string(args.workspace)
+
     if args.output:
         out_path = Path(args.output)
         if not out_path.is_absolute():
             out_path = root / out_path
     else:
-        out_path = root / "data" / f"bench_{args.suite}_task_boundary_v1.jsonl"
+        out_path = root / "data" / f"bench_{args.suite}.{schema_tag}.jsonl"
 
     task_dirs = _iter_task_dirs(suite_dir)
     if args.limit and args.limit > 0:
@@ -146,6 +219,8 @@ def main() -> int:
             benchmark_name=args.benchmark_name,
             adapter_id=args.adapter_id,
             task_dir=task_dir,
+            base_image=base_image,
+            default_task_workspace=default_task_workspace,
         )
         for task_dir in task_dirs
     ]
@@ -163,6 +238,9 @@ def main() -> int:
                 "split": args.split,
                 "benchmark_name": args.benchmark_name,
                 "adapter_id": args.adapter_id,
+                "schema_version": schema_tag,
+                "base_image": base_image,
+                "default_task_workspace": default_task_workspace,
             },
             indent=2,
             sort_keys=True,

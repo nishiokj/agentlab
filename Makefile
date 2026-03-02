@@ -1,4 +1,4 @@
-.PHONY: bootstrap lint test validate-schemas clean help
+.PHONY: bootstrap lint test mutation-test validate-schemas clean help
 
 PYTHON ?= python3
 VENV ?= .venv
@@ -23,6 +23,9 @@ lint: ## Run basic syntax checks
 test: ## Run unit tests
 	@$(PYTEST) -q --tb=short; status=$$?; \
 	if [ $$status -ne 0 ] && [ $$status -ne 5 ]; then exit $$status; fi
+
+mutation-test: ## Run lab-runner mutation gate tests
+	./scripts/run_runner_mutation_gate.sh
 
 validate-schemas: ## Validate all JSON schemas
 	$(BENCH) validate-schemas
