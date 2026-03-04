@@ -14,7 +14,7 @@ DEFAULT_SUITE = "v0"
 DEFAULT_SPLIT = "test"
 DEFAULT_BENCHMARK_NAME = "bench"
 TASK_BOUNDARY_SCHEMA_VERSION = "task_boundary_v2"
-DEFAULT_TASK_WORKSPACE = "/workspace"
+DEFAULT_TASK_WORKSPACE = "/agentlab/workspace"
 
 
 def _repo_root() -> Path:
@@ -69,9 +69,11 @@ def _resolve_task_workspace(
     default_task_workspace: str | None,
     task_image: str | None,
 ) -> str | None:
-    if task_image is None:
-        return None
-    return _candidate_string(task_yaml.get("workspace")) or default_task_workspace
+    # Runtime workspace is runner-owned; task-authored workspace overrides are ignored.
+    _ = task_yaml
+    _ = default_task_workspace
+    _ = task_image
+    return None
 
 
 def _build_task_row(
@@ -91,7 +93,7 @@ def _build_task_row(
         base_image=base_image,
         task_id=task_id,
     )
-    task_workspace = _resolve_task_workspace(
+    _ = _resolve_task_workspace(
         task_yaml=task_yaml,
         default_task_workspace=default_task_workspace,
         task_image=task_image,
@@ -117,8 +119,6 @@ def _build_task_row(
 
     if task_image:
         task_payload["image"] = task_image
-        if task_workspace:
-            task_payload["workspace"] = task_workspace
 
     public_command = task_yaml.get("public_command")
     if isinstance(public_command, str) and public_command.strip():

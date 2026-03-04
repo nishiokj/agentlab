@@ -35,7 +35,11 @@ use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
+mod persistence;
 mod sink;
+use persistence::sqlite_store::{
+    run_sqlite_path, JsonRowTable, SqliteRunStore as BackingSqliteStore,
+};
 use sink::{
     EventRow, JsonlRunSink, MetricRow, RunManifestRecord, RunSink, TrialRecord, VariantSnapshotRow,
 };
@@ -304,7 +308,6 @@ struct AdapterRunRequest<'a> {
     benchmark_grading_enabled: bool,
     run_id: &'a str,
     task_image: Option<&'a str>,
-    task_workspace: Option<&'a str>,
     agent_artifact: Option<&'a Path>,
 }
 
@@ -1072,16 +1075,16 @@ fn acquire_run_operation_lease(
 }
 
 fn load_engine_lease(run_dir: &Path) -> Result<Option<EngineLeaseRecord>> {
-    let path = engine_lease_path(run_dir);
-    if !path.exists() {
+    let store = BackingSqliteStore::open(run_dir)?;
+    let Some(value) = store.get_runtime_json(RUNTIME_KEY_ENGINE_LEASE)? else {
         return Ok(None);
-    }
-    let bytes = fs::read(path)?;
-    Ok(Some(serde_json::from_slice::<EngineLeaseRecord>(&bytes)?))
+    };
+    Ok(Some(serde_json::from_value::<EngineLeaseRecord>(value)?))
 }
 
 fn write_engine_lease(run_dir: &Path, lease: &EngineLeaseRecord) -> Result<()> {
-    atomic_write_json_pretty(&engine_lease_path(run_dir), &serde_json::to_value(lease)?)
+    let mut store = BackingSqliteStore::open(run_dir)?;
+    store.put_runtime_json(RUNTIME_KEY_ENGINE_LEASE, &serde_json::to_value(lease)?)
 }
 
 fn make_engine_lease(run_id: &str, epoch: u64) -> EngineLeaseRecord {
@@ -1204,45 +1207,109 @@ struct SlotCommitRecord {
     runtime_fsync_completed: Option<bool>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PendingTrialCompletionRecord {
+    schema_version: String,
+    schedule_idx: usize,
+    trial_result: TrialExecutionResult,
+}
+
 fn slot_commit_journal_path(run_dir: &Path) -> PathBuf {
     run_dir.join("runtime").join("slot_commit_journal.jsonl")
 }
 
+fn pending_trial_completions_path(run_dir: &Path) -> PathBuf {
+    run_dir
+        .join("runtime")
+        .join("pending_trial_completions.jsonl")
+}
+
 fn append_slot_commit_record(run_dir: &Path, record: &SlotCommitRecord) -> Result<()> {
-    let path = slot_commit_journal_path(run_dir);
-    if let Some(parent) = path.parent() {
-        ensure_dir(parent)?;
-    }
-    let mut file = fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)?;
-    serde_json::to_writer(&mut file, record)?;
-    file.write_all(b"\n")?;
-    file.sync_all()?;
-    if let Some(parent) = path.parent() {
-        if let Ok(dir) = fs::File::open(parent) {
-            let _ = dir.sync_all();
-        }
-    }
-    Ok(())
+    let mut store = BackingSqliteStore::open(run_dir)?;
+    store.upsert_slot_commit_record(&serde_json::to_value(record)?)
 }
 
 fn load_slot_commit_records(run_dir: &Path) -> Result<Vec<SlotCommitRecord>> {
-    let path = slot_commit_journal_path(run_dir);
-    if !path.exists() {
+    let store = BackingSqliteStore::open(run_dir)?;
+    let run_id = store
+        .get_runtime_json(RUNTIME_KEY_RUN_CONTROL)?
+        .and_then(|value| {
+            value
+                .pointer("/run_id")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .or_else(|| store.first_run_id_with_slot_commits().ok().flatten())
+        .unwrap_or_default();
+    if run_id.is_empty() {
         return Ok(Vec::new());
     }
-    let raw = fs::read_to_string(path)?;
-    let mut rows = Vec::new();
-    for line in raw.lines() {
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        rows.push(serde_json::from_str::<SlotCommitRecord>(trimmed)?);
+    let values = store.load_slot_commit_records(&run_id)?;
+    let mut rows = Vec::with_capacity(values.len());
+    for value in values {
+        rows.push(serde_json::from_value::<SlotCommitRecord>(value)?);
     }
     Ok(rows)
+}
+
+fn load_pending_trial_completion_records(
+    run_dir: &Path,
+) -> Result<BTreeMap<usize, TrialExecutionResult>> {
+    let store = BackingSqliteStore::open(run_dir)?;
+    let run_id = store
+        .get_runtime_json(RUNTIME_KEY_RUN_CONTROL)?
+        .and_then(|value| {
+            value
+                .pointer("/run_id")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .or_else(|| store.first_run_id_with_pending_completions().ok().flatten())
+        .unwrap_or_default();
+    if run_id.is_empty() {
+        return Ok(BTreeMap::new());
+    }
+    let records = store.load_pending_trial_completions(&run_id)?;
+    let mut by_schedule = BTreeMap::new();
+    for record_value in records {
+        let record: PendingTrialCompletionRecord = serde_json::from_value(record_value)?;
+        if record.schema_version != "pending_trial_completion_v1" {
+            continue;
+        }
+        by_schedule.insert(record.schedule_idx, record.trial_result);
+    }
+    Ok(by_schedule)
+}
+
+fn persist_pending_trial_completions(
+    run_dir: &Path,
+    committer: &DeterministicCommitter,
+) -> Result<()> {
+    let records = committer.pending_trial_completion_records();
+    let run_id = BackingSqliteStore::open(run_dir)?
+        .get_runtime_json(RUNTIME_KEY_RUN_CONTROL)?
+        .and_then(|value| {
+            value
+                .pointer("/run_id")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .or_else(|| {
+            records
+                .iter()
+                .find_map(|row| row.trial_result.deferred_trial_records.first())
+                .map(|row| row.run_id.clone())
+        })
+        .unwrap_or_default();
+    if run_id.is_empty() {
+        return Ok(());
+    }
+    let values = records
+        .iter()
+        .map(serde_json::to_value)
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    let mut store = BackingSqliteStore::open(run_dir)?;
+    store.replace_pending_trial_completions(&run_id, &values)
 }
 
 fn highest_attempt_by_schedule(records: &[SlotCommitRecord]) -> HashMap<usize, usize> {
@@ -1426,15 +1493,20 @@ fn parallel_worker_control_path(run_dir: &Path) -> PathBuf {
     run_dir.join("runtime").join("parallel_worker_control.json")
 }
 
+const RUNTIME_KEY_RUN_CONTROL: &str = "run_control_v2";
+const RUNTIME_KEY_RUN_SESSION_STATE: &str = "run_session_state_v1";
+const RUNTIME_KEY_PARALLEL_WORKER_CONTROL: &str = "parallel_worker_control_v1";
+const RUNTIME_KEY_SCHEDULE_PROGRESS: &str = "schedule_progress_v2";
+const RUNTIME_KEY_ENGINE_LEASE: &str = "engine_lease_v1";
+
 fn load_parallel_worker_control_state(
     run_dir: &Path,
 ) -> Result<Option<ParallelWorkerControlState>> {
-    let path = parallel_worker_control_path(run_dir);
-    if !path.exists() {
+    let store = BackingSqliteStore::open(run_dir)?;
+    let Some(value) = store.get_runtime_json(RUNTIME_KEY_PARALLEL_WORKER_CONTROL)? else {
         return Ok(None);
-    }
-    let bytes = fs::read(path)?;
-    let state: ParallelWorkerControlState = serde_json::from_slice(&bytes)?;
+    };
+    let state: ParallelWorkerControlState = serde_json::from_value(value)?;
     Ok(Some(state))
 }
 
@@ -1443,7 +1515,8 @@ fn write_parallel_worker_control_state(
     state: &ParallelWorkerControlState,
 ) -> Result<()> {
     let payload = serde_json::to_value(state)?;
-    atomic_write_json_pretty(&parallel_worker_control_path(run_dir), &payload)
+    let mut store = BackingSqliteStore::open(run_dir)?;
+    store.put_runtime_json(RUNTIME_KEY_PARALLEL_WORKER_CONTROL, &payload)
 }
 
 fn write_parallel_worker_control_request(
@@ -1530,18 +1603,23 @@ fn write_run_session_state(
         execution: normalize_execution_options(execution),
     };
     let payload = serde_json::to_value(state)?;
-    atomic_write_json_pretty(&run_session_state_path(run_dir), &payload)
+    let mut store = BackingSqliteStore::open(run_dir)?;
+    store.put_runtime_json(RUNTIME_KEY_RUN_SESSION_STATE, &payload)
 }
 
 fn load_run_session_state(run_dir: &Path) -> Result<RunSessionState> {
-    let path = run_session_state_path(run_dir);
-    if !path.exists() {
-        return Err(anyhow!(
-            "run_session_state.json not found — this run predates continue behavior persistence"
-        ));
+    let store = BackingSqliteStore::open(run_dir)?;
+    if let Some(value) = store.get_runtime_json(RUNTIME_KEY_RUN_SESSION_STATE)? {
+        return Ok(serde_json::from_value(value)?);
     }
-    let bytes = fs::read(path)?;
-    Ok(serde_json::from_slice(&bytes)?)
+    let path = run_session_state_path(run_dir);
+    if path.exists() {
+        let bytes = fs::read(path)?;
+        return Ok(serde_json::from_slice(&bytes)?);
+    }
+    Err(anyhow!(
+        "run_session_state.json not found — this run predates continue behavior persistence"
+    ))
 }
 
 const RUN_CONTROL_UNKNOWN_WORKER_ID: &str = "worker.unknown";
@@ -1745,7 +1823,8 @@ fn write_run_control_v2(
         "pause": pause_value,
         "updated_at": updated_at,
     });
-    atomic_write_json_pretty(&run_control_path(run_dir), &payload)
+    let mut store = BackingSqliteStore::open(run_dir)?;
+    store.put_runtime_json(RUNTIME_KEY_RUN_CONTROL, &payload)
 }
 
 fn write_trial_state(
@@ -2043,7 +2122,7 @@ pub fn continue_run(run_dir: &Path) -> Result<RunResult> {
 
     // 1. Validate run status is terminal and continuable.
     let control_path = run_control_path(&run_dir);
-    let control: Value = serde_json::from_slice(&fs::read(&control_path)?)?;
+    let control: Value = load_json_file(&control_path)?;
     let run_status = control
         .get("status")
         .and_then(|v| v.as_str())
@@ -2079,12 +2158,6 @@ pub fn continue_run(run_dir: &Path) -> Result<RunResult> {
     let execution = run_session.execution;
 
     // 2. Load schedule progress
-    let progress_path = schedule_progress_path(&run_dir);
-    if !progress_path.exists() {
-        return Err(anyhow!(
-            "schedule_progress.json not found — this run predates continue support"
-        ));
-    }
     let progress = load_schedule_progress(&run_dir)?;
     if progress.next_schedule_index >= progress.total_slots {
         return Err(anyhow!(
@@ -2248,18 +2321,12 @@ pub fn continue_run(run_dir: &Path) -> Result<RunResult> {
         });
     }
 
-    validate_jsonl_against_schema("evidence_record_v1.jsonschema", &evidence_records_path)?;
-    validate_jsonl_against_schema("task_chain_state_v1.jsonschema", &task_chain_states_path)?;
-    if let Some(adapter) = benchmark_config.adapter.as_ref() {
-        let _scores_path = process_benchmark_outputs(
-            &project_root,
-            &run_dir,
-            &run_id,
-            adapter,
-            &evidence_records_path,
-            &task_chain_states_path,
-        )?;
-    }
+    let _ = (
+        &project_root,
+        &benchmark_config,
+        &evidence_records_path,
+        &task_chain_states_path,
+    );
 
     let resolved_digest = canonical_json_digest(&json_value);
     let grades = json!({
@@ -2324,12 +2391,6 @@ pub fn recover_run(run_dir: &Path, force: bool) -> Result<RecoverResult> {
         ));
     }
 
-    let progress_path = schedule_progress_path(&run_dir);
-    if !progress_path.exists() {
-        return Err(anyhow!(
-            "schedule_progress.json not found — this run predates recover support"
-        ));
-    }
     let mut progress = load_schedule_progress(&run_dir)?;
     let journal_records = load_slot_commit_records(&run_dir)?;
     adopt_engine_lease_for_recovery(&run_dir, &run_id, force)?;
@@ -2468,18 +2529,7 @@ pub fn replay_trial(run_dir: &Path, trial_id: &str, strict: bool) -> Result<Repl
     }
     let json_value: Value = serde_json::from_slice(&fs::read(&resolved_path)?)?;
     let policy_config = parse_policies(&json_value);
-    let parent_trial_dir = run_dir.join("trials").join(trial_id);
-    if !parent_trial_dir.exists() {
-        return Err(anyhow!("parent trial not found: {}", trial_id));
-    }
-    let parent_input_path = parent_trial_dir.join("trial_input.json");
-    if !parent_input_path.exists() {
-        return Err(anyhow!(
-            "parent trial missing trial_input.json: {}",
-            parent_input_path.display()
-        ));
-    }
-    let mut input: Value = serde_json::from_slice(&fs::read(&parent_input_path)?)?;
+    let mut input = load_trial_input_payload(&run_dir, &run_id, trial_id)?;
     let (variants, _) = load_run_variants(&run_dir, &json_value)?;
     let variant_id = input
         .pointer("/ids/variant_id")
@@ -2525,7 +2575,11 @@ pub fn replay_trial(run_dir: &Path, trial_id: &str, strict: bool) -> Result<Repl
         Value::String(replay_trial_id.clone()),
     )?;
     let task_boundary = parse_task_boundary_from_trial_input(&input)?;
-    validate_task_boundary_workspace_materialization(&task_boundary, &policy_config.task_boundary)?;
+    validate_task_boundary_workspace_materialization(
+        &task_boundary,
+        &policy_config.task_boundary,
+        agent_runtime.image_source,
+    )?;
 
     let replay_trial_dir = replay_dir.join("trial_1");
     ensure_dir(&replay_trial_dir)?;
@@ -2539,14 +2593,31 @@ pub fn replay_trial(run_dir: &Path, trial_id: &str, strict: bool) -> Result<Repl
     )?;
     let mut trial_guard = TrialStateGuard::new(&replay_trial_dir, &replay_trial_id);
 
-    let workspace_src = if parent_trial_dir.join("workspace").exists() {
-        parent_trial_dir.join("workspace")
-    } else {
-        project_root.clone()
-    };
-    let trial_paths = TrialPaths::new(&replay_trial_dir, &workspace_src)?;
+    let trial_paths = TrialPaths::new(&replay_trial_dir, &project_root)?;
     trial_paths.prepare(true)?;
+    let mut has_lineage_workspace = false;
+    {
+        let store = BackingSqliteStore::open(&run_dir)?;
+        if let Some(version_id) = store.latest_lineage_version_id_for_trial(&run_id, trial_id)? {
+            if let Some(workspace_ref) = store.lineage_workspace_ref_by_version(&version_id)? {
+                let artifact_store = ArtifactStore::new(run_dir.join("artifacts"));
+                restore_workspace_from_object_ref(
+                    &artifact_store,
+                    &workspace_ref,
+                    &trial_paths.workspace,
+                )?;
+                has_lineage_workspace = true;
+            }
+        }
+    }
     stage_dependencies_for_trial(&agent_runtime, &trial_paths)?;
+    if !has_lineage_workspace {
+        materialize_workspace_seed(
+            &project_root,
+            &trial_paths,
+            task_boundary.workspace_seed.as_ref(),
+        )?;
+    }
     materialize_workspace_files(&trial_paths, &task_boundary.workspace_files)?;
     stage_workspace_patches_for_trial(&agent_runtime, &trial_paths)?;
 
@@ -2557,8 +2628,6 @@ pub fn replay_trial(run_dir: &Path, trial_id: &str, strict: bool) -> Result<Repl
     )?;
     set_json_pointer_value(&mut input, "/runtime/control_plane/mode", json!("file"))?;
     let input_bytes = serde_json::to_vec_pretty(&input)?;
-    let canonical_input = replay_trial_dir.join("trial_input.json");
-    atomic_write_bytes(&canonical_input, &input_bytes)?;
 
     let io_paths = prepare_io_paths(
         &trial_paths,
@@ -2598,17 +2667,13 @@ pub fn replay_trial(run_dir: &Path, trial_id: &str, strict: bool) -> Result<Repl
         benchmark_grading_enabled: false,
         run_id: &run_id,
         task_image: task_boundary.task_image.as_deref(),
-        task_workspace: task_boundary.task_workspace.as_deref(),
         agent_artifact: agent_runtime.agent_artifact.as_deref(),
     };
     let proc_result = adapter.run_trial(&run_request)?;
     let status = proc_result.status;
 
-    materialize_trial_result(&replay_trial_dir, &io_paths.output_host)?;
-
-    let canonical_output = replay_trial_dir.join(CANONICAL_TRIAL_RESULT_FILENAME);
-    let trial_output: Value = if canonical_output.exists() {
-        serde_json::from_slice(&fs::read(&canonical_output)?)?
+    let trial_output: Value = if io_paths.output_host.exists() {
+        serde_json::from_slice(&fs::read(&io_paths.output_host)?)?
     } else {
         json!({"schema_version":"agent_result_v1","outcome":"error"})
     };
@@ -2626,6 +2691,9 @@ pub fn replay_trial(run_dir: &Path, trial_id: &str, strict: bool) -> Result<Repl
     }
 
     let replay_grade = replay_grade_for_integration(&agent_runtime.integration_level).to_string();
+    let artifact_store = ArtifactStore::new(run_dir.join("artifacts"));
+    let trial_input_ref = artifact_store.put_bytes(&input_bytes)?;
+    let trial_output_ref = artifact_store.put_bytes(&serde_json::to_vec_pretty(&trial_output)?)?;
     let manifest = json!({
         "schema_version": "replay_manifest_v1",
         "operation": "replay",
@@ -2634,9 +2702,34 @@ pub fn replay_trial(run_dir: &Path, trial_id: &str, strict: bool) -> Result<Repl
         "strict": strict,
         "integration_level": agent_runtime.integration_level.clone(),
         "replay_grade": replay_grade.clone(),
+        "trial_id": replay_trial_id.clone(),
+        "refs": {
+            "trial_input_ref": trial_input_ref,
+            "trial_output_ref": trial_output_ref,
+        },
         "created_at": Utc::now().to_rfc3339(),
     });
-    atomic_write_json_pretty(&replay_dir.join("manifest.json"), &manifest)?;
+    let mut store = BackingSqliteStore::open(&run_dir)?;
+    store.upsert_attempt_object(
+        &run_id,
+        &replay_trial_id,
+        0,
+        1,
+        "trial_input",
+        &trial_input_ref,
+        Some(&manifest),
+    )?;
+    store.upsert_attempt_object(
+        &run_id,
+        &replay_trial_id,
+        0,
+        1,
+        "trial_output",
+        &trial_output_ref,
+        Some(&manifest),
+    )?;
+    store.upsert_runtime_operation(&run_id, "replay", &replay_id, &manifest)?;
+    trial_paths.cleanup_scratch()?;
 
     Ok(ReplayResult {
         replay_dir,
@@ -2691,25 +2784,6 @@ fn fork_trial_inner(
     }
     let json_value: Value = serde_json::from_slice(&fs::read(&resolved_path)?)?;
     let policy_config = parse_policies(&json_value);
-    let parent_trial_dir = run_dir.join("trials").join(from_trial);
-    if !parent_trial_dir.exists() {
-        return Err(anyhow!("parent trial not found: {}", from_trial));
-    }
-    let parent_input_path = parent_trial_dir.join("trial_input.json");
-    if !parent_input_path.exists() {
-        return Err(anyhow!(
-            "parent trial missing trial_input.json: {}",
-            parent_input_path.display()
-        ));
-    }
-    let parent_output_path = parent_trial_dir.join(CANONICAL_TRIAL_RESULT_FILENAME);
-    let parent_output = if parent_output_path.exists() {
-        Some(serde_json::from_slice::<Value>(&fs::read(
-            &parent_output_path,
-        )?)?)
-    } else {
-        None
-    };
     let parsed_selector = parse_fork_selector(selector)?;
 
     let run_id = run_dir
@@ -2718,7 +2792,8 @@ fn fork_trial_inner(
         .unwrap_or("run")
         .to_string();
 
-    let mut input: Value = serde_json::from_slice(&fs::read(&parent_input_path)?)?;
+    let mut input = load_trial_input_payload(&run_dir, &run_id, from_trial)?;
+    let parent_output = load_trial_output_payload(&run_dir, &run_id, from_trial).ok();
     let (variants, _) = load_run_variants(&run_dir, &json_value)?;
     let variant_id = input
         .pointer("/ids/variant_id")
@@ -2755,7 +2830,7 @@ fn fork_trial_inner(
     let source_checkpoint = resolve_selector_checkpoint(
         &parsed_selector,
         parent_output.as_ref(),
-        &parent_trial_dir,
+        &run_dir.join("trials").join(from_trial),
         strict,
     )?;
     if strict && source_checkpoint.is_none() {
@@ -2787,7 +2862,11 @@ fn fork_trial_inner(
         }),
     )?;
     let task_boundary = parse_task_boundary_from_trial_input(&input)?;
-    validate_task_boundary_workspace_materialization(&task_boundary, &policy_config.task_boundary)?;
+    validate_task_boundary_workspace_materialization(
+        &task_boundary,
+        &policy_config.task_boundary,
+        agent_runtime.image_source,
+    )?;
 
     let fork_trial_dir = fork_dir.join("trial_1");
     ensure_dir(&fork_trial_dir)?;
@@ -2801,23 +2880,30 @@ fn fork_trial_inner(
     )?;
     let mut trial_guard = TrialStateGuard::new(&fork_trial_dir, &fork_trial_id);
 
-    let workspace_src = if let Some(ref checkpoint) = source_checkpoint {
-        let p = PathBuf::from(checkpoint);
-        if p.is_dir() {
-            p
-        } else if parent_trial_dir.join("workspace").exists() {
-            parent_trial_dir.join("workspace")
-        } else {
-            project_root.clone()
-        }
-    } else if parent_trial_dir.join("workspace").exists() {
-        parent_trial_dir.join("workspace")
-    } else {
-        project_root.clone()
-    };
-    let trial_paths = TrialPaths::new(&fork_trial_dir, &workspace_src)?;
+    let trial_paths = TrialPaths::new(&fork_trial_dir, &project_root)?;
     trial_paths.prepare(true)?;
+    let mut has_checkpoint_workspace = false;
+    if let Some(ref checkpoint_token) = source_checkpoint {
+        if let Some(workspace_ref) =
+            resolve_workspace_ref_from_checkpoint_token(&run_dir, checkpoint_token)?
+        {
+            let artifact_store = ArtifactStore::new(run_dir.join("artifacts"));
+            restore_workspace_from_object_ref(
+                &artifact_store,
+                &workspace_ref,
+                &trial_paths.workspace,
+            )?;
+            has_checkpoint_workspace = true;
+        }
+    }
     stage_dependencies_for_trial(&agent_runtime, &trial_paths)?;
+    if !has_checkpoint_workspace {
+        materialize_workspace_seed(
+            &project_root,
+            &trial_paths,
+            task_boundary.workspace_seed.as_ref(),
+        )?;
+    }
     materialize_workspace_files(&trial_paths, &task_boundary.workspace_files)?;
     stage_workspace_patches_for_trial(&agent_runtime, &trial_paths)?;
 
@@ -2828,8 +2914,6 @@ fn fork_trial_inner(
     )?;
     set_json_pointer_value(&mut input, "/runtime/control_plane/mode", json!("file"))?;
     let input_bytes = serde_json::to_vec_pretty(&input)?;
-    let canonical_input = fork_trial_dir.join("trial_input.json");
-    atomic_write_bytes(&canonical_input, &input_bytes)?;
 
     let io_paths = prepare_io_paths(
         &trial_paths,
@@ -2869,17 +2953,13 @@ fn fork_trial_inner(
         benchmark_grading_enabled: false,
         run_id: &run_id,
         task_image: task_boundary.task_image.as_deref(),
-        task_workspace: task_boundary.task_workspace.as_deref(),
         agent_artifact: agent_runtime.agent_artifact.as_deref(),
     };
     let proc_result = adapter.run_trial(&run_request)?;
     let status = proc_result.status;
 
-    materialize_trial_result(&fork_trial_dir, &io_paths.output_host)?;
-
-    let canonical_output = fork_trial_dir.join(CANONICAL_TRIAL_RESULT_FILENAME);
-    let trial_output: Value = if canonical_output.exists() {
-        serde_json::from_slice(&fs::read(&canonical_output)?)?
+    let trial_output: Value = if io_paths.output_host.exists() {
+        serde_json::from_slice(&fs::read(&io_paths.output_host)?)?
     } else {
         json!({"schema_version":"agent_result_v1","outcome":"error"})
     };
@@ -2896,11 +2976,14 @@ fn fork_trial_inner(
     }
 
     let replay_grade = replay_grade_for_integration(&agent_runtime.integration_level).to_string();
-    let fallback_mode = if source_checkpoint.is_some() {
+    let fallback_mode = if has_checkpoint_workspace {
         "checkpoint".to_string()
     } else {
         "input_only".to_string()
     };
+    let artifact_store = ArtifactStore::new(run_dir.join("artifacts"));
+    let trial_input_ref = artifact_store.put_bytes(&input_bytes)?;
+    let trial_output_ref = artifact_store.put_bytes(&serde_json::to_vec_pretty(&trial_output)?)?;
     let manifest = json!({
         "schema_version": "fork_manifest_v1",
         "operation": "fork",
@@ -2912,9 +2995,34 @@ fn fork_trial_inner(
         "strict": strict,
         "integration_level": agent_runtime.integration_level.clone(),
         "replay_grade": replay_grade.clone(),
+        "trial_id": fork_trial_id.clone(),
+        "refs": {
+            "trial_input_ref": trial_input_ref,
+            "trial_output_ref": trial_output_ref,
+        },
         "created_at": Utc::now().to_rfc3339(),
     });
-    atomic_write_json_pretty(&fork_dir.join("manifest.json"), &manifest)?;
+    let mut store = BackingSqliteStore::open(&run_dir)?;
+    store.upsert_attempt_object(
+        &run_id,
+        &fork_trial_id,
+        0,
+        1,
+        "trial_input",
+        &trial_input_ref,
+        Some(&manifest),
+    )?;
+    store.upsert_attempt_object(
+        &run_id,
+        &fork_trial_id,
+        0,
+        1,
+        "trial_output",
+        &trial_output_ref,
+        Some(&manifest),
+    )?;
+    store.upsert_runtime_operation(&run_id, "fork", &fork_id, &manifest)?;
+    trial_paths.cleanup_scratch()?;
 
     Ok(ForkResult {
         fork_dir,
@@ -3122,11 +3230,11 @@ pub fn pause_run(
             failures.push(format!("{}: pause_trial_not_found", target_trial));
             continue;
         }
-        let trial_input = match load_json_file(&trial_dir.join("trial_input.json")) {
+        let trial_input = match load_trial_input_payload(&run_dir, &run_id, target_trial) {
             Ok(value) => value,
             Err(err) => {
                 failures.push(format!(
-                    "{}: failed to read trial_input.json ({})",
+                    "{}: failed to read trial input ({})",
                     target_trial, err
                 ));
                 continue;
@@ -3416,7 +3524,13 @@ pub fn resume_trial(
         ));
     }
     let pause_label = trial_state.pointer("/pause_label").and_then(|v| v.as_str());
-    let selector = resolve_resume_selector(&trial_dir, label.or(pause_label))?;
+    let run_id = run_control
+        .pointer("/run_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("run")
+        .to_string();
+    let selector =
+        resolve_resume_selector(&run_dir, &run_id, &target_trial, label.or(pause_label))?;
 
     let fork = fork_trial_inner(&run_dir, &target_trial, &selector, set_bindings, strict)?;
     Ok(ResumeResult {
@@ -3427,16 +3541,87 @@ pub fn resume_trial(
 }
 
 fn load_json_file(path: &Path) -> Result<Value> {
-    let bytes = fs::read(path)?;
-    Ok(serde_json::from_slice(&bytes)?)
+    let file_name = path.file_name().and_then(|s| s.to_str()).unwrap_or("");
+    let key = match file_name {
+        "run_control.json" => Some(RUNTIME_KEY_RUN_CONTROL),
+        "run_session_state.json" => Some(RUNTIME_KEY_RUN_SESSION_STATE),
+        "schedule_progress.json" => Some(RUNTIME_KEY_SCHEDULE_PROGRESS),
+        "parallel_worker_control.json" => Some(RUNTIME_KEY_PARALLEL_WORKER_CONTROL),
+        "engine_lease.json" => Some(RUNTIME_KEY_ENGINE_LEASE),
+        _ => None,
+    };
+    if let Some(key) = key {
+        if let Some(run_dir) = path.parent().and_then(|p| p.parent()) {
+            let store = BackingSqliteStore::open(run_dir)?;
+            if let Some(value) = store.get_runtime_json(key)? {
+                return Ok(value);
+            }
+        }
+    }
+    if path.exists() {
+        let bytes = fs::read(path)?;
+        return Ok(serde_json::from_slice(&bytes)?);
+    }
+    Err(anyhow!("json file not found: {}", path.display()))
 }
 
-fn resolve_resume_selector(trial_dir: &Path, preferred_label: Option<&str>) -> Result<String> {
-    let output_path = trial_dir.join(CANONICAL_TRIAL_RESULT_FILENAME);
-    if !output_path.exists() {
-        return Err(anyhow!("resume_no_trial_result: {}", output_path.display()));
+fn load_trial_payload_from_attempt_objects(
+    run_dir: &Path,
+    run_id: &str,
+    trial_id: &str,
+    role: &str,
+) -> Result<Option<Value>> {
+    let store = BackingSqliteStore::open(run_dir)?;
+    let Some(object_ref) = store.latest_attempt_object_ref(run_id, trial_id, role)? else {
+        return Ok(None);
+    };
+    let artifact_store = ArtifactStore::new(run_dir.join("artifacts"));
+    let payload = artifact_store.read_ref(&object_ref)?;
+    Ok(Some(serde_json::from_slice(&payload)?))
+}
+
+fn load_trial_input_payload(run_dir: &Path, run_id: &str, trial_id: &str) -> Result<Value> {
+    if let Some(value) =
+        load_trial_payload_from_attempt_objects(run_dir, run_id, trial_id, "trial_input")?
+    {
+        return Ok(value);
     }
-    let output = load_json_file(&output_path)?;
+    Err(anyhow!(
+        "trial input payload not found in sqlite for trial '{}'",
+        trial_id
+    ))
+}
+
+fn load_trial_output_payload(run_dir: &Path, run_id: &str, trial_id: &str) -> Result<Value> {
+    if let Some(value) =
+        load_trial_payload_from_attempt_objects(run_dir, run_id, trial_id, "trial_output")?
+    {
+        return Ok(value);
+    }
+    Err(anyhow!(
+        "trial output payload not found in sqlite for trial '{}'",
+        trial_id
+    ))
+}
+
+fn resolve_workspace_ref_from_checkpoint_token(
+    run_dir: &Path,
+    token: &str,
+) -> Result<Option<String>> {
+    let Some(version_id) = token.strip_prefix("lineage:") else {
+        return Ok(None);
+    };
+    let store = BackingSqliteStore::open(run_dir)?;
+    store.lineage_workspace_ref_by_version(version_id)
+}
+
+fn resolve_resume_selector(
+    run_dir: &Path,
+    run_id: &str,
+    trial_id: &str,
+    preferred_label: Option<&str>,
+) -> Result<String> {
+    let output = load_trial_output_payload(run_dir, run_id, trial_id)?;
     let checkpoints = output
         .get("checkpoints")
         .and_then(|v| v.as_array())
@@ -3821,6 +4006,28 @@ fn resolve_selector_checkpoint(
         return Ok(None);
     };
 
+    if let Some(run_dir) = infer_run_dir_from_path(trial_dir) {
+        let run_id = run_dir
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or("run")
+            .to_string();
+        let trial_id = trial_dir
+            .file_name()
+            .and_then(|value| value.to_str())
+            .ok_or_else(|| anyhow!("unable to infer trial_id from {}", trial_dir.display()))?;
+        let store = BackingSqliteStore::open(&run_dir)?;
+        if let Some(version_id) = store.latest_lineage_version_id_for_trial(&run_id, trial_id)? {
+            return Ok(Some(format!("lineage:{}", version_id)));
+        }
+        if strict {
+            return Err(anyhow!(
+                "strict_source_unavailable: selector resolved but lineage version is unavailable"
+            ));
+        }
+        return Ok(None);
+    }
+
     let raw_path = cp
         .get("path")
         .and_then(|v| v.as_str())
@@ -3833,10 +4040,16 @@ fn resolve_selector_checkpoint(
         ));
     }
     if resolved.exists() {
-        Ok(Some(resolved.to_string_lossy().to_string()))
-    } else {
-        Ok(None)
+        return Ok(Some(resolved.to_string_lossy().to_string()));
     }
+
+    if strict {
+        return Err(anyhow!(
+            "strict_source_unavailable: checkpoint path not found {}",
+            trial_dir.display()
+        ));
+    }
+    Ok(None)
 }
 
 fn apply_binding_overrides(
@@ -4908,6 +5121,32 @@ fn normalize_experiment_authoring(
             "read_only": true
         }));
     }
+    let benchmark_adapter_source_candidates = [
+        project_root
+            .join("benchmark")
+            .join("grader")
+            .join("bench_benchmark_adapter.py"),
+        project_root
+            .join(".lab")
+            .join("experiments")
+            .join("bench_benchmark_adapter_standalone.py"),
+    ];
+    let benchmark_adapter_source = benchmark_adapter_source_candidates
+        .iter()
+        .find(|candidate| candidate.exists())
+        .ok_or_else(|| {
+            anyhow!(
+                "benchmark grader adapter source not found; expected one of: {}, {}",
+                benchmark_adapter_source_candidates[0].display(),
+                benchmark_adapter_source_candidates[1].display()
+            )
+        })?;
+    file_staging.push(json!({
+        "source_from_host": benchmark_adapter_source.to_string_lossy().to_string(),
+        "destination_path": "/agentlab/deps/bench_benchmark_adapter.py",
+        "required": true,
+        "read_only": true
+    }));
     let workspace_patches = parse_dx_workspace_patches(&json_value, exp_dir, project_root)?;
 
     let timeout_ms = json_value
@@ -5006,7 +5245,7 @@ fn normalize_experiment_authoring(
             "adapter": {
                 "command": [
                     "python3",
-                    "/opt/bench/bench_benchmark_adapter.py"
+                    "/agentlab/deps/bench_benchmark_adapter.py"
                 ]
             }
         },
@@ -5528,7 +5767,7 @@ impl TrialExecutor {
         materialize_mode: MaterializationMode,
         task_boundary_policy: &TaskBoundaryPolicy,
         trials_dir: &Path,
-        evidence_dir: &Path,
+        _evidence_dir: &Path,
         evidence_records_path: &Path,
         task_chain_states_path: &Path,
         artifact_store: &ArtifactStore,
@@ -5551,7 +5790,11 @@ impl TrialExecutor {
         let task_idx = slot.task_idx;
         let task = &tasks[task_idx];
         let task_boundary = parse_task_boundary_from_dataset_task(task)?;
-        validate_task_boundary_workspace_materialization(&task_boundary, task_boundary_policy)?;
+        validate_task_boundary_workspace_materialization(
+            &task_boundary,
+            task_boundary_policy,
+            agent_runtime.image_source,
+        )?;
         let repl = slot.repl_idx;
         let task_id = task_boundary
             .task_payload
@@ -5588,18 +5831,10 @@ impl TrialExecutor {
             .get(&chain_key)
             .map(|state| state.step_index + 1)
             .unwrap_or(0);
-        let task_workspace = task_boundary
-            .task_workspace
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty());
-        let has_custom_task_workspace =
-            task_workspace.is_some_and(|workspace| workspace != AGENTLAB_CONTRACT_WORKSPACE_DIR);
         let has_chain_snapshot = chain_states.contains_key(&chain_key);
 
         *trial_index += 1;
         let trial_id = format!("trial_{}", *trial_index);
-        let chain_fs_key = sanitize_for_fs(&chain_key);
         let trial_dir = trials_dir.join(&trial_id);
         ensure_dir(&trial_dir)?;
         write_trial_state(&trial_dir, &trial_id, "running", None, None, None)?;
@@ -5608,27 +5843,24 @@ impl TrialExecutor {
         let trial_paths = TrialPaths::new(&trial_dir, project_root)?;
         trial_paths.prepare(false)?;
         stage_dependencies_for_trial(agent_runtime, &trial_paths)?;
-        if container_mode
-            && agent_runtime.image_source == ImageSource::PerTask
-            && has_custom_task_workspace
-            && (matches!(effective_policy.state_policy, StatePolicy::IsolatePerTrial)
-                || !has_chain_snapshot)
+        if matches!(effective_policy.state_policy, StatePolicy::IsolatePerTrial)
+            || !has_chain_snapshot
         {
-            let task_image = task_boundary.task_image.as_deref().ok_or_else(|| {
-                anyhow!(
-                    "task.image is required for task '{}' when runtime.agent.image_source='per_task'",
-                    task_id
-                )
-            })?;
-            let source_workspace = task_workspace.unwrap_or(AGENTLAB_CONTRACT_WORKSPACE_DIR);
-            seed_workspace_from_task_image(task_image, source_workspace, &trial_paths.workspace)?;
+            materialize_workspace_seed(
+                project_root,
+                &trial_paths,
+                task_boundary.workspace_seed.as_ref(),
+            )?;
         }
         if !matches!(effective_policy.state_policy, StatePolicy::IsolatePerTrial) {
             if let Some(chain_state) = chain_states.get(&chain_key) {
-                restore_workspace_from_snapshot(
-                    &chain_state.latest_snapshot_path,
-                    &trial_paths.workspace,
-                )?;
+                if let Some(workspace_ref) = chain_state.latest_workspace_ref.as_deref() {
+                    restore_workspace_from_object_ref(
+                        artifact_store,
+                        workspace_ref,
+                        &trial_paths.workspace,
+                    )?;
+                }
             }
         }
 
@@ -5651,8 +5883,17 @@ impl TrialExecutor {
             agent_runtime,
         );
         let input_bytes = serde_json::to_vec_pretty(&input)?;
-        let canonical_input_path = trial_dir.join("trial_input.json");
-        atomic_write_bytes(&canonical_input_path, &input_bytes)?;
+        let trial_input_ref = artifact_store.put_bytes(&input_bytes)?;
+        let mut bootstrap_store = BackingSqliteStore::open(run_dir)?;
+        bootstrap_store.upsert_attempt_object(
+            run_id,
+            &trial_id,
+            schedule_idx,
+            0,
+            "trial_input",
+            &trial_input_ref,
+            None,
+        )?;
         let variant_digest = variant_digest(variant)?;
 
         let trial_metadata = json!({
@@ -5710,6 +5951,13 @@ impl TrialExecutor {
             }
         });
         atomic_write_json_pretty(&trial_dir.join("trial_metadata.json"), &trial_metadata)?;
+
+        let io_paths = prepare_io_paths(
+            &trial_paths,
+            container_mode,
+            &input_bytes,
+            is_clean_contract_experiment(trial_experiment),
+        )?;
         stage_benchmark_trial_preflight(
             benchmark_config,
             &trial_dir,
@@ -5718,14 +5966,7 @@ impl TrialExecutor {
             schedule_idx,
             &variant.id,
             &task_boundary.task_payload,
-            &canonical_input_path,
-        )?;
-
-        let io_paths = prepare_io_paths(
-            &trial_paths,
-            container_mode,
-            &input_bytes,
-            is_clean_contract_experiment(trial_experiment),
+            &io_paths.input_host,
         )?;
         let runtime_env = build_runtime_contract_env(
             run_id,
@@ -5743,34 +5984,21 @@ impl TrialExecutor {
         let adapter = adapter_registry_entry(&agent_runtime.adapter_ref)?;
         let trial_evidence_dir = trial_dir.join("evidence");
         ensure_dir(&trial_evidence_dir)?;
-        let chains_dir = evidence_dir.join("chains").join(&chain_fs_key);
-        ensure_dir(&chains_dir)?;
 
         let pre_snapshot_manifest = collect_workspace_snapshot_manifest(&trial_paths.workspace)?;
         let pre_snapshot_path = trial_evidence_dir.join("workspace_pre_snapshot.json");
         atomic_write_json_pretty(&pre_snapshot_path, &pre_snapshot_manifest)?;
         let pre_snapshot_ref = artifact_store.put_file(&pre_snapshot_path)?;
 
-        let (chain_root_snapshot_ref, chain_root_snapshot_path) = if let Some(existing) =
-            chain_states.get(&chain_key)
-        {
-            (
-                existing.chain_root_snapshot_ref.clone(),
-                existing.chain_root_snapshot_path.clone(),
-            )
-        } else {
-            let root_workspace = chains_dir.join(chain_root_workspace_dir_name(trial_id.as_str()));
-            if root_workspace.exists() {
-                fs::remove_dir_all(&root_workspace)?;
-            }
-            ensure_dir(&root_workspace)?;
-            copy_dir_filtered(
-                &trial_paths.workspace,
-                &root_workspace,
-                WORKSPACE_EVIDENCE_EXCLUDE_PREFIXES,
-            )?;
-            (pre_snapshot_ref.clone(), root_workspace)
-        };
+        let (chain_root_snapshot_ref, chain_root_snapshot_manifest) =
+            if let Some(existing) = chain_states.get(&chain_key) {
+                (
+                    existing.chain_root_snapshot_ref.clone(),
+                    existing.chain_root_snapshot_manifest.clone(),
+                )
+            } else {
+                (pre_snapshot_ref.clone(), pre_snapshot_manifest.clone())
+            };
 
         let mut status = String::new();
         let mut trial_output: Value =
@@ -5830,7 +6058,6 @@ impl TrialExecutor {
                 benchmark_grading_enabled,
                 run_id,
                 task_image: task_boundary.task_image.as_deref(),
-                task_workspace: task_boundary.task_workspace.as_deref(),
                 agent_artifact: agent_runtime.agent_artifact.as_deref(),
             };
             let proc_result = adapter.run_trial(&run_request)?;
@@ -5848,10 +6075,8 @@ impl TrialExecutor {
                 }
             }
 
-            materialize_trial_result(&trial_dir, &io_paths.output_host)?;
-            let canonical_output = trial_dir.join(CANONICAL_TRIAL_RESULT_FILENAME);
-            trial_output = if canonical_output.exists() {
-                serde_json::from_slice(&fs::read(&canonical_output)?)?
+            trial_output = if io_paths.output_host.exists() {
+                serde_json::from_slice(&fs::read(&io_paths.output_host)?)?
             } else {
                 json!({"schema_version": "agent_result_v1", "outcome": "error"})
             };
@@ -5913,8 +6138,6 @@ impl TrialExecutor {
         atomic_write_json_pretty(&post_snapshot_path, &post_snapshot_manifest)?;
         let post_snapshot_ref = artifact_store.put_file(&post_snapshot_path)?;
 
-        let chain_root_snapshot_manifest =
-            collect_workspace_snapshot_manifest(&chain_root_snapshot_path)?;
         let diff_incremental =
             diff_workspace_snapshots(&pre_snapshot_manifest, &post_snapshot_manifest);
         let diff_cumulative =
@@ -5935,45 +6158,32 @@ impl TrialExecutor {
         let diff_cumulative_ref = artifact_store.put_file(&diff_cumulative_path)?;
         let patch_incremental_ref = artifact_store.put_file(&patch_incremental_path)?;
         let patch_cumulative_ref = artifact_store.put_file(&patch_cumulative_path)?;
-
-        let mut latest_snapshot_path = chain_states
-            .get(&chain_key)
-            .map(|state| state.latest_snapshot_path.clone())
-            .unwrap_or_else(|| chain_root_snapshot_path.clone());
-        if !workspace_diff_is_empty(&diff_incremental) {
-            let post_workspace_snapshot_dir = chains_dir.join(format!(
-                "step_{:06}_{}_workspace",
-                chain_step_index,
-                sanitize_for_fs(&trial_id)
-            ));
-            if post_workspace_snapshot_dir.exists() {
-                fs::remove_dir_all(&post_workspace_snapshot_dir)?;
-            }
-            ensure_dir(&post_workspace_snapshot_dir)?;
-            copy_dir_filtered(
+        let workspace_bundle_ref = if workspace_diff_is_empty(&diff_incremental) {
+            chain_states
+                .get(&chain_key)
+                .and_then(|state| state.latest_workspace_ref.clone())
+        } else {
+            Some(capture_workspace_object_ref(
+                artifact_store,
                 &trial_paths.workspace,
-                &post_workspace_snapshot_dir,
-                WORKSPACE_EVIDENCE_EXCLUDE_PREFIXES,
-            )?;
-            latest_snapshot_path = post_workspace_snapshot_dir;
-        }
+            )?)
+        };
 
         if !matches!(effective_policy.state_policy, StatePolicy::IsolatePerTrial) {
             chain_states.insert(
                 chain_key.clone(),
                 ChainRuntimeState {
                     chain_root_snapshot_ref: chain_root_snapshot_ref.clone(),
-                    chain_root_snapshot_path: chain_root_snapshot_path.clone(),
+                    chain_root_snapshot_manifest: chain_root_snapshot_manifest.clone(),
                     latest_snapshot_ref: post_snapshot_ref.clone(),
-                    latest_snapshot_path,
+                    latest_workspace_ref: workspace_bundle_ref.clone(),
                     step_index: chain_step_index,
                 },
             );
         }
 
-        let canonical_output = trial_dir.join(CANONICAL_TRIAL_RESULT_FILENAME);
-        let trial_input_ref = artifact_store.put_file(&canonical_input_path)?;
-        let trial_output_ref = artifact_store.put_file(&canonical_output)?;
+        let trial_output_ref =
+            artifact_store.put_bytes(&serde_json::to_vec_pretty(&trial_output)?)?;
 
         let stdout_path = trial_dir.join("harness_stdout.log");
         let stderr_path = trial_dir.join("harness_stderr.log");
@@ -6038,21 +6248,8 @@ impl TrialExecutor {
                 "diff_incremental_ref": diff_incremental_ref.clone(),
                 "diff_cumulative_ref": diff_cumulative_ref.clone(),
                 "patch_incremental_ref": patch_incremental_ref.clone(),
-                "patch_cumulative_ref": patch_cumulative_ref.clone()
-            },
-            "paths": {
-                "trial_dir": rel_to_run_dir(&trial_dir, run_dir),
-                "trial_input": rel_to_run_dir(&canonical_input_path, run_dir),
-                "trial_output": rel_to_run_dir(&canonical_output, run_dir),
-                "stdout": rel_to_run_dir(&stdout_path, run_dir),
-                "stderr": rel_to_run_dir(&stderr_path, run_dir),
-                "hook_events": hook_events_path.as_ref().map(|p| rel_to_run_dir(p, run_dir)),
-                "workspace_pre_snapshot": rel_to_run_dir(&pre_snapshot_path, run_dir),
-                "workspace_post_snapshot": rel_to_run_dir(&post_snapshot_path, run_dir),
-                "diff_incremental": rel_to_run_dir(&diff_incremental_path, run_dir),
-                "diff_cumulative": rel_to_run_dir(&diff_cumulative_path, run_dir),
-                "patch_incremental": rel_to_run_dir(&patch_incremental_path, run_dir),
-                "patch_cumulative": rel_to_run_dir(&patch_cumulative_path, run_dir)
+                "patch_cumulative_ref": patch_cumulative_ref.clone(),
+                "workspace_bundle_ref": workspace_bundle_ref.clone()
             }
         });
 
@@ -6070,20 +6267,26 @@ impl TrialExecutor {
                 evidence.remove("hook_events_ref");
             }
         }
-        if hook_events_path.is_none() {
-            if let Some(paths_obj) = evidence_record
-                .get_mut("paths")
-                .and_then(Value::as_object_mut)
-            {
-                paths_obj.remove("hook_events");
-            }
-        }
-
         validate_required_evidence_classes(
             &evidence_record,
             &effective_policy.required_evidence_classes,
         )?;
         append_jsonl(evidence_records_path, &evidence_record)?;
+
+        let checkpoint_labels = trial_output
+            .get("checkpoints")
+            .and_then(Value::as_array)
+            .map(|rows| {
+                rows.iter()
+                    .filter_map(|row| {
+                        row.get("logical_name")
+                            .and_then(Value::as_str)
+                            .or_else(|| row.get("path").and_then(Value::as_str))
+                    })
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
 
         let chain_state_record = json!({
             "schema_version": "task_chain_state_v1",
@@ -6109,11 +6312,14 @@ impl TrialExecutor {
                 "patch_incremental_ref": patch_incremental_ref,
                 "patch_cumulative_ref": patch_cumulative_ref
             },
+            "checkpoint_labels": checkpoint_labels,
             "ext": {
-                "chain_fs_key": chain_fs_key,
                 "latest_snapshot_ref": chain_states
                     .get(&chain_key)
-                    .map(|state| state.latest_snapshot_ref.clone())
+                    .map(|state| state.latest_snapshot_ref.clone()),
+                "latest_workspace_ref": chain_states
+                    .get(&chain_key)
+                    .and_then(|state| state.latest_workspace_ref.clone())
             }
         });
         append_jsonl(task_chain_states_path, &chain_state_record)?;
@@ -6286,7 +6492,8 @@ impl TrialExecutor {
             Some("result_error".to_string())
         };
 
-        apply_materialization_policy(&trial_dir, materialize_mode)?;
+        let _ = materialize_mode;
+        trial_paths.cleanup_scratch()?;
 
         let slot_status = if grade_error_reason.is_none() && status == "0" && outcome != "error" {
             "completed"
@@ -6799,6 +7006,20 @@ impl DeterministicCommitter {
         }
         self.pending_by_schedule.insert(schedule_idx, pending);
         Ok(true)
+    }
+
+    fn pending_trial_completion_records(&self) -> Vec<PendingTrialCompletionRecord> {
+        let mut out = Vec::new();
+        for (schedule_idx, pending) in &self.pending_by_schedule {
+            if let PendingSlotCommit::Trial(result) = pending {
+                out.push(PendingTrialCompletionRecord {
+                    schema_version: "pending_trial_completion_v1".to_string(),
+                    schedule_idx: *schedule_idx,
+                    trial_result: (**result).clone(),
+                });
+            }
+        }
+        out
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -7384,6 +7605,14 @@ fn execute_schedule_engine_parallel(
 
     let journal_records = load_slot_commit_records(run_dir)?;
     let mut committer = DeterministicCommitter::from_progress(schedule_progress, &journal_records);
+    let persisted_pending = load_pending_trial_completion_records(run_dir)?;
+    for (schedule_idx, result) in &persisted_pending {
+        if *schedule_idx < schedule_progress.next_schedule_index || *schedule_idx >= schedule.len()
+        {
+            continue;
+        }
+        committer.enqueue_trial(*schedule_idx, result.clone())?;
+    }
     if !recovered_active_trials.is_empty() {
         let mut variant_idx_by_id: HashMap<String, usize> = HashMap::new();
         for (idx, variant) in variants.iter().enumerate() {
@@ -7398,6 +7627,10 @@ fn execute_schedule_engine_parallel(
             {
                 continue;
             }
+            // If we already persisted a completion for this slot, prefer it over recovered worker_lost.
+            if persisted_pending.contains_key(&schedule_idx) {
+                continue;
+            }
             let variant_idx = recovered
                 .variant_id
                 .as_ref()
@@ -7410,6 +7643,7 @@ fn execute_schedule_engine_parallel(
             committer.enqueue_trial(schedule_idx, result)?;
         }
     }
+    persist_pending_trial_completions(run_dir, &committer)?;
 
     let mut next_dispatch_idx = schedule_progress.next_schedule_index;
     let mut in_flight: HashMap<String, InFlightDispatch> = HashMap::new();
@@ -7428,6 +7662,7 @@ fn execute_schedule_engine_parallel(
         consecutive_failures,
         run_sink,
     )?;
+    persist_pending_trial_completions(run_dir, &committer)?;
     write_run_control_v2(
         run_dir,
         run_id,
@@ -7550,6 +7785,7 @@ fn execute_schedule_engine_parallel(
             consecutive_failures,
             run_sink,
         )?;
+        persist_pending_trial_completions(run_dir, &committer)?;
         if committed > 0 {
             made_progress = true;
         }
@@ -7595,6 +7831,7 @@ fn execute_schedule_engine_parallel(
             let trial_result = decode_parallel_completion_result(&completion, &in_flight_entry)?;
             committer.enqueue_trial(in_flight_entry.schedule_idx, trial_result)?;
         }
+        persist_pending_trial_completions(run_dir, &committer)?;
 
         write_run_control_v2(
             run_dir,
@@ -7616,6 +7853,7 @@ fn execute_schedule_engine_parallel(
             consecutive_failures,
             run_sink,
         )?;
+        persist_pending_trial_completions(run_dir, &committer)?;
     }
 
     committer.drain_ready(
@@ -7631,6 +7869,7 @@ fn execute_schedule_engine_parallel(
         consecutive_failures,
         run_sink,
     )?;
+    persist_pending_trial_completions(run_dir, &committer)?;
     write_run_control_v2(
         run_dir,
         run_id,
@@ -8352,19 +8591,12 @@ fn run_experiment_with_behavior(
         run_guard.disarm();
         return Ok(RunResult { run_dir, run_id });
     }
-    validate_jsonl_against_schema("evidence_record_v1.jsonschema", &evidence_records_path)?;
-    validate_jsonl_against_schema("task_chain_state_v1.jsonschema", &task_chain_states_path)?;
-
-    if let Some(adapter) = benchmark_config.adapter.as_ref() {
-        let _scores_path = process_benchmark_outputs(
-            &project_root,
-            &run_dir,
-            &run_id,
-            adapter,
-            &evidence_records_path,
-            &task_chain_states_path,
-        )?;
-    }
+    let _ = (
+        &project_root,
+        &benchmark_config,
+        &evidence_records_path,
+        &task_chain_states_path,
+    );
 
     let grades = json!({
         "schema_version": "grades_v1",
@@ -8427,6 +8659,7 @@ pub fn describe_experiment_with_overrides(
         &RunBehavior::default(),
         &RunExecutionOptions::default(),
     )?;
+    let preflight_runtime_profiles = vec![runtime_profile.clone()];
     let VariantRuntimeProfile {
         experiment: runtime_experiment,
         agent_runtime: runtime_agent,
@@ -8460,7 +8693,11 @@ pub fn describe_experiment_with_overrides(
     let tasks_for_preflight = load_tasks(&dataset_path, &json_value).unwrap_or_default();
     let is_clean = is_clean_contract_experiment(&json_value);
     let mut preflight_warnings = Vec::new();
-    for check in check_dataset_task_ids(&tasks_for_preflight, &benchmark_config) {
+    for check in check_dataset_task_ids(
+        &tasks_for_preflight,
+        &benchmark_config,
+        &preflight_runtime_profiles,
+    ) {
         if matches!(check.severity, PreflightSeverity::Warning) || !check.passed {
             preflight_warnings.push(format!("[{}] {}", check.name, check.message));
         }
@@ -8689,7 +8926,10 @@ fn resolve_preflight_grader_binary(
     runtime_profile: &VariantRuntimeProfile,
 ) -> String {
     let mut render_env = BTreeMap::new();
-    render_env.insert("WORKSPACE".to_string(), "/workspace".to_string());
+    render_env.insert(
+        "WORKSPACE".to_string(),
+        AGENTLAB_CONTRACT_WORKSPACE_DIR.to_string(),
+    );
     for (key, value) in &runtime_profile.agent_runtime_env {
         render_env.insert(key.clone(), value.clone());
     }
@@ -9314,6 +9554,11 @@ fn collect_preflight_checks(
     // Structural checks (probe_trial_input, dataset_task_ids) are now
     // validated at build time in build_swebench_curated_ab_experiment.mjs.
     // Only machine-state-dependent checks remain here.
+    checks.extend(check_dataset_task_ids(
+        tasks,
+        benchmark_config,
+        variant_runtime_profiles,
+    ));
 
     // PROFILING: throwaway stage timing
     macro_rules! timed_check {
@@ -9394,20 +9639,29 @@ fn collect_preflight_checks(
 fn check_dataset_task_ids(
     tasks: &[Value],
     benchmark_config: &BenchmarkConfig,
+    variant_runtime_profiles: &[VariantRuntimeProfile],
 ) -> Vec<PreflightCheck> {
     let mut checks = Vec::new();
     let mut seen_ids: BTreeMap<String, Vec<usize>> = BTreeMap::new();
+    let mut malformed_boundary_rows = Vec::new();
     let mut missing_ids = Vec::new();
     let mut grading_disabled_lines = Vec::new();
+    let mut missing_materialization_lines = Vec::new();
     let has_benchmark = benchmark_config.adapter.is_some();
+    let require_materialization = variant_runtime_profiles
+        .iter()
+        .any(|profile| profile.agent_runtime.image_source == ImageSource::PerTask);
 
     for (idx, task) in tasks.iter().enumerate() {
         let line_num = idx + 1;
-        // For task_boundary rows, ID is at task.id inside the boundary
-        let id = task
-            .pointer("/task/id")
-            .and_then(|v| v.as_str())
-            .or_else(|| task.get("id").and_then(|v| v.as_str()));
+        let parsed = match parse_task_boundary_from_dataset_task(task) {
+            Ok(parsed) => parsed,
+            Err(err) => {
+                malformed_boundary_rows.push(format!("line {}: {}", line_num, err));
+                continue;
+            }
+        };
+        let id = parsed.task_payload.get("id").and_then(|v| v.as_str());
 
         match id {
             Some(id_str) if !id_str.is_empty() => {
@@ -9422,9 +9676,9 @@ fn check_dataset_task_ids(
         }
 
         if has_benchmark {
-            if let Some(enabled) = task
-                .pointer("/task/grading/enabled")
-                .or_else(|| task.pointer("/grading/enabled"))
+            if let Some(enabled) = parsed
+                .task_payload
+                .pointer("/grading/enabled")
                 .and_then(|v| v.as_bool())
             {
                 if !enabled {
@@ -9432,6 +9686,25 @@ fn check_dataset_task_ids(
                 }
             }
         }
+        if require_materialization
+            && parsed.workspace_seed.is_none()
+            && parsed.workspace_files.is_empty()
+            && parsed.mount_references.is_empty()
+        {
+            missing_materialization_lines.push(line_num);
+        }
+    }
+
+    if !malformed_boundary_rows.is_empty() {
+        checks.push(PreflightCheck {
+            name: "dataset_task_ids",
+            passed: false,
+            severity: PreflightSeverity::Error,
+            message: format!(
+                "malformed task boundary rows (expected strict task_boundary_v2): {}",
+                format_preview(&malformed_boundary_rows, 3)
+            ),
+        });
     }
 
     if !missing_ids.is_empty() {
@@ -9440,6 +9713,17 @@ fn check_dataset_task_ids(
             passed: false,
             severity: PreflightSeverity::Error,
             message: format!("tasks missing 'id' field at lines: {:?}", missing_ids),
+        });
+    }
+    if !missing_materialization_lines.is_empty() {
+        checks.push(PreflightCheck {
+            name: "dataset_task_ids",
+            passed: false,
+            severity: PreflightSeverity::Error,
+            message: format!(
+                "tasks missing workspace materialization (workspace_seed, workspace_files, or mount_references) at lines: {:?}",
+                missing_materialization_lines
+            ),
         });
     }
 
@@ -9460,7 +9744,11 @@ fn check_dataset_task_ids(
         });
     }
 
-    if missing_ids.is_empty() && duplicates.is_empty() {
+    if missing_ids.is_empty()
+        && duplicates.is_empty()
+        && malformed_boundary_rows.is_empty()
+        && missing_materialization_lines.is_empty()
+    {
         checks.push(PreflightCheck {
             name: "dataset_task_ids",
             passed: true,
@@ -9554,7 +9842,10 @@ fn check_benchmark_grader_reachable_with_scan(
 
     // Render templates in the grader binary name using placeholder env.
     let mut render_env = BTreeMap::new();
-    render_env.insert("WORKSPACE".to_string(), "/workspace".to_string());
+    render_env.insert(
+        "WORKSPACE".to_string(),
+        AGENTLAB_CONTRACT_WORKSPACE_DIR.to_string(),
+    );
     for (k, v) in &runtime_profile.agent_runtime_env {
         render_env.insert(k.clone(), v.clone());
     }
@@ -9571,6 +9862,19 @@ fn check_benchmark_grader_reachable_with_scan(
             None
         }
     });
+    if let Some(script_path) = resolved_script_path.as_deref() {
+        if script_path.starts_with("/opt/bench/") {
+            return PreflightCheck {
+                name,
+                passed: false,
+                severity: PreflightSeverity::Error,
+                message: format!(
+                    "forbidden grader script path '{}': benchmark grader must be staged under {} so benchmark internals are not image-visible to the agent",
+                    script_path, AGENTLAB_CONTRACT_DEPS_DIR
+                ),
+            };
+        }
+    }
     if resolved_binary.trim().is_empty() {
         return PreflightCheck {
             name,
@@ -10001,7 +10305,7 @@ fn check_dependency_files_exist(json_value: &Value, exp_dir: &Path) -> Vec<Prefl
                 name,
                 passed: false,
                 severity: PreflightSeverity::Error,
-                message: format!("failed to parse file_staging config: {}", e),
+                message: format!("failed to parse dependency staging config: {}", e),
             }];
         }
     };
@@ -10011,7 +10315,7 @@ fn check_dependency_files_exist(json_value: &Value, exp_dir: &Path) -> Vec<Prefl
             name,
             passed: true,
             severity: PreflightSeverity::Error,
-            message: "no file_staging dependencies configured".to_string(),
+            message: "no dependency file staging configured".to_string(),
         }];
     }
 
@@ -10047,7 +10351,7 @@ fn check_dependency_files_exist(json_value: &Value, exp_dir: &Path) -> Vec<Prefl
             name,
             passed: true,
             severity: PreflightSeverity::Error,
-            message: format!("all {} file_staging entries present", staging.len()),
+            message: format!("all {} dependency staging entries present", staging.len()),
         });
     }
 
@@ -10181,9 +10485,9 @@ struct EffectiveTaskPolicy {
 #[derive(Debug, Clone)]
 struct ChainRuntimeState {
     chain_root_snapshot_ref: String,
-    chain_root_snapshot_path: PathBuf,
+    chain_root_snapshot_manifest: Value,
     latest_snapshot_ref: String,
-    latest_snapshot_path: PathBuf,
+    latest_workspace_ref: Option<String>,
     step_index: usize,
 }
 
@@ -10916,14 +11220,20 @@ fn schedule_progress_path(run_dir: &Path) -> PathBuf {
 }
 
 fn load_schedule_progress(run_dir: &Path) -> Result<ScheduleProgress> {
-    let path = schedule_progress_path(run_dir);
-    let bytes = fs::read(&path)?;
-    let mut progress: ScheduleProgress = serde_json::from_slice(&bytes)?;
+    let store = BackingSqliteStore::open(run_dir)?;
+    let mut progress: ScheduleProgress =
+        if let Some(value) = store.get_runtime_json(RUNTIME_KEY_SCHEDULE_PROGRESS)? {
+            serde_json::from_value(value)?
+        } else {
+            let path = schedule_progress_path(run_dir);
+            let bytes = fs::read(&path)?;
+            serde_json::from_slice(&bytes)?
+        };
     if progress.schema_version != "schedule_progress_v2" {
         return Err(anyhow!(
-            "unsupported schedule_progress schema_version '{}' in {}",
+            "unsupported schedule_progress schema_version '{}' for {}",
             progress.schema_version,
-            path.display()
+            run_dir.display()
         ));
     }
     normalize_schedule_progress(&mut progress);
@@ -10934,7 +11244,8 @@ fn write_schedule_progress(run_dir: &Path, progress: &ScheduleProgress) -> Resul
     let mut next = progress.clone();
     normalize_schedule_progress(&mut next);
     let value = serde_json::to_value(next)?;
-    atomic_write_json_pretty(&schedule_progress_path(run_dir), &value)
+    let mut store = BackingSqliteStore::open(run_dir)?;
+    store.put_runtime_json(RUNTIME_KEY_SCHEDULE_PROGRESS, &value)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -11578,7 +11889,6 @@ fn count_tasks(path: &Path, json_value: &Value) -> Result<usize> {
     Ok(count)
 }
 
-const TASK_BOUNDARY_V1_SCHEMA_VERSION: &str = "task_boundary_v1";
 const TASK_BOUNDARY_V2_SCHEMA_VERSION: &str = "task_boundary_v2";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -11597,6 +11907,11 @@ struct MountReferenceSpec {
     mount_path: String,
     #[serde(default)]
     read_only: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct WorkspaceSeedSpec {
+    dataset_pack_ref: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -11623,11 +11938,11 @@ impl TaskBoundaryLimits {
 #[derive(Debug, Clone)]
 struct TaskBoundaryMaterialization {
     task_payload: Value,
+    workspace_seed: Option<WorkspaceSeedSpec>,
     workspace_files: Vec<WorkspaceFileSpec>,
     mount_references: Vec<MountReferenceSpec>,
     limits: TaskBoundaryLimits,
     task_image: Option<String>,
-    task_workspace: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -11636,43 +11951,23 @@ struct ResolvedMountReference {
     mount_path: String,
 }
 
-fn default_task_boundary(task_payload: Value) -> TaskBoundaryMaterialization {
-    let task_image = task_payload
-        .pointer("/image")
-        .and_then(|v| v.as_str())
-        .map(str::trim)
-        .filter(|v| !v.is_empty())
-        .map(ToString::to_string);
-    let task_workspace = task_payload
-        .pointer("/workspace")
-        .and_then(|v| v.as_str())
-        .map(str::trim)
-        .filter(|v| !v.is_empty())
-        .map(ToString::to_string);
-    TaskBoundaryMaterialization {
-        task_payload,
-        workspace_files: Vec::new(),
-        mount_references: Vec::new(),
-        limits: TaskBoundaryLimits::default(),
-        task_image,
-        task_workspace,
-    }
-}
-
 fn parse_task_boundary_from_dataset_task(task: &Value) -> Result<TaskBoundaryMaterialization> {
-    let schema_version = task.get("schema_version").and_then(|v| v.as_str());
-    if schema_version != Some(TASK_BOUNDARY_V1_SCHEMA_VERSION)
-        && schema_version != Some(TASK_BOUNDARY_V2_SCHEMA_VERSION)
-    {
-        return Ok(default_task_boundary(task.clone()));
-    }
     let obj = task
         .as_object()
         .ok_or_else(|| anyhow!("task boundary must be an object"))?;
+    let schema_version = obj.get("schema_version").and_then(|v| v.as_str());
+    if schema_version != Some(TASK_BOUNDARY_V2_SCHEMA_VERSION) {
+        return Err(anyhow!(
+            "task boundary schema_version must be '{}' (got {:?})",
+            TASK_BOUNDARY_V2_SCHEMA_VERSION,
+            schema_version
+        ));
+    }
 
     let allowed = [
         "schema_version",
         "task",
+        "workspace_seed",
         "workspace_files",
         "mount_references",
         "limits",
@@ -11680,7 +11975,7 @@ fn parse_task_boundary_from_dataset_task(task: &Value) -> Result<TaskBoundaryMat
     for key in obj.keys() {
         if !allowed.contains(&key.as_str()) {
             return Err(anyhow!(
-                "task boundary contains unsupported key '{}'; expected task + workspace_files + mount_references + limits",
+                "task boundary contains unsupported key '{}'; expected task + workspace_seed + workspace_files + mount_references + limits",
                 key
             ));
         }
@@ -11704,20 +11999,14 @@ fn parse_task_boundary_from_dataset_task(task: &Value) -> Result<TaskBoundaryMat
             "task boundary field 'task.image' must be a non-empty string when provided"
         ));
     }
-    let task_workspace = task_payload
-        .pointer("/workspace")
-        .and_then(|v| v.as_str())
-        .map(str::trim)
-        .filter(|v| !v.is_empty())
-        .map(ToString::to_string);
 
     Ok(TaskBoundaryMaterialization {
         task_payload,
+        workspace_seed: parse_workspace_seed(obj.get("workspace_seed"))?,
         workspace_files: parse_workspace_files(obj.get("workspace_files"))?,
         mount_references: parse_mount_references(obj.get("mount_references"))?,
         limits: parse_task_limits(obj.get("limits"))?,
         task_image,
-        task_workspace,
     })
 }
 
@@ -11726,35 +12015,20 @@ fn parse_task_boundary_from_trial_input(input: &Value) -> Result<TaskBoundaryMat
         if !task_payload.is_object() {
             return Err(anyhow!("trial_input /task must be an object"));
         }
-
-        if let Some(ext) = input.pointer("/ext/task_boundary_v1") {
-            parse_task_boundary_ext(ext, task_payload)
-        } else if task_payload.get("schema_version").and_then(|v| v.as_str())
-            == Some(TASK_BOUNDARY_V1_SCHEMA_VERSION)
-            || task_payload.get("schema_version").and_then(|v| v.as_str())
-                == Some(TASK_BOUNDARY_V2_SCHEMA_VERSION)
-        {
-            parse_task_boundary_from_dataset_task(&task_payload)
-        } else {
-            Ok(default_task_boundary(task_payload))
-        }
+        let ext = input
+            .pointer("/ext/task_boundary_v2")
+            .ok_or_else(|| anyhow!("trial_input /ext/task_boundary_v2 is required"))?;
+        parse_task_boundary_ext(ext, task_payload)
     } else if input.is_object() {
-        let looks_like_legacy_envelope = input.get("ids").is_some()
-            || input.get("bindings").is_some()
-            || input.get("dependencies").is_some()
-            || input.get("policy").is_some()
-            || input.get("runtime").is_some();
-        if looks_like_legacy_envelope {
-            return Err(anyhow!("trial_input missing required /task"));
-        }
         if input.get("schema_version").and_then(|v| v.as_str())
-            == Some(TASK_BOUNDARY_V1_SCHEMA_VERSION)
-            || input.get("schema_version").and_then(|v| v.as_str())
-                == Some(TASK_BOUNDARY_V2_SCHEMA_VERSION)
+            == Some(TASK_BOUNDARY_V2_SCHEMA_VERSION)
         {
             parse_task_boundary_from_dataset_task(input)
         } else {
-            Ok(default_task_boundary(input.clone()))
+            Err(anyhow!(
+                "trial_input must provide '/task' + '/ext/task_boundary_v2' or be a '{}' object",
+                TASK_BOUNDARY_V2_SCHEMA_VERSION
+            ))
         }
     } else {
         Err(anyhow!("trial_input missing required /task"))
@@ -11767,11 +12041,26 @@ fn parse_task_boundary_ext(
 ) -> Result<TaskBoundaryMaterialization> {
     let obj = ext
         .as_object()
-        .ok_or_else(|| anyhow!("trial_input /ext/task_boundary_v1 must be an object"))?;
-    if let Some(schema_version) = obj.get("schema_version") {
-        if schema_version.as_str() != Some(TASK_BOUNDARY_V1_SCHEMA_VERSION) {
+        .ok_or_else(|| anyhow!("trial_input /ext/task_boundary_v2 must be an object"))?;
+    let schema_version = obj.get("schema_version").and_then(|v| v.as_str());
+    if schema_version != Some(TASK_BOUNDARY_V2_SCHEMA_VERSION) {
+        return Err(anyhow!(
+            "trial_input /ext/task_boundary_v2 schema_version must be '{}'",
+            TASK_BOUNDARY_V2_SCHEMA_VERSION
+        ));
+    }
+    let allowed = [
+        "schema_version",
+        "workspace_seed",
+        "workspace_files",
+        "mount_references",
+        "limits",
+    ];
+    for key in obj.keys() {
+        if !allowed.contains(&key.as_str()) {
             return Err(anyhow!(
-                "unsupported task boundary schema version in /ext/task_boundary_v1"
+                "trial_input /ext/task_boundary_v2 contains unsupported key '{}'",
+                key
             ));
         }
     }
@@ -11786,31 +12075,31 @@ fn parse_task_boundary_ext(
             "trial_input /task.image must be a non-empty string when provided"
         ));
     }
-    let task_workspace = task_payload
-        .pointer("/workspace")
-        .and_then(|v| v.as_str())
-        .map(str::trim)
-        .filter(|v| !v.is_empty())
-        .map(ToString::to_string);
 
     Ok(TaskBoundaryMaterialization {
         task_payload,
+        workspace_seed: parse_workspace_seed(obj.get("workspace_seed"))?,
         workspace_files: parse_workspace_files(obj.get("workspace_files"))?,
         mount_references: parse_mount_references(obj.get("mount_references"))?,
         limits: parse_task_limits(obj.get("limits"))?,
         task_image,
-        task_workspace,
     })
 }
 
 fn validate_task_boundary_workspace_materialization(
     task_boundary: &TaskBoundaryMaterialization,
     task_boundary_policy: &TaskBoundaryPolicy,
+    image_source: ImageSource,
 ) -> Result<()> {
-    if !task_boundary_policy.require_workspace_materialization {
+    let require_materialization =
+        task_boundary_policy.require_workspace_materialization || image_source == ImageSource::PerTask;
+    if !require_materialization {
         return Ok(());
     }
-    if !task_boundary.workspace_files.is_empty() || !task_boundary.mount_references.is_empty() {
+    if task_boundary.workspace_seed.is_some()
+        || !task_boundary.workspace_files.is_empty()
+        || !task_boundary.mount_references.is_empty()
+    {
         return Ok(());
     }
     let task_id = task_boundary
@@ -11819,7 +12108,7 @@ fn validate_task_boundary_workspace_materialization(
         .and_then(|v| v.as_str())
         .unwrap_or("<unknown_task>");
     Err(anyhow!(
-        "task '{}' is missing required workspace materialization: provide task boundary workspace_files or mount_references",
+        "task '{}' is missing required workspace materialization: provide task boundary workspace_seed, workspace_files, or mount_references",
         task_id
     ))
 }
@@ -11891,6 +12180,22 @@ fn parse_mount_references(value: Option<&Value>) -> Result<Vec<MountReferenceSpe
         mounts.push(mount);
     }
     Ok(mounts)
+}
+
+fn parse_workspace_seed(value: Option<&Value>) -> Result<Option<WorkspaceSeedSpec>> {
+    let Some(raw) = value else {
+        return Ok(None);
+    };
+    let seed: WorkspaceSeedSpec =
+        serde_json::from_value(raw.clone()).map_err(|e| anyhow!("invalid workspace_seed: {}", e))?;
+    let _ = parse_dataset_pack_ref_digest(&seed.dataset_pack_ref).map_err(|e| {
+        anyhow!(
+            "invalid workspace_seed.dataset_pack_ref '{}': {}",
+            seed.dataset_pack_ref,
+            e
+        )
+    })?;
+    Ok(Some(seed))
 }
 
 fn parse_task_limits(value: Option<&Value>) -> Result<TaskBoundaryLimits> {
@@ -12007,6 +12312,29 @@ fn resolve_task_mounts(
         });
     }
     Ok(mounts)
+}
+
+fn materialize_workspace_seed(
+    project_root: &Path,
+    paths: &TrialPaths,
+    workspace_seed: Option<&WorkspaceSeedSpec>,
+) -> Result<()> {
+    let Some(seed) = workspace_seed else {
+        return Ok(());
+    };
+    let source = resolve_dataset_pack_host_path(project_root, &seed.dataset_pack_ref)?;
+    if !source.is_dir() {
+        return Err(anyhow!(
+            "workspace_seed dataset pack must resolve to a directory: {}",
+            source.display()
+        ));
+    }
+    if paths.workspace.exists() {
+        fs::remove_dir_all(&paths.workspace)?;
+    }
+    ensure_dir(&paths.workspace)?;
+    copy_dir_filtered(&source, &paths.workspace, &[])?;
+    Ok(())
 }
 
 fn materialize_workspace_files(
@@ -12151,20 +12479,17 @@ fn stage_workspace_patches_for_trial(
     Ok(())
 }
 
-fn task_boundary_ext_value(task_boundary: &TaskBoundaryMaterialization) -> Option<Value> {
-    if task_boundary.workspace_files.is_empty()
-        && task_boundary.mount_references.is_empty()
-        && task_boundary.limits.is_empty()
-    {
-        return None;
-    }
-
-    Some(json!({
-        "schema_version": TASK_BOUNDARY_V1_SCHEMA_VERSION,
+fn task_boundary_ext_value(task_boundary: &TaskBoundaryMaterialization) -> Value {
+    let mut ext = json!({
+        "schema_version": TASK_BOUNDARY_V2_SCHEMA_VERSION,
         "workspace_files": task_boundary.workspace_files,
         "mount_references": task_boundary.mount_references,
         "limits": task_boundary.limits,
-    }))
+    });
+    if let Some(seed) = task_boundary.workspace_seed.clone() {
+        set_json_pointer_value(&mut ext, "/workspace_seed", json!(seed)).ok();
+    }
+    ext
 }
 
 #[derive(Clone)]
@@ -12254,11 +12579,144 @@ fn resolve_host_path_from_spec(raw: &str, exp_dir: &Path) -> Result<PathBuf> {
     } else {
         PathBuf::from(trimmed)
     };
-    if expanded.is_absolute() {
-        Ok(normalize_path(&expanded))
+    let resolved = if expanded.is_absolute() {
+        normalize_path(&expanded)
     } else {
-        Ok(normalize_path(&exp_dir.join(expanded)))
+        normalize_path(&exp_dir.join(expanded))
+    };
+    let project_root = find_project_root(exp_dir);
+    ensure_path_within_project_root(&resolved, &project_root)?;
+    Ok(resolved)
+}
+
+fn canonicalize_best_effort(path: &Path) -> PathBuf {
+    fs::canonicalize(path).unwrap_or_else(|_| normalize_path(path))
+}
+
+fn nearest_existing_ancestor(path: &Path) -> Option<PathBuf> {
+    let mut current = Some(path);
+    while let Some(candidate) = current {
+        if candidate.exists() {
+            return Some(canonicalize_best_effort(candidate));
+        }
+        current = candidate.parent();
     }
+    None
+}
+
+fn ensure_path_within_project_root(path: &Path, project_root: &Path) -> Result<()> {
+    let root = canonicalize_best_effort(project_root);
+    let candidate = canonicalize_best_effort(path);
+    if candidate.starts_with(&root) {
+        return Ok(());
+    }
+    if let Some(ancestor) = nearest_existing_ancestor(path) {
+        if ancestor.starts_with(&root) {
+            return Ok(());
+        }
+    }
+    Err(anyhow!(
+        "host path '{}' resolves outside project root '{}'; host path leaks are not allowed",
+        path.display(),
+        root.display()
+    ))
+}
+
+fn validate_dependency_destination_path(destination_path: &str, field_name: &str) -> Result<()> {
+    let trimmed = destination_path.trim();
+    if trimmed.is_empty() {
+        return Err(anyhow!("{} must not be empty", field_name));
+    }
+    if !trimmed.starts_with('/') {
+        return Err(anyhow!("{} must be absolute", field_name));
+    }
+    let Some((root, rest)) = resolve_contract_path_components(trimmed) else {
+        return Err(anyhow!(
+            "{} must be under {} or {}",
+            field_name,
+            AGENTLAB_CONTRACT_DEPS_DIR,
+            AGENTLAB_CONTRACT_STATE_DIR
+        ));
+    };
+    if !matches!(root, ContractPathRoot::Deps | ContractPathRoot::State) {
+        return Err(anyhow!(
+            "{} must be under {} or {}",
+            field_name,
+            AGENTLAB_CONTRACT_DEPS_DIR,
+            AGENTLAB_CONTRACT_STATE_DIR
+        ));
+    }
+    let rel = rest.trim_start_matches('/');
+    if rel.is_empty() {
+        return Err(anyhow!(
+            "{} must target a file path (not a mount root)",
+            field_name
+        ));
+    }
+    for component in Path::new(rel).components() {
+        if matches!(component, Component::ParentDir) {
+            return Err(anyhow!("{} cannot contain '..'", field_name));
+        }
+    }
+    Ok(())
+}
+
+fn parse_dependency_file_staging_entries(
+    value: Option<&Value>,
+    source_name: &str,
+    exp_dir: &Path,
+    default_required: bool,
+    default_read_only: bool,
+) -> Result<Vec<DependencyFileStagingSpec>> {
+    let Some(raw_items) = value else {
+        return Ok(Vec::new());
+    };
+    let items = raw_items
+        .as_array()
+        .ok_or_else(|| anyhow!("{} must be an array", source_name))?;
+
+    let mut parsed = Vec::with_capacity(items.len());
+    for (idx, item) in items.iter().enumerate() {
+        let obj = item
+            .as_object()
+            .ok_or_else(|| anyhow!("{}[{}] must be an object", source_name, idx))?;
+        let source_raw = obj
+            .get("source_from_host")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("{}[{}].source_from_host missing", source_name, idx))?;
+        let destination_path = obj
+            .get("destination_path")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| anyhow!("{}[{}].destination_path missing", source_name, idx))?
+            .trim()
+            .to_string();
+        if destination_path.is_empty() {
+            return Err(anyhow!(
+                "{}[{}].destination_path must not be empty",
+                source_name,
+                idx
+            ));
+        }
+        validate_dependency_destination_path(
+            &destination_path,
+            &format!("{}[{}].destination_path", source_name, idx),
+        )?;
+        let required = obj
+            .get("required")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(default_required);
+        let read_only = obj
+            .get("read_only")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(default_read_only);
+        parsed.push(DependencyFileStagingSpec {
+            source_from_host: resolve_host_path_from_spec(source_raw, exp_dir)?,
+            destination_path,
+            required,
+            read_only,
+        });
+    }
+    Ok(parsed)
 }
 
 fn parse_string_array_field(value: Option<&Value>, field: &str) -> Result<Vec<String>> {
@@ -12341,53 +12799,22 @@ fn parse_dependency_file_staging(
     json_value: &Value,
     exp_dir: &Path,
 ) -> Result<Vec<DependencyFileStagingSpec>> {
-    let source_name = "runtime.dependencies.file_staging";
-    let raw_items = json_value.pointer("/runtime/dependencies/file_staging");
-
-    match raw_items {
-        None => Ok(Vec::new()),
-        Some(Value::Array(items)) => {
-            let mut parsed = Vec::with_capacity(items.len());
-            for (idx, item) in items.iter().enumerate() {
-                let obj = item
-                    .as_object()
-                    .ok_or_else(|| anyhow!("{}[{}] must be an object", source_name, idx))?;
-                let source_raw = obj
-                    .get("source_from_host")
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| anyhow!("{}[{}].source_from_host missing", source_name, idx))?;
-                let destination_path = obj
-                    .get("destination_path")
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| anyhow!("{}[{}].destination_path missing", source_name, idx))?
-                    .trim()
-                    .to_string();
-                if destination_path.is_empty() {
-                    return Err(anyhow!(
-                        "{}[{}].destination_path must not be empty",
-                        source_name,
-                        idx
-                    ));
-                }
-                let required = obj
-                    .get("required")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(true);
-                let read_only = obj
-                    .get("read_only")
-                    .and_then(|v| v.as_bool())
-                    .unwrap_or(false);
-                parsed.push(DependencyFileStagingSpec {
-                    source_from_host: resolve_host_path_from_spec(source_raw, exp_dir)?,
-                    destination_path,
-                    required,
-                    read_only,
-                });
-            }
-            Ok(parsed)
-        }
-        Some(_) => Err(anyhow!("{} must be an array", source_name)),
-    }
+    let mut parsed = parse_dependency_file_staging_entries(
+        json_value.pointer("/runtime/dependencies/file_staging"),
+        "runtime.dependencies.file_staging",
+        exp_dir,
+        true,
+        false,
+    )?;
+    let mut secret_file_entries = parse_dependency_file_staging_entries(
+        json_value.pointer("/runtime/dependencies/secret_files"),
+        "runtime.dependencies.secret_files",
+        exp_dir,
+        true,
+        true,
+    )?;
+    parsed.append(&mut secret_file_entries);
+    Ok(parsed)
 }
 
 fn parse_bindings_to_args(value: Option<&Value>) -> Result<Vec<BindingArgProjectionSpec>> {
@@ -12609,7 +13036,7 @@ fn resolve_agent_runtime(json_value: &Value, exp_dir: &Path) -> Result<AgentRunt
         .pointer("/runtime/policy/sandbox/mode")
         .and_then(|v| v.as_str())
         == Some("container");
-    let dependency_file_staging = parse_dependency_file_staging(json_value, exp_dir)?;
+    let mut dependency_file_staging = parse_dependency_file_staging(json_value, exp_dir)?;
     let dependency_services = json_value
         .pointer("/runtime/dependencies/services")
         .and_then(|v| v.as_array())
@@ -12654,7 +13081,7 @@ fn resolve_agent_runtime(json_value: &Value, exp_dir: &Path) -> Result<AgentRunt
         ));
     }
 
-    let command = parse_command_field(agent.pointer("/command"), "runtime.agent.command")?
+    let mut command = parse_command_field(agent.pointer("/command"), "runtime.agent.command")?
         .ok_or_else(|| anyhow!("runtime.agent.command is required"))?;
     let integration_level = agent
         .pointer("/integration_level")
@@ -12668,11 +13095,91 @@ fn resolve_agent_runtime(json_value: &Value, exp_dir: &Path) -> Result<AgentRunt
         .pointer("/default_timeout_ms")
         .and_then(|v| v.as_u64())
         .filter(|v| *v > 0);
-    let env = parse_string_map_field(agent.pointer("/env"), "runtime.agent.env")?;
-    let env_from_host = parse_string_array_field(
+    let mut env = parse_string_map_field(agent.pointer("/env"), "runtime.agent.env")?;
+    let mut env_from_host = parse_string_array_field(
         agent.pointer("/env_from_host"),
         "runtime.agent.env_from_host",
     )?;
+    for env_name in
+        parse_string_array_field(agent.pointer("/secret_env"), "runtime.agent.secret_env")?
+    {
+        if !env_from_host.iter().any(|entry| entry == &env_name) {
+            env_from_host.push(env_name);
+        }
+    }
+    for env_name in parse_string_array_field(
+        json_value.pointer("/runtime/dependencies/secret_env"),
+        "runtime.dependencies.secret_env",
+    )? {
+        if !env_from_host.iter().any(|entry| entry == &env_name) {
+            env_from_host.push(env_name);
+        }
+    }
+    let mut config_files =
+        parse_string_array_field(agent.pointer("/config_files"), "runtime.agent.config_files")?;
+    for (idx, file) in config_files.iter().enumerate() {
+        if Path::new(file).is_absolute() {
+            return Err(anyhow!(
+                "runtime.agent.config_files[{}] must be a relative path",
+                idx
+            ));
+        }
+    }
+    if let Some(default_config) = parse_optional_nonempty_string(
+        agent.pointer("/default_config"),
+        "runtime.agent.default_config",
+    )? {
+        if Path::new(default_config.as_str()).is_absolute() {
+            return Err(anyhow!(
+                "runtime.agent.default_config must be a relative path"
+            ));
+        }
+        if !config_files.iter().any(|entry| entry == &default_config) {
+            config_files.push(default_config.clone());
+        }
+        if !command_contains_flag(&command, "--config") {
+            append_flag_value_once(
+                &mut command,
+                "--config",
+                deps_destination_for_config_file(&default_config),
+            );
+        }
+    }
+    ensure_home_for_staged_auth_files(&mut env, &config_files);
+    for (idx, file) in config_files.iter().enumerate() {
+        let source = resolve_host_path_from_spec(file, exp_dir).map_err(|e| {
+            anyhow!(
+                "runtime.agent.config_files[{}] invalid '{}': {}",
+                idx,
+                file,
+                e
+            )
+        })?;
+        let destination = deps_destination_for_config_file(file);
+        if let Some(conflict) = dependency_file_staging
+            .iter()
+            .find(|spec| spec.destination_path == destination && spec.source_from_host != source)
+        {
+            return Err(anyhow!(
+                "runtime.agent.config_files[{}] destination '{}' conflicts with dependency staging source '{}'",
+                idx,
+                destination,
+                conflict.source_from_host.display()
+            ));
+        }
+        if dependency_file_staging
+            .iter()
+            .any(|spec| spec.destination_path == destination && spec.source_from_host == source)
+        {
+            continue;
+        }
+        dependency_file_staging.push(DependencyFileStagingSpec {
+            source_from_host: source,
+            destination_path: destination,
+            required: true,
+            read_only: true,
+        });
+    }
     let bindings_to_args = parse_bindings_to_args(
         agent
             .pointer("/arg_map")
@@ -12868,6 +13375,7 @@ fn resolve_variant_runtime_profile(
 
 struct TrialPaths {
     trial_dir: PathBuf,
+    scratch_dir: PathBuf,
     in_dir: PathBuf,
     workspace: PathBuf,
     state: PathBuf,
@@ -12878,11 +13386,29 @@ struct TrialPaths {
     exp_dir: PathBuf,
 }
 
+fn trial_runtime_scratch_dir(trial_dir: &Path) -> PathBuf {
+    let root = infer_run_dir_from_path(trial_dir).unwrap_or_else(|| trial_dir.to_path_buf());
+    let trial_label = trial_dir
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or("trial");
+    static SCRATCH_SEQ: AtomicU64 = AtomicU64::new(0);
+    let seq = SCRATCH_SEQ.fetch_add(1, Ordering::Relaxed);
+    root.join(".scratch").join(format!(
+        "{}_{}_{}",
+        sanitize_for_fs(trial_label),
+        std::process::id(),
+        seq
+    ))
+}
+
 impl TrialPaths {
     fn new(trial_dir: &Path, exp_dir: &Path) -> Result<Self> {
-        let runtime = runner_runtime_host_paths(trial_dir);
+        let scratch_dir = trial_runtime_scratch_dir(trial_dir);
+        let runtime = runner_runtime_host_paths(&scratch_dir);
         Ok(Self {
             trial_dir: trial_dir.to_path_buf(),
+            scratch_dir,
             in_dir: runtime.in_dir.clone(),
             workspace: runtime.workspace_dir.clone(),
             state: runtime.state_dir.clone(),
@@ -12928,6 +13454,10 @@ impl TrialPaths {
         }
         Ok(())
     }
+
+    fn cleanup_scratch(&self) -> Result<()> {
+        remove_path_if_exists(&self.scratch_dir)
+    }
 }
 
 fn build_agent_task(
@@ -12972,13 +13502,12 @@ fn build_agent_task(
         },
         "policy": policy,
     });
-    if let Some(task_boundary_ext) = task_boundary_ext_value(task_boundary) {
-        if let Some(obj) = input.as_object_mut() {
-            obj.insert(
-                "ext".to_string(),
-                json!({ "task_boundary_v1": task_boundary_ext }),
-            );
-        }
+    let task_boundary_ext = task_boundary_ext_value(task_boundary);
+    if let Some(obj) = input.as_object_mut() {
+        obj.insert(
+            "ext".to_string(),
+            json!({ "task_boundary_v2": task_boundary_ext }),
+        );
     }
     input
 }
@@ -13067,7 +13596,53 @@ fn sanitize_for_fs(raw: &str) -> String {
     }
 }
 
+fn infer_run_dir_from_path(path: &Path) -> Option<PathBuf> {
+    for ancestor in path.ancestors() {
+        if run_sqlite_path(ancestor).exists() {
+            return Some(ancestor.to_path_buf());
+        }
+    }
+    None
+}
+
+fn json_row_table_from_path(path: &Path) -> Option<JsonRowTable> {
+    let name = path.file_name()?.to_string_lossy().to_ascii_lowercase();
+    if name.contains("evidence") {
+        return Some(JsonRowTable::Evidence);
+    }
+    if name.contains("task_chain") || name.contains("chain_state") {
+        return Some(JsonRowTable::ChainState);
+    }
+    if name.contains("prediction") {
+        return Some(JsonRowTable::BenchmarkPrediction);
+    }
+    if name.contains("score") {
+        return Some(JsonRowTable::BenchmarkScore);
+    }
+    None
+}
+
 fn append_jsonl(path: &Path, value: &Value) -> Result<()> {
+    if let (Some(run_dir), Some(table)) = (
+        infer_run_dir_from_path(path),
+        json_row_table_from_path(path),
+    ) {
+        let mut row = value.clone();
+        if row.pointer("/run_id").is_none() {
+            if let Some(control) =
+                BackingSqliteStore::open(&run_dir)?.get_runtime_json(RUNTIME_KEY_RUN_CONTROL)?
+            {
+                if let Some(run_id) = control.pointer("/run_id").and_then(Value::as_str) {
+                    if let Some(obj) = row.as_object_mut() {
+                        obj.insert("run_id".to_string(), json!(run_id));
+                    }
+                }
+            }
+        }
+        let mut store = BackingSqliteStore::open(&run_dir)?;
+        return store.upsert_json_row(table, &row);
+    }
+
     if let Some(parent) = path.parent() {
         ensure_dir(parent)?;
     }
@@ -13226,6 +13801,104 @@ fn workspace_diff_is_empty(diff: &Value) -> bool {
     })
 }
 
+fn capture_workspace_object_ref(
+    artifact_store: &ArtifactStore,
+    workspace_dir: &Path,
+) -> Result<String> {
+    let mut files: Vec<Value> = Vec::new();
+    if workspace_dir.exists() {
+        let walker = walkdir::WalkDir::new(workspace_dir).into_iter();
+        for entry in walker {
+            let entry = entry?;
+            if !entry.file_type().is_file() {
+                continue;
+            }
+            let rel_path = entry
+                .path()
+                .strip_prefix(workspace_dir)
+                .unwrap_or(entry.path());
+            if is_workspace_evidence_excluded(rel_path) {
+                continue;
+            }
+            let bytes = fs::read(entry.path())?;
+            #[cfg(unix)]
+            let executable = entry.metadata()?.permissions().mode() & 0o111 != 0;
+            #[cfg(not(unix))]
+            let executable = false;
+            files.push(json!({
+                "path": rel_path.to_string_lossy().to_string(),
+                "encoding": "base64",
+                "content": BASE64_STANDARD.encode(bytes),
+                "executable": executable,
+            }));
+        }
+    }
+    files.sort_by(|a, b| {
+        a.get("path")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .cmp(b.get("path").and_then(Value::as_str).unwrap_or(""))
+    });
+    let payload = json!({
+        "schema_version": "workspace_bundle_v1",
+        "captured_at": Utc::now().to_rfc3339(),
+        "files": files,
+    });
+    let bytes = serde_json::to_vec_pretty(&payload)?;
+    artifact_store.put_bytes(&bytes)
+}
+
+fn restore_workspace_from_object_ref(
+    artifact_store: &ArtifactStore,
+    object_ref: &str,
+    workspace_dir: &Path,
+) -> Result<()> {
+    let payload = artifact_store.read_ref(object_ref)?;
+    let bundle: Value = serde_json::from_slice(&payload)?;
+    if bundle.get("schema_version").and_then(Value::as_str) != Some("workspace_bundle_v1") {
+        return Err(anyhow!(
+            "unsupported workspace bundle schema for {}",
+            object_ref
+        ));
+    }
+    if workspace_dir.exists() {
+        fs::remove_dir_all(workspace_dir)?;
+    }
+    ensure_dir(workspace_dir)?;
+    let files = bundle
+        .get("files")
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow!("workspace bundle missing files array"))?;
+    for row in files {
+        let path = row
+            .get("path")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("workspace bundle row missing path"))?;
+        let rel = validate_workspace_relative_path(path)?;
+        let content = row
+            .get("content")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("workspace bundle row missing content"))?;
+        let bytes = BASE64_STANDARD
+            .decode(content.as_bytes())
+            .map_err(|err| anyhow!("workspace bundle base64 decode failed: {}", err))?;
+        let host_path = workspace_dir.join(rel);
+        atomic_write_bytes(&host_path, &bytes)?;
+        #[cfg(unix)]
+        if row
+            .get("executable")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            let metadata = fs::metadata(&host_path)?;
+            let mut perms = metadata.permissions();
+            perms.set_mode(perms.mode() | 0o111);
+            fs::set_permissions(&host_path, perms)?;
+        }
+    }
+    Ok(())
+}
+
 fn restore_workspace_from_snapshot(snapshot_dir: &Path, workspace_dir: &Path) -> Result<()> {
     if workspace_dir.exists() {
         fs::remove_dir_all(workspace_dir)?;
@@ -13266,6 +13939,7 @@ struct ProcessRunResult {
 }
 
 struct PreparedTrialIo {
+    input_host: PathBuf,
     output_host: PathBuf,
     events_host: PathBuf,
     task_path: String,
@@ -13499,7 +14173,6 @@ impl AgentAdapter for PrebuiltCommandAdapter {
             benchmark_grading_enabled: request.benchmark_grading_enabled,
             run_id: request.run_id,
             task_image: request.task_image,
-            task_workspace: request.task_workspace,
             agent_artifact: request.agent_artifact,
         };
         run_command_contract_trial(&prebuilt_request)
@@ -13532,13 +14205,17 @@ fn run_builtin_adapter_local(request: &AdapterRunRequest<'_>) -> Result<ProcessR
     )
 }
 
-fn resolve_benchmark_grader_command(request: &AdapterRunRequest<'_>) -> Option<Vec<String>> {
+fn resolve_benchmark_grader_command(
+    request: &AdapterRunRequest<'_>,
+) -> Result<Option<Vec<String>>> {
     if request.runtime.clean_contract_v1 || !request.benchmark_grading_enabled {
-        return None;
+        return Ok(None);
     }
-    let adapter = request.benchmark_adapter?;
+    let Some(adapter) = request.benchmark_adapter else {
+        return Ok(None);
+    };
     if adapter.command.is_empty() {
-        return None;
+        return Ok(None);
     }
     let mut render_env = request.runtime_overrides_env.clone();
     for (key, value) in request.runtime_env {
@@ -13552,10 +14229,17 @@ fn resolve_benchmark_grader_command(request: &AdapterRunRequest<'_>) -> Option<V
         request.trial_paths.workspace.to_string_lossy().to_string()
     };
     render_env.insert("WORKSPACE".to_string(), workspace);
-    Some(apply_agentlab_template_to_command(
-        &adapter.command,
-        &render_env,
-    ))
+    let rendered = apply_agentlab_template_to_command(&adapter.command, &render_env);
+    if let Some(script_path) = rendered.get(1).map(|value| value.trim()) {
+        if Path::new(script_path).is_absolute() && script_path.starts_with("/opt/bench/") {
+            return Err(anyhow!(
+                "forbidden benchmark adapter script path '{}': benchmark internals must be staged under {}",
+                script_path,
+                AGENTLAB_CONTRACT_DEPS_DIR
+            ));
+        }
+    }
+    Ok(Some(rendered))
 }
 
 fn run_builtin_adapter_container(request: &AdapterRunRequest<'_>) -> Result<ProcessRunResult> {
@@ -13596,21 +14280,11 @@ fn resolve_container_image(request: &AdapterRunRequest<'_>) -> Result<String> {
 }
 
 fn resolve_container_workspace<'a>(request: &'a AdapterRunRequest<'_>) -> Option<&'a str> {
-    let per_task_workspace = if request.runtime.image_source == ImageSource::PerTask {
-        request
-            .task_workspace
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-    } else {
+    if request.runtime.clean_contract_v1 {
         None
-    };
-    per_task_workspace.or({
-        if request.runtime.clean_contract_v1 {
-            None
-        } else {
-            Some(AGENTLAB_CONTRACT_WORKSPACE_DIR)
-        }
-    })
+    } else {
+        Some(AGENTLAB_CONTRACT_WORKSPACE_DIR)
+    }
 }
 
 fn append_container_sandbox_args(
@@ -13754,14 +14428,6 @@ fn append_container_sandbox_args(
                 AGENTLAB_CONTRACT_WORKSPACE_DIR
             ),
         ]);
-        if let Some(workspace) = workspace {
-            if workspace != AGENTLAB_CONTRACT_WORKSPACE_DIR {
-                cmd.args([
-                    "-v",
-                    &format!("{}:{}", request.trial_paths.workspace.display(), workspace),
-                ]);
-            }
-        }
         for mount in request.dynamic_mounts {
             cmd.args([
                 "-v",
@@ -13769,6 +14435,10 @@ fn append_container_sandbox_args(
             ]);
         }
         cmd.args(["--tmpfs", "/tmp:rw"]);
+        // Mask legacy image-level /workspace so agent cannot read image internals.
+        cmd.args(["--tmpfs", "/workspace:rw"]);
+        // Mask benchmark internals bundled in task images from agent runtime view.
+        cmd.args(["--tmpfs", "/opt/bench:rw"]);
         if let Some(workspace) = workspace {
             cmd.args(["-w", workspace]);
         }
@@ -13883,7 +14553,7 @@ fn run_baked_container(
     workspace: Option<&str>,
 ) -> Result<ProcessRunResult> {
     let command = resolve_runtime_agent_command(request)?;
-    let grader_command = resolve_benchmark_grader_command(request);
+    let grader_command = resolve_benchmark_grader_command(request)?;
 
     let mut cmd = Command::new("docker");
     cmd.arg("run").arg("--rm").args(["--pull", "never"]);
@@ -14098,47 +14768,6 @@ fn resolve_agent_artifact_mount_dir(artifact: &Path) -> Result<PathBuf> {
     Ok(unpacked_dir)
 }
 
-fn seed_workspace_from_task_image(
-    image: &str,
-    source_workspace: &str,
-    host_workspace: &Path,
-) -> Result<()> {
-    ensure_container_image_ready(image)?;
-    if host_workspace.exists() {
-        fs::remove_dir_all(host_workspace)?;
-    }
-    ensure_dir(host_workspace)?;
-
-    let mut create = Command::new("docker");
-    create.arg("create");
-    create.arg(image);
-    create.args(["tail", "-f", "/dev/null"]);
-    let create_out = run_checked_command(create, "docker create failed (workspace seed)")?;
-    let container_id = String::from_utf8_lossy(&create_out.stdout)
-        .trim()
-        .to_string();
-    if container_id.is_empty() {
-        return Err(anyhow!(
-            "docker create failed (workspace seed): missing container id"
-        ));
-    }
-    let _cleanup = ContainerCleanupGuard {
-        container_id: container_id.clone(),
-    };
-
-    let mut start = Command::new("docker");
-    start.args(["start", &container_id]);
-    run_checked_command(start, "docker start failed (workspace seed)")?;
-
-    let mut cp = Command::new("docker");
-    cp.arg("cp");
-    cp.arg(format!("{}:{}/.", container_id, source_workspace));
-    cp.arg(host_workspace);
-    run_checked_command(cp, "docker cp failed (workspace seed)")?;
-
-    Ok(())
-}
-
 fn run_injected_container(
     request: &AdapterRunRequest<'_>,
     image: &str,
@@ -14155,7 +14784,7 @@ fn run_injected_container(
 
     if let Ok(artifact_mount_dir) = resolve_agent_artifact_mount_dir(artifact) {
         let command = resolve_runtime_agent_command(request)?;
-        let grader_command = resolve_benchmark_grader_command(request);
+        let grader_command = resolve_benchmark_grader_command(request)?;
         let mut cmd = Command::new("docker");
         cmd.arg("run").arg("--rm").args(["--pull", "never"]);
         append_container_sandbox_args(&mut cmd, request, workspace);
@@ -14178,7 +14807,7 @@ fn run_injected_container(
     }
 
     let command = resolve_runtime_agent_command(request)?;
-    let grader_command = resolve_benchmark_grader_command(request);
+    let grader_command = resolve_benchmark_grader_command(request)?;
 
     let mut create = Command::new("docker");
     create.arg("create");
@@ -14637,6 +15266,7 @@ fn prepare_io_paths(
         };
 
         return Ok(PreparedTrialIo {
+            input_host: task_host,
             output_host,
             events_host,
             task_path,
@@ -14758,6 +15388,7 @@ fn prepare_io_paths(
     }
 
     Ok(PreparedTrialIo {
+        input_host,
         output_host,
         events_host,
         task_path,
@@ -15457,6 +16088,79 @@ mod tests {
         )
         .expect("trial state");
 
+        let run_id = run_dir
+            .file_name()
+            .and_then(|value| value.to_str())
+            .unwrap_or("run")
+            .to_string();
+        let artifact_store = ArtifactStore::new(run_dir.join("artifacts"));
+        let input_ref = artifact_store
+            .put_bytes(&serde_json::to_vec_pretty(&trial_input).expect("trial input bytes"))
+            .expect("input ref");
+        let output_ref = artifact_store
+            .put_bytes(&serde_json::to_vec_pretty(&trial_output).expect("trial output bytes"))
+            .expect("output ref");
+        let workspace_ref =
+            capture_workspace_object_ref(&artifact_store, &trial_dir.join("workspace"))
+                .expect("workspace ref");
+        let checkpoint_labels = trial_output
+            .get("checkpoints")
+            .and_then(Value::as_array)
+            .map(|rows| {
+                rows.iter()
+                    .filter_map(|row| {
+                        row.get("logical_name")
+                            .and_then(Value::as_str)
+                            .or_else(|| row.get("path").and_then(Value::as_str))
+                    })
+                    .map(str::to_string)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let mut store = BackingSqliteStore::open(run_dir).expect("store");
+        store
+            .upsert_attempt_object(&run_id, trial_id, 0, 1, "trial_input", &input_ref, None)
+            .expect("attempt input");
+        store
+            .upsert_attempt_object(&run_id, trial_id, 0, 1, "trial_output", &output_ref, None)
+            .expect("attempt output");
+        store
+            .upsert_json_row(
+                JsonRowTable::ChainState,
+                &json!({
+                    "schema_version": "task_chain_state_v1",
+                    "run_id": run_id,
+                    "chain_id": "base::task_1",
+                    "step_index": 0,
+                    "ids": {
+                        "trial_id": trial_id,
+                        "variant_id": "base",
+                        "task_id": "task_1",
+                        "repl_idx": 0
+                    },
+                    "snapshots": {
+                        "chain_root_ref": workspace_ref,
+                        "prev_ref": workspace_ref,
+                        "post_ref": workspace_ref
+                    },
+                    "diffs": {
+                        "incremental_ref": output_ref,
+                        "cumulative_ref": output_ref,
+                        "patch_incremental_ref": output_ref,
+                        "patch_cumulative_ref": output_ref
+                    },
+                    "checkpoint_labels": checkpoint_labels,
+                    "ext": {
+                        "latest_workspace_ref": workspace_ref
+                    },
+                    "schedule_idx": 0,
+                    "attempt": 1,
+                    "row_seq": 0,
+                    "slot_commit_id": "seed_slot_commit"
+                }),
+            )
+            .expect("seed lineage");
+
         trial_dir
     }
 
@@ -16084,6 +16788,7 @@ mod tests {
     #[test]
     fn build_runtime_contract_env_includes_agentlabd_keys() {
         let io = PreparedTrialIo {
+            input_host: PathBuf::from("/tmp/trial_input.json"),
             output_host: PathBuf::from("/tmp/out.json"),
             events_host: PathBuf::from("/tmp/events.jsonl"),
             task_path: AGENTLAB_TASK_PATH.to_string(),
@@ -16119,6 +16824,7 @@ mod tests {
     #[test]
     fn build_runtime_contract_env_is_empty_for_clean_contract() {
         let io = PreparedTrialIo {
+            input_host: PathBuf::from("/tmp/trial_input.json"),
             output_host: PathBuf::from("/tmp/out.json"),
             events_host: PathBuf::from("/tmp/events.jsonl"),
             task_path: HARNESS_TASK_PATH.to_string(),
@@ -16177,6 +16883,229 @@ mod tests {
             format!("{}/.graphd/graphd.db", AGENTLAB_CONTRACT_STATE_DIR)
         );
         assert!(entry.required);
+    }
+
+    #[test]
+    fn resolve_harness_rejects_host_paths_outside_project_root() {
+        let root = TempDirGuard::new("agentlab_host_path_boundary");
+        let exp_dir = root.path.join("exp");
+        ensure_dir(&exp_dir).expect("exp dir");
+        let outside_path = std::env::temp_dir().join(format!(
+            "agentlab_outside_path_{}_{}",
+            std::process::id(),
+            Utc::now().timestamp_micros()
+        ));
+        fs::write(&outside_path, "outside").expect("outside fixture");
+        let spec = json!({
+            "runtime": {
+                "agent": {
+                    "command": ["sh", "-lc", "echo ok"],
+                    "image": "img"
+                },
+                "dependencies": {
+                    "file_staging": [
+                        {
+                            "source_from_host": outside_path.to_string_lossy().to_string(),
+                            "destination_path": format!("{}/secret.txt", AGENTLAB_CONTRACT_DEPS_DIR)
+                        }
+                    ]
+                },
+                "policy": {
+                    "timeout_ms": 600000,
+                    "network": {"mode":"none","allowed_hosts":[]},
+                    "sandbox": { "mode": "container", "image": "img" }
+                }
+            }
+        });
+
+        let err = match resolve_agent_runtime(&spec, &exp_dir) {
+            Ok(_) => panic!("outside path must fail"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string().contains("outside project root"),
+            "unexpected error: {}",
+            err
+        );
+        let _ = fs::remove_file(outside_path);
+    }
+
+    #[test]
+    fn resolve_harness_rejects_dependency_destination_outside_allowed_roots() {
+        let root = TempDirGuard::new("agentlab_dependency_destination_boundary");
+        let exp_dir = root.path.join("exp");
+        ensure_dir(&exp_dir).expect("exp dir");
+        let spec = json!({
+            "runtime": {
+                "agent": {
+                    "command": ["sh", "-lc", "echo ok"],
+                    "image": "img"
+                },
+                "dependencies": {
+                    "file_staging": [
+                        {
+                            "source_from_host": "./secrets/token.txt",
+                            "destination_path": format!("{}/token.txt", AGENTLAB_CONTRACT_WORKSPACE_DIR)
+                        }
+                    ]
+                },
+                "policy": {
+                    "timeout_ms": 600000,
+                    "network": {"mode":"none","allowed_hosts":[]},
+                    "sandbox": { "mode": "container", "image": "img" }
+                }
+            }
+        });
+
+        let err = match resolve_agent_runtime(&spec, &exp_dir) {
+            Ok(_) => panic!("workspace destination must fail"),
+            Err(err) => err,
+        };
+        assert!(
+            err.to_string()
+                .contains("must be under /agentlab/deps or /agentlab/state"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn resolve_harness_parses_secret_files_as_read_only_staging() {
+        let root = TempDirGuard::new("agentlab_secret_files_parse");
+        let exp_dir = root.path.join("exp");
+        ensure_dir(&exp_dir).expect("exp dir");
+        let spec = json!({
+            "runtime": {
+                "agent": {
+                    "command": ["sh", "-lc", "echo ok"],
+                    "image": "img"
+                },
+                "dependencies": {
+                    "secret_files": [
+                        {
+                            "source_from_host": "./secrets/api.key",
+                            "destination_path": format!("{}/api.key", AGENTLAB_CONTRACT_DEPS_DIR)
+                        }
+                    ]
+                },
+                "policy": {
+                    "timeout_ms": 600000,
+                    "network": {"mode":"none","allowed_hosts":[]},
+                    "sandbox": { "mode": "container", "image": "img" }
+                }
+            }
+        });
+
+        let agent_runtime = resolve_agent_runtime(&spec, &exp_dir).expect("resolve runtime");
+        assert_eq!(agent_runtime.dependency_file_staging.len(), 1);
+        let entry = &agent_runtime.dependency_file_staging[0];
+        assert_eq!(
+            entry.destination_path,
+            format!("{}/api.key", AGENTLAB_CONTRACT_DEPS_DIR)
+        );
+        assert!(entry.required);
+        assert!(entry.read_only);
+    }
+
+    #[test]
+    fn resolve_harness_supports_secret_env_aliases() {
+        let root = TempDirGuard::new("agentlab_secret_env_aliases");
+        let exp_dir = root.path.join("exp");
+        ensure_dir(&exp_dir).expect("exp dir");
+        let spec = json!({
+            "runtime": {
+                "agent": {
+                    "command": ["sh", "-lc", "echo ok"],
+                    "image": "img",
+                    "env_from_host": ["OPENAI_API_KEY"],
+                    "secret_env": ["ANTHROPIC_API_KEY"]
+                },
+                "dependencies": {
+                    "secret_env": ["OPENAI_API_KEY", "GEMINI_API_KEY"]
+                },
+                "policy": {
+                    "timeout_ms": 600000,
+                    "network": {"mode":"none","allowed_hosts":[]},
+                    "sandbox": { "mode": "container", "image": "img" }
+                }
+            }
+        });
+
+        let agent_runtime = resolve_agent_runtime(&spec, &exp_dir).expect("resolve runtime");
+        assert_eq!(
+            agent_runtime.env_from_host,
+            vec![
+                "OPENAI_API_KEY".to_string(),
+                "ANTHROPIC_API_KEY".to_string(),
+                "GEMINI_API_KEY".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn resolve_harness_supports_first_class_config_files() {
+        let root = TempDirGuard::new("agentlab_first_class_config_files");
+        let exp_dir = root.path.join("exp");
+        ensure_dir(&exp_dir).expect("exp dir");
+        ensure_dir(&exp_dir.join("overrides")).expect("overrides dir");
+        ensure_dir(&exp_dir.join(".config").join("agent")).expect("dot config dir");
+        fs::write(exp_dir.join("overrides").join("defaults.json"), "{}")
+            .expect("defaults config fixture");
+        fs::write(
+            exp_dir.join(".config").join("agent").join("auth.json"),
+            "{}",
+        )
+        .expect("auth config fixture");
+        let spec = json!({
+            "runtime": {
+                "agent": {
+                    "command": ["rex", "run"],
+                    "image": "img",
+                    "config_files": [
+                        "overrides/defaults.json",
+                        ".config/agent/auth.json"
+                    ],
+                    "default_config": "overrides/defaults.json"
+                },
+                "policy": {
+                    "timeout_ms": 600000,
+                    "network": {"mode":"none","allowed_hosts":[]},
+                    "sandbox": { "mode": "container", "image": "img" }
+                }
+            }
+        });
+
+        let agent_runtime = resolve_agent_runtime(&spec, &exp_dir).expect("resolve runtime");
+        assert!(
+            command_contains_flag_value(
+                &agent_runtime.command_raw,
+                "--config",
+                &format!("{}/overrides/defaults.json", AGENTLAB_CONTRACT_DEPS_DIR)
+            ),
+            "default config flag should be injected once"
+        );
+        assert_eq!(
+            agent_runtime.env.get("HOME").map(String::as_str),
+            Some(AGENTLAB_CONTRACT_DEPS_DIR)
+        );
+        assert!(
+            agent_runtime
+                .dependency_file_staging
+                .iter()
+                .any(|entry| entry.destination_path
+                    == format!("{}/overrides/defaults.json", AGENTLAB_CONTRACT_DEPS_DIR)
+                    && entry.read_only),
+            "defaults config should stage into deps as read-only"
+        );
+        assert!(
+            agent_runtime
+                .dependency_file_staging
+                .iter()
+                .any(|entry| entry.destination_path
+                    == format!("{}/.config/agent/auth.json", AGENTLAB_CONTRACT_DEPS_DIR)
+                    && entry.read_only),
+            ".config auth file should stage into deps as read-only"
+        );
     }
 
     #[test]
@@ -16328,69 +17257,52 @@ mod tests {
 
     #[test]
     fn resolve_resume_selector_prefers_requested_label() {
-        let root = std::env::temp_dir().join(format!(
-            "agentlab_resume_sel_test_{}_{}",
-            std::process::id(),
-            Utc::now().timestamp_micros()
-        ));
-        ensure_dir(&root).expect("root");
-        let trial_dir = root.join("trial_1");
-        ensure_dir(&trial_dir).expect("trial");
-        let output = json!({
-            "schema_version": "agent_result_v1",
-            "outcome": "success",
-            "checkpoints": [
+        let (_root, run_dir) = create_run_dir("agentlab_resume_sel_test", "run_1");
+        seed_parent_trial(
+            &run_dir,
+            "trial_1",
+            json!([
                 {"path": format!("{}/ckpt_a", AGENTLAB_CONTRACT_STATE_DIR), "logical_name": "a", "step": 1},
                 {"path": format!("{}/ckpt_b", AGENTLAB_CONTRACT_STATE_DIR), "logical_name": "b", "step": 2}
-            ]
-        });
-        atomic_write_json_pretty(&trial_dir.join(CANONICAL_TRIAL_RESULT_FILENAME), &output)
-            .expect("write");
-        let selector = resolve_resume_selector(&trial_dir, Some("a")).expect("selector");
+            ]),
+            "paused",
+            Some("a"),
+        );
+        let selector =
+            resolve_resume_selector(&run_dir, "run_1", "trial_1", Some("a")).expect("selector");
         assert_eq!(selector, "checkpoint:a");
-        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
     fn resolve_resume_selector_defaults_to_latest_step() {
-        let root = std::env::temp_dir().join(format!(
-            "agentlab_resume_default_test_{}_{}",
-            std::process::id(),
-            Utc::now().timestamp_micros()
-        ));
-        ensure_dir(&root).expect("root");
-        let trial_dir = root.join("trial_1");
-        ensure_dir(&trial_dir).expect("trial");
-        let output = json!({
-            "schema_version": "agent_result_v1",
-            "outcome": "success",
-            "checkpoints": [
+        let (_root, run_dir) = create_run_dir("agentlab_resume_default_test", "run_1");
+        seed_parent_trial(
+            &run_dir,
+            "trial_1",
+            json!([
                 {"path": format!("{}/ckpt_a", AGENTLAB_CONTRACT_STATE_DIR), "logical_name": "a", "step": 3},
                 {"path": format!("{}/ckpt_b", AGENTLAB_CONTRACT_STATE_DIR), "logical_name": "b", "step": 5}
-            ]
-        });
-        atomic_write_json_pretty(&trial_dir.join(CANONICAL_TRIAL_RESULT_FILENAME), &output)
-            .expect("write");
-        let selector = resolve_resume_selector(&trial_dir, None).expect("selector");
+            ]),
+            "paused",
+            Some("b"),
+        );
+        let selector =
+            resolve_resume_selector(&run_dir, "run_1", "trial_1", None).expect("selector");
         assert_eq!(selector, "checkpoint:b");
-        let _ = fs::remove_dir_all(root);
     }
 
     #[test]
     fn resolve_resume_selector_errors_when_label_not_found() {
-        let root = TempDirGuard::new("agentlab_resume_missing_label_test");
-        let trial_dir = root.path.join("trial_1");
-        ensure_dir(&trial_dir).expect("trial");
-        let output = json!({
-            "schema_version": "agent_result_v1",
-            "outcome": "success",
-            "checkpoints": [
-                {"path": format!("{}/ckpt_a", AGENTLAB_CONTRACT_STATE_DIR), "logical_name": "a", "step": 1}
-            ]
-        });
-        atomic_write_json_pretty(&trial_dir.join(CANONICAL_TRIAL_RESULT_FILENAME), &output)
-            .expect("write");
-        let err = resolve_resume_selector(&trial_dir, Some("missing")).expect_err("should fail");
+        let (_root, run_dir) = create_run_dir("agentlab_resume_missing_label_test", "run_1");
+        seed_parent_trial(
+            &run_dir,
+            "trial_1",
+            json!([{"path": format!("{}/ckpt_a", AGENTLAB_CONTRACT_STATE_DIR), "logical_name": "a", "step": 1}]),
+            "paused",
+            Some("a"),
+        );
+        let err = resolve_resume_selector(&run_dir, "run_1", "trial_1", Some("missing"))
+            .expect_err("should fail");
         assert!(
             err.to_string().contains("resume_checkpoint_not_found"),
             "unexpected error: {}",
@@ -16412,10 +17324,15 @@ mod tests {
     }
 
     #[test]
-    fn resolve_selector_checkpoint_non_strict_returns_none_when_path_missing() {
-        let root = TempDirGuard::new("agentlab_fork_selector_path_missing");
-        let trial_dir = root.path.join("trial_1");
-        ensure_dir(&trial_dir).expect("trial");
+    fn resolve_selector_checkpoint_non_strict_uses_lineage_token_when_available() {
+        let (_root, run_dir) = create_run_dir("agentlab_fork_selector_path_missing", "run_1");
+        let trial_dir = seed_parent_trial(
+            &run_dir,
+            "trial_1",
+            json!([{"path": format!("{}/cp_missing", AGENTLAB_CONTRACT_STATE_DIR), "logical_name": "cp1", "step": 3}]),
+            "completed",
+            None,
+        );
         let output = json!({
             "checkpoints": [
                 {"path": format!("{}/cp_missing", AGENTLAB_CONTRACT_STATE_DIR), "logical_name": "cp1", "step": 3}
@@ -16424,26 +17341,39 @@ mod tests {
         let selector = parse_fork_selector("checkpoint:cp1").expect("selector");
         let source = resolve_selector_checkpoint(&selector, Some(&output), &trial_dir, false)
             .expect("selector resolution");
-        assert_eq!(source, None);
+        assert!(
+            source
+                .as_deref()
+                .is_some_and(|token| token.starts_with("lineage:")),
+            "expected lineage token, got {:?}",
+            source
+        );
     }
 
     #[test]
-    fn resolve_selector_checkpoint_strict_requires_existing_checkpoint_path() {
-        let root = TempDirGuard::new("agentlab_fork_selector_strict_missing");
-        let trial_dir = root.path.join("trial_1");
-        ensure_dir(&trial_dir).expect("trial");
+    fn resolve_selector_checkpoint_strict_uses_lineage_not_fs_path() {
+        let (_root, run_dir) = create_run_dir("agentlab_fork_selector_strict_missing", "run_1");
+        let trial_dir = seed_parent_trial(
+            &run_dir,
+            "trial_1",
+            json!([{"path": format!("{}/cp_missing", AGENTLAB_CONTRACT_STATE_DIR), "logical_name": "cp1", "step": 3}]),
+            "completed",
+            None,
+        );
         let output = json!({
             "checkpoints": [
                 {"path": format!("{}/cp_missing", AGENTLAB_CONTRACT_STATE_DIR), "logical_name": "cp1", "step": 3}
             ]
         });
         let selector = parse_fork_selector("checkpoint:cp1").expect("selector");
-        let err = resolve_selector_checkpoint(&selector, Some(&output), &trial_dir, true)
-            .expect_err("strict resolution should fail");
+        let token = resolve_selector_checkpoint(&selector, Some(&output), &trial_dir, true)
+            .expect("strict resolution should succeed with lineage");
         assert!(
-            err.to_string().contains("strict_source_unavailable"),
-            "unexpected error: {}",
-            err
+            token
+                .as_deref()
+                .is_some_and(|value| value.starts_with("lineage:")),
+            "unexpected token: {:?}",
+            token
         );
     }
 
@@ -16463,14 +17393,21 @@ mod tests {
             .expect("replay should not require legacy trial dataset dir");
         let replay_trial_dir = replay.replay_dir.join("trial_1");
         assert!(
-            replay_trial_dir.join("trial_input.json").exists(),
-            "replay trial input missing at {}",
-            replay_trial_dir.display()
-        );
-        assert!(
             replay_trial_dir.join("trial_state.json").exists(),
             "replay trial state missing at {}",
             replay_trial_dir.display()
+        );
+        let store = BackingSqliteStore::open(&run_dir).expect("store");
+        let replay_op = store
+            .latest_runtime_operation("run_1", "replay")
+            .expect("runtime op")
+            .expect("replay op payload");
+        assert_eq!(
+            replay_op
+                .pointer("/replay_id")
+                .and_then(Value::as_str)
+                .unwrap_or(""),
+            replay.replay_id
         );
         assert!(
             !replay_trial_dir.join("dataset").exists(),
@@ -16489,6 +17426,11 @@ mod tests {
             "completed",
             None,
         );
+        let conn = rusqlite::Connection::open(run_sqlite_path(&run_dir)).expect("open sqlite");
+        conn.execute("DELETE FROM lineage_versions", [])
+            .expect("delete lineage versions");
+        conn.execute("DELETE FROM lineage_heads", [])
+            .expect("delete lineage heads");
 
         let result = fork_trial(
             &run_dir,
@@ -16500,8 +17442,11 @@ mod tests {
         .expect("fork should succeed");
         assert_eq!(result.fallback_mode, "input_only");
         assert_eq!(result.source_checkpoint, None);
-
-        let manifest = load_json_file(&result.fork_dir.join("manifest.json")).expect("manifest");
+        let store = BackingSqliteStore::open(&run_dir).expect("store");
+        let manifest = store
+            .latest_runtime_operation("run_1", "fork")
+            .expect("runtime op")
+            .expect("manifest");
         assert_eq!(
             manifest
                 .pointer("/fallback_mode")
@@ -16552,6 +17497,11 @@ mod tests {
             "completed",
             None,
         );
+        let conn = rusqlite::Connection::open(run_sqlite_path(&run_dir)).expect("open sqlite");
+        conn.execute("DELETE FROM lineage_versions", [])
+            .expect("delete lineage versions");
+        conn.execute("DELETE FROM lineage_heads", [])
+            .expect("delete lineage heads");
 
         let err = fork_trial(
             &run_dir,
@@ -16772,15 +17722,9 @@ mod tests {
         assert_eq!(resumed.fork.parent_trial_id, "trial_1");
         assert_eq!(resumed.fork.fallback_mode, "checkpoint");
         assert!(resumed.fork.source_checkpoint.is_some());
-
-        let fork_input = load_json_file(
-            &resumed
-                .fork
-                .fork_dir
-                .join("trial_1")
-                .join("trial_input.json"),
-        )
-        .expect("fork trial input");
+        let fork_trial_id = format!("trial_1_{}", resumed.fork.fork_id);
+        let fork_input =
+            load_trial_input_payload(&run_dir, "run_1", &fork_trial_id).expect("fork trial input");
         assert_eq!(
             fork_input
                 .pointer("/bindings/resume/override")
@@ -18953,10 +19897,7 @@ mod tests {
         assert!(pruned_variants.is_empty());
         assert!(consecutive_failures.is_empty());
 
-        let persisted: ScheduleProgress = serde_json::from_slice(
-            &fs::read(schedule_progress_path(&run_dir)).expect("read persisted progress"),
-        )
-        .expect("deserialize persisted progress");
+        let persisted = load_schedule_progress(&run_dir).expect("load persisted progress");
         assert_eq!(persisted.next_schedule_index, 0);
         assert!(persisted.completed_slots.is_empty());
     }
@@ -19156,6 +20097,125 @@ mod tests {
     }
 
     #[test]
+    fn p7_persisted_pending_completion_survives_restart_and_drains_after_head_slot() {
+        let (_root, run_dir) = create_run_dir("agentlab_p7_pending_recovery", "run_1");
+        let slot_count = 2usize;
+        let mut schedule_progress = ScheduleProgress {
+            schema_version: "schedule_progress_v1".to_string(),
+            run_id: "run_1".to_string(),
+            total_slots: slot_count,
+            next_schedule_index: 0,
+            next_trial_index: slot_count,
+            schedule: (0..slot_count)
+                .map(|idx| TrialSlot {
+                    variant_idx: 0,
+                    task_idx: idx,
+                    repl_idx: 0,
+                })
+                .collect(),
+            completed_slots: Vec::new(),
+            pruned_variants: Vec::new(),
+            consecutive_failures: BTreeMap::new(),
+            use_container: false,
+            updated_at: Utc::now().to_rfc3339(),
+        };
+        let policy_config = PolicyConfig::default();
+        let evidence_records_path = run_dir.join("runtime").join("p7_pending_evidence.jsonl");
+        let chain_state_path = run_dir.join("runtime").join("p7_pending_chain_state.jsonl");
+        let benchmark_predictions_path =
+            run_dir.join("runtime").join("p7_pending_predictions.jsonl");
+        let benchmark_scores_path = run_dir.join("runtime").join("p7_pending_scores.jsonl");
+        let mut pruned_variants: HashSet<usize> = HashSet::new();
+        let mut consecutive_failures: BTreeMap<usize, usize> = BTreeMap::new();
+        let mut run_sink = BufferedRunSink::default();
+
+        // First process lifetime: slot 1 finishes before slot 0, so it is buffered pending.
+        let mut committer = DeterministicCommitter::from_progress(&schedule_progress, &[]);
+        committer
+            .enqueue_trial(1, p7_trial_result_with_trial_record(1))
+            .expect("enqueue slot 1 result");
+        let committed = committer
+            .drain_ready(
+                &run_dir,
+                &policy_config,
+                &evidence_records_path,
+                &chain_state_path,
+                &benchmark_predictions_path,
+                &benchmark_scores_path,
+                &mut schedule_progress,
+                slot_count,
+                &mut pruned_variants,
+                &mut consecutive_failures,
+                &mut run_sink,
+            )
+            .expect("drain should buffer slot 1");
+        assert_eq!(committed, 0, "slot 1 cannot commit before slot 0");
+        assert_eq!(schedule_progress.next_schedule_index, 0);
+        persist_pending_trial_completions(&run_dir, &committer).expect("persist pending");
+
+        // Simulate restart: reload persisted pending completion, then recover slot 0 as worker_lost.
+        let journal_records = load_slot_commit_records(&run_dir).expect("load journal");
+        let mut restarted =
+            DeterministicCommitter::from_progress(&schedule_progress, &journal_records);
+        let persisted = load_pending_trial_completion_records(&run_dir).expect("load pending");
+        assert!(
+            persisted.contains_key(&1),
+            "slot 1 pending completion should persist across restart"
+        );
+        for (schedule_idx, result) in persisted {
+            restarted
+                .enqueue_trial(schedule_idx, result)
+                .expect("re-enqueue persisted completion");
+        }
+        restarted
+            .enqueue_trial(
+                0,
+                TrialExecutionResult::worker_lost(
+                    "trial_1".to_string(),
+                    Some(0),
+                    Some("worker_lost".to_string()),
+                ),
+            )
+            .expect("enqueue recovered slot 0");
+
+        let committed_after_restart = restarted
+            .drain_ready(
+                &run_dir,
+                &policy_config,
+                &evidence_records_path,
+                &chain_state_path,
+                &benchmark_predictions_path,
+                &benchmark_scores_path,
+                &mut schedule_progress,
+                slot_count,
+                &mut pruned_variants,
+                &mut consecutive_failures,
+                &mut run_sink,
+            )
+            .expect("drain after restart");
+        assert_eq!(
+            committed_after_restart, 2,
+            "slot 0 and persisted slot 1 should both commit"
+        );
+        assert_eq!(schedule_progress.next_schedule_index, 2);
+        assert_eq!(
+            schedule_progress
+                .completed_slots
+                .iter()
+                .map(|slot| slot.schedule_index)
+                .collect::<Vec<_>>(),
+            vec![0, 1]
+        );
+        assert!(
+            run_sink
+                .trial_records
+                .iter()
+                .any(|row| row.schedule_idx == 1 && row.trial_id == "trial_2"),
+            "persisted slot 1 completion should appear in committed facts after restart"
+        );
+    }
+
+    #[test]
     fn p7_release_gate_rejects_non_isolate_state_policy() {
         let (_root, run_dir) = create_run_dir("agentlab_p7_release_gate", "run_1");
         write_run_control_v2(&run_dir, "run_1", "paused", &[], None).expect("run control");
@@ -19229,7 +20289,7 @@ mod tests {
     #[test]
     fn parse_task_boundary_extracts_runtime_fields() {
         let task = json!({
-            "schema_version": "task_boundary_v1",
+            "schema_version": "task_boundary_v2",
             "task": {
                 "id": "task_1",
                 "prompt": "solve this"
@@ -19270,32 +20330,34 @@ mod tests {
     }
 
     #[test]
-    fn parse_task_boundary_v2_extracts_task_image_and_workspace() {
+    fn parse_task_boundary_v2_parses_workspace_seed() {
         let task = json!({
             "schema_version": "task_boundary_v2",
             "task": {
                 "id": "task_1",
                 "image": "swebench/sweb.eval.x86_64.astropy__astropy-12907:latest",
-                "workspace": "/testbed",
                 "prompt": "solve this"
+            },
+            "workspace_seed": {
+                "dataset_pack_ref": format!("sha256:{}", "d".repeat(64))
             },
             "workspace_files": [],
             "mount_references": [],
             "limits": {}
         });
 
-        let parsed = parse_task_boundary_from_dataset_task(&task).expect("parse boundary");
+        let parsed = parse_task_boundary_from_dataset_task(&task).expect("workspace seed");
+        let seed = parsed.workspace_seed.expect("workspace seed present");
         assert_eq!(
-            parsed.task_image.as_deref(),
-            Some("swebench/sweb.eval.x86_64.astropy__astropy-12907:latest")
+            seed.dataset_pack_ref,
+            format!("sha256:{}", "d".repeat(64))
         );
-        assert_eq!(parsed.task_workspace.as_deref(), Some("/testbed"));
     }
 
     #[test]
     fn parse_task_boundary_rejects_unsupported_keys() {
         let task = json!({
-            "schema_version": "task_boundary_v1",
+            "schema_version": "task_boundary_v2",
             "task": { "id": "task_1" },
             "workspace_files": [],
             "mount_references": [],
@@ -19332,23 +20394,37 @@ mod tests {
                 "id": "swebench_like_id",
                 "swebench": { "repo": "x/y" }
             }),
+            workspace_seed: None,
             workspace_files: Vec::new(),
             mount_references: Vec::new(),
             limits: TaskBoundaryLimits::default(),
             task_image: None,
-            task_workspace: None,
         };
         let not_required = TaskBoundaryPolicy {
             require_workspace_materialization: false,
         };
-        validate_task_boundary_workspace_materialization(&boundary, &not_required)
+        validate_task_boundary_workspace_materialization(&boundary, &not_required, ImageSource::Global)
             .expect("should not require materialization when policy flag is false");
 
         let required = TaskBoundaryPolicy {
             require_workspace_materialization: true,
         };
-        let err = validate_task_boundary_workspace_materialization(&boundary, &required)
+        let err =
+            validate_task_boundary_workspace_materialization(&boundary, &required, ImageSource::Global)
             .expect_err("policy-required materialization should fail when task boundary is empty");
+        assert!(
+            err.to_string()
+                .contains("missing required workspace materialization"),
+            "unexpected error: {}",
+            err
+        );
+
+        let err = validate_task_boundary_workspace_materialization(
+            &boundary,
+            &not_required,
+            ImageSource::PerTask,
+        )
+        .expect_err("per-task image source must require materialization");
         assert!(
             err.to_string()
                 .contains("missing required workspace materialization"),
@@ -19372,46 +20448,44 @@ mod tests {
         let err =
             parse_task_boundary_from_trial_input(&input).expect_err("should require task field");
         assert!(
-            err.to_string().contains("missing required /task"),
+            err.to_string()
+                .contains("must provide '/task' + '/ext/task_boundary_v2'"),
             "unexpected error: {}",
             err
         );
     }
 
     #[test]
-    fn parse_task_boundary_from_trial_input_accepts_clean_task_payload() {
+    fn parse_task_boundary_from_trial_input_rejects_untyped_task_payload() {
         let input = json!({
             "id": "task_1",
             "prompt": "hello"
         });
-        let parsed = parse_task_boundary_from_trial_input(&input).expect("clean payload");
-        assert_eq!(
-            parsed
-                .task_payload
-                .get("id")
-                .and_then(|v| v.as_str())
-                .unwrap_or(""),
-            "task_1"
+        let err = parse_task_boundary_from_trial_input(&input).expect_err("untyped payload");
+        assert!(
+            err.to_string()
+                .contains("must provide '/task' + '/ext/task_boundary_v2'"),
+            "unexpected error: {}",
+            err
         );
     }
 
     #[test]
-    fn parse_task_boundary_from_trial_input_preserves_task_image_and_workspace() {
+    fn parse_task_boundary_from_trial_input_requires_boundary_ext() {
         let input = json!({
             "schema_version": "agent_task_v1",
             "task": {
                 "id": "task_1",
                 "image": "swebench/sweb.eval.x86_64.astropy__astropy-12907:latest",
-                "workspace": "/testbed",
                 "input": { "prompt": "hello" }
             }
         });
-        let parsed = parse_task_boundary_from_trial_input(&input).expect("agent task input");
-        assert_eq!(
-            parsed.task_image.as_deref(),
-            Some("swebench/sweb.eval.x86_64.astropy__astropy-12907:latest")
+        let err = parse_task_boundary_from_trial_input(&input).expect_err("missing boundary ext");
+        assert!(
+            err.to_string().contains("/ext/task_boundary_v2 is required"),
+            "unexpected error: {}",
+            err
         );
-        assert_eq!(parsed.task_workspace.as_deref(), Some("/testbed"));
     }
 
     #[test]
@@ -19482,6 +20556,44 @@ mod tests {
     }
 
     #[test]
+    fn materialize_workspace_seed_copies_dataset_pack_into_workspace() {
+        let root = TempDirGuard::new("agentlab_workspace_seed_materialize");
+        let digest = "e".repeat(64);
+        let pack_root = root
+            .path
+            .join(".lab")
+            .join("dataset_packs")
+            .join("sha256")
+            .join(&digest);
+        ensure_dir(&pack_root).expect("pack root");
+        ensure_dir(&pack_root.join("src")).expect("pack src");
+        fs::write(pack_root.join("src/main.ts"), "export const value = 1;\n").expect("seed file");
+
+        let exp_dir = root.path.join("exp");
+        ensure_dir(&exp_dir).expect("exp");
+        fs::write(exp_dir.join("README.md"), "fixture").expect("exp fixture");
+        let trial_dir = root.path.join("trial_1");
+        ensure_dir(&trial_dir).expect("trial");
+        let paths = TrialPaths::new(&trial_dir, &exp_dir).expect("trial paths");
+        paths.prepare(true).expect("prepare");
+        fs::write(paths.workspace.join("stale.txt"), "stale").expect("stale workspace file");
+
+        let seed = WorkspaceSeedSpec {
+            dataset_pack_ref: format!("sha256:{}", digest),
+        };
+        materialize_workspace_seed(&root.path, &paths, Some(&seed)).expect("materialize seed");
+
+        assert!(
+            !paths.workspace.join("stale.txt").exists(),
+            "workspace seed should replace existing workspace content"
+        );
+        assert_eq!(
+            fs::read_to_string(paths.workspace.join("src/main.ts")).expect("seeded file"),
+            "export const value = 1;\n"
+        );
+    }
+
+    #[test]
     fn build_trial_input_uses_run_id_and_limits() {
         let root = TempDirGuard::new("agentlab_task_boundary_trial_input");
         let exp_dir = root.path.join("exp");
@@ -19519,6 +20631,7 @@ mod tests {
         };
         let task_boundary = TaskBoundaryMaterialization {
             task_payload: json!({ "id": "task_1", "prompt": "x" }),
+            workspace_seed: None,
             workspace_files: vec![WorkspaceFileSpec {
                 path: "input.txt".to_string(),
                 content: "hello".to_string(),
@@ -19537,7 +20650,6 @@ mod tests {
                 trial_seconds: Some(90),
             },
             task_image: None,
-            task_workspace: None,
         };
 
         let input = build_agent_task(
@@ -19567,7 +20679,7 @@ mod tests {
         );
         assert_eq!(
             input
-                .pointer("/ext/task_boundary_v1/workspace_files/0/path")
+                .pointer("/ext/task_boundary_v2/workspace_files/0/path")
                 .and_then(|v| v.as_str())
                 .unwrap_or(""),
             "input.txt"
@@ -19947,6 +21059,7 @@ mod tests {
     #[test]
     fn inv02_timeout_policy_propagates_to_runtime_env() {
         let io = PreparedTrialIo {
+            input_host: PathBuf::from("/tmp/trial_input.json"),
             output_host: PathBuf::from("/tmp/out.json"),
             events_host: PathBuf::from("/tmp/events.jsonl"),
             task_path: AGENTLAB_TASK_PATH.to_string(),
@@ -20591,8 +21704,14 @@ mod tests {
         let root = TempDirGuard::new("agentlab_inv04_artifact_layout_repair");
         let artifact_src = root.path.join("artifact_src");
         ensure_dir(&artifact_src.join("node_modules")).expect("node_modules dir");
-        ensure_dir(&artifact_src.join("packages").join("packages").join("infra").join("comms-bus"))
-            .expect("nested comms-bus dir");
+        ensure_dir(
+            &artifact_src
+                .join("packages")
+                .join("packages")
+                .join("infra")
+                .join("comms-bus"),
+        )
+        .expect("nested comms-bus dir");
         fs::write(
             artifact_src
                 .join("packages")
@@ -20730,9 +21849,21 @@ mod tests {
         let root = TempDirGuard::new(prefix);
         let dataset_dir = root.path.join(".lab").join("experiments").join("data");
         ensure_dir(&dataset_dir).expect("dataset dir");
+        let workspace_seed_digest = "f".repeat(64);
+        let workspace_seed_pack = root
+            .path
+            .join(".lab")
+            .join("dataset_packs")
+            .join("sha256")
+            .join(&workspace_seed_digest);
+        ensure_dir(&workspace_seed_pack).expect("workspace seed pack dir");
+        fs::write(workspace_seed_pack.join("README.md"), "seed").expect("workspace seed content");
         fs::write(
             dataset_dir.join("bench_v0.task_boundary_v2.jsonl"),
-            r#"{"schema_version":"task_boundary_v2","task":{"id":"TASK001","image":"python:3.11-slim","workspace":"/agentlab/workspace"},"workspace_files":[],"mount_references":[]}"#,
+            format!(
+                r#"{{"schema_version":"task_boundary_v2","task":{{"id":"TASK001","image":"python:3.11-slim"}},"workspace_seed":{{"dataset_pack_ref":"sha256:{digest}"}},"workspace_files":[],"mount_references":[]}}"#,
+                digest = workspace_seed_digest
+            ),
         )
         .expect("dataset row");
 
@@ -20765,6 +21896,14 @@ mod tests {
         let codex_auth_dir = overrides_dir.join(".config").join("nova");
         ensure_dir(&codex_auth_dir).expect("codex auth dir");
         fs::write(codex_auth_dir.join("codex-auth.json"), "{}\n").expect("codex auth");
+
+        let benchmark_grader_dir = root.path.join("benchmark").join("grader");
+        ensure_dir(&benchmark_grader_dir).expect("benchmark grader dir");
+        fs::write(
+            benchmark_grader_dir.join("bench_benchmark_adapter.py"),
+            "#!/usr/bin/env python3\nprint('ok')\n",
+        )
+        .expect("benchmark adapter");
         root
     }
 
@@ -20893,7 +22032,7 @@ mod tests {
                 .pointer("/benchmark/adapter/command/1")
                 .and_then(Value::as_str)
                 .unwrap_or(""),
-            "/opt/bench/bench_benchmark_adapter.py"
+            "/agentlab/deps/bench_benchmark_adapter.py"
         );
         assert_eq!(
             resolved_a
@@ -21165,7 +22304,7 @@ mod tests {
     }
 
     #[test]
-    fn p0_i06_preflight_grader_reachability_fails_when_script_missing() {
+    fn p0_i06_preflight_grader_reachability_rejects_forbidden_opt_bench_path() {
         let docker_ok = Command::new("docker")
             .arg("info")
             .stdout(Stdio::null())
@@ -21195,8 +22334,8 @@ mod tests {
             agent_runtime: AgentRuntimeConfig {
                 adapter_ref: AgentAdapterRef::default(),
                 command_raw: vec!["rex".to_string()],
-                container_image: None,
-                image_source: ImageSource::PerTask,
+                container_image: Some("python:3.11-slim".to_string()),
+                image_source: ImageSource::Global,
                 agent_artifact: None,
                 agent_artifact_digest: None,
                 agent_artifact_resolved_path: None,
@@ -21230,9 +22369,7 @@ mod tests {
         let tasks = vec![json!({
             "schema_version": "task_boundary_v2",
             "task": {
-                "id": "TASK001",
-                "image": "python:3.11-slim",
-                "workspace": "/workspace"
+                "id": "TASK001"
             },
             "workspace_files": [],
             "mount_references": []
@@ -21242,12 +22379,10 @@ mod tests {
             check_benchmark_grader_reachable(&benchmark_config, &runtime_profile, &tasks, false);
         assert!(
             !check.passed,
-            "preflight must fail when grader script path is missing from image"
+            "preflight must fail when grader script path is under forbidden /opt/bench"
         );
         assert!(
-            check
-                .message
-                .contains("grader script path '/opt/bench/bench_benchmark_adapter.py'"),
+            check.message.contains("forbidden grader script path"),
             "unexpected message: {}",
             check.message
         );
@@ -21280,6 +22415,7 @@ mod tests {
         let runtime_env = BTreeMap::new();
         let overrides = BTreeMap::new();
         let io_paths = PreparedTrialIo {
+            input_host: PathBuf::from("/tmp/trial_input.json"),
             output_host: paths.out.join("result.json"),
             events_host: paths.state.join("events.jsonl"),
             task_path: AGENTLAB_TASK_PATH.to_string(),
@@ -21323,7 +22459,6 @@ mod tests {
             benchmark_grading_enabled: false,
             run_id: "run_1",
             task_image: None,
-            task_workspace: None,
             agent_artifact: None,
         };
         let mut cmd = Command::new("docker");
@@ -21398,6 +22533,7 @@ mod tests {
         let runtime_env = BTreeMap::new();
         let overrides = BTreeMap::new();
         let io_paths = PreparedTrialIo {
+            input_host: PathBuf::from("/tmp/trial_input.json"),
             output_host: paths.out.join("result.json"),
             events_host: paths.state.join("events.jsonl"),
             task_path: AGENTLAB_TASK_PATH.to_string(),
@@ -21424,7 +22560,6 @@ mod tests {
             benchmark_grading_enabled: false,
             run_id: "run_1",
             task_image: None,
-            task_workspace: None,
             agent_artifact: runtime.agent_artifact.as_deref(),
         };
         let mut cmd = Command::new("docker");
@@ -21473,6 +22608,7 @@ mod tests {
         let runtime_env = BTreeMap::new();
         let overrides = BTreeMap::new();
         let io_paths = PreparedTrialIo {
+            input_host: PathBuf::from("/tmp/trial_input.json"),
             output_host: paths.out.join("result.json"),
             events_host: paths.state.join("events.jsonl"),
             task_path: AGENTLAB_TASK_PATH.to_string(),
@@ -21499,7 +22635,6 @@ mod tests {
             benchmark_grading_enabled: true,
             run_id: "run_1",
             task_image: None,
-            task_workspace: None,
             agent_artifact: runtime.agent_artifact.as_deref(),
         };
         let mut cmd = Command::new("docker");
@@ -21507,7 +22642,10 @@ mod tests {
             &mut cmd,
             &request,
             &["rex".to_string(), "run".to_string()],
-            Some(vec!["python3".to_string(), "/opt/bench/grader.py".to_string()]),
+            Some(vec![
+                "python3".to_string(),
+                "/agentlab/deps/grader.py".to_string(),
+            ]),
         );
         let args = cmd
             .get_args()
@@ -21738,7 +22876,10 @@ mod tests {
 
     #[test]
     fn sanitize_name_for_path_strips_special_chars() {
-        assert_eq!(sanitize_name_for_path("hello world.v2/3"), "hello_world_v2_3");
+        assert_eq!(
+            sanitize_name_for_path("hello world.v2/3"),
+            "hello_world_v2_3"
+        );
     }
 
     #[test]
@@ -21978,7 +23119,10 @@ mod tests {
 
     #[test]
     fn strip_contract_prefix_with_subpath_returns_rest() {
-        assert_eq!(strip_contract_prefix("/in/data.json", "/in"), Some("/data.json"));
+        assert_eq!(
+            strip_contract_prefix("/in/data.json", "/in"),
+            Some("/data.json")
+        );
     }
 
     #[test]
@@ -21988,7 +23132,10 @@ mod tests {
 
     #[test]
     fn strip_contract_prefix_no_slash_boundary_returns_none() {
-        assert_eq!(strip_contract_prefix("/agentlab/inbox", "/agentlab/in"), None);
+        assert_eq!(
+            strip_contract_prefix("/agentlab/inbox", "/agentlab/in"),
+            None
+        );
     }
 
     #[test]
@@ -22053,7 +23200,10 @@ mod tests {
 
     #[test]
     fn experiment_version_string_from_string() {
-        assert_eq!(experiment_version_string(&json!({"version": "1.0"})), Some("1.0".to_string()));
+        assert_eq!(
+            experiment_version_string(&json!({"version": "1.0"})),
+            Some("1.0".to_string())
+        );
     }
 
     #[test]
@@ -22068,12 +23218,17 @@ mod tests {
 
     #[test]
     fn experiment_version_string_trims_whitespace() {
-        assert_eq!(experiment_version_string(&json!({"version": "  1.0  "})), Some("1.0".to_string()));
+        assert_eq!(
+            experiment_version_string(&json!({"version": "  1.0  "})),
+            Some("1.0".to_string())
+        );
     }
 
     #[test]
     fn is_dx_contract_authoring_agent_section() {
-        assert!(is_dx_contract_authoring(&json!({"agent": {"command": ["echo"]}})));
+        assert!(is_dx_contract_authoring(
+            &json!({"agent": {"command": ["echo"]}})
+        ));
     }
 
     #[test]
@@ -22125,7 +23280,8 @@ mod tests {
             &format!("{}/task.json", AGENTLAB_CONTRACT_IN_DIR),
             &roots,
             ContractPathMode::ContainerMount,
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(result, trial.join("in").join("task.json"));
     }
 
@@ -22137,7 +23293,8 @@ mod tests {
             &format!("{}/data.json", AGENTLAB_CONTRACT_STATE_DIR),
             &roots,
             ContractPathMode::ContainerMount,
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(result, trial.join("state").join("data.json"));
     }
 
@@ -22149,7 +23306,8 @@ mod tests {
             &format!("{}/result.json", AGENTLAB_CONTRACT_OUT_DIR),
             &roots,
             ContractPathMode::ContainerMount,
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(result, trial.join("out").join("result.json"));
     }
 
@@ -22161,7 +23319,8 @@ mod tests {
             &format!("{}/dep.tar", AGENTLAB_CONTRACT_DEPS_DIR),
             &roots,
             ContractPathMode::ContainerMount,
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(result, trial.join("deps").join("dep.tar"));
     }
 
@@ -22173,7 +23332,8 @@ mod tests {
             &format!("{}/src/main.py", AGENTLAB_CONTRACT_WORKSPACE_DIR),
             &roots,
             ContractPathMode::ContainerMount,
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(result, trial.join("workspace").join("src").join("main.py"));
     }
 
@@ -22183,16 +23343,25 @@ mod tests {
         let roots = test_contract_roots(&trial);
         let err = map_contract_path_to_host("", &roots, ContractPathMode::ContainerMount)
             .expect_err("should reject empty");
-        assert!(err.to_string().contains("empty"), "unexpected error: {}", err);
+        assert!(
+            err.to_string().contains("empty"),
+            "unexpected error: {}",
+            err
+        );
     }
 
     #[test]
     fn map_contract_path_container_mode_rejects_relative() {
         let trial = PathBuf::from("/tmp/trial_1");
         let roots = test_contract_roots(&trial);
-        let err = map_contract_path_to_host("relative/path", &roots, ContractPathMode::ContainerMount)
-            .expect_err("should reject relative");
-        assert!(err.to_string().contains("absolute"), "unexpected error: {}", err);
+        let err =
+            map_contract_path_to_host("relative/path", &roots, ContractPathMode::ContainerMount)
+                .expect_err("should reject relative");
+        assert!(
+            err.to_string().contains("absolute"),
+            "unexpected error: {}",
+            err
+        );
     }
 
     #[test]
@@ -22200,7 +23369,8 @@ mod tests {
         let trial = PathBuf::from("/tmp/trial_1");
         let roots = test_contract_roots(&trial);
         let padded = format!("  {}  ", AGENTLAB_CONTRACT_IN_DIR);
-        let result = map_contract_path_to_host(&padded, &roots, ContractPathMode::ContainerMount).unwrap();
+        let result =
+            map_contract_path_to_host(&padded, &roots, ContractPathMode::ContainerMount).unwrap();
         assert_eq!(result, trial.join("in"));
     }
 
@@ -22210,7 +23380,11 @@ mod tests {
         let roots = test_contract_roots(&trial);
         let err = map_contract_path_to_host("", &roots, ContractPathMode::RuntimeIo)
             .expect_err("should reject empty");
-        assert!(err.to_string().contains("runtime io path"), "unexpected error: {}", err);
+        assert!(
+            err.to_string().contains("runtime io path"),
+            "unexpected error: {}",
+            err
+        );
     }
 
     #[test]
@@ -22219,7 +23393,11 @@ mod tests {
         let roots = test_contract_roots(&trial);
         let err = map_contract_path_to_host("relative/path", &roots, ContractPathMode::RuntimeIo)
             .expect_err("should reject relative");
-        assert!(err.to_string().contains("absolute"), "unexpected error: {}", err);
+        assert!(
+            err.to_string().contains("absolute"),
+            "unexpected error: {}",
+            err
+        );
     }
 
     #[test]
@@ -22230,8 +23408,13 @@ mod tests {
             &format!("{}/data.bin", AGENTLAB_CONTRACT_DEPS_DIR),
             &roots,
             ContractPathMode::RuntimeEvents,
-        ).expect_err("RuntimeEvents should reject deps");
-        assert!(err.to_string().contains("unsupported"), "unexpected error: {}", err);
+        )
+        .expect_err("RuntimeEvents should reject deps");
+        assert!(
+            err.to_string().contains("unsupported"),
+            "unexpected error: {}",
+            err
+        );
     }
 
     #[test]
@@ -22242,7 +23425,8 @@ mod tests {
             &format!("{}/events.jsonl", AGENTLAB_CONTRACT_STATE_DIR),
             &roots,
             ContractPathMode::RuntimeEvents,
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(result, trial.join("state").join("events.jsonl"));
     }
 
@@ -22254,8 +23438,16 @@ mod tests {
             &format!("{}/nested/deep/file.json", AGENTLAB_CONTRACT_IN_DIR),
             &roots,
             ContractPathMode::ContainerMount,
-        ).unwrap();
-        assert_eq!(result, trial.join("in").join("nested").join("deep").join("file.json"));
+        )
+        .unwrap();
+        assert_eq!(
+            result,
+            trial
+                .join("in")
+                .join("nested")
+                .join("deep")
+                .join("file.json")
+        );
     }
 
     #[test]
@@ -22266,7 +23458,8 @@ mod tests {
             &format!("{}//file.json", AGENTLAB_CONTRACT_IN_DIR),
             &roots,
             ContractPathMode::ContainerMount,
-        ).unwrap();
+        )
+        .unwrap();
         assert!(result.to_string_lossy().contains("file.json"));
     }
 
@@ -22274,19 +23467,37 @@ mod tests {
     fn map_contract_path_container_mode_unknown_path_fails() {
         let trial = PathBuf::from("/tmp/trial_1");
         let roots = test_contract_roots(&trial);
-        assert!(map_contract_path_to_host("/unknown/root/file", &roots, ContractPathMode::ContainerMount).is_err());
+        assert!(map_contract_path_to_host(
+            "/unknown/root/file",
+            &roots,
+            ContractPathMode::ContainerMount
+        )
+        .is_err());
     }
 
     #[test]
     fn mode_allows_root_container_mount_allows_all() {
-        for root in [ContractPathRoot::In, ContractPathRoot::State, ContractPathRoot::Out, ContractPathRoot::Deps, ContractPathRoot::Workspace] {
-            assert!(mode_allows_root(ContractPathMode::ContainerMount, root), "ContainerMount should allow {:?}", root);
+        for root in [
+            ContractPathRoot::In,
+            ContractPathRoot::State,
+            ContractPathRoot::Out,
+            ContractPathRoot::Deps,
+            ContractPathRoot::Workspace,
+        ] {
+            assert!(
+                mode_allows_root(ContractPathMode::ContainerMount, root),
+                "ContainerMount should allow {:?}",
+                root
+            );
         }
     }
 
     #[test]
     fn mode_allows_root_runtime_events_denies_deps() {
-        assert!(!mode_allows_root(ContractPathMode::RuntimeEvents, ContractPathRoot::Deps));
+        assert!(!mode_allows_root(
+            ContractPathMode::RuntimeEvents,
+            ContractPathRoot::Deps
+        ));
     }
 
     #[test]
@@ -22320,14 +23531,19 @@ mod tests {
         let result = resolve_event_path_for_trial(
             &format!("{}/events.jsonl", AGENTLAB_CONTRACT_STATE_DIR),
             &trial,
-        ).unwrap();
+        )
+        .unwrap();
         assert_eq!(result, trial.join("state").join("events.jsonl"));
     }
 
     #[test]
     fn resolve_event_path_for_trial_rejects_deps_root() {
         let trial = PathBuf::from("/tmp/trial_1");
-        assert!(resolve_event_path_for_trial(&format!("{}/data.bin", AGENTLAB_CONTRACT_DEPS_DIR), &trial).is_err());
+        assert!(resolve_event_path_for_trial(
+            &format!("{}/data.bin", AGENTLAB_CONTRACT_DEPS_DIR),
+            &trial
+        )
+        .is_err());
     }
 
     #[test]
@@ -22337,7 +23553,9 @@ mod tests {
 
     #[test]
     fn workspace_evidence_excluded_node_modules() {
-        assert!(is_workspace_evidence_excluded(Path::new("node_modules/pkg")));
+        assert!(is_workspace_evidence_excluded(Path::new(
+            "node_modules/pkg"
+        )));
     }
 
     #[test]
@@ -22352,7 +23570,9 @@ mod tests {
 
     #[test]
     fn workspace_evidence_excluded_pycache() {
-        assert!(is_workspace_evidence_excluded(Path::new("__pycache__/mod.pyc")));
+        assert!(is_workspace_evidence_excluded(Path::new(
+            "__pycache__/mod.pyc"
+        )));
     }
 
     #[test]
@@ -22362,17 +23582,23 @@ mod tests {
 
     #[test]
     fn workspace_evidence_excluded_nested_node_modules() {
-        assert!(is_workspace_evidence_excluded(Path::new("deep/nested/node_modules/x")));
+        assert!(is_workspace_evidence_excluded(Path::new(
+            "deep/nested/node_modules/x"
+        )));
     }
 
     #[test]
     fn workspace_evidence_excluded_dot_claude() {
-        assert!(is_workspace_evidence_excluded(Path::new(".claude/settings")));
+        assert!(is_workspace_evidence_excluded(Path::new(
+            ".claude/settings"
+        )));
     }
 
     #[test]
     fn workspace_evidence_excluded_target_dir() {
-        assert!(is_workspace_evidence_excluded(Path::new("target/debug/bin")));
+        assert!(is_workspace_evidence_excluded(Path::new(
+            "target/debug/bin"
+        )));
     }
 
     #[test]
@@ -22387,22 +23613,30 @@ mod tests {
 
     #[test]
     fn workspace_evidence_not_excluded_nested_source() {
-        assert!(!is_workspace_evidence_excluded(Path::new("src/components/App.tsx")));
+        assert!(!is_workspace_evidence_excluded(Path::new(
+            "src/components/App.tsx"
+        )));
     }
 
     #[test]
     fn workspace_evidence_excluded_pytest_cache() {
-        assert!(is_workspace_evidence_excluded(Path::new(".pytest_cache/v/cache")));
+        assert!(is_workspace_evidence_excluded(Path::new(
+            ".pytest_cache/v/cache"
+        )));
     }
 
     #[test]
     fn workspace_evidence_excluded_mypy_cache() {
-        assert!(is_workspace_evidence_excluded(Path::new(".mypy_cache/3.9/module")));
+        assert!(is_workspace_evidence_excluded(Path::new(
+            ".mypy_cache/3.9/module"
+        )));
     }
 
     #[test]
     fn workspace_evidence_excluded_ruff_cache() {
-        assert!(is_workspace_evidence_excluded(Path::new(".ruff_cache/0.1.0")));
+        assert!(is_workspace_evidence_excluded(Path::new(
+            ".ruff_cache/0.1.0"
+        )));
     }
 
     #[test]
@@ -22432,12 +23666,16 @@ mod tests {
 
     #[test]
     fn workspace_evidence_excluded_agentlab_generated() {
-        assert!(is_workspace_evidence_excluded(Path::new(".agentlab_generated/output")));
+        assert!(is_workspace_evidence_excluded(Path::new(
+            ".agentlab_generated/output"
+        )));
     }
 
     #[test]
     fn workspace_evidence_excluded_auth_states() {
-        assert!(is_workspace_evidence_excluded(Path::new("auth-states/token.json")));
+        assert!(is_workspace_evidence_excluded(Path::new(
+            "auth-states/token.json"
+        )));
     }
 
     #[test]
@@ -22453,8 +23691,13 @@ mod tests {
 
     #[test]
     fn validate_workspace_relative_path_rejects_absolute() {
-        let err = validate_workspace_relative_path("/absolute").expect_err("should reject absolute");
-        assert!(err.to_string().contains("relative") || err.to_string().contains("absolute"), "unexpected error: {}", err);
+        let err =
+            validate_workspace_relative_path("/absolute").expect_err("should reject absolute");
+        assert!(
+            err.to_string().contains("relative") || err.to_string().contains("absolute"),
+            "unexpected error: {}",
+            err
+        );
     }
 
     #[test]
@@ -22466,7 +23709,11 @@ mod tests {
     #[test]
     fn validate_workspace_relative_path_dot_only_resolves_empty() {
         let err = validate_workspace_relative_path(".").expect_err("dot-only should fail");
-        assert!(err.to_string().contains("empty"), "unexpected error: {}", err);
+        assert!(
+            err.to_string().contains("empty"),
+            "unexpected error: {}",
+            err
+        );
     }
 
     #[test]
@@ -22478,7 +23725,11 @@ mod tests {
     #[test]
     fn validate_container_workspace_path_rejects_non_workspace_root() {
         let err = validate_container_workspace_path("/some/other/path").expect_err("should reject");
-        assert!(err.to_string().contains("mount_path must be under"), "unexpected error: {}", err);
+        assert!(
+            err.to_string().contains("mount_path must be under"),
+            "unexpected error: {}",
+            err
+        );
     }
 
     #[test]
@@ -22582,7 +23833,10 @@ mod tests {
     #[test]
     fn validate_required_fields_v1_missing_baseline_variant_id_fails() {
         let mut spec = clean_contract_base();
-        spec["baseline"].as_object_mut().unwrap().remove("variant_id");
+        spec["baseline"]
+            .as_object_mut()
+            .unwrap()
+            .remove("variant_id");
         assert!(validate_required_fields(&spec).is_err());
     }
 
@@ -22605,7 +23859,11 @@ mod tests {
         let mut spec = legacy_experiment_base();
         spec["runtime"]["agent"]["mode"] = json!("container");
         let err = validate_required_fields(&spec).expect_err("should reject /runtime/agent/mode");
-        assert!(err.to_string().contains("mode"), "unexpected error: {}", err);
+        assert!(
+            err.to_string().contains("mode"),
+            "unexpected error: {}",
+            err
+        );
     }
 
     #[test]
@@ -22613,7 +23871,11 @@ mod tests {
         let mut spec = legacy_experiment_base();
         spec["runtime"]["agent"]["known_agent_ref"] = json!("codex");
         let err = validate_required_fields(&spec).expect_err("should reject known_agent_ref");
-        assert!(err.to_string().contains("known_agent_ref"), "unexpected error: {}", err);
+        assert!(
+            err.to_string().contains("known_agent_ref"),
+            "unexpected error: {}",
+            err
+        );
     }
 
     #[test]
@@ -22621,7 +23883,11 @@ mod tests {
         let mut spec = legacy_experiment_base();
         spec["runtime"]["agent"]["custom_image"] = json!("img:v2");
         let err = validate_required_fields(&spec).expect_err("should reject custom_image");
-        assert!(err.to_string().contains("custom_image"), "unexpected error: {}", err);
+        assert!(
+            err.to_string().contains("custom_image"),
+            "unexpected error: {}",
+            err
+        );
     }
 
     #[test]
@@ -22629,7 +23895,11 @@ mod tests {
         let mut spec = legacy_experiment_base();
         spec["runtime"]["agent"]["adapter"] = json!("custom_adapter");
         let err = validate_required_fields(&spec).expect_err("should reject adapter");
-        assert!(err.to_string().contains("adapter"), "unexpected error: {}", err);
+        assert!(
+            err.to_string().contains("adapter"),
+            "unexpected error: {}",
+            err
+        );
     }
 
     #[test]
@@ -22637,7 +23907,11 @@ mod tests {
         let mut spec = legacy_experiment_base();
         spec["runtime"]["agent"]["image_source"] = json!("per_task");
         let err = validate_required_fields(&spec).expect_err("per_task needs container");
-        assert!(err.to_string().contains("per_task"), "unexpected error: {}", err);
+        assert!(
+            err.to_string().contains("per_task"),
+            "unexpected error: {}",
+            err
+        );
     }
 
     #[test]
@@ -22646,7 +23920,11 @@ mod tests {
         spec["runtime"]["policy"]["sandbox"]["mode"] = json!("container");
         spec["runtime"]["agent"]["image_source"] = json!("per_task");
         let err = validate_required_fields(&spec).expect_err("per_task needs artifact");
-        assert!(err.to_string().contains("artifact"), "unexpected error: {}", err);
+        assert!(
+            err.to_string().contains("artifact"),
+            "unexpected error: {}",
+            err
+        );
     }
 
     #[test]
@@ -22654,7 +23932,11 @@ mod tests {
         let mut spec = legacy_experiment_base();
         spec["runtime"]["agent"]["image_source"] = json!("custom");
         let err = validate_required_fields(&spec).expect_err("invalid image_source");
-        assert!(err.to_string().contains("image_source"), "unexpected error: {}", err);
+        assert!(
+            err.to_string().contains("image_source"),
+            "unexpected error: {}",
+            err
+        );
     }
 
     #[test]
@@ -22665,21 +23947,30 @@ mod tests {
     #[test]
     fn validate_required_fields_legacy_missing_command_fails() {
         let mut spec = legacy_experiment_base();
-        spec["runtime"]["agent"].as_object_mut().unwrap().remove("command");
+        spec["runtime"]["agent"]
+            .as_object_mut()
+            .unwrap()
+            .remove("command");
         assert!(validate_required_fields(&spec).is_err());
     }
 
     #[test]
     fn validate_required_fields_legacy_missing_replications_fails() {
         let mut spec = legacy_experiment_base();
-        spec["design"].as_object_mut().unwrap().remove("replications");
+        spec["design"]
+            .as_object_mut()
+            .unwrap()
+            .remove("replications");
         assert!(validate_required_fields(&spec).is_err());
     }
 
     #[test]
     fn validate_required_fields_legacy_missing_network_mode_fails() {
         let mut spec = legacy_experiment_base();
-        spec["runtime"]["policy"]["network"].as_object_mut().unwrap().remove("mode");
+        spec["runtime"]["policy"]["network"]
+            .as_object_mut()
+            .unwrap()
+            .remove("mode");
         assert!(validate_required_fields(&spec).is_err());
     }
 
@@ -22687,49 +23978,80 @@ mod tests {
     fn reject_legacy_fields_dataset_section() {
         let spec = json!({"dataset": {"path": "data.jsonl"}});
         let err = reject_legacy_fields_in_dx_authoring(&spec).expect_err("should reject /dataset");
-        assert!(err.to_string().contains("/dataset"), "unexpected error: {}", err);
+        assert!(
+            err.to_string().contains("/dataset"),
+            "unexpected error: {}",
+            err
+        );
     }
 
     #[test]
     fn reject_legacy_fields_design_section() {
         let spec = json!({"design": {"replications": 2}});
         let err = reject_legacy_fields_in_dx_authoring(&spec).expect_err("should reject /design");
-        assert!(err.to_string().contains("/design"), "unexpected error: {}", err);
+        assert!(
+            err.to_string().contains("/design"),
+            "unexpected error: {}",
+            err
+        );
     }
 
     #[test]
     fn reject_legacy_fields_runtime_section() {
         let spec = json!({"runtime": {"image": "img"}});
         let err = reject_legacy_fields_in_dx_authoring(&spec).expect_err("should reject /runtime");
-        assert!(err.to_string().contains("/runtime"), "unexpected error: {}", err);
+        assert!(
+            err.to_string().contains("/runtime"),
+            "unexpected error: {}",
+            err
+        );
     }
 
     #[test]
     fn reject_legacy_fields_metrics_section() {
         let spec = json!({"metrics": {"accuracy": true}});
         let err = reject_legacy_fields_in_dx_authoring(&spec).expect_err("should reject /metrics");
-        assert!(err.to_string().contains("/metrics"), "unexpected error: {}", err);
+        assert!(
+            err.to_string().contains("/metrics"),
+            "unexpected error: {}",
+            err
+        );
     }
 
     #[test]
     fn reject_legacy_fields_variant_plan_section() {
         let spec = json!({"variant_plan": [{"id": "v1"}]});
-        let err = reject_legacy_fields_in_dx_authoring(&spec).expect_err("should reject /variant_plan");
-        assert!(err.to_string().contains("/variant_plan"), "unexpected error: {}", err);
+        let err =
+            reject_legacy_fields_in_dx_authoring(&spec).expect_err("should reject /variant_plan");
+        assert!(
+            err.to_string().contains("/variant_plan"),
+            "unexpected error: {}",
+            err
+        );
     }
 
     #[test]
     fn reject_legacy_fields_baseline_variant_id() {
         let spec = json!({"baseline": {"variant_id": "b1"}});
-        let err = reject_legacy_fields_in_dx_authoring(&spec).expect_err("should reject /baseline/variant_id");
-        assert!(err.to_string().contains("/baseline/variant_id"), "unexpected error: {}", err);
+        let err = reject_legacy_fields_in_dx_authoring(&spec)
+            .expect_err("should reject /baseline/variant_id");
+        assert!(
+            err.to_string().contains("/baseline/variant_id"),
+            "unexpected error: {}",
+            err
+        );
     }
 
     #[test]
     fn reject_legacy_fields_benchmark_object() {
         let spec = json!({"benchmark": {"name": "b1"}});
-        let err = reject_legacy_fields_in_dx_authoring(&spec).expect_err("should reject /benchmark object");
-        assert!(err.to_string().contains("/benchmark"), "unexpected error: {}", err);
+        let err = reject_legacy_fields_in_dx_authoring(&spec)
+            .expect_err("should reject /benchmark object");
+        assert!(
+            err.to_string().contains("/benchmark"),
+            "unexpected error: {}",
+            err
+        );
     }
 
     #[test]
@@ -22858,7 +24180,13 @@ mod tests {
         let cp_path = format!("{}/checkpoint_1.json", AGENTLAB_CONTRACT_STATE_DIR);
         fs::write(state_dir.join("checkpoint_1.json"), "{}").unwrap();
         let output = json!({"checkpoints": [{"logical_name": "cp1", "path": &cp_path, "step": 1}]});
-        let result = resolve_selector_checkpoint(&ForkSelector::Checkpoint("cp1".to_string()), Some(&output), &trial_dir, true).unwrap();
+        let result = resolve_selector_checkpoint(
+            &ForkSelector::Checkpoint("cp1".to_string()),
+            Some(&output),
+            &trial_dir,
+            true,
+        )
+        .unwrap();
         assert!(result.is_some());
     }
 
@@ -22868,7 +24196,13 @@ mod tests {
         let trial_dir = root.path.join("trial_1");
         ensure_dir(&trial_dir).unwrap();
         let output = json!({"checkpoints": []});
-        let err = resolve_selector_checkpoint(&ForkSelector::Checkpoint("missing".to_string()), Some(&output), &trial_dir, true).expect_err("strict should fail");
+        let err = resolve_selector_checkpoint(
+            &ForkSelector::Checkpoint("missing".to_string()),
+            Some(&output),
+            &trial_dir,
+            true,
+        )
+        .expect_err("strict should fail");
         assert!(err.to_string().contains("strict_source_unavailable"));
     }
 
@@ -22878,7 +24212,13 @@ mod tests {
         let trial_dir = root.path.join("trial_1");
         ensure_dir(&trial_dir).unwrap();
         let output = json!({"checkpoints": []});
-        let result = resolve_selector_checkpoint(&ForkSelector::Checkpoint("missing".to_string()), Some(&output), &trial_dir, false).unwrap();
+        let result = resolve_selector_checkpoint(
+            &ForkSelector::Checkpoint("missing".to_string()),
+            Some(&output),
+            &trial_dir,
+            false,
+        )
+        .unwrap();
         assert!(result.is_none());
     }
 
@@ -22895,7 +24235,9 @@ mod tests {
             {"logical_name": "cp5", "path": &cp5_path, "step": 5},
             {"logical_name": "cp8", "path": &format!("{}/cp8.json", AGENTLAB_CONTRACT_STATE_DIR), "step": 8}
         ]});
-        let result = resolve_selector_checkpoint(&ForkSelector::Step(5), Some(&output), &trial_dir, false).unwrap();
+        let result =
+            resolve_selector_checkpoint(&ForkSelector::Step(5), Some(&output), &trial_dir, false)
+                .unwrap();
         assert!(result.is_some());
         assert!(result.unwrap().contains("cp5"));
     }
@@ -22909,7 +24251,13 @@ mod tests {
             {"logical_name": "cp3", "path": "/state/cp3.json", "step": 3},
             {"logical_name": "cp5", "path": "/state/cp5.json", "step": 5}
         ]});
-        assert!(resolve_selector_checkpoint(&ForkSelector::Step(1), Some(&output), &trial_dir, true).is_err());
+        assert!(resolve_selector_checkpoint(
+            &ForkSelector::Step(1),
+            Some(&output),
+            &trial_dir,
+            true
+        )
+        .is_err());
     }
 
     #[test]
@@ -22925,7 +24273,13 @@ mod tests {
             {"logical_name": "cp10", "path": &cp_path, "step": 10},
             {"logical_name": "cp20", "path": &format!("{}/cp20.json", AGENTLAB_CONTRACT_STATE_DIR), "step": 20}
         ]});
-        let result = resolve_selector_checkpoint(&ForkSelector::EventSeq(15), Some(&output), &trial_dir, false).unwrap();
+        let result = resolve_selector_checkpoint(
+            &ForkSelector::EventSeq(15),
+            Some(&output),
+            &trial_dir,
+            false,
+        )
+        .unwrap();
         assert!(result.is_some());
         assert!(result.unwrap().contains("cp10"));
     }
@@ -22935,7 +24289,13 @@ mod tests {
         let root = TempDirGuard::new("resolve_cp_no_output_strict");
         let trial_dir = root.path.join("trial_1");
         ensure_dir(&trial_dir).unwrap();
-        assert!(resolve_selector_checkpoint(&ForkSelector::Checkpoint("any".to_string()), None, &trial_dir, true).is_err());
+        assert!(resolve_selector_checkpoint(
+            &ForkSelector::Checkpoint("any".to_string()),
+            None,
+            &trial_dir,
+            true
+        )
+        .is_err());
     }
 
     #[test]
@@ -22943,7 +24303,14 @@ mod tests {
         let root = TempDirGuard::new("resolve_cp_no_output_nonstrict");
         let trial_dir = root.path.join("trial_1");
         ensure_dir(&trial_dir).unwrap();
-        assert!(resolve_selector_checkpoint(&ForkSelector::Checkpoint("any".to_string()), None, &trial_dir, false).unwrap().is_none());
+        assert!(resolve_selector_checkpoint(
+            &ForkSelector::Checkpoint("any".to_string()),
+            None,
+            &trial_dir,
+            false
+        )
+        .unwrap()
+        .is_none());
     }
 
     #[test]
@@ -22951,7 +24318,13 @@ mod tests {
         let root = TempDirGuard::new("resolve_cp_empty_strict");
         let trial_dir = root.path.join("trial_1");
         ensure_dir(&trial_dir).unwrap();
-        assert!(resolve_selector_checkpoint(&ForkSelector::Step(5), Some(&json!({"checkpoints": []})), &trial_dir, true).is_err());
+        assert!(resolve_selector_checkpoint(
+            &ForkSelector::Step(5),
+            Some(&json!({"checkpoints": []})),
+            &trial_dir,
+            true
+        )
+        .is_err());
     }
 
     #[test]
@@ -22959,20 +24332,33 @@ mod tests {
         let root = TempDirGuard::new("resolve_cp_empty_nonstrict");
         let trial_dir = root.path.join("trial_1");
         ensure_dir(&trial_dir).unwrap();
-        assert!(resolve_selector_checkpoint(&ForkSelector::Step(5), Some(&json!({"checkpoints": []})), &trial_dir, false).unwrap().is_none());
+        assert!(resolve_selector_checkpoint(
+            &ForkSelector::Step(5),
+            Some(&json!({"checkpoints": []})),
+            &trial_dir,
+            false
+        )
+        .unwrap()
+        .is_none());
     }
 
     #[test]
     fn adapter_control_ack_received_missing_file_returns_false() {
         let root = TempDirGuard::new("ack_missing");
-        assert!(!adapter_control_ack_received(&root.path.join("events.jsonl"), "pause", "v1").unwrap());
+        assert!(
+            !adapter_control_ack_received(&root.path.join("events.jsonl"), "pause", "v1").unwrap()
+        );
     }
 
     #[test]
     fn adapter_control_ack_received_wrong_action_returns_false() {
         let root = TempDirGuard::new("ack_wrong_action");
         let events_path = root.path.join("events.jsonl");
-        fs::write(&events_path, r#"{"event_type":"control_ack","action_observed":"resume","control_version":"v1"}"#).unwrap();
+        fs::write(
+            &events_path,
+            r#"{"event_type":"control_ack","action_observed":"resume","control_version":"v1"}"#,
+        )
+        .unwrap();
         assert!(!adapter_control_ack_received(&events_path, "pause", "v1").unwrap());
     }
 
@@ -22980,7 +24366,11 @@ mod tests {
     fn adapter_control_ack_received_wrong_version_returns_false() {
         let root = TempDirGuard::new("ack_wrong_version");
         let events_path = root.path.join("events.jsonl");
-        fs::write(&events_path, r#"{"event_type":"control_ack","action_observed":"pause","control_version":"v2"}"#).unwrap();
+        fs::write(
+            &events_path,
+            r#"{"event_type":"control_ack","action_observed":"pause","control_version":"v2"}"#,
+        )
+        .unwrap();
         assert!(!adapter_control_ack_received(&events_path, "pause", "v1").unwrap());
     }
 
@@ -23011,7 +24401,10 @@ mod tests {
     #[test]
     fn read_control_seq_missing_file_returns_zero() {
         let root = TempDirGuard::new("ctrl_seq_missing");
-        assert_eq!(read_control_seq(&root.path.join("control.json")).unwrap(), 0);
+        assert_eq!(
+            read_control_seq(&root.path.join("control.json")).unwrap(),
+            0
+        );
     }
 
     #[test]
@@ -23110,7 +24503,12 @@ mod tests {
         let b = build_trial_schedule(5, 10, 3, SchedulingPolicy::Randomized, 12345);
         assert_eq!(a.len(), 150);
         for (i, (sa, sb)) in a.iter().zip(b.iter()).enumerate() {
-            assert_eq!((sa.variant_idx, sa.task_idx, sa.repl_idx), (sb.variant_idx, sb.task_idx, sb.repl_idx), "mismatch at slot {}", i);
+            assert_eq!(
+                (sa.variant_idx, sa.task_idx, sa.repl_idx),
+                (sb.variant_idx, sb.task_idx, sb.repl_idx),
+                "mismatch at slot {}",
+                i
+            );
         }
     }
 
@@ -23119,7 +24517,10 @@ mod tests {
         let a = build_trial_schedule(2, 3, 1, SchedulingPolicy::Randomized, 0);
         let b = build_trial_schedule(2, 3, 1, SchedulingPolicy::Randomized, 0);
         for (sa, sb) in a.iter().zip(b.iter()) {
-            assert_eq!((sa.variant_idx, sa.task_idx, sa.repl_idx), (sb.variant_idx, sb.task_idx, sb.repl_idx));
+            assert_eq!(
+                (sa.variant_idx, sa.task_idx, sa.repl_idx),
+                (sb.variant_idx, sb.task_idx, sb.repl_idx)
+            );
         }
     }
 
@@ -23147,7 +24548,11 @@ mod tests {
 
     #[test]
     fn schedule_slot_count_equals_product() {
-        for policy in [SchedulingPolicy::VariantSequential, SchedulingPolicy::PairedInterleaved, SchedulingPolicy::Randomized] {
+        for policy in [
+            SchedulingPolicy::VariantSequential,
+            SchedulingPolicy::PairedInterleaved,
+            SchedulingPolicy::Randomized,
+        ] {
             let slots = build_trial_schedule(3, 4, 2, policy, 42);
             assert_eq!(slots.len(), 3 * 4 * 2, "policy {:?}", policy);
         }
@@ -23157,7 +24562,10 @@ mod tests {
     fn schedule_randomized_different_seeds_produce_different_orders() {
         let a = build_trial_schedule(3, 5, 1, SchedulingPolicy::Randomized, 111);
         let b = build_trial_schedule(3, 5, 1, SchedulingPolicy::Randomized, 222);
-        let same = a.iter().zip(b.iter()).all(|(sa, sb)| sa.variant_idx == sb.variant_idx && sa.task_idx == sb.task_idx);
+        let same = a
+            .iter()
+            .zip(b.iter())
+            .all(|(sa, sb)| sa.variant_idx == sb.variant_idx && sa.task_idx == sb.task_idx);
         assert!(!same, "different seeds should produce different orderings");
     }
 
@@ -23195,8 +24603,12 @@ mod tests {
 
     #[test]
     fn parse_policies_concurrency_max_in_flight() {
-        let spec = json!({"design": {"policies": {"concurrency": {"max_in_flight_per_variant": 4}}}});
-        assert_eq!(parse_policies(&spec).concurrency.max_in_flight_per_variant, Some(4));
+        let spec =
+            json!({"design": {"policies": {"concurrency": {"max_in_flight_per_variant": 4}}}});
+        assert_eq!(
+            parse_policies(&spec).concurrency.max_in_flight_per_variant,
+            Some(4)
+        );
     }
 
     #[test]
@@ -23208,33 +24620,53 @@ mod tests {
     #[test]
     fn parse_policies_task_boundary_require_workspace_materialization_false() {
         let spec = json!({"design": {"policies": {"task_boundary": {"require_workspace_materialization": false}}}});
-        assert!(!parse_policies(&spec).task_boundary.require_workspace_materialization);
+        assert!(
+            !parse_policies(&spec)
+                .task_boundary
+                .require_workspace_materialization
+        );
     }
 
     #[test]
     fn parse_policies_pruning_max_consecutive_failures() {
         let spec = json!({"design": {"policies": {"pruning": {"max_consecutive_failures": 5}}}});
-        assert_eq!(parse_policies(&spec).pruning_max_consecutive_failures, Some(5));
+        assert_eq!(
+            parse_policies(&spec).pruning_max_consecutive_failures,
+            Some(5)
+        );
     }
 
     #[test]
     fn parse_policies_pruning_default_none() {
-        assert!(parse_policies(&json!({"design": {"policies": {}}})).pruning_max_consecutive_failures.is_none());
+        assert!(parse_policies(&json!({"design": {"policies": {}}}))
+            .pruning_max_consecutive_failures
+            .is_none());
     }
 
     #[test]
     fn parse_policies_scheduling_paired_interleaved() {
-        assert_eq!(parse_policies(&json!({"design": {"policies": {"scheduling": "paired_interleaved"}}})).scheduling, SchedulingPolicy::PairedInterleaved);
+        assert_eq!(
+            parse_policies(&json!({"design": {"policies": {"scheduling": "paired_interleaved"}}}))
+                .scheduling,
+            SchedulingPolicy::PairedInterleaved
+        );
     }
 
     #[test]
     fn parse_policies_scheduling_randomized() {
-        assert_eq!(parse_policies(&json!({"design": {"policies": {"scheduling": "randomized"}}})).scheduling, SchedulingPolicy::Randomized);
+        assert_eq!(
+            parse_policies(&json!({"design": {"policies": {"scheduling": "randomized"}}}))
+                .scheduling,
+            SchedulingPolicy::Randomized
+        );
     }
 
     #[test]
     fn parse_policies_scheduling_default_variant_sequential() {
-        assert_eq!(parse_policies(&json!({"design": {"policies": {}}})).scheduling, SchedulingPolicy::VariantSequential);
+        assert_eq!(
+            parse_policies(&json!({"design": {"policies": {}}})).scheduling,
+            SchedulingPolicy::VariantSequential
+        );
     }
 
     #[test]
@@ -23247,7 +24679,11 @@ mod tests {
 
     #[test]
     fn parse_policies_retry_max_attempts() {
-        assert_eq!(parse_policies(&json!({"design": {"policies": {"retry": {"max_attempts": 5}}}})).retry_max_attempts, 5);
+        assert_eq!(
+            parse_policies(&json!({"design": {"policies": {"retry": {"max_attempts": 5}}}}))
+                .retry_max_attempts,
+            5
+        );
     }
 
     #[test]
@@ -23262,17 +24698,29 @@ mod tests {
 
     #[test]
     fn should_retry_outcome_timeout_with_timeout_trigger() {
-        assert!(should_retry_outcome("timeout", "0", &["timeout".to_string()]));
+        assert!(should_retry_outcome(
+            "timeout",
+            "0",
+            &["timeout".to_string()]
+        ));
     }
 
     #[test]
     fn should_retry_outcome_timeout_without_trigger() {
-        assert!(!should_retry_outcome("timeout", "0", &["error".to_string()]));
+        assert!(!should_retry_outcome(
+            "timeout",
+            "0",
+            &["error".to_string()]
+        ));
     }
 
     #[test]
     fn should_retry_outcome_failure_with_failure_trigger() {
-        assert!(should_retry_outcome("completed", "1", &["failure".to_string()]));
+        assert!(should_retry_outcome(
+            "completed",
+            "1",
+            &["failure".to_string()]
+        ));
     }
 
     #[test]
@@ -23287,25 +24735,42 @@ mod tests {
 
     #[test]
     fn should_retry_outcome_error_without_error_trigger() {
-        assert!(!should_retry_outcome("error", "0", &["timeout".to_string()]));
+        assert!(!should_retry_outcome(
+            "error",
+            "0",
+            &["timeout".to_string()]
+        ));
     }
 
     #[test]
     fn should_retry_outcome_success_with_triggers_never_retried() {
-        assert!(!should_retry_outcome("success", "0", &["error".to_string(), "timeout".to_string()]));
+        assert!(!should_retry_outcome(
+            "success",
+            "0",
+            &["error".to_string(), "timeout".to_string()]
+        ));
     }
 
     #[test]
     fn normalize_schedule_progress_fills_missing_attempt() {
         let mut progress = ScheduleProgress {
-            schema_version: String::new(), run_id: "run_001".to_string(),
-            total_slots: 1, next_schedule_index: 1, next_trial_index: 1,
-            schedule: vec![], completed_slots: vec![SlotCompletion {
-                schedule_index: 0, trial_id: "trial_1".to_string(),
-                status: "completed".to_string(), slot_commit_id: "abc".to_string(), attempt: 0,
+            schema_version: String::new(),
+            run_id: "run_001".to_string(),
+            total_slots: 1,
+            next_schedule_index: 1,
+            next_trial_index: 1,
+            schedule: vec![],
+            completed_slots: vec![SlotCompletion {
+                schedule_index: 0,
+                trial_id: "trial_1".to_string(),
+                status: "completed".to_string(),
+                slot_commit_id: "abc".to_string(),
+                attempt: 0,
             }],
-            pruned_variants: vec![], consecutive_failures: BTreeMap::new(),
-            use_container: false, updated_at: String::new(),
+            pruned_variants: vec![],
+            consecutive_failures: BTreeMap::new(),
+            use_container: false,
+            updated_at: String::new(),
         };
         normalize_schedule_progress(&mut progress);
         assert_eq!(progress.completed_slots[0].attempt, 1);
@@ -23314,26 +24779,44 @@ mod tests {
     #[test]
     fn normalize_schedule_progress_fills_missing_commit_id() {
         let mut progress = ScheduleProgress {
-            schema_version: String::new(), run_id: "run_001".to_string(),
-            total_slots: 1, next_schedule_index: 1, next_trial_index: 1,
-            schedule: vec![], completed_slots: vec![SlotCompletion {
-                schedule_index: 0, trial_id: "trial_1".to_string(),
-                status: "completed".to_string(), slot_commit_id: "".to_string(), attempt: 1,
+            schema_version: String::new(),
+            run_id: "run_001".to_string(),
+            total_slots: 1,
+            next_schedule_index: 1,
+            next_trial_index: 1,
+            schedule: vec![],
+            completed_slots: vec![SlotCompletion {
+                schedule_index: 0,
+                trial_id: "trial_1".to_string(),
+                status: "completed".to_string(),
+                slot_commit_id: "".to_string(),
+                attempt: 1,
             }],
-            pruned_variants: vec![], consecutive_failures: BTreeMap::new(),
-            use_container: false, updated_at: String::new(),
+            pruned_variants: vec![],
+            consecutive_failures: BTreeMap::new(),
+            use_container: false,
+            updated_at: String::new(),
         };
         normalize_schedule_progress(&mut progress);
-        assert!(progress.completed_slots[0].slot_commit_id.starts_with("legacy_"));
+        assert!(progress.completed_slots[0]
+            .slot_commit_id
+            .starts_with("legacy_"));
     }
 
     #[test]
     fn normalize_schedule_progress_sets_schema_version() {
         let mut progress = ScheduleProgress {
-            schema_version: "old".to_string(), run_id: "run_001".to_string(),
-            total_slots: 0, next_schedule_index: 0, next_trial_index: 0,
-            schedule: vec![], completed_slots: vec![], pruned_variants: vec![],
-            consecutive_failures: BTreeMap::new(), use_container: false, updated_at: String::new(),
+            schema_version: "old".to_string(),
+            run_id: "run_001".to_string(),
+            total_slots: 0,
+            next_schedule_index: 0,
+            next_trial_index: 0,
+            schedule: vec![],
+            completed_slots: vec![],
+            pruned_variants: vec![],
+            consecutive_failures: BTreeMap::new(),
+            use_container: false,
+            updated_at: String::new(),
         };
         normalize_schedule_progress(&mut progress);
         assert_eq!(progress.schema_version, "schedule_progress_v2");
@@ -23346,7 +24829,10 @@ mod tests {
         ensure_dir(&run_dir.join("runtime")).unwrap();
         let progress = json!({"schema_version": "schedule_progress_v1", "run_id": "run_001", "total_slots": 0, "next_schedule_index": 0, "next_trial_index": 0, "schedule": [], "completed_slots": [], "pruned_variants": [], "consecutive_failures": {}, "use_container": false, "updated_at": ""});
         atomic_write_json_pretty(&schedule_progress_path(&run_dir), &progress).unwrap();
-        assert!(load_schedule_progress(&run_dir).unwrap_err().to_string().contains("unsupported"));
+        assert!(load_schedule_progress(&run_dir)
+            .unwrap_err()
+            .to_string()
+            .contains("unsupported"));
     }
 
     #[test]
@@ -23355,11 +24841,27 @@ mod tests {
         let run_dir = root.path.join("run");
         ensure_dir(&run_dir.join("runtime")).unwrap();
         let progress = ScheduleProgress {
-            schema_version: "schedule_progress_v2".to_string(), run_id: "run_001".to_string(),
-            total_slots: 6, next_schedule_index: 3, next_trial_index: 3,
-            schedule: vec![TrialSlot { variant_idx: 0, task_idx: 0, repl_idx: 0 }],
-            completed_slots: vec![SlotCompletion { schedule_index: 0, trial_id: "trial_1".to_string(), status: "completed".to_string(), slot_commit_id: "abc123".to_string(), attempt: 1 }],
-            pruned_variants: vec![], consecutive_failures: BTreeMap::new(), use_container: false, updated_at: "2024-01-01T00:00:00Z".to_string(),
+            schema_version: "schedule_progress_v2".to_string(),
+            run_id: "run_001".to_string(),
+            total_slots: 6,
+            next_schedule_index: 3,
+            next_trial_index: 3,
+            schedule: vec![TrialSlot {
+                variant_idx: 0,
+                task_idx: 0,
+                repl_idx: 0,
+            }],
+            completed_slots: vec![SlotCompletion {
+                schedule_index: 0,
+                trial_id: "trial_1".to_string(),
+                status: "completed".to_string(),
+                slot_commit_id: "abc123".to_string(),
+                attempt: 1,
+            }],
+            pruned_variants: vec![],
+            consecutive_failures: BTreeMap::new(),
+            use_container: false,
+            updated_at: "2024-01-01T00:00:00Z".to_string(),
         };
         write_schedule_progress(&run_dir, &progress).unwrap();
         let loaded = load_schedule_progress(&run_dir).unwrap();
@@ -23369,20 +24871,47 @@ mod tests {
 
     #[test]
     fn schedule_progress_path_uses_runtime_dir() {
-        assert_eq!(schedule_progress_path(&PathBuf::from("/tmp/run_001")), PathBuf::from("/tmp/run_001/runtime/schedule_progress.json"));
+        assert_eq!(
+            schedule_progress_path(&PathBuf::from("/tmp/run_001")),
+            PathBuf::from("/tmp/run_001/runtime/schedule_progress.json")
+        );
     }
 
     #[test]
     fn legacy_slot_commit_id_deterministic() {
-        let slot = SlotCompletion { schedule_index: 0, trial_id: "trial_1".to_string(), status: "completed".to_string(), slot_commit_id: String::new(), attempt: 1 };
-        assert_eq!(legacy_slot_commit_id("run_001", &slot), legacy_slot_commit_id("run_001", &slot));
+        let slot = SlotCompletion {
+            schedule_index: 0,
+            trial_id: "trial_1".to_string(),
+            status: "completed".to_string(),
+            slot_commit_id: String::new(),
+            attempt: 1,
+        };
+        assert_eq!(
+            legacy_slot_commit_id("run_001", &slot),
+            legacy_slot_commit_id("run_001", &slot)
+        );
     }
 
     #[test]
     fn legacy_slot_commit_id_different_for_different_slots() {
-        let a = SlotCompletion { schedule_index: 0, trial_id: "trial_1".to_string(), status: "completed".to_string(), slot_commit_id: String::new(), attempt: 1 };
-        let b = SlotCompletion { schedule_index: 1, trial_id: "trial_2".to_string(), status: "completed".to_string(), slot_commit_id: String::new(), attempt: 1 };
-        assert_ne!(legacy_slot_commit_id("run_001", &a), legacy_slot_commit_id("run_001", &b));
+        let a = SlotCompletion {
+            schedule_index: 0,
+            trial_id: "trial_1".to_string(),
+            status: "completed".to_string(),
+            slot_commit_id: String::new(),
+            attempt: 1,
+        };
+        let b = SlotCompletion {
+            schedule_index: 1,
+            trial_id: "trial_2".to_string(),
+            status: "completed".to_string(),
+            slot_commit_id: String::new(),
+            attempt: 1,
+        };
+        assert_ne!(
+            legacy_slot_commit_id("run_001", &a),
+            legacy_slot_commit_id("run_001", &b)
+        );
     }
 
     #[test]
@@ -23393,35 +24922,82 @@ mod tests {
     #[test]
     fn active_trials_use_worker_control_plane_all_qualified() {
         let mut active = HashMap::new();
-        active.insert("trial_1".to_string(), RunControlActiveTrial { trial_id: "trial_1".to_string(), worker_id: "worker_a".to_string(), schedule_idx: Some(0), variant_id: None, started_at: None, control: None });
-        assert!(active_trials_use_worker_control_plane(&active, &["trial_1".to_string()]));
+        active.insert(
+            "trial_1".to_string(),
+            RunControlActiveTrial {
+                trial_id: "trial_1".to_string(),
+                worker_id: "worker_a".to_string(),
+                schedule_idx: Some(0),
+                variant_id: None,
+                started_at: None,
+                control: None,
+            },
+        );
+        assert!(active_trials_use_worker_control_plane(
+            &active,
+            &["trial_1".to_string()]
+        ));
     }
 
     #[test]
     fn active_trials_use_worker_control_plane_some_have_control() {
         let mut active = HashMap::new();
-        active.insert("trial_1".to_string(), RunControlActiveTrial {
-            trial_id: "trial_1".to_string(), worker_id: "worker_a".to_string(), schedule_idx: Some(0), variant_id: None, started_at: None,
-            control: Some(ActiveAdapterControl { adapter_id: BUILTIN_COMMAND_ADAPTER_ID.to_string(), adapter_version: BUILTIN_COMMAND_ADAPTER_VERSION.to_string(), command_path: "/tmp/control".to_string(), events_path: Some("/tmp/events".to_string()) }),
-        });
-        assert!(!active_trials_use_worker_control_plane(&active, &["trial_1".to_string()]));
+        active.insert(
+            "trial_1".to_string(),
+            RunControlActiveTrial {
+                trial_id: "trial_1".to_string(),
+                worker_id: "worker_a".to_string(),
+                schedule_idx: Some(0),
+                variant_id: None,
+                started_at: None,
+                control: Some(ActiveAdapterControl {
+                    adapter_id: BUILTIN_COMMAND_ADAPTER_ID.to_string(),
+                    adapter_version: BUILTIN_COMMAND_ADAPTER_VERSION.to_string(),
+                    command_path: "/tmp/control".to_string(),
+                    events_path: Some("/tmp/events".to_string()),
+                }),
+            },
+        );
+        assert!(!active_trials_use_worker_control_plane(
+            &active,
+            &["trial_1".to_string()]
+        ));
     }
 
     #[test]
     fn active_trials_use_worker_control_plane_empty_targets() {
-        assert!(!active_trials_use_worker_control_plane(&HashMap::new(), &[]));
+        assert!(!active_trials_use_worker_control_plane(
+            &HashMap::new(),
+            &[]
+        ));
     }
 
     #[test]
     fn active_trials_use_worker_control_plane_unknown_worker() {
         let mut active = HashMap::new();
-        active.insert("trial_1".to_string(), RunControlActiveTrial { trial_id: "trial_1".to_string(), worker_id: RUN_CONTROL_UNKNOWN_WORKER_ID.to_string(), schedule_idx: Some(0), variant_id: None, started_at: None, control: None });
-        assert!(!active_trials_use_worker_control_plane(&active, &["trial_1".to_string()]));
+        active.insert(
+            "trial_1".to_string(),
+            RunControlActiveTrial {
+                trial_id: "trial_1".to_string(),
+                worker_id: RUN_CONTROL_UNKNOWN_WORKER_ID.to_string(),
+                schedule_idx: Some(0),
+                variant_id: None,
+                started_at: None,
+                control: None,
+            },
+        );
+        assert!(!active_trials_use_worker_control_plane(
+            &active,
+            &["trial_1".to_string()]
+        ));
     }
 
     #[test]
     fn active_trials_use_worker_control_plane_missing_from_map() {
-        assert!(!active_trials_use_worker_control_plane(&HashMap::new(), &["trial_1".to_string()]));
+        assert!(!active_trials_use_worker_control_plane(
+            &HashMap::new(),
+            &["trial_1".to_string()]
+        ));
     }
 
     // ───────────────────────────────────────────────────────────────────
@@ -23430,51 +25006,133 @@ mod tests {
 
     #[test]
     fn variant_digest_deterministic() {
-        let v = Variant { id: "v1".to_string(), bindings: json!({"key": "value"}), args: vec![], env: BTreeMap::new(), image: None, runtime_overrides: None };
+        let v = Variant {
+            id: "v1".to_string(),
+            bindings: json!({"key": "value"}),
+            args: vec![],
+            env: BTreeMap::new(),
+            image: None,
+            runtime_overrides: None,
+        };
         assert_eq!(variant_digest(&v).unwrap(), variant_digest(&v).unwrap());
     }
 
     #[test]
     fn variant_digest_changes_with_bindings() {
-        let v1 = Variant { id: "v1".to_string(), bindings: json!({"key": "a"}), args: vec![], env: BTreeMap::new(), image: None, runtime_overrides: None };
-        let v2 = Variant { id: "v1".to_string(), bindings: json!({"key": "b"}), args: vec![], env: BTreeMap::new(), image: None, runtime_overrides: None };
+        let v1 = Variant {
+            id: "v1".to_string(),
+            bindings: json!({"key": "a"}),
+            args: vec![],
+            env: BTreeMap::new(),
+            image: None,
+            runtime_overrides: None,
+        };
+        let v2 = Variant {
+            id: "v1".to_string(),
+            bindings: json!({"key": "b"}),
+            args: vec![],
+            env: BTreeMap::new(),
+            image: None,
+            runtime_overrides: None,
+        };
         assert_ne!(variant_digest(&v1).unwrap(), variant_digest(&v2).unwrap());
     }
 
     #[test]
     fn variant_digest_changes_with_env() {
-        let mut env1 = BTreeMap::new(); env1.insert("FOO".to_string(), "bar".to_string());
-        let mut env2 = BTreeMap::new(); env2.insert("FOO".to_string(), "baz".to_string());
-        let v1 = Variant { id: "v1".to_string(), bindings: json!({}), args: vec![], env: env1, image: None, runtime_overrides: None };
-        let v2 = Variant { id: "v1".to_string(), bindings: json!({}), args: vec![], env: env2, image: None, runtime_overrides: None };
+        let mut env1 = BTreeMap::new();
+        env1.insert("FOO".to_string(), "bar".to_string());
+        let mut env2 = BTreeMap::new();
+        env2.insert("FOO".to_string(), "baz".to_string());
+        let v1 = Variant {
+            id: "v1".to_string(),
+            bindings: json!({}),
+            args: vec![],
+            env: env1,
+            image: None,
+            runtime_overrides: None,
+        };
+        let v2 = Variant {
+            id: "v1".to_string(),
+            bindings: json!({}),
+            args: vec![],
+            env: env2,
+            image: None,
+            runtime_overrides: None,
+        };
         assert_ne!(variant_digest(&v1).unwrap(), variant_digest(&v2).unwrap());
     }
 
     #[test]
     fn variant_digest_changes_with_image() {
-        let v1 = Variant { id: "v1".to_string(), bindings: json!({}), args: vec![], env: BTreeMap::new(), image: Some("img:v1".to_string()), runtime_overrides: None };
-        let v2 = Variant { id: "v1".to_string(), bindings: json!({}), args: vec![], env: BTreeMap::new(), image: Some("img:v2".to_string()), runtime_overrides: None };
+        let v1 = Variant {
+            id: "v1".to_string(),
+            bindings: json!({}),
+            args: vec![],
+            env: BTreeMap::new(),
+            image: Some("img:v1".to_string()),
+            runtime_overrides: None,
+        };
+        let v2 = Variant {
+            id: "v1".to_string(),
+            bindings: json!({}),
+            args: vec![],
+            env: BTreeMap::new(),
+            image: Some("img:v2".to_string()),
+            runtime_overrides: None,
+        };
         assert_ne!(variant_digest(&v1).unwrap(), variant_digest(&v2).unwrap());
     }
 
     #[test]
     fn find_variant_by_id_finds_match() {
         let variants = vec![
-            Variant { id: "baseline".to_string(), bindings: json!({}), args: vec![], env: BTreeMap::new(), image: None, runtime_overrides: None },
-            Variant { id: "treatment".to_string(), bindings: json!({"temp": 0.5}), args: vec![], env: BTreeMap::new(), image: None, runtime_overrides: None },
+            Variant {
+                id: "baseline".to_string(),
+                bindings: json!({}),
+                args: vec![],
+                env: BTreeMap::new(),
+                image: None,
+                runtime_overrides: None,
+            },
+            Variant {
+                id: "treatment".to_string(),
+                bindings: json!({"temp": 0.5}),
+                args: vec![],
+                env: BTreeMap::new(),
+                image: None,
+                runtime_overrides: None,
+            },
         ];
-        assert_eq!(find_variant_by_id(&variants, "treatment").unwrap().id, "treatment");
+        assert_eq!(
+            find_variant_by_id(&variants, "treatment").unwrap().id,
+            "treatment"
+        );
     }
 
     #[test]
     fn find_variant_by_id_empty_id_returns_first() {
-        let variants = vec![Variant { id: "baseline".to_string(), bindings: json!({}), args: vec![], env: BTreeMap::new(), image: None, runtime_overrides: None }];
+        let variants = vec![Variant {
+            id: "baseline".to_string(),
+            bindings: json!({}),
+            args: vec![],
+            env: BTreeMap::new(),
+            image: None,
+            runtime_overrides: None,
+        }];
         assert_eq!(find_variant_by_id(&variants, "").unwrap().id, "baseline");
     }
 
     #[test]
     fn find_variant_by_id_missing_fails() {
-        let variants = vec![Variant { id: "baseline".to_string(), bindings: json!({}), args: vec![], env: BTreeMap::new(), image: None, runtime_overrides: None }];
+        let variants = vec![Variant {
+            id: "baseline".to_string(),
+            bindings: json!({}),
+            args: vec![],
+            env: BTreeMap::new(),
+            image: None,
+            runtime_overrides: None,
+        }];
         assert!(find_variant_by_id(&variants, "missing").is_err());
     }
 
@@ -23514,29 +25172,75 @@ mod tests {
 
     #[test]
     fn operation_lease_is_stale_expired_returns_true() {
-        let record = OperationLeaseRecord { schema_version: "v1".to_string(), operation_id: "op1".to_string(), op_type: "run".to_string(), owner_pid: 12345, owner_host: "localhost".to_string(), acquired_at: "2024-01-01T00:00:00Z".to_string(), expires_at: "2024-01-01T00:05:00Z".to_string(), stale_takeover_of: None };
-        let now = chrono::DateTime::parse_from_rfc3339("2024-01-01T00:10:00Z").unwrap().with_timezone(&Utc);
+        let record = OperationLeaseRecord {
+            schema_version: "v1".to_string(),
+            operation_id: "op1".to_string(),
+            op_type: "run".to_string(),
+            owner_pid: 12345,
+            owner_host: "localhost".to_string(),
+            acquired_at: "2024-01-01T00:00:00Z".to_string(),
+            expires_at: "2024-01-01T00:05:00Z".to_string(),
+            stale_takeover_of: None,
+        };
+        let now = chrono::DateTime::parse_from_rfc3339("2024-01-01T00:10:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
         assert!(operation_lease_is_stale(&record, now));
     }
 
     #[test]
     fn operation_lease_is_stale_fresh_returns_false() {
-        let record = OperationLeaseRecord { schema_version: "v1".to_string(), operation_id: "op1".to_string(), op_type: "run".to_string(), owner_pid: 12345, owner_host: "localhost".to_string(), acquired_at: "2024-01-01T00:00:00Z".to_string(), expires_at: "2024-01-01T00:10:00Z".to_string(), stale_takeover_of: None };
-        let now = chrono::DateTime::parse_from_rfc3339("2024-01-01T00:05:00Z").unwrap().with_timezone(&Utc);
+        let record = OperationLeaseRecord {
+            schema_version: "v1".to_string(),
+            operation_id: "op1".to_string(),
+            op_type: "run".to_string(),
+            owner_pid: 12345,
+            owner_host: "localhost".to_string(),
+            acquired_at: "2024-01-01T00:00:00Z".to_string(),
+            expires_at: "2024-01-01T00:10:00Z".to_string(),
+            stale_takeover_of: None,
+        };
+        let now = chrono::DateTime::parse_from_rfc3339("2024-01-01T00:05:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
         assert!(!operation_lease_is_stale(&record, now));
     }
 
     #[test]
     fn engine_lease_is_stale_expired_returns_true() {
-        let record = EngineLeaseRecord { schema_version: "v1".to_string(), run_id: "run_001".to_string(), owner_id: "o1".to_string(), pid: 12345, hostname: "localhost".to_string(), started_at: "2024-01-01T00:00:00Z".to_string(), heartbeat_at: "2024-01-01T00:00:00Z".to_string(), expires_at: "2024-01-01T00:05:00Z".to_string(), epoch: 0 };
-        let now = chrono::DateTime::parse_from_rfc3339("2024-01-01T00:10:00Z").unwrap().with_timezone(&Utc);
+        let record = EngineLeaseRecord {
+            schema_version: "v1".to_string(),
+            run_id: "run_001".to_string(),
+            owner_id: "o1".to_string(),
+            pid: 12345,
+            hostname: "localhost".to_string(),
+            started_at: "2024-01-01T00:00:00Z".to_string(),
+            heartbeat_at: "2024-01-01T00:00:00Z".to_string(),
+            expires_at: "2024-01-01T00:05:00Z".to_string(),
+            epoch: 0,
+        };
+        let now = chrono::DateTime::parse_from_rfc3339("2024-01-01T00:10:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
         assert!(engine_lease_is_stale(&record, now));
     }
 
     #[test]
     fn engine_lease_is_stale_fresh_returns_false() {
-        let record = EngineLeaseRecord { schema_version: "v1".to_string(), run_id: "run_001".to_string(), owner_id: "o1".to_string(), pid: 12345, hostname: "localhost".to_string(), started_at: "2024-01-01T00:00:00Z".to_string(), heartbeat_at: "2024-01-01T00:00:00Z".to_string(), expires_at: "2024-01-01T00:10:00Z".to_string(), epoch: 0 };
-        let now = chrono::DateTime::parse_from_rfc3339("2024-01-01T00:05:00Z").unwrap().with_timezone(&Utc);
+        let record = EngineLeaseRecord {
+            schema_version: "v1".to_string(),
+            run_id: "run_001".to_string(),
+            owner_id: "o1".to_string(),
+            pid: 12345,
+            hostname: "localhost".to_string(),
+            started_at: "2024-01-01T00:00:00Z".to_string(),
+            heartbeat_at: "2024-01-01T00:00:00Z".to_string(),
+            expires_at: "2024-01-01T00:10:00Z".to_string(),
+            epoch: 0,
+        };
+        let now = chrono::DateTime::parse_from_rfc3339("2024-01-01T00:05:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
         assert!(!engine_lease_is_stale(&record, now));
     }
 
@@ -23555,7 +25259,11 @@ mod tests {
         let root = TempDirGuard::new("run_ctrl_paused");
         let run_dir = root.path.join("run");
         ensure_dir(&run_dir.join("runtime")).unwrap();
-        let pause = RunControlPauseMetadata { label: "user_pause".to_string(), requested_at: "2024-01-01T00:00:00Z".to_string(), requested_by: None };
+        let pause = RunControlPauseMetadata {
+            label: "user_pause".to_string(),
+            requested_at: "2024-01-01T00:00:00Z".to_string(),
+            requested_by: None,
+        };
         write_run_control_v2(&run_dir, "run_001", "paused", &[], Some(&pause)).unwrap();
         let loaded = load_json_file(&run_control_path(&run_dir)).unwrap();
         assert_eq!(loaded["status"], "paused");
@@ -23567,7 +25275,14 @@ mod tests {
         let root = TempDirGuard::new("run_ctrl_active");
         let run_dir = root.path.join("run");
         ensure_dir(&run_dir.join("runtime")).unwrap();
-        let trials = vec![RunControlActiveTrial { trial_id: "trial_1".to_string(), worker_id: "worker_a".to_string(), schedule_idx: Some(0), variant_id: Some("baseline".to_string()), started_at: Some("2024-01-01T00:00:00Z".to_string()), control: None }];
+        let trials = vec![RunControlActiveTrial {
+            trial_id: "trial_1".to_string(),
+            worker_id: "worker_a".to_string(),
+            schedule_idx: Some(0),
+            variant_id: Some("baseline".to_string()),
+            started_at: Some("2024-01-01T00:00:00Z".to_string()),
+            control: None,
+        }];
         write_run_control_v2(&run_dir, "run_001", "running", &trials, None).unwrap();
         let loaded = load_json_file(&run_control_path(&run_dir)).unwrap();
         let active = loaded["active_trials"].as_object().unwrap();
@@ -23581,7 +25296,10 @@ mod tests {
         let run_dir = root.path.join("run");
         ensure_dir(&run_dir.join("runtime")).unwrap();
         write_run_control_v2(&run_dir, "run_001", "running", &[], None).unwrap();
-        assert_eq!(load_json_file(&run_control_path(&run_dir)).unwrap()["schema_version"], "run_control_v2");
+        assert_eq!(
+            load_json_file(&run_control_path(&run_dir)).unwrap()["schema_version"],
+            "run_control_v2"
+        );
     }
 
     #[test]
@@ -23590,7 +25308,10 @@ mod tests {
         let run_dir = root.path.join("run");
         ensure_dir(&run_dir.join("runtime")).unwrap();
         write_run_control_v2(&run_dir, "my_run_123", "running", &[], None).unwrap();
-        assert_eq!(load_json_file(&run_control_path(&run_dir)).unwrap()["run_id"], "my_run_123");
+        assert_eq!(
+            load_json_file(&run_control_path(&run_dir)).unwrap()["run_id"],
+            "my_run_123"
+        );
     }
 
     #[test]
@@ -23599,7 +25320,60 @@ mod tests {
         let run_dir = root.path.join("run");
         ensure_dir(&run_dir.join("runtime")).unwrap();
         write_run_control_v2(&run_dir, "run_001", "running", &[], None).unwrap();
-        assert!(!load_json_file(&run_control_path(&run_dir)).unwrap()["updated_at"].as_str().unwrap().is_empty());
+        assert!(
+            !load_json_file(&run_control_path(&run_dir)).unwrap()["updated_at"]
+                .as_str()
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn write_run_control_v2_persists_in_sqlite_without_runtime_file() {
+        let root = TempDirGuard::new("run_ctrl_sqlite_only");
+        let run_dir = root.path.join("run");
+        ensure_dir(&run_dir.join("runtime")).unwrap();
+        write_run_control_v2(&run_dir, "run_sqlite", "running", &[], None).unwrap();
+        assert!(
+            !run_control_path(&run_dir).exists(),
+            "runtime/run_control.json should not be the canonical write target"
+        );
+        let store = BackingSqliteStore::open(&run_dir).expect("open sqlite store");
+        let persisted = store
+            .get_runtime_json(RUNTIME_KEY_RUN_CONTROL)
+            .expect("load run control from sqlite")
+            .expect("run control row should exist");
+        assert_eq!(
+            persisted.pointer("/run_id").and_then(Value::as_str),
+            Some("run_sqlite")
+        );
+        assert_eq!(
+            persisted.pointer("/status").and_then(Value::as_str),
+            Some("running")
+        );
+    }
+
+    #[test]
+    fn append_jsonl_evidence_rows_route_to_sqlite_store() {
+        let root = TempDirGuard::new("append_jsonl_sqlite_route");
+        let run_dir = root.path.join("run");
+        ensure_dir(&run_dir.join("runtime")).unwrap();
+        write_run_control_v2(&run_dir, "run_evidence", "running", &[], None).unwrap();
+        let evidence_path = run_dir.join("runtime").join("evidence_records.jsonl");
+        append_jsonl(
+            &evidence_path,
+            &json!({
+                "run_id": "run_evidence",
+                "schedule_idx": 0,
+                "attempt": 1,
+                "row_seq": 0,
+                "slot_commit_id": "slot_x",
+                "kind": "test"
+            }),
+        )
+        .expect("append_jsonl should route into sqlite");
+        let store = BackingSqliteStore::open(&run_dir).expect("open sqlite store");
+        assert_eq!(store.row_count("evidence_rows").expect("row count"), 1);
     }
 
     #[test]
@@ -23614,7 +25388,15 @@ mod tests {
     #[test]
     fn write_trial_state_paused_with_label() {
         let root = TempDirGuard::new("trial_state_paused");
-        write_trial_state(&root.path, "trial_1", "paused", Some("checkpoint_pause"), None, None).unwrap();
+        write_trial_state(
+            &root.path,
+            "trial_1",
+            "paused",
+            Some("checkpoint_pause"),
+            None,
+            None,
+        )
+        .unwrap();
         let loaded = load_json_file(&root.path.join("trial_state.json")).unwrap();
         assert_eq!(loaded["pause_label"], "checkpoint_pause");
     }
@@ -23623,7 +25405,10 @@ mod tests {
     fn write_trial_state_completed() {
         let root = TempDirGuard::new("trial_state_completed");
         write_trial_state(&root.path, "trial_1", "completed", None, None, None).unwrap();
-        assert_eq!(load_json_file(&root.path.join("trial_state.json")).unwrap()["status"], "completed");
+        assert_eq!(
+            load_json_file(&root.path.join("trial_state.json")).unwrap()["status"],
+            "completed"
+        );
     }
 
     #[test]
@@ -23638,14 +25423,28 @@ mod tests {
     fn write_trial_state_schema_version() {
         let root = TempDirGuard::new("trial_state_schema");
         write_trial_state(&root.path, "trial_1", "running", None, None, None).unwrap();
-        assert_eq!(load_json_file(&root.path.join("trial_state.json")).unwrap()["schema_version"], "trial_state_v1");
+        assert_eq!(
+            load_json_file(&root.path.join("trial_state.json")).unwrap()["schema_version"],
+            "trial_state_v1"
+        );
     }
 
     #[test]
     fn write_trial_state_with_checkpoint() {
         let root = TempDirGuard::new("trial_state_cp");
-        write_trial_state(&root.path, "trial_1", "paused", None, Some("checkpoint_5"), None).unwrap();
-        assert_eq!(load_json_file(&root.path.join("trial_state.json")).unwrap()["checkpoint_selected"], "checkpoint_5");
+        write_trial_state(
+            &root.path,
+            "trial_1",
+            "paused",
+            None,
+            Some("checkpoint_5"),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            load_json_file(&root.path.join("trial_state.json")).unwrap()["checkpoint_selected"],
+            "checkpoint_5"
+        );
     }
 
     #[test]
@@ -23653,8 +25452,13 @@ mod tests {
         let root = TempDirGuard::new("guard_drop_fail");
         let run_dir = root.path.join("run");
         ensure_dir(&run_dir.join("runtime")).unwrap();
-        { let _guard = RunControlGuard::new(&run_dir, "run_001"); }
-        assert_eq!(load_json_file(&run_control_path(&run_dir)).unwrap()["status"], "failed");
+        {
+            let _guard = RunControlGuard::new(&run_dir, "run_001");
+        }
+        assert_eq!(
+            load_json_file(&run_control_path(&run_dir)).unwrap()["status"],
+            "failed"
+        );
     }
 
     #[test]
@@ -23662,14 +25466,22 @@ mod tests {
         let root = TempDirGuard::new("guard_complete");
         let run_dir = root.path.join("run");
         ensure_dir(&run_dir.join("runtime")).unwrap();
-        { let mut guard = RunControlGuard::new(&run_dir, "run_001"); guard.complete("completed").unwrap(); }
-        assert_eq!(load_json_file(&run_control_path(&run_dir)).unwrap()["status"], "completed");
+        {
+            let mut guard = RunControlGuard::new(&run_dir, "run_001");
+            guard.complete("completed").unwrap();
+        }
+        assert_eq!(
+            load_json_file(&run_control_path(&run_dir)).unwrap()["status"],
+            "completed"
+        );
     }
 
     #[test]
     fn trial_state_guard_marks_aborted_on_drop() {
         let root = TempDirGuard::new("trial_guard_drop");
-        { let _guard = TrialStateGuard::new(&root.path, "trial_1"); }
+        {
+            let _guard = TrialStateGuard::new(&root.path, "trial_1");
+        }
         let loaded = load_json_file(&root.path.join("trial_state.json")).unwrap();
         assert_eq!(loaded["status"], "failed");
         assert_eq!(loaded["exit_reason"], "aborted");
@@ -23678,8 +25490,14 @@ mod tests {
     #[test]
     fn trial_state_guard_complete_prevents_drop_abort() {
         let root = TempDirGuard::new("trial_guard_complete");
-        { let mut guard = TrialStateGuard::new(&root.path, "trial_1"); guard.complete("completed", None).unwrap(); }
-        assert_eq!(load_json_file(&root.path.join("trial_state.json")).unwrap()["status"], "completed");
+        {
+            let mut guard = TrialStateGuard::new(&root.path, "trial_1");
+            guard.complete("completed", None).unwrap();
+        }
+        assert_eq!(
+            load_json_file(&root.path.join("trial_state.json")).unwrap()["status"],
+            "completed"
+        );
     }
 
     #[test]
@@ -23700,12 +25518,18 @@ mod tests {
 
     #[test]
     fn run_control_path_correct() {
-        assert_eq!(run_control_path(&PathBuf::from("/tmp/run_001")), PathBuf::from("/tmp/run_001/runtime/run_control.json"));
+        assert_eq!(
+            run_control_path(&PathBuf::from("/tmp/run_001")),
+            PathBuf::from("/tmp/run_001/runtime/run_control.json")
+        );
     }
 
     #[test]
     fn run_session_state_path_correct() {
-        assert_eq!(run_session_state_path(&PathBuf::from("/tmp/run_001")), PathBuf::from("/tmp/run_001/runtime/run_session_state.json"));
+        assert_eq!(
+            run_session_state_path(&PathBuf::from("/tmp/run_001")),
+            PathBuf::from("/tmp/run_001/runtime/run_session_state.json")
+        );
     }
 
     #[test]
@@ -23713,8 +25537,15 @@ mod tests {
         let root = TempDirGuard::new("session_roundtrip");
         let run_dir = root.path.join("run");
         ensure_dir(&run_dir.join("runtime")).unwrap();
-        let behavior = RunBehavior { setup_command: Some("echo setup".to_string()), network_mode_override: Some("bridge".to_string()), require_network_none: false };
-        let execution = RunExecutionOptions { executor: Some(ExecutorKind::LocalDocker), materialize: Some(MaterializationMode::Full) };
+        let behavior = RunBehavior {
+            setup_command: Some("echo setup".to_string()),
+            network_mode_override: Some("bridge".to_string()),
+            require_network_none: false,
+        };
+        let execution = RunExecutionOptions {
+            executor: Some(ExecutorKind::LocalDocker),
+            materialize: Some(MaterializationMode::Full),
+        };
         write_run_session_state(&run_dir, "run_001", &behavior, &execution).unwrap();
         let loaded = load_run_session_state(&run_dir).unwrap();
         assert_eq!(loaded.run_id, "run_001");
@@ -23726,8 +25557,21 @@ mod tests {
         let root = TempDirGuard::new("session_behavior");
         let run_dir = root.path.join("run");
         ensure_dir(&run_dir.join("runtime")).unwrap();
-        let behavior = RunBehavior { setup_command: Some("echo hi".to_string()), network_mode_override: Some("host".to_string()), require_network_none: true };
-        write_run_session_state(&run_dir, "run_002", &behavior, &RunExecutionOptions { executor: None, materialize: None }).unwrap();
+        let behavior = RunBehavior {
+            setup_command: Some("echo hi".to_string()),
+            network_mode_override: Some("host".to_string()),
+            require_network_none: true,
+        };
+        write_run_session_state(
+            &run_dir,
+            "run_002",
+            &behavior,
+            &RunExecutionOptions {
+                executor: None,
+                materialize: None,
+            },
+        )
+        .unwrap();
         let loaded = load_run_session_state(&run_dir).unwrap();
         assert_eq!(loaded.behavior.setup_command, Some("echo hi".to_string()));
         assert!(loaded.behavior.require_network_none);
@@ -23738,10 +25582,20 @@ mod tests {
         let root = TempDirGuard::new("session_execution");
         let run_dir = root.path.join("run");
         ensure_dir(&run_dir.join("runtime")).unwrap();
-        let behavior = RunBehavior { setup_command: None, network_mode_override: None, require_network_none: false };
-        let execution = RunExecutionOptions { executor: Some(ExecutorKind::LocalProcess), materialize: Some(MaterializationMode::MetadataOnly) };
+        let behavior = RunBehavior {
+            setup_command: None,
+            network_mode_override: None,
+            require_network_none: false,
+        };
+        let execution = RunExecutionOptions {
+            executor: Some(ExecutorKind::LocalProcess),
+            materialize: Some(MaterializationMode::MetadataOnly),
+        };
         write_run_session_state(&run_dir, "run_003", &behavior, &execution).unwrap();
-        assert_eq!(load_run_session_state(&run_dir).unwrap().execution.executor, Some(ExecutorKind::LocalProcess));
+        assert_eq!(
+            load_run_session_state(&run_dir).unwrap().execution.executor,
+            Some(ExecutorKind::LocalProcess)
+        );
     }
 
     #[test]
@@ -23853,17 +25707,24 @@ mod tests {
 
     #[test]
     fn is_worker_backend_capacity_error_matches_prefix() {
-        assert!(is_worker_backend_capacity_error(&anyhow::anyhow!("{}in_flight=4, max=4", LOCAL_WORKER_CAPACITY_ERROR_PREFIX)));
+        assert!(is_worker_backend_capacity_error(&anyhow::anyhow!(
+            "{}in_flight=4, max=4",
+            LOCAL_WORKER_CAPACITY_ERROR_PREFIX
+        )));
     }
 
     #[test]
     fn is_worker_backend_capacity_error_matches_at_capacity() {
-        assert!(is_worker_backend_capacity_error(&anyhow::anyhow!("worker at capacity")));
+        assert!(is_worker_backend_capacity_error(&anyhow::anyhow!(
+            "worker at capacity"
+        )));
     }
 
     #[test]
     fn is_worker_backend_capacity_error_rejects_other() {
-        assert!(!is_worker_backend_capacity_error(&anyhow::anyhow!("network timeout")));
+        assert!(!is_worker_backend_capacity_error(&anyhow::anyhow!(
+            "network timeout"
+        )));
     }
 
     #[test]
@@ -23884,7 +25745,10 @@ mod tests {
         fs::write(src_dir.join("file.txt"), "content").unwrap();
         let dst_dir = root.path.join("dest_dir");
         copy_path_into_package(&src_dir, &dst_dir).unwrap();
-        assert_eq!(fs::read_to_string(dst_dir.join("file.txt")).unwrap(), "content");
+        assert_eq!(
+            fs::read_to_string(dst_dir.join("file.txt")).unwrap(),
+            "content"
+        );
     }
 
     #[test]
@@ -23898,7 +25762,16 @@ mod tests {
         fs::write(&src, "data").unwrap();
         let mut copies = BTreeMap::new();
         let mut counter = 0usize;
-        let rel = stage_source_into_package(src.to_str().unwrap(), &exp_dir, &pkg_dir, "agent_builds", "build", &mut copies, &mut counter).unwrap();
+        let rel = stage_source_into_package(
+            src.to_str().unwrap(),
+            &exp_dir,
+            &pkg_dir,
+            "agent_builds",
+            "build",
+            &mut copies,
+            &mut counter,
+        )
+        .unwrap();
         assert!(!rel.is_empty());
         assert_eq!(counter, 1);
     }
@@ -23913,7 +25786,17 @@ mod tests {
         ensure_dir(&pkg_dir).unwrap();
         let mut copies = BTreeMap::new();
         let mut counter = 0usize;
-        assert!(!stage_source_into_package("agent.tar", &exp_dir, &pkg_dir, "agent_builds", "build", &mut copies, &mut counter).unwrap().is_empty());
+        assert!(!stage_source_into_package(
+            "agent.tar",
+            &exp_dir,
+            &pkg_dir,
+            "agent_builds",
+            "build",
+            &mut copies,
+            &mut counter
+        )
+        .unwrap()
+        .is_empty());
     }
 
     #[test]
@@ -23925,7 +25808,16 @@ mod tests {
         ensure_dir(&pkg_dir).unwrap();
         let mut copies = BTreeMap::new();
         let mut counter = 0usize;
-        assert!(stage_source_into_package("nonexistent.tar", &exp_dir, &pkg_dir, "agent_builds", "build", &mut copies, &mut counter).is_err());
+        assert!(stage_source_into_package(
+            "nonexistent.tar",
+            &exp_dir,
+            &pkg_dir,
+            "agent_builds",
+            "build",
+            &mut copies,
+            &mut counter
+        )
+        .is_err());
     }
 
     #[test]
@@ -23940,7 +25832,16 @@ mod tests {
         ensure_dir(&pkg_dir).unwrap();
         let mut copies = BTreeMap::new();
         let mut counter = 0usize;
-        let rel = stage_source_into_package("agent_dir", &exp_dir, &pkg_dir, "agent_builds", "build", &mut copies, &mut counter).unwrap();
+        let rel = stage_source_into_package(
+            "agent_dir",
+            &exp_dir,
+            &pkg_dir,
+            "agent_builds",
+            "build",
+            &mut copies,
+            &mut counter,
+        )
+        .unwrap();
         assert!(pkg_dir.join(rel.trim_start_matches('/')).exists());
     }
 
@@ -23954,8 +25855,26 @@ mod tests {
         ensure_dir(&pkg_dir).unwrap();
         let mut copies = BTreeMap::new();
         let mut counter = 0usize;
-        let rel1 = stage_source_into_package("artifact.tar", &exp_dir, &pkg_dir, "agent_builds", "build", &mut copies, &mut counter).unwrap();
-        let rel2 = stage_source_into_package("artifact.tar", &exp_dir, &pkg_dir, "agent_builds", "build", &mut copies, &mut counter).unwrap();
+        let rel1 = stage_source_into_package(
+            "artifact.tar",
+            &exp_dir,
+            &pkg_dir,
+            "agent_builds",
+            "build",
+            &mut copies,
+            &mut counter,
+        )
+        .unwrap();
+        let rel2 = stage_source_into_package(
+            "artifact.tar",
+            &exp_dir,
+            &pkg_dir,
+            "agent_builds",
+            "build",
+            &mut copies,
+            &mut counter,
+        )
+        .unwrap();
         assert_eq!(rel1, rel2);
         assert_eq!(counter, 1);
     }
@@ -23970,26 +25889,58 @@ mod tests {
     #[test]
     fn materialize_workspace_files_utf8() {
         let (_root, paths) = create_trial_paths_fixture("mat_utf8");
-        let files = vec![WorkspaceFileSpec { path: "hello.txt".to_string(), content: "hello world".to_string(), encoding: None, executable: false }];
+        let files = vec![WorkspaceFileSpec {
+            path: "hello.txt".to_string(),
+            content: "hello world".to_string(),
+            encoding: None,
+            executable: false,
+        }];
         materialize_workspace_files(&paths, &files).unwrap();
-        assert_eq!(fs::read_to_string(paths.workspace.join("hello.txt")).unwrap(), "hello world");
+        assert_eq!(
+            fs::read_to_string(paths.workspace.join("hello.txt")).unwrap(),
+            "hello world"
+        );
     }
 
     #[test]
     fn materialize_workspace_files_base64() {
         let (_root, paths) = create_trial_paths_fixture("mat_b64");
         let encoded = BASE64_STANDARD.encode(b"binary content");
-        let files = vec![WorkspaceFileSpec { path: "data.bin".to_string(), content: encoded, encoding: Some("base64".to_string()), executable: false }];
+        let files = vec![WorkspaceFileSpec {
+            path: "data.bin".to_string(),
+            content: encoded,
+            encoding: Some("base64".to_string()),
+            executable: false,
+        }];
         materialize_workspace_files(&paths, &files).unwrap();
-        assert_eq!(fs::read(paths.workspace.join("data.bin")).unwrap(), b"binary content");
+        assert_eq!(
+            fs::read(paths.workspace.join("data.bin")).unwrap(),
+            b"binary content"
+        );
     }
 
     #[test]
     fn materialize_workspace_files_creates_parent_dirs() {
         let (_root, paths) = create_trial_paths_fixture("mat_nested");
-        let files = vec![WorkspaceFileSpec { path: "deep/nested/dir/file.txt".to_string(), content: "nested".to_string(), encoding: None, executable: false }];
+        let files = vec![WorkspaceFileSpec {
+            path: "deep/nested/dir/file.txt".to_string(),
+            content: "nested".to_string(),
+            encoding: None,
+            executable: false,
+        }];
         materialize_workspace_files(&paths, &files).unwrap();
-        assert_eq!(fs::read_to_string(paths.workspace.join("deep").join("nested").join("dir").join("file.txt")).unwrap(), "nested");
+        assert_eq!(
+            fs::read_to_string(
+                paths
+                    .workspace
+                    .join("deep")
+                    .join("nested")
+                    .join("dir")
+                    .join("file.txt")
+            )
+            .unwrap(),
+            "nested"
+        );
     }
 
     #[test]
@@ -24025,7 +25976,10 @@ mod tests {
 
     #[test]
     fn replay_grade_for_integration_unknown_level() {
-        assert_eq!(replay_grade_for_integration("something_unknown"), "best_effort");
+        assert_eq!(
+            replay_grade_for_integration("something_unknown"),
+            "best_effort"
+        );
     }
 
     // ── Batch 6 extension: resolve_variant_plan ──
@@ -24093,7 +26047,11 @@ mod tests {
         let (variants, _) = resolve_variant_plan(&exp).unwrap();
         assert!(variants[0].runtime_overrides.is_some());
         assert_eq!(
-            variants[0].runtime_overrides.as_ref().unwrap().pointer("/agent/timeout_ms"),
+            variants[0]
+                .runtime_overrides
+                .as_ref()
+                .unwrap()
+                .pointer("/agent/timeout_ms"),
             Some(&json!(5000))
         );
     }
@@ -24133,7 +26091,11 @@ mod tests {
         let (variants, _) = resolve_variant_plan(&exp).unwrap();
         assert!(variants[0].runtime_overrides.is_some());
         assert_eq!(
-            variants[0].runtime_overrides.as_ref().unwrap().pointer("/agent/image"),
+            variants[0]
+                .runtime_overrides
+                .as_ref()
+                .unwrap()
+                .pointer("/agent/image"),
             Some(&json!("custom:latest"))
         );
     }
@@ -24148,6 +26110,7 @@ mod tests {
             "policy": { "timeout_ms": 30000 }
         });
         let io = PreparedTrialIo {
+            input_host: PathBuf::from("/tmp/trial_input.json"),
             output_host: PathBuf::from("/out"),
             events_host: PathBuf::from("/events"),
             task_path: "/agentlab/in/task.json".to_string(),
@@ -24164,7 +26127,10 @@ mod tests {
         assert_eq!(env.get(AGENTLAB_ENV_TASK_ID).unwrap(), "task_a");
         assert_eq!(env.get(AGENTLAB_ENV_REPL_IDX).unwrap(), "2");
         assert_eq!(env.get(AGENTLAB_ENV_TIMEOUT_MS).unwrap(), "30000");
-        assert_eq!(env.get(AGENTLAB_ENV_TASK_PATH).unwrap(), "/agentlab/in/task.json");
+        assert_eq!(
+            env.get(AGENTLAB_ENV_TASK_PATH).unwrap(),
+            "/agentlab/in/task.json"
+        );
         assert!(env.contains_key(AGENTLAB_ENV_TASK_IMAGE));
     }
 
@@ -24172,6 +26138,7 @@ mod tests {
     fn build_runtime_contract_env_clean_contract_returns_empty() {
         let input = json!({ "ids": { "trial_id": "t1" } });
         let io = PreparedTrialIo {
+            input_host: PathBuf::from("/tmp/trial_input.json"),
             output_host: PathBuf::from("/out"),
             events_host: PathBuf::from("/events"),
             task_path: "/in/task.json".to_string(),
@@ -24189,6 +26156,7 @@ mod tests {
     fn build_runtime_contract_env_no_timeout_omits_key() {
         let input = json!({ "ids": { "trial_id": "t1" } });
         let io = PreparedTrialIo {
+            input_host: PathBuf::from("/tmp/trial_input.json"),
             output_host: PathBuf::from("/out"),
             events_host: PathBuf::from("/events"),
             task_path: "/in/task.json".to_string(),
@@ -24206,6 +26174,7 @@ mod tests {
     fn build_runtime_contract_env_no_task_image_omits_key() {
         let input = json!({ "ids": { "trial_id": "t1" }, "task": {} });
         let io = PreparedTrialIo {
+            input_host: PathBuf::from("/tmp/trial_input.json"),
             output_host: PathBuf::from("/out"),
             events_host: PathBuf::from("/events"),
             task_path: "/in/task.json".to_string(),
@@ -24252,7 +26221,10 @@ mod tests {
         let guard = TempDirGuard::new("load_exp_no_manifest");
         let err = load_experiment_input(&guard.path, None).unwrap_err();
         let msg = err.to_string();
-        assert!(msg.contains("manifest.json"), "expected manifest error, got: {msg}");
+        assert!(
+            msg.contains("manifest.json"),
+            "expected manifest error, got: {msg}"
+        );
     }
 
     #[test]
@@ -24276,10 +26248,17 @@ mod tests {
     fn load_experiment_input_directory_package_with_manifest_loads() {
         let guard = TempDirGuard::new("load_exp_pkg");
         let manifest = guard.path.join("manifest.json");
-        fs::write(&manifest, r#"{"resolved_experiment":{"version":"1.0","experiment":{"id":"e1"}}}"#).unwrap();
+        fs::write(
+            &manifest,
+            r#"{"resolved_experiment":{"version":"1.0","experiment":{"id":"e1"}}}"#,
+        )
+        .unwrap();
         let loaded = load_experiment_input(&guard.path, None).unwrap();
         assert_eq!(loaded.json_value.pointer("/version"), Some(&json!("1.0")));
-        assert_eq!(loaded.json_value.pointer("/experiment/id"), Some(&json!("e1")));
+        assert_eq!(
+            loaded.json_value.pointer("/experiment/id"),
+            Some(&json!("e1"))
+        );
     }
 
     #[test]
@@ -24390,9 +26369,27 @@ mod tests {
             next_trial_index: 4,
             schedule: Vec::new(),
             completed_slots: vec![
-                SlotCompletion { schedule_index: 0, trial_id: "trial_1".into(), status: "completed".into(), slot_commit_id: "c1".into(), attempt: 1 },
-                SlotCompletion { schedule_index: 1, trial_id: "trial_2".into(), status: "completed".into(), slot_commit_id: "c2".into(), attempt: 1 },
-                SlotCompletion { schedule_index: 2, trial_id: "trial_3".into(), status: "failed".into(), slot_commit_id: "c3".into(), attempt: 1 },
+                SlotCompletion {
+                    schedule_index: 0,
+                    trial_id: "trial_1".into(),
+                    status: "completed".into(),
+                    slot_commit_id: "c1".into(),
+                    attempt: 1,
+                },
+                SlotCompletion {
+                    schedule_index: 1,
+                    trial_id: "trial_2".into(),
+                    status: "completed".into(),
+                    slot_commit_id: "c2".into(),
+                    attempt: 1,
+                },
+                SlotCompletion {
+                    schedule_index: 2,
+                    trial_id: "trial_3".into(),
+                    status: "failed".into(),
+                    slot_commit_id: "c3".into(),
+                    attempt: 1,
+                },
             ],
             pruned_variants: Vec::new(),
             consecutive_failures: BTreeMap::new(),
@@ -24556,7 +26553,10 @@ mod tests {
 
     #[test]
     fn output_peer_path_no_parent_returns_filename() {
-        assert_eq!(output_peer_path("result.json", "prediction.json"), "prediction.json");
+        assert_eq!(
+            output_peer_path("result.json", "prediction.json"),
+            "prediction.json"
+        );
     }
 
     // ── Batch 10: find_project_root ──
@@ -24582,6 +26582,30 @@ mod tests {
     #[test]
     fn slot_commit_journal_path_correct_structure() {
         let path = slot_commit_journal_path(Path::new("/runs/run_1"));
-        assert_eq!(path, PathBuf::from("/runs/run_1/runtime/slot_commit_journal.jsonl"));
+        assert_eq!(
+            path,
+            PathBuf::from("/runs/run_1/runtime/slot_commit_journal.jsonl")
+        );
+    }
+
+    // ── Mutation gate support tests ──
+
+    #[test]
+    fn validate_required_fields_v1_whitespace_experiment_id_fails() {
+        let mut spec = clean_contract_base();
+        spec["experiment"]["id"] = json!("  ");
+        let err = validate_required_fields(&spec).unwrap_err();
+        assert!(err.to_string().contains("/experiment/id"), "err: {err}");
+    }
+
+    #[test]
+    fn validate_required_fields_v1_whitespace_baseline_variant_id_fails() {
+        let mut spec = clean_contract_base();
+        spec["baseline"]["variant_id"] = json!("  ");
+        let err = validate_required_fields(&spec).unwrap_err();
+        assert!(
+            err.to_string().contains("/baseline/variant_id"),
+            "err: {err}"
+        );
     }
 }

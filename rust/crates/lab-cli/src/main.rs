@@ -1,5 +1,6 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand, ValueEnum};
+use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
@@ -1174,7 +1175,14 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
             let sleep_interval = Duration::from_secs(interval_seconds.max(1));
             let meta = read_scoreboard_metadata(&run_dir);
             loop {
-                let table = build_live_scoreboard_table(&run_dir, metric_limit)?;
+                let mut table = build_live_scoreboard_table(&run_dir, metric_limit)?;
+                let mut showing_in_flight = false;
+                if table.rows.is_empty() {
+                    if let Some(in_flight) = build_inflight_scoreboard_table(&run_dir) {
+                        table = in_flight;
+                        showing_in_flight = true;
+                    }
+                }
                 let variants = scoreboard_variant_ids(&table);
                 let variant_bindings = fetch_variant_bindings(&run_dir);
                 if !no_clear {
@@ -1202,6 +1210,12 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
                     println!("refresh: {}s (Ctrl-C to stop)", sleep_interval.as_secs());
                 }
                 println!();
+                if showing_in_flight {
+                    println!(
+                        "note: no committed trial rows yet; showing active trials from run.sqlite runtime state"
+                    );
+                    println!();
+                }
                 print_scoreboard_grouped_by_variant(&table, &variant_bindings);
 
                 if once {
@@ -1739,12 +1753,13 @@ fn run_result_to_json(result: &lab_runner::RunResult) -> Value {
 }
 
 fn run_artifacts_to_json(result: &lab_runner::RunResult) -> Value {
-    let evidence = result.run_dir.join("evidence");
+    let sqlite = result.run_dir.join("run.sqlite");
+    let objects = result.run_dir.join("objects");
     let benchmark = result.run_dir.join("benchmark");
     let summary_path = benchmark.join("summary.json");
     json!({
-        "evidence_records_path": evidence.join("evidence_records.jsonl").display().to_string(),
-        "task_chain_states_path": evidence.join("task_chain_states.jsonl").display().to_string(),
+        "run_sqlite_path": sqlite.display().to_string(),
+        "objects_dir": objects.display().to_string(),
         "benchmark_dir": benchmark.display().to_string(),
         "benchmark_summary_path": if summary_path.exists() {
             Some(summary_path.display().to_string())
@@ -1752,6 +1767,30 @@ fn run_artifacts_to_json(result: &lab_runner::RunResult) -> Value {
             None::<String>
         }
     })
+}
+
+fn load_run_control(run_dir: &Path) -> Option<Value> {
+    let legacy_path = run_dir.join("runtime").join("run_control.json");
+    if legacy_path.exists() {
+        let raw = std::fs::read_to_string(&legacy_path).ok()?;
+        if let Ok(parsed) = serde_json::from_str::<Value>(&raw) {
+            return Some(parsed);
+        }
+    }
+    let sqlite_path = run_dir.join("run.sqlite");
+    if !sqlite_path.exists() {
+        return None;
+    }
+    let conn = Connection::open(sqlite_path).ok()?;
+    let raw: Option<String> = conn
+        .query_row(
+            "SELECT value_json FROM runtime_kv WHERE key=?1",
+            params!["run_control_v2"],
+            |row| row.get(0),
+        )
+        .optional()
+        .ok()?;
+    raw.and_then(|payload| serde_json::from_str::<Value>(&payload).ok())
 }
 
 fn replay_result_to_json(result: &lab_runner::ReplayResult) -> Value {
@@ -2276,6 +2315,66 @@ fn build_live_scoreboard_table(
     lab_analysis::query_run(run_dir, &sql)
 }
 
+fn build_inflight_scoreboard_table(run_dir: &Path) -> Option<lab_analysis::QueryTable> {
+    let parsed = load_run_control(run_dir)?;
+    let active_trials = parsed.get("active_trials").and_then(Value::as_object)?;
+    if active_trials.is_empty() {
+        return None;
+    }
+
+    let mut rows: Vec<(i64, String, Vec<Value>)> = Vec::with_capacity(active_trials.len());
+    for (trial_key, entry) in active_trials {
+        let trial_id = entry
+            .get("trial_id")
+            .and_then(Value::as_str)
+            .unwrap_or(trial_key)
+            .to_string();
+        let variant_id = entry
+            .get("variant_id")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown")
+            .to_string();
+        let schedule_idx = entry
+            .get("schedule_idx")
+            .and_then(|v| v.as_i64().or_else(|| v.as_u64().map(|u| u as i64)));
+        let worker_id = entry
+            .get("worker_id")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let started_at = entry
+            .get("started_at")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+
+        let row = vec![
+            Value::String(variant_id),
+            Value::String(trial_id.clone()),
+            schedule_idx.map_or(Value::Null, |idx| json!(idx)),
+            Value::String(worker_id),
+            Value::String(started_at),
+            Value::String("in_flight".to_string()),
+        ];
+        rows.push((schedule_idx.unwrap_or(i64::MAX), trial_id, row));
+    }
+
+    rows.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+    let sorted_rows = rows.into_iter().map(|(_, _, row)| row).collect();
+
+    Some(lab_analysis::QueryTable {
+        columns: vec![
+            "variant_id".to_string(),
+            "trial_id".to_string(),
+            "schedule_idx".to_string(),
+            "worker_id".to_string(),
+            "started_at".to_string(),
+            "lifecycle".to_string(),
+        ],
+        rows: sorted_rows,
+    })
+}
+
 fn fetch_scoreboard_metric_names(run_dir: &Path, metric_limit: usize) -> Result<Vec<String>> {
     let sql = format!(
         "SELECT metric_name
@@ -2648,17 +2747,8 @@ fn cap_widths(natural: &[usize], budget: usize) -> Vec<usize> {
 }
 
 fn read_run_status(run_dir: &Path) -> String {
-    let path = run_dir.join("runtime").join("run_control.json");
-    if !path.exists() {
+    let Some(parsed) = load_run_control(run_dir) else {
         return "unknown".to_string();
-    }
-    let raw = match std::fs::read_to_string(&path) {
-        Ok(v) => v,
-        Err(_) => return "unknown".to_string(),
-    };
-    let parsed: Value = match serde_json::from_str(&raw) {
-        Ok(v) => v,
-        Err(_) => return "unknown".to_string(),
     };
     let status = parsed
         .get("status")
@@ -3782,47 +3872,81 @@ fn build_runs_table(project_root: &Path) -> Result<lab_analysis::QueryTable> {
             String::new()
         };
 
-        // Canonical: facts/trials.jsonl (variant_summary is query-time derived).
-        let trials_facts_path = run_path.join("facts").join("trials.jsonl");
-        let (variants, pass_rate) = if trials_facts_path.exists() {
-            let raw = std::fs::read_to_string(&trials_facts_path).unwrap_or_default();
-            let mut baseline_id = String::new();
-            let mut variant_ids: BTreeSet<String> = BTreeSet::new();
-            let mut baseline_total = 0usize;
-            let mut baseline_successes = 0usize;
-            for line in raw.lines().filter(|line| !line.trim().is_empty()) {
-                let row: Value = serde_json::from_str(line).unwrap_or(json!({}));
-                let variant_id = row
-                    .get("variant_id")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_string();
-                if variant_id.is_empty() {
-                    continue;
+        let sqlite_path = run_path.join("run.sqlite");
+        let (variants, pass_rate) = if sqlite_path.exists() {
+            match Connection::open(&sqlite_path) {
+                Ok(conn) => {
+                    let variants = conn
+                        .query_row(
+                            "SELECT count(DISTINCT variant_id) FROM trial_rows",
+                            [],
+                            |row| row.get::<_, i64>(0),
+                        )
+                        .unwrap_or(0_i64) as usize;
+                    let baseline_id: Option<String> = conn
+                        .query_row("SELECT baseline_id FROM trial_rows LIMIT 1", [], |row| {
+                            row.get(0)
+                        })
+                        .optional()
+                        .unwrap_or(None);
+                    let pass_rate = match baseline_id {
+                        Some(baseline) => conn
+                            .query_row(
+                                "SELECT avg(CASE WHEN outcome = 'success' THEN 1.0 ELSE 0.0 END)
+                                 FROM trial_rows
+                                 WHERE variant_id = ?1",
+                                params![baseline],
+                                |row| row.get::<_, Option<f64>>(0),
+                            )
+                            .unwrap_or(None),
+                        None => None,
+                    };
+                    (variants, pass_rate)
                 }
-                variant_ids.insert(variant_id.clone());
-                if baseline_id.is_empty() {
-                    baseline_id = row
-                        .get("baseline_id")
+                Err(_) => (0, None),
+            }
+        } else {
+            let trials_facts_path = run_path.join("facts").join("trials.jsonl");
+            if trials_facts_path.exists() {
+                let raw = std::fs::read_to_string(&trials_facts_path).unwrap_or_default();
+                let mut baseline_id = String::new();
+                let mut variant_ids: BTreeSet<String> = BTreeSet::new();
+                let mut baseline_total = 0usize;
+                let mut baseline_successes = 0usize;
+                for line in raw.lines().filter(|line| !line.trim().is_empty()) {
+                    let row: Value = serde_json::from_str(line).unwrap_or(json!({}));
+                    let variant_id = row
+                        .get("variant_id")
                         .and_then(Value::as_str)
                         .unwrap_or_default()
                         .to_string();
-                }
-                if !baseline_id.is_empty() && variant_id == baseline_id {
-                    baseline_total += 1;
-                    if row.get("outcome").and_then(Value::as_str) == Some("success") {
-                        baseline_successes += 1;
+                    if variant_id.is_empty() {
+                        continue;
+                    }
+                    variant_ids.insert(variant_id.clone());
+                    if baseline_id.is_empty() {
+                        baseline_id = row
+                            .get("baseline_id")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default()
+                            .to_string();
+                    }
+                    if !baseline_id.is_empty() && variant_id == baseline_id {
+                        baseline_total += 1;
+                        if row.get("outcome").and_then(Value::as_str) == Some("success") {
+                            baseline_successes += 1;
+                        }
                     }
                 }
-            }
-            let pr = if baseline_total > 0 {
-                Some(baseline_successes as f64 / baseline_total as f64)
+                let pr = if baseline_total > 0 {
+                    Some(baseline_successes as f64 / baseline_total as f64)
+                } else {
+                    None
+                };
+                (variant_ids.len(), pr)
             } else {
-                None
-            };
-            (variant_ids.len(), pr)
-        } else {
-            (0, None)
+                (0, None)
+            }
         };
 
         entries.push(RunRow {
@@ -3959,6 +4083,7 @@ fn write_knob_files(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rusqlite::Connection as SqliteConnection;
 
     fn temp_dir(label: &str) -> PathBuf {
         let nanos = SystemTime::now()
@@ -3971,6 +4096,100 @@ mod tests {
             std::process::id(),
             nanos
         ))
+    }
+
+    fn count_temp_sqlite_export_dirs_for_run(run_id: &str) -> usize {
+        let prefix = format!("agentlab_sqlite_export_{}_", run_id);
+        std::fs::read_dir(std::env::temp_dir())
+            .ok()
+            .into_iter()
+            .flatten()
+            .filter_map(|entry| {
+                let entry = entry.ok()?;
+                let name = entry.file_name().to_string_lossy().to_string();
+                if name.starts_with(&prefix) && entry.file_type().ok()?.is_dir() {
+                    Some(())
+                } else {
+                    None
+                }
+            })
+            .count()
+    }
+
+    fn seed_sqlite_run_for_analysis_query(run_dir: &Path) {
+        let sqlite_path = run_dir.join("run.sqlite");
+        let conn = SqliteConnection::open(&sqlite_path).expect("open sqlite");
+        conn.execute_batch(
+            "CREATE TABLE trial_rows(row_json TEXT NOT NULL);
+             CREATE TABLE metric_rows(row_json TEXT NOT NULL);
+             CREATE TABLE event_rows(row_json TEXT NOT NULL);
+             CREATE TABLE variant_snapshot_rows(row_json TEXT NOT NULL);
+             CREATE TABLE slot_commit_records(
+                 schedule_idx INTEGER NOT NULL,
+                 attempt INTEGER NOT NULL,
+                 record_type TEXT NOT NULL,
+                 record_json TEXT NOT NULL
+             );
+             CREATE TABLE runtime_kv(
+                 key TEXT PRIMARY KEY,
+                 value_json TEXT NOT NULL
+             );",
+        )
+        .expect("create sqlite schema");
+        conn.execute(
+            "INSERT INTO trial_rows(row_json) VALUES (?1)",
+            [r#"{"run_id":"run_test","trial_id":"trial_1","variant_id":"base","task_id":"task_1","outcome":"success","slot_commit_id":"slot_1","schedule_idx":0}"#],
+        )
+        .expect("insert trial row");
+        conn.execute(
+            "INSERT INTO metric_rows(row_json) VALUES (?1)",
+            [r#"{"run_id":"run_test","trial_id":"trial_1","variant_id":"base","task_id":"task_1","metric_name":"latency_ms","metric_value":12.3,"slot_commit_id":"slot_1","schedule_idx":0}"#],
+        )
+        .expect("insert metric row");
+        conn.execute(
+            "INSERT INTO event_rows(row_json) VALUES (?1)",
+            [r#"{"run_id":"run_test","trial_id":"trial_1","variant_id":"base","task_id":"task_1","event_type":"model_call_end","slot_commit_id":"slot_1","schedule_idx":0}"#],
+        )
+        .expect("insert event row");
+        conn.execute(
+            "INSERT INTO variant_snapshot_rows(row_json) VALUES (?1)",
+            [r#"{"run_id":"run_test","variant_id":"base","task_id":"task_1","slot_commit_id":"slot_1","schedule_idx":0}"#],
+        )
+        .expect("insert variant snapshot row");
+        conn.execute(
+            "INSERT INTO slot_commit_records(schedule_idx, attempt, record_type, record_json) VALUES (?1, ?2, ?3, ?4)",
+            (
+                0_i64,
+                0_i64,
+                "commit",
+                r#"{"record_type":"commit","schedule_idx":0,"slot_commit_id":"slot_1","attempt":0}"#,
+            ),
+        )
+        .expect("insert slot commit record");
+    }
+
+    #[test]
+    fn query_run_sqlite_cleans_temp_exports_and_keeps_real_run_id_in_metadata() {
+        let run_dir = temp_dir("sqlite_query_cleanup");
+        std::fs::create_dir_all(&run_dir).expect("run dir");
+        seed_sqlite_run_for_analysis_query(&run_dir);
+
+        let run_id = run_dir
+            .file_name()
+            .and_then(|v| v.to_str())
+            .unwrap_or("run");
+        let before = count_temp_sqlite_export_dirs_for_run(run_id);
+
+        let table =
+            lab_analysis::query_run(&run_dir, "SELECT run_id FROM analysis_metadata LIMIT 1")
+                .expect("query run");
+        assert_eq!(table.rows.len(), 1);
+        assert_eq!(table.rows[0][0], Value::String(run_id.to_string()));
+
+        let after = count_temp_sqlite_export_dirs_for_run(run_id);
+        assert_eq!(before, after, "sqlite temp export dirs should be cleaned");
+
+        let _ = std::fs::remove_dir_all(&run_dir);
     }
 
     #[test]
@@ -4013,6 +4232,64 @@ mod tests {
             status,
             "running (active_trials=2, workers=worker_1,worker_2)"
         );
+
+        let _ = std::fs::remove_dir_all(&run_dir);
+    }
+
+    #[test]
+    fn build_inflight_scoreboard_table_reads_active_trials_when_facts_are_empty() {
+        let run_dir = temp_dir("inflight_scoreboard");
+        let runtime_dir = run_dir.join("runtime");
+        std::fs::create_dir_all(&runtime_dir).expect("runtime dir");
+        let control = json!({
+            "schema_version": "run_control_v2",
+            "run_id": "run_1",
+            "status": "running",
+            "active_trials": {
+                "trial_2": {
+                    "trial_id": "trial_2",
+                    "worker_id": "worker_2",
+                    "schedule_idx": 1,
+                    "variant_id": "codex_spark",
+                    "started_at": "2026-02-22T00:00:01Z",
+                    "control": null
+                },
+                "trial_1": {
+                    "trial_id": "trial_1",
+                    "worker_id": "worker_1",
+                    "schedule_idx": 0,
+                    "variant_id": "glm_5",
+                    "started_at": "2026-02-22T00:00:00Z",
+                    "control": null
+                }
+            },
+            "updated_at": "2026-02-22T00:00:02Z"
+        });
+        std::fs::write(
+            runtime_dir.join("run_control.json"),
+            serde_json::to_vec_pretty(&control).expect("serialize control"),
+        )
+        .expect("write control");
+
+        let table =
+            build_inflight_scoreboard_table(&run_dir).expect("in-flight scoreboard should exist");
+        assert_eq!(
+            table.columns,
+            vec![
+                "variant_id".to_string(),
+                "trial_id".to_string(),
+                "schedule_idx".to_string(),
+                "worker_id".to_string(),
+                "started_at".to_string(),
+                "lifecycle".to_string(),
+            ]
+        );
+        assert_eq!(table.rows.len(), 2);
+        assert_eq!(table.rows[0][0], Value::String("glm_5".to_string()));
+        assert_eq!(table.rows[0][1], Value::String("trial_1".to_string()));
+        assert_eq!(table.rows[0][5], Value::String("in_flight".to_string()));
+        assert_eq!(table.rows[1][0], Value::String("codex_spark".to_string()));
+        assert_eq!(table.rows[1][1], Value::String("trial_2".to_string()));
 
         let _ = std::fs::remove_dir_all(&run_dir);
     }

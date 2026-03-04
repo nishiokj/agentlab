@@ -24,6 +24,7 @@ from bench.taskkit.grading import grade_patch_for_task
 DEFAULT_ADAPTER_ID = "bench_v0"
 DEFAULT_BENCHMARK_NAME = "bench"
 DEFAULT_BENCHMARK_SPLIT = "test"
+RUNNER_WORKSPACE = "/agentlab/workspace"
 
 
 def _required_env(name: str) -> str:
@@ -165,7 +166,7 @@ def _extract_patch_text(agent_result: Any) -> str | None:
             return candidate
 
     # Then artifact file references if present.
-    workspace = Path(os.environ.get("WORKSPACE", ".")).resolve()
+    workspace = Path(os.environ.get("WORKSPACE", RUNNER_WORKSPACE)).resolve()
     artifacts = agent_result.get("artifacts")
     if isinstance(artifacts, list):
         for item in artifacts:
