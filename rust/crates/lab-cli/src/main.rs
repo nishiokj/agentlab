@@ -69,6 +69,15 @@ enum InitProfileArg {
 
 #[derive(Subcommand)]
 enum Commands {
+    Build {
+        experiment: PathBuf,
+        #[arg(long)]
+        out: Option<PathBuf>,
+        #[arg(long)]
+        overrides: Option<PathBuf>,
+        #[arg(long)]
+        json: bool,
+    },
     Run {
         experiment: PathBuf,
         #[arg(long)]
@@ -562,6 +571,33 @@ fn main() -> Result<()> {
 
 fn run_command(command: Commands) -> Result<Option<Value>> {
     match command {
+        Commands::Build {
+            experiment,
+            out,
+            overrides,
+            json,
+        } => {
+            if !json {
+                eprintln!("building package from: {}", experiment.display());
+            }
+            let build = lab_runner::build_experiment_package(
+                &experiment,
+                overrides.as_deref(),
+                out.as_deref(),
+            )?;
+            if json {
+                return Ok(Some(json!({
+                    "ok": true,
+                    "command": "build",
+                    "package_dir": build.package_dir.display().to_string(),
+                    "manifest_path": build.manifest_path.display().to_string(),
+                    "checksums_path": build.checksums_path.display().to_string(),
+                })));
+            }
+            println!("package_dir: {}", build.package_dir.display());
+            println!("manifest: {}", build.manifest_path.display());
+            println!("checksums: {}", build.checksums_path.display());
+        }
         Commands::Run {
             experiment,
             container,
@@ -1670,7 +1706,8 @@ fn json_error(code: &str, message: String, details: Value) -> Value {
 
 fn command_json_mode(command: &Commands) -> bool {
     match command {
-        Commands::Run { json, .. }
+        Commands::Build { json, .. }
+        | Commands::Run { json, .. }
         | Commands::RunDev { json, .. }
         | Commands::RunExperiment { json, .. }
         | Commands::Replay { json, .. }

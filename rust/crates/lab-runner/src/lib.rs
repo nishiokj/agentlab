@@ -1915,6 +1915,20 @@ pub struct ExperimentSummary {
     pub preflight_warnings: Vec<String>,
 }
 
+#[derive(Debug, Clone)]
+pub struct BuildResult {
+    pub package_dir: PathBuf,
+    pub manifest_path: PathBuf,
+    pub checksums_path: PathBuf,
+}
+
+#[derive(Debug, Clone)]
+struct LoadedExperimentInput {
+    json_value: Value,
+    exp_dir: PathBuf,
+    project_root: PathBuf,
+}
+
 pub fn run_experiment(path: &Path, use_container: bool) -> Result<RunResult> {
     run_experiment_with_behavior(
         path,
@@ -4024,9 +4038,9 @@ fn parse_dx_workspace_patches_raw(
         Value::Object(map) => {
             let mut ordered: BTreeMap<String, String> = BTreeMap::new();
             for (source, target) in map {
-                let target = target.as_str().ok_or_else(|| {
-                    anyhow!("{}['{}'] must be a string", field_prefix, source)
-                })?;
+                let target = target
+                    .as_str()
+                    .ok_or_else(|| anyhow!("{}['{}'] must be a string", field_prefix, source))?;
                 ordered.insert(source.clone(), target.to_string());
             }
             for (source, target) in ordered {
@@ -4044,12 +4058,14 @@ fn parse_dx_workspace_patches_raw(
                 let obj = item
                     .as_object()
                     .ok_or_else(|| anyhow!("{}[{}] must be an object", field_prefix, idx))?;
-                let source = obj.get("source").and_then(Value::as_str).ok_or_else(|| {
-                    anyhow!("{}[{}].source missing", field_prefix, idx)
-                })?;
-                let target = obj.get("target").and_then(Value::as_str).ok_or_else(|| {
-                    anyhow!("{}[{}].target missing", field_prefix, idx)
-                })?;
+                let source = obj
+                    .get("source")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow!("{}[{}].source missing", field_prefix, idx))?;
+                let target = obj
+                    .get("target")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow!("{}[{}].target missing", field_prefix, idx))?;
                 let _ = validate_workspace_relative_path(target).map_err(|e| {
                     anyhow!(
                         "{}[{}].target '{}' is invalid: {}",
@@ -4065,12 +4081,7 @@ fn parse_dx_workspace_patches_raw(
                 }));
             }
         }
-        _ => {
-            return Err(anyhow!(
-                "{} must be an object or an array",
-                field_prefix
-            ))
-        }
+        _ => return Err(anyhow!("{} must be an object or an array", field_prefix)),
     }
     Ok(patches)
 }
@@ -4172,7 +4183,6 @@ fn parse_dx_workspace_patches(
 
 #[derive(Debug, Clone)]
 struct DxResolvedAgentBuild {
-    id: String,
     artifact_raw: String,
     artifact_path: PathBuf,
     artifact_digest: String,
@@ -4214,7 +4224,6 @@ fn uses_new_variant_agent_model(json_value: &Value) -> bool {
 fn parse_dx_agent_build(
     root: &Value,
     root_name: &str,
-    id: String,
     exp_dir: &Path,
     project_root: &Path,
 ) -> Result<DxResolvedAgentBuild> {
@@ -4234,7 +4243,8 @@ fn parse_dx_agent_build(
         ));
     }
     let artifact_digest = compute_artifact_content_digest(&artifact_path)?;
-    let command = parse_dx_command_field_named(root.get("command"), &format!("{}.command", root_name))?;
+    let command =
+        parse_dx_command_field_named(root.get("command"), &format!("{}.command", root_name))?;
 
     let io_input_arg = root
         .pointer("/io/input")
@@ -4253,15 +4263,19 @@ fn parse_dx_agent_build(
         .unwrap_or("--output")
         .to_string();
     let env = parse_string_map_field(root.get("env"), &format!("{}.env", root_name))?;
-    let env_from_host =
-        parse_string_array_field(root.get("env_from_host"), &format!("{}.env_from_host", root_name))?;
+    let env_from_host = parse_string_array_field(
+        root.get("env_from_host"),
+        &format!("{}.env_from_host", root_name),
+    )?;
     let bindings_to_args = parse_dx_arg_map(
         root.get("arg_map").or_else(|| root.get("bindings_to_args")),
         &format!("{}.arg_map", root_name),
     )?;
 
-    let config_files =
-        parse_string_array_field(root.get("config_files"), &format!("{}.config_files", root_name))?;
+    let config_files = parse_string_array_field(
+        root.get("config_files"),
+        &format!("{}.config_files", root_name),
+    )?;
     let mut file_staging = Vec::new();
     for file in &config_files {
         let source = resolve_dx_config_file_path(file, exp_dir, project_root);
@@ -4284,7 +4298,6 @@ fn parse_dx_agent_build(
         project_root,
     )?;
     Ok(DxResolvedAgentBuild {
-        id,
         artifact_raw,
         artifact_path,
         artifact_digest,
@@ -4311,23 +4324,23 @@ fn runtime_override_for_variant_build(
     }
     json!({
         "agent": {
-            "command": build.command,
+            "command": build.command.clone(),
             "image_source": "per_task",
             "artifact": build.artifact_path.to_string_lossy().to_string(),
             "artifact_digest": format!("sha256:{}", build.artifact_digest),
             "artifact_resolved_path": build.artifact_path.to_string_lossy().to_string(),
             "io": {
-                "input_arg": build.io_input_arg,
-                "output_arg": build.io_output_arg
+                "input_arg": build.io_input_arg.clone(),
+                "output_arg": build.io_output_arg.clone()
             },
             "env": merged_env,
-            "env_from_host": build.env_from_host,
-            "arg_map": build.bindings_to_args,
-            "bindings_to_args": build.bindings_to_args,
-            "workspace_patches": build.workspace_patches_resolved
+            "env_from_host": build.env_from_host.clone(),
+            "arg_map": build.bindings_to_args.clone(),
+            "bindings_to_args": build.bindings_to_args.clone(),
+            "workspace_patches": build.workspace_patches_resolved.clone()
         },
         "dependencies": {
-            "file_staging": build.file_staging,
+            "file_staging": build.file_staging.clone(),
             "services": []
         }
     })
@@ -4365,7 +4378,6 @@ fn rewrite_new_variant_agent_model(
             let parsed = parse_dx_agent_build(
                 item,
                 &format!("agent_builds[{}]", idx),
-                id.clone(),
                 exp_dir,
                 project_root,
             )?;
@@ -4375,13 +4387,7 @@ fn rewrite_new_variant_agent_model(
         let legacy_agent = json_value
             .pointer("/agent")
             .ok_or_else(|| anyhow!("agent_builds is required when agent section is missing"))?;
-        let parsed = parse_dx_agent_build(
-            legacy_agent,
-            "agent",
-            "default".to_string(),
-            exp_dir,
-            project_root,
-        )?;
+        let parsed = parse_dx_agent_build(legacy_agent, "agent", exp_dir, project_root)?;
         builds_by_id.insert("default".to_string(), parsed);
     }
 
@@ -4481,17 +4487,17 @@ fn rewrite_new_variant_agent_model(
     }
     let baseline_agent = {
         let mut agent = json!({
-            "artifact": baseline_build.artifact_raw,
-            "command": baseline_build.command,
+            "artifact": baseline_build.artifact_raw.clone(),
+            "command": baseline_build.command.clone(),
             "io": {
-                "input": baseline_build.io_input_arg,
-                "output": baseline_build.io_output_arg,
+                "input": baseline_build.io_input_arg.clone(),
+                "output": baseline_build.io_output_arg.clone(),
             },
             "env": baseline_agent_env,
-            "env_from_host": baseline_build.env_from_host,
-            "bindings_to_args": baseline_build.bindings_to_args,
-            "arg_map": baseline_build.bindings_to_args,
-            "config_files": baseline_build.config_files,
+            "env_from_host": baseline_build.env_from_host.clone(),
+            "bindings_to_args": baseline_build.bindings_to_args.clone(),
+            "arg_map": baseline_build.bindings_to_args.clone(),
+            "config_files": baseline_build.config_files.clone(),
         });
         if let Some(workspace_patches_raw) = baseline_build.workspace_patches_raw.clone() {
             set_json_pointer_value(&mut agent, "/workspace_patches", workspace_patches_raw)?;
@@ -4530,7 +4536,11 @@ fn rewrite_new_variant_agent_model(
         }
         treatment_variants.push(entry);
     }
-    set_json_pointer_value(&mut rewritten, "/variants", Value::Array(treatment_variants))?;
+    set_json_pointer_value(
+        &mut rewritten,
+        "/variants",
+        Value::Array(treatment_variants),
+    )?;
     if rewritten.pointer("/agent_builds").is_some() {
         set_json_pointer_value(&mut rewritten, "/agent_builds", Value::Null)?;
     }
@@ -4591,6 +4601,10 @@ fn normalize_experiment_authoring(
     if !is_dx_contract_authoring(&json_value) {
         return Ok(json_value);
     }
+    let mut json_value = json_value;
+    if uses_new_variant_agent_model(&json_value) {
+        json_value = rewrite_new_variant_agent_model(&json_value, exp_dir, project_root)?;
+    }
     reject_legacy_fields_in_dx_authoring(&json_value)?;
 
     let experiment_id = json_value
@@ -4645,10 +4659,11 @@ fn normalize_experiment_authoring(
         .to_string();
     let baseline_bindings = json_value
         .pointer("/baseline/bindings")
+        .or_else(|| json_value.pointer("/baseline/config"))
         .cloned()
         .unwrap_or_else(|| json!({}));
     if !baseline_bindings.is_object() {
-        return Err(anyhow!("baseline.bindings must be an object"));
+        return Err(anyhow!("baseline.bindings/config must be an object"));
     }
 
     let mut variant_plan = Vec::new();
@@ -4663,14 +4678,35 @@ fn normalize_experiment_authoring(
                 .map(str::trim)
                 .filter(|v| !v.is_empty())
                 .ok_or_else(|| anyhow!("variants[{}].id is required", idx))?;
-            let bindings = item.get("bindings").cloned().unwrap_or_else(|| json!({}));
+            let bindings = item
+                .get("bindings")
+                .or_else(|| item.get("config"))
+                .cloned()
+                .unwrap_or_else(|| json!({}));
             if !bindings.is_object() {
-                return Err(anyhow!("variants[{}].bindings must be an object", idx));
+                return Err(anyhow!(
+                    "variants[{}].bindings/config must be an object",
+                    idx
+                ));
             }
-            variant_plan.push(json!({
+            let mut variant_entry = json!({
                 "variant_id": id,
                 "bindings": bindings
-            }));
+            });
+            if let Some(runtime_overrides) = item.get("runtime_overrides") {
+                if !runtime_overrides.is_object() {
+                    return Err(anyhow!(
+                        "variants[{}].runtime_overrides must be an object",
+                        idx
+                    ));
+                }
+                set_json_pointer_value(
+                    &mut variant_entry,
+                    "/runtime_overrides",
+                    runtime_overrides.clone(),
+                )?;
+            }
+            variant_plan.push(variant_entry);
         }
     }
 
@@ -4720,10 +4756,12 @@ fn normalize_experiment_authoring(
     let agent_env = parse_string_map_field(agent_root.pointer("/env"), "agent.env")?;
     let agent_env_from_host =
         parse_string_array_field(agent_root.pointer("/env_from_host"), "agent.env_from_host")?;
-    let bindings_to_args = agent_root
-        .pointer("/bindings_to_args")
-        .cloned()
-        .unwrap_or_else(|| json!([]));
+    let bindings_to_args = parse_dx_arg_map(
+        agent_root
+            .pointer("/arg_map")
+            .or_else(|| agent_root.pointer("/bindings_to_args")),
+        "agent.arg_map",
+    )?;
 
     let config_files =
         parse_string_array_field(agent_root.pointer("/config_files"), "agent.config_files")?;
@@ -4856,6 +4894,7 @@ fn normalize_experiment_authoring(
                 },
                 "env": agent_env,
                 "env_from_host": agent_env_from_host,
+                "arg_map": bindings_to_args.clone(),
                 "bindings_to_args": bindings_to_args,
                 "workspace_patches": workspace_patches
             },
@@ -7540,14 +7579,71 @@ fn execute_schedule_engine(
     )
 }
 
-fn run_experiment_with_behavior(
+fn load_experiment_input(
     path: &Path,
-    use_container: bool,
-    behavior: RunBehavior,
     overrides_path: Option<&Path>,
-    execution: RunExecutionOptions,
-) -> Result<RunResult> {
-    let exp_dir = path
+) -> Result<LoadedExperimentInput> {
+    let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+    if canonical.is_dir() {
+        let manifest_path = canonical.join("manifest.json");
+        if manifest_path.exists() {
+            if overrides_path.is_some() {
+                return Err(anyhow!(
+                    "overrides are not supported when running from a built package directory"
+                ));
+            }
+            let manifest = load_json_file(&manifest_path)?;
+            let json_value = manifest
+                .pointer("/resolved_experiment")
+                .cloned()
+                .unwrap_or(manifest);
+            let exp_dir = canonical;
+            let project_root = find_project_root(&exp_dir)
+                .canonicalize()
+                .unwrap_or_else(|_| find_project_root(&exp_dir));
+            return Ok(LoadedExperimentInput {
+                json_value,
+                exp_dir,
+                project_root,
+            });
+        }
+        return Err(anyhow!(
+            "directory input is not a built package (missing manifest.json): {}",
+            canonical.display()
+        ));
+    }
+
+    if canonical
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name == "manifest.json")
+    {
+        if overrides_path.is_some() {
+            return Err(anyhow!(
+                "overrides are not supported when running from a built package manifest"
+            ));
+        }
+        let manifest = load_json_file(&canonical)?;
+        let json_value = manifest
+            .pointer("/resolved_experiment")
+            .cloned()
+            .unwrap_or(manifest);
+        let exp_dir = canonical
+            .parent()
+            .unwrap_or(Path::new("."))
+            .canonicalize()
+            .unwrap_or_else(|_| PathBuf::from("."));
+        let project_root = find_project_root(&exp_dir)
+            .canonicalize()
+            .unwrap_or_else(|_| find_project_root(&exp_dir));
+        return Ok(LoadedExperimentInput {
+            json_value,
+            exp_dir,
+            project_root,
+        });
+    }
+
+    let exp_dir = canonical
         .parent()
         .unwrap_or(Path::new("."))
         .canonicalize()
@@ -7555,13 +7651,348 @@ fn run_experiment_with_behavior(
     let project_root = find_project_root(&exp_dir)
         .canonicalize()
         .unwrap_or_else(|_| find_project_root(&exp_dir));
-    let raw_yaml = fs::read_to_string(path)?;
+    let raw_yaml = fs::read_to_string(&canonical)?;
     let yaml_value: serde_yaml::Value = serde_yaml::from_str(&raw_yaml)?;
     let mut json_value: Value = serde_json::to_value(yaml_value)?;
     if let Some(overrides_path) = overrides_path {
         json_value = apply_experiment_overrides(json_value, overrides_path, &project_root)?;
     }
     json_value = normalize_experiment_authoring(json_value, &exp_dir, &project_root)?;
+    Ok(LoadedExperimentInput {
+        json_value,
+        exp_dir,
+        project_root,
+    })
+}
+
+fn as_portable_rel(path: &Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
+}
+
+fn copy_path_into_package(source: &Path, destination: &Path) -> Result<()> {
+    if source.is_dir() {
+        ensure_dir(destination)?;
+        return copy_dir_filtered(source, destination, &[]);
+    }
+    if source.is_file() {
+        if let Some(parent) = destination.parent() {
+            ensure_dir(parent)?;
+        }
+        fs::copy(source, destination)?;
+        return Ok(());
+    }
+    Err(anyhow!(
+        "package build expected file or directory source, got: {}",
+        source.display()
+    ))
+}
+
+fn stage_source_into_package(
+    raw_source: &str,
+    exp_dir: &Path,
+    package_dir: &Path,
+    subdir: &str,
+    prefix: &str,
+    copies: &mut BTreeMap<String, String>,
+    counter: &mut usize,
+) -> Result<String> {
+    let raw_path = PathBuf::from(raw_source);
+    let resolved = if raw_path.is_absolute() {
+        normalize_path(&raw_path)
+    } else {
+        normalize_path(&exp_dir.join(raw_path))
+    };
+    let key = resolved.to_string_lossy().to_string();
+    if let Some(existing) = copies.get(&key) {
+        return Ok(existing.clone());
+    }
+    if !resolved.exists() {
+        return Err(anyhow!(
+            "package build could not resolve source path: {}",
+            resolved.display()
+        ));
+    }
+    let name = resolved
+        .file_name()
+        .and_then(|n| n.to_str())
+        .map(|s| s.to_string())
+        .unwrap_or_else(|| format!("{}_{}", prefix, counter));
+    let rel_path = PathBuf::from(subdir).join(format!("{:03}_{}", *counter, name));
+    let destination = package_dir.join(&rel_path);
+    copy_path_into_package(&resolved, &destination)?;
+    *counter += 1;
+    let rel_portable = as_portable_rel(&rel_path);
+    copies.insert(key, rel_portable.clone());
+    Ok(rel_portable)
+}
+
+fn rewrite_runtime_paths_for_package(
+    runtime_root: &mut Value,
+    exp_dir: &Path,
+    package_dir: &Path,
+    artifact_copies: &mut BTreeMap<String, String>,
+    file_copies: &mut BTreeMap<String, String>,
+    artifact_counter: &mut usize,
+    file_counter: &mut usize,
+) -> Result<()> {
+    if let Some(raw) = runtime_root
+        .pointer("/agent/artifact")
+        .and_then(Value::as_str)
+    {
+        let rel = stage_source_into_package(
+            raw,
+            exp_dir,
+            package_dir,
+            "agent_builds",
+            "build",
+            artifact_copies,
+            artifact_counter,
+        )?;
+        set_json_pointer_value(runtime_root, "/agent/artifact", json!(rel.clone()))?;
+        set_json_pointer_value(runtime_root, "/agent/artifact_resolved_path", json!(rel))?;
+    }
+
+    if let Some(file_staging) = runtime_root
+        .pointer_mut("/dependencies/file_staging")
+        .and_then(Value::as_array_mut)
+    {
+        for entry in file_staging.iter_mut() {
+            if let Some(raw) = entry.get("source_from_host").and_then(Value::as_str) {
+                let rel = stage_source_into_package(
+                    raw,
+                    exp_dir,
+                    package_dir,
+                    "files",
+                    "dep",
+                    file_copies,
+                    file_counter,
+                )?;
+                if let Some(obj) = entry.as_object_mut() {
+                    obj.insert("source_from_host".to_string(), json!(rel));
+                }
+            }
+        }
+    }
+    if let Some(workspace_patches) = runtime_root
+        .pointer_mut("/agent/workspace_patches")
+        .and_then(Value::as_array_mut)
+    {
+        for entry in workspace_patches.iter_mut() {
+            if let Some(raw) = entry.get("source_from_host").and_then(Value::as_str) {
+                let rel = stage_source_into_package(
+                    raw,
+                    exp_dir,
+                    package_dir,
+                    "files",
+                    "patch",
+                    file_copies,
+                    file_counter,
+                )?;
+                if let Some(obj) = entry.as_object_mut() {
+                    obj.insert("source_from_host".to_string(), json!(rel));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn sanitize_name_for_path(raw: &str) -> String {
+    let mut out = String::new();
+    for ch in raw.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+            out.push(ch);
+        } else {
+            out.push('_');
+        }
+    }
+    let trimmed = out.trim_matches('_');
+    if trimmed.is_empty() {
+        "experiment".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
+pub fn build_experiment_package(
+    path: &Path,
+    overrides_path: Option<&Path>,
+    out_dir: Option<&Path>,
+) -> Result<BuildResult> {
+    let loaded = load_experiment_input(path, overrides_path)?;
+    let mut json_value = loaded.json_value.clone();
+    validate_required_fields(&json_value)?;
+
+    let experiment_id = json_value
+        .pointer("/experiment/id")
+        .and_then(Value::as_str)
+        .unwrap_or("experiment");
+    let package_dir = if let Some(out_dir) = out_dir {
+        out_dir.to_path_buf()
+    } else {
+        let ts = Utc::now().format("%Y%m%d_%H%M%S_%6f");
+        loaded
+            .project_root
+            .join(".lab")
+            .join("builds")
+            .join(format!("{}_{}", sanitize_name_for_path(experiment_id), ts))
+    };
+    if package_dir.exists() {
+        if !package_dir.is_dir() {
+            return Err(anyhow!(
+                "build output path exists and is not a directory: {}",
+                package_dir.display()
+            ));
+        }
+        let mut entries = fs::read_dir(&package_dir)?;
+        if entries.next().is_some() {
+            return Err(anyhow!(
+                "build output directory must be empty: {}",
+                package_dir.display()
+            ));
+        }
+    } else {
+        ensure_dir(&package_dir)?;
+    }
+
+    ensure_dir(&package_dir.join("agent_builds"))?;
+    ensure_dir(&package_dir.join("tasks"))?;
+    ensure_dir(&package_dir.join("files"))?;
+
+    let dataset_path = resolve_dataset_path(&json_value, &loaded.exp_dir)?;
+    let dataset_target = package_dir.join("tasks").join("tasks.jsonl");
+    copy_path_into_package(&dataset_path, &dataset_target)?;
+    let dataset_rel = PathBuf::from("tasks").join("tasks.jsonl");
+    set_json_pointer_value(
+        &mut json_value,
+        "/dataset/path",
+        json!(as_portable_rel(&dataset_rel)),
+    )?;
+
+    let mut artifact_copies: BTreeMap<String, String> = BTreeMap::new();
+    let mut file_copies: BTreeMap<String, String> = BTreeMap::new();
+    let mut artifact_counter = 0usize;
+    let mut file_counter = 0usize;
+
+    if let Some(runtime) = json_value.pointer_mut("/runtime") {
+        rewrite_runtime_paths_for_package(
+            runtime,
+            &loaded.exp_dir,
+            &package_dir,
+            &mut artifact_copies,
+            &mut file_copies,
+            &mut artifact_counter,
+            &mut file_counter,
+        )?;
+    }
+    if let Some(runtime_overrides) = json_value.pointer_mut("/baseline/runtime_overrides") {
+        rewrite_runtime_paths_for_package(
+            runtime_overrides,
+            &loaded.exp_dir,
+            &package_dir,
+            &mut artifact_copies,
+            &mut file_copies,
+            &mut artifact_counter,
+            &mut file_counter,
+        )?;
+    }
+    if let Some(variant_plan) = json_value
+        .pointer_mut("/variant_plan")
+        .and_then(Value::as_array_mut)
+    {
+        for variant in variant_plan.iter_mut() {
+            if let Some(runtime_overrides) = variant.get_mut("runtime_overrides") {
+                rewrite_runtime_paths_for_package(
+                    runtime_overrides,
+                    &loaded.exp_dir,
+                    &package_dir,
+                    &mut artifact_copies,
+                    &mut file_copies,
+                    &mut artifact_counter,
+                    &mut file_counter,
+                )?;
+            }
+        }
+    }
+    if let Some(variants) = json_value
+        .pointer_mut("/variants")
+        .and_then(Value::as_array_mut)
+    {
+        for variant in variants.iter_mut() {
+            if let Some(runtime_overrides) = variant.get_mut("runtime_overrides") {
+                rewrite_runtime_paths_for_package(
+                    runtime_overrides,
+                    &loaded.exp_dir,
+                    &package_dir,
+                    &mut artifact_copies,
+                    &mut file_copies,
+                    &mut artifact_counter,
+                    &mut file_counter,
+                )?;
+            }
+        }
+    }
+
+    let package_manifest = json!({
+        "schema_version": "experiment_package_v1",
+        "created_at": Utc::now().to_rfc3339(),
+        "resolved_experiment": json_value,
+    });
+    let manifest_path = package_dir.join("manifest.json");
+    atomic_write_json_pretty(&manifest_path, &package_manifest)?;
+    let resolved_for_manifest = package_manifest
+        .pointer("/resolved_experiment")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    atomic_write_json_pretty(
+        &package_dir.join("resolved_experiment.json"),
+        &resolved_for_manifest,
+    )?;
+
+    let checksums_path = package_dir.join("checksums.json");
+    let mut checksums: BTreeMap<String, String> = BTreeMap::new();
+    for entry in walkdir::WalkDir::new(&package_dir)
+        .into_iter()
+        .filter_map(|entry| entry.ok())
+    {
+        let path = entry.path();
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        if path == checksums_path {
+            continue;
+        }
+        let rel = path
+            .strip_prefix(&package_dir)
+            .map(as_portable_rel)
+            .unwrap_or_else(|_| path.display().to_string());
+        checksums.insert(rel, sha256_file(path)?);
+    }
+    let checksums_value = json!({
+        "schema_version": "experiment_package_checksums_v1",
+        "files": checksums,
+    });
+    atomic_write_json_pretty(&checksums_path, &checksums_value)?;
+
+    Ok(BuildResult {
+        package_dir,
+        manifest_path,
+        checksums_path,
+    })
+}
+
+fn run_experiment_with_behavior(
+    path: &Path,
+    use_container: bool,
+    behavior: RunBehavior,
+    overrides_path: Option<&Path>,
+    execution: RunExecutionOptions,
+) -> Result<RunResult> {
+    let LoadedExperimentInput {
+        json_value,
+        exp_dir,
+        project_root,
+    } = load_experiment_input(path, overrides_path)?;
     validate_required_fields(&json_value)?;
     let workload_type = experiment_workload_type(&json_value)?;
 
@@ -7839,21 +8270,11 @@ pub fn describe_experiment_with_overrides(
     path: &Path,
     overrides_path: Option<&Path>,
 ) -> Result<ExperimentSummary> {
-    let exp_dir = path
-        .parent()
-        .unwrap_or(Path::new("."))
-        .canonicalize()
-        .unwrap_or_else(|_| PathBuf::from("."));
-    let project_root = find_project_root(&exp_dir)
-        .canonicalize()
-        .unwrap_or_else(|_| find_project_root(&exp_dir));
-    let raw_yaml = fs::read_to_string(path)?;
-    let yaml_value: serde_yaml::Value = serde_yaml::from_str(&raw_yaml)?;
-    let mut json_value: Value = serde_json::to_value(yaml_value)?;
-    if let Some(overrides_path) = overrides_path {
-        json_value = apply_experiment_overrides(json_value, overrides_path, &project_root)?;
-    }
-    json_value = normalize_experiment_authoring(json_value, &exp_dir, &project_root)?;
+    let LoadedExperimentInput {
+        json_value,
+        exp_dir,
+        project_root,
+    } = load_experiment_input(path, overrides_path)?;
     validate_required_fields(&json_value)?;
 
     let dataset_path = resolve_dataset_path(&json_value, &exp_dir)?;
@@ -8015,21 +8436,11 @@ impl std::fmt::Display for PreflightReport {
 pub fn preflight_experiment(path: &Path, overrides_path: Option<&Path>) -> Result<PreflightReport> {
     emit_preflight_log(format!("resolving experiment {}", path.display()));
     let preflight_started = Instant::now();
-    let exp_dir = path
-        .parent()
-        .unwrap_or(Path::new("."))
-        .canonicalize()
-        .unwrap_or_else(|_| PathBuf::from("."));
-    let project_root = find_project_root(&exp_dir)
-        .canonicalize()
-        .unwrap_or_else(|_| find_project_root(&exp_dir));
-    let raw_yaml = fs::read_to_string(path)?;
-    let yaml_value: serde_yaml::Value = serde_yaml::from_str(&raw_yaml)?;
-    let mut json_value: Value = serde_json::to_value(yaml_value)?;
-    if let Some(overrides_path) = overrides_path {
-        json_value = apply_experiment_overrides(json_value, overrides_path, &project_root)?;
-    }
-    json_value = normalize_experiment_authoring(json_value, &exp_dir, &project_root)?;
+    let LoadedExperimentInput {
+        json_value,
+        exp_dir,
+        project_root,
+    } = load_experiment_input(path, overrides_path)?;
     validate_required_fields(&json_value)?;
 
     let dataset_path = resolve_dataset_path(&json_value, &exp_dir)?;
@@ -10537,11 +10948,6 @@ fn resolve_variant_plan(json_value: &Value) -> Result<(Vec<Variant>, String)> {
         .and_then(|v| v.as_str())
         .ok_or_else(|| anyhow!("missing /baseline/variant_id"))?
         .to_string();
-    if json_value.get("variants").is_some() {
-        return Err(anyhow!(
-            "/variants is not supported; use /variant_plan for experiment variant plans"
-        ));
-    }
 
     let clean_contract = is_clean_contract_experiment(json_value);
 
@@ -10595,21 +11001,25 @@ fn resolve_variant_plan(json_value: &Value) -> Result<(Vec<Variant>, String)> {
         });
     }
 
-    let variant_list: &[Value] = match json_value.pointer("/variant_plan") {
+    let variant_list: &[Value] = match json_value
+        .pointer("/variant_plan")
+        .or_else(|| json_value.pointer("/variants"))
+    {
         Some(value) => value.as_array().map(|v| v.as_slice()).ok_or_else(|| {
-            anyhow!("/variant_plan must be an array of {{ variant_id, bindings }} objects")
+            anyhow!("/variant_plan (or /variants) must be an array of variant objects")
         })?,
         None => &[],
     };
     for (idx, item) in variant_list.iter().enumerate() {
         let id = item
             .get("variant_id")
+            .or_else(|| item.get("id"))
             .and_then(|v| v.as_str())
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .ok_or_else(|| {
                 anyhow!(
-                    "/variant_plan[{}] must include non-empty string variant_id",
+                    "/variant_plan[{}] must include non-empty string variant_id/id",
                     idx
                 )
             })?
@@ -10634,9 +11044,16 @@ fn resolve_variant_plan(json_value: &Value) -> Result<(Vec<Variant>, String)> {
                 runtime_overrides: None,
             });
         } else {
-            let bindings = item.get("bindings").cloned().unwrap_or(json!({}));
+            let bindings = item
+                .get("bindings")
+                .or_else(|| item.get("config"))
+                .cloned()
+                .unwrap_or(json!({}));
             if !bindings.is_object() {
-                return Err(anyhow!("/variant_plan[{}].bindings must be an object", idx));
+                return Err(anyhow!(
+                    "/variant_plan[{}].bindings/config must be an object",
+                    idx
+                ));
             }
             let mut runtime_overrides = match item.get("runtime_overrides") {
                 None | Some(Value::Null) => None,
@@ -11850,20 +12267,21 @@ fn parse_bindings_to_args(value: Option<&Value>) -> Result<Vec<BindingArgProject
     };
     let items = raw
         .as_array()
-        .ok_or_else(|| anyhow!("runtime.agent.bindings_to_args must be an array"))?;
+        .ok_or_else(|| anyhow!("runtime.agent.arg_map must be an array"))?;
     let mut parsed = Vec::with_capacity(items.len());
     for (idx, item) in items.iter().enumerate() {
         let obj = item
             .as_object()
-            .ok_or_else(|| anyhow!("runtime.agent.bindings_to_args[{}] must be an object", idx))?;
+            .ok_or_else(|| anyhow!("runtime.agent.arg_map[{}] must be an object", idx))?;
         let binding = obj
-            .get("binding")
+            .get("key")
+            .or_else(|| obj.get("binding"))
             .and_then(Value::as_str)
             .map(str::trim)
             .filter(|v| !v.is_empty())
             .ok_or_else(|| {
                 anyhow!(
-                    "runtime.agent.bindings_to_args[{}].binding must be a non-empty string",
+                    "runtime.agent.arg_map[{}].key (or legacy .binding) must be a non-empty string",
                     idx
                 )
             })?;
@@ -11874,7 +12292,7 @@ fn parse_bindings_to_args(value: Option<&Value>) -> Result<Vec<BindingArgProject
             .filter(|v| !v.is_empty())
             .ok_or_else(|| {
                 anyhow!(
-                    "runtime.agent.bindings_to_args[{}].flag must be a non-empty string",
+                    "runtime.agent.arg_map[{}].flag must be a non-empty string",
                     idx
                 )
             })?;
@@ -11956,7 +12374,7 @@ fn project_bindings_to_args(
     for spec in specs {
         let value = binding_lookup(bindings, &spec.binding).ok_or_else(|| {
             anyhow!(
-                "missing required binding key '{}' for runtime.agent.bindings_to_args",
+                "missing required config key '{}' for runtime.agent.arg_map",
                 spec.binding
             )
         })?;
@@ -12093,7 +12511,14 @@ fn resolve_agent_runtime(json_value: &Value, exp_dir: &Path) -> Result<AgentRunt
         agent.pointer("/artifact_resolved_path"),
         "runtime.agent.artifact_resolved_path",
     )?
-    .map(PathBuf::from);
+    .map(|raw| {
+        let path = PathBuf::from(raw);
+        if path.is_absolute() {
+            normalize_path(&path)
+        } else {
+            normalize_path(&exp_dir.join(path))
+        }
+    });
     if image_source == ImageSource::PerTask && agent_artifact.is_none() {
         return Err(anyhow!(
             "runtime.agent.artifact is required when runtime.agent.image_source='per_task'"
@@ -12119,7 +12544,11 @@ fn resolve_agent_runtime(json_value: &Value, exp_dir: &Path) -> Result<AgentRunt
         agent.pointer("/env_from_host"),
         "runtime.agent.env_from_host",
     )?;
-    let bindings_to_args = parse_bindings_to_args(agent.pointer("/bindings_to_args"))?;
+    let bindings_to_args = parse_bindings_to_args(
+        agent
+            .pointer("/arg_map")
+            .or_else(|| agent.pointer("/bindings_to_args")),
+    )?;
     let workspace_patches = parse_workspace_patches(agent.pointer("/workspace_patches"), exp_dir)?;
     let input_arg = agent
         .pointer("/io/input_arg")
@@ -16312,19 +16741,26 @@ mod tests {
     }
 
     #[test]
-    fn resolve_variant_plan_rejects_legacy_variants_field() {
+    fn resolve_variant_plan_accepts_variants_alias() {
         let spec = json!({
             "baseline": { "variant_id": "base", "bindings": {} },
             "variants": [
-                { "variant_id": "old", "bindings": { "temperature": 0.7 } }
+                { "id": "old", "config": { "temperature": 0.7 } }
             ]
         });
 
-        let err = resolve_variant_plan(&spec).expect_err("legacy variants should fail");
-        assert!(
-            err.to_string().contains("/variants is not supported"),
-            "unexpected error: {}",
-            err
+        let (variants, baseline_id) =
+            resolve_variant_plan(&spec).expect("variants alias should parse");
+        assert_eq!(baseline_id, "base");
+        assert_eq!(variants.len(), 2);
+        assert_eq!(variants[1].id, "old");
+        assert_eq!(
+            variants[1]
+                .bindings
+                .pointer("/temperature")
+                .and_then(Value::as_f64)
+                .unwrap_or(0.0),
+            0.7
         );
     }
 
@@ -20004,6 +20440,67 @@ mod tests {
         })
     }
 
+    fn minimal_new_dx_spec() -> Value {
+        json!({
+            "experiment": {
+                "id": "bench_v0_multi_build",
+                "name": "Bench v0 Multi Build",
+                "tags": ["bench-v0", "multi-build"]
+            },
+            "benchmark": "bench_v0",
+            "limit": 10,
+            "agent_builds": [
+                {
+                    "id": "rex_default",
+                    "artifact": "rex-minimal-linux-dir",
+                    "command": ["rex", "run", "--dangerous"],
+                    "io": { "input": "--input-file", "output": "--output" },
+                    "config_files": ["providers.a.ts"],
+                    "workspace_patches": {
+                        "providers.a.ts": "packages/core/types/src/providers.ts"
+                    },
+                    "arg_map": [
+                        { "key": "model_provider", "flag": "--provider" },
+                        { "key": "model", "flag": "--model" }
+                    ]
+                },
+                {
+                    "id": "rex_alt",
+                    "artifact": "rex-minimal-linux-dir",
+                    "command": ["rex", "run", "--alternate"],
+                    "io": { "input": "--input-file", "output": "--output" },
+                    "config_files": ["providers.b.ts"],
+                    "workspace_patches": {
+                        "providers.b.ts": "packages/core/types/src/providers.ts"
+                    },
+                    "arg_map": [
+                        { "key": "model_provider", "flag": "--provider" },
+                        { "key": "model", "flag": "--model" }
+                    ]
+                }
+            ],
+            "variants": [
+                {
+                    "id": "qwen",
+                    "baseline": true,
+                    "agent_ref": "rex_default",
+                    "env": { "BASELINE_ONLY": "1" },
+                    "config": { "model_provider": "lmstudio", "model": "qwen3.5-35b-a3b" }
+                },
+                {
+                    "id": "sonnet",
+                    "agent_ref": "rex_alt",
+                    "env": { "ANTHROPIC_REGION": "us" },
+                    "config": { "model_provider": "anthropic", "model": "claude-sonnet-4" }
+                }
+            ],
+            "overrides": {
+                "network": "full",
+                "root_read_only": false
+            }
+        })
+    }
+
     #[test]
     fn p0_i01_and_p0_i05_dx_registry_resolution_is_complete_and_deterministic() {
         let root = create_dx_authoring_fixture("agentlab_p0_registry_resolution");
@@ -20054,6 +20551,100 @@ mod tests {
             "artifact digest missing: {}",
             artifact_digest
         );
+    }
+
+    #[test]
+    fn normalize_authoring_supports_agent_builds_and_variant_agent_refs() {
+        let root = create_dx_authoring_fixture("agentlab_dx_v2_agent_builds");
+        let spec = minimal_new_dx_spec();
+        let resolved =
+            normalize_experiment_authoring(spec, &root.path, &root.path).expect("normalize");
+
+        assert_eq!(
+            resolved
+                .pointer("/baseline/variant_id")
+                .and_then(Value::as_str)
+                .unwrap_or(""),
+            "qwen"
+        );
+        assert_eq!(
+            resolved
+                .pointer("/runtime/agent/env/BASELINE_ONLY")
+                .and_then(Value::as_str)
+                .unwrap_or(""),
+            "1"
+        );
+        assert_eq!(
+            resolved
+                .pointer("/runtime/agent/arg_map/0/binding")
+                .and_then(Value::as_str)
+                .unwrap_or(""),
+            "model_provider"
+        );
+        assert_eq!(
+            resolved
+                .pointer("/variant_plan/0/variant_id")
+                .and_then(Value::as_str)
+                .unwrap_or(""),
+            "sonnet"
+        );
+        assert_eq!(
+            resolved
+                .pointer("/variant_plan/0/runtime_overrides/agent/command/2")
+                .and_then(Value::as_str)
+                .unwrap_or(""),
+            "--alternate"
+        );
+        assert_eq!(
+            resolved
+                .pointer("/variant_plan/0/runtime_overrides/agent/env/ANTHROPIC_REGION")
+                .and_then(Value::as_str)
+                .unwrap_or(""),
+            "us"
+        );
+    }
+
+    #[test]
+    fn build_experiment_package_rewrites_runtime_sources() {
+        let root = create_dx_authoring_fixture("agentlab_build_package");
+        let spec = minimal_new_dx_spec();
+        let spec_path = root.path.join("experiment.yaml");
+        fs::write(&spec_path, serde_yaml::to_string(&spec).expect("yaml")).expect("write spec");
+
+        let out_dir = root.path.join("package");
+        let build =
+            build_experiment_package(&spec_path, None, Some(&out_dir)).expect("build package");
+        assert!(build.manifest_path.exists(), "manifest missing");
+        assert!(build.checksums_path.exists(), "checksums missing");
+
+        let manifest = load_json_file(&build.manifest_path).expect("manifest json");
+        assert_eq!(
+            manifest
+                .pointer("/schema_version")
+                .and_then(Value::as_str)
+                .unwrap_or(""),
+            "experiment_package_v1"
+        );
+        assert_eq!(
+            manifest
+                .pointer("/resolved_experiment/dataset/path")
+                .and_then(Value::as_str)
+                .unwrap_or(""),
+            "tasks/tasks.jsonl"
+        );
+        let artifact = manifest
+            .pointer("/resolved_experiment/runtime/agent/artifact")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        assert!(
+            artifact.starts_with("agent_builds/"),
+            "artifact path should be packaged, got {}",
+            artifact
+        );
+
+        let summary = describe_experiment(&build.package_dir).expect("describe package");
+        assert_eq!(summary.exp_id, "bench_v0_multi_build");
+        assert_eq!(summary.task_count, 1);
     }
 
     #[test]
@@ -20300,7 +20891,7 @@ mod tests {
             .expect_err("missing model binding should fail");
         assert!(
             err.to_string()
-                .contains("missing required binding key 'model'"),
+                .contains("missing required config key 'model'"),
             "unexpected error: {}",
             err
         );
