@@ -13809,6 +13809,11 @@ fn append_container_entrypoint(
     command: &[String],
     grader_command: Option<Vec<String>>,
 ) {
+    let artifact_path_export = if request.agent_artifact.is_some() {
+        format!("export {}\n", AGENT_ARTIFACT_PATH_ENV_VALUE)
+    } else {
+        String::new()
+    };
     if let Some(grader_command) = grader_command {
         let setup_block = if let Some(setup) = request.setup_command {
             format!("{}\nsetup_status=$?", setup)
@@ -13822,6 +13827,7 @@ fn append_container_entrypoint(
         let wrapped = format!(
             "set +e\n\
              rm -f {marker}\n\
+             {artifact_path_export}\
              {setup}\n\
              if [ \"$setup_status\" -ne 0 ]; then\n\
                exit \"$setup_status\"\n\
@@ -13845,6 +13851,7 @@ fn append_container_entrypoint(
              fi\n\
              exit 0",
             marker = shell_quote(&grade_error_marker_path),
+            artifact_path_export = artifact_path_export,
             setup = setup_block,
             agent = shell_join(command),
             agent_exit_env = AGENTLAB_ENV_AGENT_EXIT_STATUS,
@@ -13856,7 +13863,12 @@ fn append_container_entrypoint(
         cmd.arg("-lc");
         cmd.arg(wrapped);
     } else if let Some(setup) = request.setup_command {
-        let wrapped = format!("{} && exec {}", setup, shell_join(command));
+        let wrapped = format!(
+            "{}{} && exec {}",
+            artifact_path_export,
+            setup,
+            shell_join(command)
+        );
         cmd.arg("/bin/sh");
         cmd.arg("-lc");
         cmd.arg(wrapped);
@@ -21429,6 +21441,92 @@ mod tests {
     }
 
     #[test]
+    fn p0_i03_injected_container_grader_wrapper_exports_agent_path() {
+        let (_root, paths) = create_trial_paths_fixture("agentlab_p0_path_wrapper");
+        let runtime = AgentRuntimeConfig {
+            adapter_ref: AgentAdapterRef::default(),
+            command_raw: vec!["rex".to_string(), "run".to_string()],
+            container_image: Some("image:latest".to_string()),
+            image_source: ImageSource::Global,
+            agent_artifact: Some(PathBuf::from("/tmp/agent-artifact")),
+            agent_artifact_digest: None,
+            agent_artifact_resolved_path: None,
+            io: AgentRuntimeIoConfig {
+                input_arg: "--input".to_string(),
+                output_arg: "--output".to_string(),
+            },
+            clean_contract_v1: false,
+            integration_level: "cli_basic".to_string(),
+            launch_mode: AgentLaunchMode::File,
+            env: BTreeMap::new(),
+            env_from_host: Vec::new(),
+            bindings_to_args: Vec::new(),
+            workspace_patches: Vec::new(),
+            trajectory_path: None,
+            causal_extraction: None,
+            default_timeout_ms: None,
+            tracing_mode: None,
+            force_container: true,
+            dependency_file_staging: Vec::new(),
+            dependency_services: Vec::new(),
+        };
+        let runtime_env = BTreeMap::new();
+        let overrides = BTreeMap::new();
+        let io_paths = PreparedTrialIo {
+            output_host: paths.out.join("result.json"),
+            events_host: paths.state.join("events.jsonl"),
+            task_path: AGENTLAB_TASK_PATH.to_string(),
+            bindings_path: AGENTLAB_BINDINGS_PATH.to_string(),
+            dependencies_path: AGENTLAB_DEPENDENCIES_PATH.to_string(),
+            policy_path: AGENTLAB_POLICY_PATH.to_string(),
+            result_path: AGENTLAB_RESULT_PATH.to_string(),
+            trajectory_path: AGENTLAB_TRAJECTORY_PATH.to_string(),
+        };
+        let empty_json = json!({});
+        let request = AdapterRunRequest {
+            runtime_experiment: &empty_json,
+            runtime: &runtime,
+            variant_args: &[],
+            runtime_env: &runtime_env,
+            runtime_overrides_env: &overrides,
+            container_mode: true,
+            trial_paths: &paths,
+            dynamic_mounts: &[],
+            io_paths: &io_paths,
+            network_mode: "none",
+            setup_command: None,
+            benchmark_adapter: None,
+            benchmark_grading_enabled: true,
+            run_id: "run_1",
+            task_image: None,
+            task_workspace: None,
+            agent_artifact: runtime.agent_artifact.as_deref(),
+        };
+        let mut cmd = Command::new("docker");
+        append_container_entrypoint(
+            &mut cmd,
+            &request,
+            &["rex".to_string(), "run".to_string()],
+            Some(vec!["python3".to_string(), "/opt/bench/grader.py".to_string()]),
+        );
+        let args = cmd
+            .get_args()
+            .map(|value| value.to_string_lossy().to_string())
+            .collect::<Vec<_>>();
+        let wrapper = args
+            .iter()
+            .position(|arg| arg == "-lc")
+            .and_then(|idx| args.get(idx + 1))
+            .cloned()
+            .unwrap_or_default();
+        assert!(
+            wrapper.contains(AGENT_ARTIFACT_PATH_ENV_VALUE),
+            "grader wrapper missing PATH export for artifact command lookup: {:?}",
+            wrapper
+        );
+    }
+
+    #[test]
     fn p0_i04_artifact_digest_pin_rejects_mutation() {
         let root = TempDirGuard::new("agentlab_p0_artifact_digest_pin");
         let artifact_dir = root.path.join("artifact");
@@ -21634,4 +21732,2856 @@ mod tests {
         );
     }
 
+    // ───────────────────────────────────────────────────────────────────
+    // Batch 1: Pure Functions & Data Utilities
+    // ───────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn sanitize_name_for_path_strips_special_chars() {
+        assert_eq!(sanitize_name_for_path("hello world.v2/3"), "hello_world_v2_3");
+    }
+
+    #[test]
+    fn sanitize_name_for_path_all_special_returns_experiment() {
+        assert_eq!(sanitize_name_for_path("@#$%^&"), "experiment");
+    }
+
+    #[test]
+    fn sanitize_name_for_path_trims_leading_trailing_underscores() {
+        assert_eq!(sanitize_name_for_path("__hello__"), "hello");
+    }
+
+    #[test]
+    fn sanitize_name_for_path_preserves_alphanumeric_hyphen() {
+        assert_eq!(sanitize_name_for_path("a-b_c"), "a-b_c");
+    }
+
+    #[test]
+    fn sanitize_name_for_path_empty_returns_experiment() {
+        assert_eq!(sanitize_name_for_path(""), "experiment");
+    }
+
+    #[test]
+    fn sanitize_name_for_path_unicode_to_underscores() {
+        let result = sanitize_name_for_path("café");
+        assert!(!result.contains('é'), "unicode char should be replaced");
+    }
+
+    #[test]
+    fn sanitize_name_for_path_numbers_preserved() {
+        assert_eq!(sanitize_name_for_path("test123"), "test123");
+    }
+
+    #[test]
+    fn sanitize_name_for_path_mixed_special_and_alpha() {
+        let result = sanitize_name_for_path("my@experiment.v2");
+        assert!(!result.contains('@'));
+        assert!(!result.contains('.'));
+        assert!(result.contains("my"));
+        assert!(result.contains("v2"));
+    }
+
+    #[test]
+    fn sanitize_name_for_path_only_underscores() {
+        assert_eq!(sanitize_name_for_path("___"), "experiment");
+    }
+
+    #[test]
+    fn sanitize_name_for_path_single_char() {
+        assert_eq!(sanitize_name_for_path("x"), "x");
+    }
+
+    #[test]
+    fn experiment_workload_type_reads_explicit_value() {
+        let spec = json!({"version": "1.0", "experiment": {"workload_type": "agent_runtime"}});
+        assert_eq!(experiment_workload_type(&spec).unwrap(), "agent_runtime");
+    }
+
+    #[test]
+    fn experiment_workload_type_clean_contract_defaults_to_agent_runtime() {
+        let spec = json!({"version": "1.0", "experiment": {"id": "e1"}});
+        assert_eq!(experiment_workload_type(&spec).unwrap(), "agent_runtime");
+    }
+
+    #[test]
+    fn experiment_workload_type_empty_string_falls_back() {
+        let spec = json!({"version": "1.0", "experiment": {"workload_type": "  "}});
+        assert_eq!(experiment_workload_type(&spec).unwrap(), "agent_runtime");
+    }
+
+    #[test]
+    fn experiment_workload_type_missing_field_fails() {
+        let spec = json!({"experiment": {"id": "e1"}});
+        assert!(experiment_workload_type(&spec).is_err());
+    }
+
+    #[test]
+    fn experiment_workload_type_trimmed() {
+        let spec = json!({"version": "1.0", "experiment": {"workload_type": "  agent_runtime  "}});
+        assert_eq!(experiment_workload_type(&spec).unwrap(), "agent_runtime");
+    }
+
+    #[test]
+    fn experiment_random_seed_clean_contract_reads_design_seed() {
+        let spec = json!({"version": "1.0", "design": {"seed": 42}});
+        assert_eq!(experiment_random_seed(&spec), 42);
+    }
+
+    #[test]
+    fn experiment_random_seed_legacy_reads_design_random_seed() {
+        let spec = json!({"design": {"random_seed": 99}});
+        assert_eq!(experiment_random_seed(&spec), 99);
+    }
+
+    #[test]
+    fn experiment_random_seed_defaults_to_one() {
+        assert_eq!(experiment_random_seed(&json!({})), 1);
+    }
+
+    #[test]
+    fn experiment_max_concurrency_clamps_zero_to_one() {
+        let spec = json!({"design": {"max_concurrency": 0}});
+        assert_eq!(experiment_max_concurrency(&spec), 1);
+    }
+
+    #[test]
+    fn experiment_max_concurrency_defaults_to_one() {
+        assert_eq!(experiment_max_concurrency(&json!({})), 1);
+    }
+
+    #[test]
+    fn experiment_max_concurrency_preserves_large_value() {
+        let spec = json!({"design": {"max_concurrency": 128}});
+        assert_eq!(experiment_max_concurrency(&spec), 128);
+    }
+
+    #[test]
+    fn experiment_max_concurrency_negative_as_json_defaults() {
+        let spec = json!({"design": {"max_concurrency": -1}});
+        assert_eq!(experiment_max_concurrency(&spec), 1);
+    }
+
+    #[test]
+    fn configured_network_mode_clean_contract_reads_runtime_network() {
+        let spec = json!({"version": "1.0", "runtime": {"network": "bridge"}});
+        assert_eq!(configured_network_mode(&spec).unwrap(), "bridge");
+    }
+
+    #[test]
+    fn configured_network_mode_legacy_reads_policy_path() {
+        let spec = json!({"runtime": {"policy": {"network": {"mode": "host"}}}});
+        assert_eq!(configured_network_mode(&spec).unwrap(), "host");
+    }
+
+    #[test]
+    fn configured_network_mode_clean_contract_defaults_to_none() {
+        let spec = json!({"version": "1.0"});
+        assert_eq!(configured_network_mode(&spec).unwrap(), "none");
+    }
+
+    #[test]
+    fn configured_network_mode_legacy_missing_fails() {
+        assert!(configured_network_mode(&json!({"runtime": {}})).is_err());
+    }
+
+    #[test]
+    fn configured_network_mode_legacy_reads_value() {
+        let spec = json!({"runtime": {"policy": {"network": {"mode": "none"}}}});
+        assert_eq!(configured_network_mode(&spec).unwrap(), "none");
+    }
+
+    #[test]
+    fn trial_index_from_trial_id_parses_standard_format() {
+        assert_eq!(trial_index_from_trial_id("trial_5"), Some(5));
+    }
+
+    #[test]
+    fn trial_index_from_trial_id_rejects_non_numeric() {
+        assert_eq!(trial_index_from_trial_id("trial_abc"), None);
+    }
+
+    #[test]
+    fn trial_index_from_trial_id_rejects_no_prefix() {
+        assert_eq!(trial_index_from_trial_id("5"), None);
+    }
+
+    #[test]
+    fn trial_index_from_trial_id_handles_zero() {
+        assert_eq!(trial_index_from_trial_id("trial_0"), None);
+    }
+
+    #[test]
+    fn trial_index_from_trial_id_large_number() {
+        assert_eq!(trial_index_from_trial_id("trial_999999"), Some(999999));
+    }
+
+    #[test]
+    fn trial_index_from_trial_id_empty_suffix() {
+        assert_eq!(trial_index_from_trial_id("trial_"), None);
+    }
+
+    #[test]
+    fn recover_reconciled_status_maps_completed() {
+        assert_eq!(recover_reconciled_status("completed"), "completed");
+    }
+
+    #[test]
+    fn recover_reconciled_status_maps_killed() {
+        assert_eq!(recover_reconciled_status("killed"), "killed");
+    }
+
+    #[test]
+    fn recover_reconciled_status_maps_unknown_to_interrupted() {
+        assert_eq!(recover_reconciled_status("running"), "interrupted");
+        assert_eq!(recover_reconciled_status("unknown"), "interrupted");
+    }
+
+    #[test]
+    fn recover_reconciled_status_paused_to_interrupted() {
+        assert_eq!(recover_reconciled_status("paused"), "interrupted");
+    }
+
+    #[test]
+    fn recover_reconciled_status_failed_to_interrupted() {
+        assert_eq!(recover_reconciled_status("failed"), "interrupted");
+    }
+
+    #[test]
+    fn recover_reconciled_status_empty_to_interrupted() {
+        assert_eq!(recover_reconciled_status(""), "interrupted");
+    }
+
+    #[test]
+    fn as_portable_rel_converts_backslashes() {
+        assert_eq!(as_portable_rel(Path::new("a\\b\\c")), "a/b/c");
+    }
+
+    #[test]
+    fn as_portable_rel_preserves_forward_slashes() {
+        assert_eq!(as_portable_rel(Path::new("a/b/c")), "a/b/c");
+    }
+
+    #[test]
+    fn as_portable_rel_mixed_separators() {
+        assert_eq!(as_portable_rel(Path::new("a\\b/c\\d")), "a/b/c/d");
+    }
+
+    #[test]
+    fn as_portable_rel_empty_path() {
+        assert_eq!(as_portable_rel(Path::new("")), "");
+    }
+
+    #[test]
+    fn strip_contract_prefix_exact_match_returns_empty() {
+        assert_eq!(strip_contract_prefix("/in", "/in"), Some(""));
+    }
+
+    #[test]
+    fn strip_contract_prefix_with_subpath_returns_rest() {
+        assert_eq!(strip_contract_prefix("/in/data.json", "/in"), Some("/data.json"));
+    }
+
+    #[test]
+    fn strip_contract_prefix_partial_match_returns_none() {
+        assert_eq!(strip_contract_prefix("/infoo", "/in"), None);
+    }
+
+    #[test]
+    fn strip_contract_prefix_no_slash_boundary_returns_none() {
+        assert_eq!(strip_contract_prefix("/agentlab/inbox", "/agentlab/in"), None);
+    }
+
+    #[test]
+    fn strip_contract_prefix_longer_prefix_returns_none() {
+        assert!(strip_contract_prefix("/in", "/in/extra").is_none());
+    }
+
+    #[test]
+    fn strip_contract_prefix_completely_different_returns_none() {
+        assert!(strip_contract_prefix("/out/data", "/in").is_none());
+    }
+
+    #[test]
+    fn resolve_contract_path_components_maps_all_roots() {
+        let cases = vec![
+            (AGENTLAB_CONTRACT_IN_DIR, ContractPathRoot::In),
+            (AGENTLAB_CONTRACT_STATE_DIR, ContractPathRoot::State),
+            (AGENTLAB_CONTRACT_OUT_DIR, ContractPathRoot::Out),
+            (AGENTLAB_CONTRACT_DEPS_DIR, ContractPathRoot::Deps),
+            (AGENTLAB_CONTRACT_WORKSPACE_DIR, ContractPathRoot::Workspace),
+        ];
+        for (dir, expected_root) in cases {
+            let path = format!("{}/file.txt", dir);
+            let (root, rest) = resolve_contract_path_components(&path)
+                .unwrap_or_else(|| panic!("should resolve {}", dir));
+            assert_eq!(root, expected_root, "root mismatch for {}", dir);
+            assert_eq!(rest, "/file.txt", "rest mismatch for {}", dir);
+        }
+    }
+
+    #[test]
+    fn resolve_contract_path_components_unknown_root_returns_none() {
+        assert!(resolve_contract_path_components("/unknown/path").is_none());
+    }
+
+    #[test]
+    fn resolve_contract_path_components_exact_root() {
+        let (root, rest) = resolve_contract_path_components(AGENTLAB_CONTRACT_IN_DIR).unwrap();
+        assert_eq!(root, ContractPathRoot::In);
+        assert_eq!(rest, "");
+    }
+
+    #[test]
+    fn is_clean_contract_experiment_version_1_0() {
+        assert!(is_clean_contract_experiment(&json!({"version": "1.0"})));
+    }
+
+    #[test]
+    fn is_clean_contract_experiment_numeric_1_0() {
+        assert!(is_clean_contract_experiment(&json!({"version": 1.0})));
+    }
+
+    #[test]
+    fn is_clean_contract_experiment_no_version() {
+        assert!(!is_clean_contract_experiment(&json!({})));
+    }
+
+    #[test]
+    fn is_clean_contract_experiment_wrong_version() {
+        assert!(!is_clean_contract_experiment(&json!({"version": "2.0"})));
+    }
+
+    #[test]
+    fn experiment_version_string_from_string() {
+        assert_eq!(experiment_version_string(&json!({"version": "1.0"})), Some("1.0".to_string()));
+    }
+
+    #[test]
+    fn experiment_version_string_from_number() {
+        assert!(experiment_version_string(&json!({"version": 1})).is_some());
+    }
+
+    #[test]
+    fn experiment_version_string_missing() {
+        assert!(experiment_version_string(&json!({})).is_none());
+    }
+
+    #[test]
+    fn experiment_version_string_trims_whitespace() {
+        assert_eq!(experiment_version_string(&json!({"version": "  1.0  "})), Some("1.0".to_string()));
+    }
+
+    #[test]
+    fn is_dx_contract_authoring_agent_section() {
+        assert!(is_dx_contract_authoring(&json!({"agent": {"command": ["echo"]}})));
+    }
+
+    #[test]
+    fn is_dx_contract_authoring_overrides_section() {
+        assert!(is_dx_contract_authoring(&json!({"overrides": "path"})));
+    }
+
+    #[test]
+    fn is_dx_contract_authoring_baseline_id() {
+        assert!(is_dx_contract_authoring(&json!({"baseline": {"id": "b1"}})));
+    }
+
+    #[test]
+    fn is_dx_contract_authoring_benchmark_string() {
+        assert!(is_dx_contract_authoring(&json!({"benchmark": "bench_v0"})));
+    }
+
+    #[test]
+    fn is_dx_contract_authoring_variants_section() {
+        assert!(is_dx_contract_authoring(&json!({"variants": []})));
+    }
+
+    #[test]
+    fn is_dx_contract_authoring_false_for_empty() {
+        assert!(!is_dx_contract_authoring(&json!({})));
+    }
+
+    #[test]
+    fn is_dx_contract_authoring_false_for_legacy() {
+        assert!(!is_dx_contract_authoring(&json!({
+            "experiment": {"workload_type": "agent_runtime"},
+            "runtime": {"agent": {"command": ["echo"]}}
+        })));
+    }
+
+    // ───────────────────────────────────────────────────────────────────
+    // Batch 2: Path & Contract Resolution
+    // ───────────────────────────────────────────────────────────────────
+
+    fn test_contract_roots(trial_dir: &Path) -> ContractPathHostRoots {
+        ContractPathHostRoots::from_trial_dir(trial_dir)
+    }
+
+    #[test]
+    fn map_contract_path_container_mode_maps_in_dir() {
+        let trial = PathBuf::from("/tmp/trial_1");
+        let roots = test_contract_roots(&trial);
+        let result = map_contract_path_to_host(
+            &format!("{}/task.json", AGENTLAB_CONTRACT_IN_DIR),
+            &roots,
+            ContractPathMode::ContainerMount,
+        ).unwrap();
+        assert_eq!(result, trial.join("in").join("task.json"));
+    }
+
+    #[test]
+    fn map_contract_path_container_mode_maps_state_dir() {
+        let trial = PathBuf::from("/tmp/trial_1");
+        let roots = test_contract_roots(&trial);
+        let result = map_contract_path_to_host(
+            &format!("{}/data.json", AGENTLAB_CONTRACT_STATE_DIR),
+            &roots,
+            ContractPathMode::ContainerMount,
+        ).unwrap();
+        assert_eq!(result, trial.join("state").join("data.json"));
+    }
+
+    #[test]
+    fn map_contract_path_container_mode_maps_out_dir() {
+        let trial = PathBuf::from("/tmp/trial_1");
+        let roots = test_contract_roots(&trial);
+        let result = map_contract_path_to_host(
+            &format!("{}/result.json", AGENTLAB_CONTRACT_OUT_DIR),
+            &roots,
+            ContractPathMode::ContainerMount,
+        ).unwrap();
+        assert_eq!(result, trial.join("out").join("result.json"));
+    }
+
+    #[test]
+    fn map_contract_path_container_mode_maps_deps_dir() {
+        let trial = PathBuf::from("/tmp/trial_1");
+        let roots = test_contract_roots(&trial);
+        let result = map_contract_path_to_host(
+            &format!("{}/dep.tar", AGENTLAB_CONTRACT_DEPS_DIR),
+            &roots,
+            ContractPathMode::ContainerMount,
+        ).unwrap();
+        assert_eq!(result, trial.join("deps").join("dep.tar"));
+    }
+
+    #[test]
+    fn map_contract_path_container_mode_maps_workspace_dir() {
+        let trial = PathBuf::from("/tmp/trial_1");
+        let roots = test_contract_roots(&trial);
+        let result = map_contract_path_to_host(
+            &format!("{}/src/main.py", AGENTLAB_CONTRACT_WORKSPACE_DIR),
+            &roots,
+            ContractPathMode::ContainerMount,
+        ).unwrap();
+        assert_eq!(result, trial.join("workspace").join("src").join("main.py"));
+    }
+
+    #[test]
+    fn map_contract_path_container_mode_rejects_empty() {
+        let trial = PathBuf::from("/tmp/trial_1");
+        let roots = test_contract_roots(&trial);
+        let err = map_contract_path_to_host("", &roots, ContractPathMode::ContainerMount)
+            .expect_err("should reject empty");
+        assert!(err.to_string().contains("empty"), "unexpected error: {}", err);
+    }
+
+    #[test]
+    fn map_contract_path_container_mode_rejects_relative() {
+        let trial = PathBuf::from("/tmp/trial_1");
+        let roots = test_contract_roots(&trial);
+        let err = map_contract_path_to_host("relative/path", &roots, ContractPathMode::ContainerMount)
+            .expect_err("should reject relative");
+        assert!(err.to_string().contains("absolute"), "unexpected error: {}", err);
+    }
+
+    #[test]
+    fn map_contract_path_container_mode_trims_whitespace() {
+        let trial = PathBuf::from("/tmp/trial_1");
+        let roots = test_contract_roots(&trial);
+        let padded = format!("  {}  ", AGENTLAB_CONTRACT_IN_DIR);
+        let result = map_contract_path_to_host(&padded, &roots, ContractPathMode::ContainerMount).unwrap();
+        assert_eq!(result, trial.join("in"));
+    }
+
+    #[test]
+    fn map_contract_path_runtime_io_mode_rejects_empty() {
+        let trial = PathBuf::from("/tmp/trial_1");
+        let roots = test_contract_roots(&trial);
+        let err = map_contract_path_to_host("", &roots, ContractPathMode::RuntimeIo)
+            .expect_err("should reject empty");
+        assert!(err.to_string().contains("runtime io path"), "unexpected error: {}", err);
+    }
+
+    #[test]
+    fn map_contract_path_runtime_io_mode_rejects_relative() {
+        let trial = PathBuf::from("/tmp/trial_1");
+        let roots = test_contract_roots(&trial);
+        let err = map_contract_path_to_host("relative/path", &roots, ContractPathMode::RuntimeIo)
+            .expect_err("should reject relative");
+        assert!(err.to_string().contains("absolute"), "unexpected error: {}", err);
+    }
+
+    #[test]
+    fn map_contract_path_runtime_events_mode_rejects_deps() {
+        let trial = PathBuf::from("/tmp/trial_1");
+        let roots = test_contract_roots(&trial);
+        let err = map_contract_path_to_host(
+            &format!("{}/data.bin", AGENTLAB_CONTRACT_DEPS_DIR),
+            &roots,
+            ContractPathMode::RuntimeEvents,
+        ).expect_err("RuntimeEvents should reject deps");
+        assert!(err.to_string().contains("unsupported"), "unexpected error: {}", err);
+    }
+
+    #[test]
+    fn map_contract_path_runtime_events_allows_state() {
+        let trial = PathBuf::from("/tmp/trial_1");
+        let roots = test_contract_roots(&trial);
+        let result = map_contract_path_to_host(
+            &format!("{}/events.jsonl", AGENTLAB_CONTRACT_STATE_DIR),
+            &roots,
+            ContractPathMode::RuntimeEvents,
+        ).unwrap();
+        assert_eq!(result, trial.join("state").join("events.jsonl"));
+    }
+
+    #[test]
+    fn map_contract_path_nested_subpath_resolves() {
+        let trial = PathBuf::from("/tmp/trial_1");
+        let roots = test_contract_roots(&trial);
+        let result = map_contract_path_to_host(
+            &format!("{}/nested/deep/file.json", AGENTLAB_CONTRACT_IN_DIR),
+            &roots,
+            ContractPathMode::ContainerMount,
+        ).unwrap();
+        assert_eq!(result, trial.join("in").join("nested").join("deep").join("file.json"));
+    }
+
+    #[test]
+    fn map_contract_path_double_slash_in_subpath() {
+        let trial = PathBuf::from("/tmp/trial_1");
+        let roots = test_contract_roots(&trial);
+        let result = map_contract_path_to_host(
+            &format!("{}//file.json", AGENTLAB_CONTRACT_IN_DIR),
+            &roots,
+            ContractPathMode::ContainerMount,
+        ).unwrap();
+        assert!(result.to_string_lossy().contains("file.json"));
+    }
+
+    #[test]
+    fn map_contract_path_container_mode_unknown_path_fails() {
+        let trial = PathBuf::from("/tmp/trial_1");
+        let roots = test_contract_roots(&trial);
+        assert!(map_contract_path_to_host("/unknown/root/file", &roots, ContractPathMode::ContainerMount).is_err());
+    }
+
+    #[test]
+    fn mode_allows_root_container_mount_allows_all() {
+        for root in [ContractPathRoot::In, ContractPathRoot::State, ContractPathRoot::Out, ContractPathRoot::Deps, ContractPathRoot::Workspace] {
+            assert!(mode_allows_root(ContractPathMode::ContainerMount, root), "ContainerMount should allow {:?}", root);
+        }
+    }
+
+    #[test]
+    fn mode_allows_root_runtime_events_denies_deps() {
+        assert!(!mode_allows_root(ContractPathMode::RuntimeEvents, ContractPathRoot::Deps));
+    }
+
+    #[test]
+    fn find_project_root_from_run_dir_standard_depth() {
+        let root = TempDirGuard::new("find_root_std");
+        let run_dir = root.path.join(".lab").join("runs").join("run_001");
+        ensure_dir(&run_dir).unwrap();
+        let found = find_project_root_from_run_dir(&run_dir).unwrap();
+        assert_eq!(found, root.path);
+    }
+
+    #[test]
+    fn find_project_root_from_run_dir_too_shallow_fails() {
+        assert!(find_project_root_from_run_dir(Path::new("shallow")).is_err());
+    }
+
+    #[test]
+    fn contract_path_host_roots_from_trial_dir_creates_expected_dirs() {
+        let trial_dir = PathBuf::from("/tmp/trial_1");
+        let roots = ContractPathHostRoots::from_trial_dir(&trial_dir);
+        assert_eq!(roots.in_dir, trial_dir.join("in"));
+        assert_eq!(roots.state_dir, trial_dir.join("state"));
+        assert_eq!(roots.out_dir, trial_dir.join("out"));
+        assert_eq!(roots.deps_dir, trial_dir.join("deps"));
+        assert_eq!(roots.workspace_dir, trial_dir.join("workspace"));
+    }
+
+    #[test]
+    fn resolve_event_path_for_trial_state_events_resolves() {
+        let trial = PathBuf::from("/tmp/trial_1");
+        let result = resolve_event_path_for_trial(
+            &format!("{}/events.jsonl", AGENTLAB_CONTRACT_STATE_DIR),
+            &trial,
+        ).unwrap();
+        assert_eq!(result, trial.join("state").join("events.jsonl"));
+    }
+
+    #[test]
+    fn resolve_event_path_for_trial_rejects_deps_root() {
+        let trial = PathBuf::from("/tmp/trial_1");
+        assert!(resolve_event_path_for_trial(&format!("{}/data.bin", AGENTLAB_CONTRACT_DEPS_DIR), &trial).is_err());
+    }
+
+    #[test]
+    fn workspace_evidence_excluded_logs_prefix() {
+        assert!(is_workspace_evidence_excluded(Path::new("logs/app.log")));
+    }
+
+    #[test]
+    fn workspace_evidence_excluded_node_modules() {
+        assert!(is_workspace_evidence_excluded(Path::new("node_modules/pkg")));
+    }
+
+    #[test]
+    fn workspace_evidence_excluded_git_dir() {
+        assert!(is_workspace_evidence_excluded(Path::new(".git/config")));
+    }
+
+    #[test]
+    fn workspace_evidence_excluded_ds_store() {
+        assert!(is_workspace_evidence_excluded(Path::new(".DS_Store")));
+    }
+
+    #[test]
+    fn workspace_evidence_excluded_pycache() {
+        assert!(is_workspace_evidence_excluded(Path::new("__pycache__/mod.pyc")));
+    }
+
+    #[test]
+    fn workspace_evidence_not_excluded_source_file() {
+        assert!(!is_workspace_evidence_excluded(Path::new("src/main.py")));
+    }
+
+    #[test]
+    fn workspace_evidence_excluded_nested_node_modules() {
+        assert!(is_workspace_evidence_excluded(Path::new("deep/nested/node_modules/x")));
+    }
+
+    #[test]
+    fn workspace_evidence_excluded_dot_claude() {
+        assert!(is_workspace_evidence_excluded(Path::new(".claude/settings")));
+    }
+
+    #[test]
+    fn workspace_evidence_excluded_target_dir() {
+        assert!(is_workspace_evidence_excluded(Path::new("target/debug/bin")));
+    }
+
+    #[test]
+    fn workspace_evidence_excluded_underscore_dot_prefix() {
+        assert!(is_workspace_evidence_excluded(Path::new("._hidden")));
+    }
+
+    #[test]
+    fn workspace_evidence_not_excluded_readme() {
+        assert!(!is_workspace_evidence_excluded(Path::new("README.md")));
+    }
+
+    #[test]
+    fn workspace_evidence_not_excluded_nested_source() {
+        assert!(!is_workspace_evidence_excluded(Path::new("src/components/App.tsx")));
+    }
+
+    #[test]
+    fn workspace_evidence_excluded_pytest_cache() {
+        assert!(is_workspace_evidence_excluded(Path::new(".pytest_cache/v/cache")));
+    }
+
+    #[test]
+    fn workspace_evidence_excluded_mypy_cache() {
+        assert!(is_workspace_evidence_excluded(Path::new(".mypy_cache/3.9/module")));
+    }
+
+    #[test]
+    fn workspace_evidence_excluded_ruff_cache() {
+        assert!(is_workspace_evidence_excluded(Path::new(".ruff_cache/0.1.0")));
+    }
+
+    #[test]
+    fn workspace_evidence_excluded_pnpm_store() {
+        assert!(is_workspace_evidence_excluded(Path::new(".pnpm-store/v3")));
+    }
+
+    #[test]
+    fn workspace_evidence_excluded_yarn_dir() {
+        assert!(is_workspace_evidence_excluded(Path::new(".yarn/cache")));
+    }
+
+    #[test]
+    fn workspace_evidence_excluded_haiku_prefix() {
+        assert!(is_workspace_evidence_excluded(Path::new(".haiku/settings")));
+    }
+
+    #[test]
+    fn workspace_evidence_excluded_graphd_prefix() {
+        assert!(is_workspace_evidence_excluded(Path::new(".graphd/data")));
+    }
+
+    #[test]
+    fn workspace_evidence_excluded_watcher_prefix() {
+        assert!(is_workspace_evidence_excluded(Path::new(".watcher/config")));
+    }
+
+    #[test]
+    fn workspace_evidence_excluded_agentlab_generated() {
+        assert!(is_workspace_evidence_excluded(Path::new(".agentlab_generated/output")));
+    }
+
+    #[test]
+    fn workspace_evidence_excluded_auth_states() {
+        assert!(is_workspace_evidence_excluded(Path::new("auth-states/token.json")));
+    }
+
+    #[test]
+    fn workspace_evidence_excluded_cockpit() {
+        assert!(is_workspace_evidence_excluded(Path::new(".cockpit/state")));
+    }
+
+    #[test]
+    fn validate_workspace_relative_path_rejects_dot_dot() {
+        let err = validate_workspace_relative_path("../escape").expect_err("should reject ..");
+        assert!(err.to_string().contains(".."), "unexpected error: {}", err);
+    }
+
+    #[test]
+    fn validate_workspace_relative_path_rejects_absolute() {
+        let err = validate_workspace_relative_path("/absolute").expect_err("should reject absolute");
+        assert!(err.to_string().contains("relative") || err.to_string().contains("absolute"), "unexpected error: {}", err);
+    }
+
+    #[test]
+    fn validate_workspace_relative_path_accepts_normal() {
+        let result = validate_workspace_relative_path("src/main.py").unwrap();
+        assert_eq!(result, PathBuf::from("src/main.py"));
+    }
+
+    #[test]
+    fn validate_workspace_relative_path_dot_only_resolves_empty() {
+        let err = validate_workspace_relative_path(".").expect_err("dot-only should fail");
+        assert!(err.to_string().contains("empty"), "unexpected error: {}", err);
+    }
+
+    #[test]
+    fn validate_workspace_relative_path_normalizes_dot_segments() {
+        let result = validate_workspace_relative_path("./src/main.py").unwrap();
+        assert_eq!(result, PathBuf::from("src/main.py"));
+    }
+
+    #[test]
+    fn validate_container_workspace_path_rejects_non_workspace_root() {
+        let err = validate_container_workspace_path("/some/other/path").expect_err("should reject");
+        assert!(err.to_string().contains("mount_path must be under"), "unexpected error: {}", err);
+    }
+
+    #[test]
+    fn validate_container_workspace_path_exact_match() {
+        validate_container_workspace_path(AGENTLAB_CONTRACT_WORKSPACE_DIR).unwrap();
+    }
+
+    #[test]
+    fn validate_container_workspace_path_subpath() {
+        let path = format!("{}/src/main.py", AGENTLAB_CONTRACT_WORKSPACE_DIR);
+        validate_container_workspace_path(&path).unwrap();
+    }
+
+    #[test]
+    fn validate_container_workspace_path_rejects_dot_dot() {
+        let path = format!("{}/../escape", AGENTLAB_CONTRACT_WORKSPACE_DIR);
+        assert!(validate_container_workspace_path(&path).is_err());
+    }
+
+    // ───────────────────────────────────────────────────────────────────
+    // Batch 3: Experiment Validation & Normalization
+    // ───────────────────────────────────────────────────────────────────
+
+    fn clean_contract_base() -> Value {
+        json!({
+            "version": "1.0",
+            "experiment": {"id": "e1", "name": "test"},
+            "dataset": {"path": "tasks.jsonl"},
+            "design": {"replications": 1},
+            "baseline": {"variant_id": "baseline"},
+            "runtime": {"image": "img:latest", "command": ["python", "main.py"]}
+        })
+    }
+
+    fn legacy_experiment_base() -> Value {
+        json!({
+            "experiment": {"workload_type": "agent_runtime"},
+            "design": {"sanitization_profile": "standard", "replications": 1},
+            "runtime": {
+                "policy": {"timeout_ms": 60000, "network": {"mode": "none"}, "sandbox": {"mode": "local"}},
+                "agent": {"command": ["python", "main.py"], "image": "img:latest"}
+            },
+            "baseline": {"variant_id": "baseline"}
+        })
+    }
+
+    #[test]
+    fn validate_required_fields_v1_empty_command_array_fails() {
+        let mut spec = clean_contract_base();
+        spec["runtime"]["command"] = json!([]);
+        assert!(validate_required_fields(&spec).is_err());
+    }
+
+    #[test]
+    fn validate_required_fields_v1_whitespace_command_fails() {
+        let mut spec = clean_contract_base();
+        spec["runtime"]["command"] = json!(["  "]);
+        assert!(validate_required_fields(&spec).is_err());
+    }
+
+    #[test]
+    fn validate_required_fields_v1_zero_replications_fails() {
+        let mut spec = clean_contract_base();
+        spec["design"]["replications"] = json!(0);
+        assert!(validate_required_fields(&spec).is_err());
+    }
+
+    #[test]
+    fn validate_required_fields_v1_string_command_accepted() {
+        let mut spec = clean_contract_base();
+        spec["runtime"]["command"] = json!("python main.py");
+        assert!(validate_required_fields(&spec).is_ok());
+    }
+
+    #[test]
+    fn validate_required_fields_v1_missing_image_for_container_mode() {
+        let mut spec = clean_contract_base();
+        spec["runtime"].as_object_mut().unwrap().remove("image");
+        assert!(validate_required_fields(&spec).is_err());
+    }
+
+    #[test]
+    fn validate_required_fields_v1_valid_spec_passes() {
+        assert!(validate_required_fields(&clean_contract_base()).is_ok());
+    }
+
+    #[test]
+    fn validate_required_fields_v1_missing_experiment_id_fails() {
+        let mut spec = clean_contract_base();
+        spec["experiment"].as_object_mut().unwrap().remove("id");
+        assert!(validate_required_fields(&spec).is_err());
+    }
+
+    #[test]
+    fn validate_required_fields_v1_missing_dataset_path_fails() {
+        let mut spec = clean_contract_base();
+        spec["dataset"].as_object_mut().unwrap().remove("path");
+        assert!(validate_required_fields(&spec).is_err());
+    }
+
+    #[test]
+    fn validate_required_fields_v1_missing_baseline_variant_id_fails() {
+        let mut spec = clean_contract_base();
+        spec["baseline"].as_object_mut().unwrap().remove("variant_id");
+        assert!(validate_required_fields(&spec).is_err());
+    }
+
+    #[test]
+    fn validate_required_fields_legacy_empty_workload_type_fails() {
+        let mut spec = legacy_experiment_base();
+        spec["experiment"]["workload_type"] = json!("");
+        assert!(validate_required_fields(&spec).is_err());
+    }
+
+    #[test]
+    fn validate_required_fields_legacy_zero_timeout_fails() {
+        let mut spec = legacy_experiment_base();
+        spec["runtime"]["policy"]["timeout_ms"] = json!(0);
+        assert!(validate_required_fields(&spec).is_err());
+    }
+
+    #[test]
+    fn validate_required_fields_legacy_rejects_removed_mode_field() {
+        let mut spec = legacy_experiment_base();
+        spec["runtime"]["agent"]["mode"] = json!("container");
+        let err = validate_required_fields(&spec).expect_err("should reject /runtime/agent/mode");
+        assert!(err.to_string().contains("mode"), "unexpected error: {}", err);
+    }
+
+    #[test]
+    fn validate_required_fields_legacy_rejects_known_agent_ref() {
+        let mut spec = legacy_experiment_base();
+        spec["runtime"]["agent"]["known_agent_ref"] = json!("codex");
+        let err = validate_required_fields(&spec).expect_err("should reject known_agent_ref");
+        assert!(err.to_string().contains("known_agent_ref"), "unexpected error: {}", err);
+    }
+
+    #[test]
+    fn validate_required_fields_legacy_rejects_custom_image() {
+        let mut spec = legacy_experiment_base();
+        spec["runtime"]["agent"]["custom_image"] = json!("img:v2");
+        let err = validate_required_fields(&spec).expect_err("should reject custom_image");
+        assert!(err.to_string().contains("custom_image"), "unexpected error: {}", err);
+    }
+
+    #[test]
+    fn validate_required_fields_legacy_rejects_adapter() {
+        let mut spec = legacy_experiment_base();
+        spec["runtime"]["agent"]["adapter"] = json!("custom_adapter");
+        let err = validate_required_fields(&spec).expect_err("should reject adapter");
+        assert!(err.to_string().contains("adapter"), "unexpected error: {}", err);
+    }
+
+    #[test]
+    fn validate_required_fields_per_task_image_requires_container() {
+        let mut spec = legacy_experiment_base();
+        spec["runtime"]["agent"]["image_source"] = json!("per_task");
+        let err = validate_required_fields(&spec).expect_err("per_task needs container");
+        assert!(err.to_string().contains("per_task"), "unexpected error: {}", err);
+    }
+
+    #[test]
+    fn validate_required_fields_per_task_image_requires_artifact() {
+        let mut spec = legacy_experiment_base();
+        spec["runtime"]["policy"]["sandbox"]["mode"] = json!("container");
+        spec["runtime"]["agent"]["image_source"] = json!("per_task");
+        let err = validate_required_fields(&spec).expect_err("per_task needs artifact");
+        assert!(err.to_string().contains("artifact"), "unexpected error: {}", err);
+    }
+
+    #[test]
+    fn validate_required_fields_invalid_image_source_fails() {
+        let mut spec = legacy_experiment_base();
+        spec["runtime"]["agent"]["image_source"] = json!("custom");
+        let err = validate_required_fields(&spec).expect_err("invalid image_source");
+        assert!(err.to_string().contains("image_source"), "unexpected error: {}", err);
+    }
+
+    #[test]
+    fn validate_required_fields_legacy_valid_spec_passes() {
+        assert!(validate_required_fields(&legacy_experiment_base()).is_ok());
+    }
+
+    #[test]
+    fn validate_required_fields_legacy_missing_command_fails() {
+        let mut spec = legacy_experiment_base();
+        spec["runtime"]["agent"].as_object_mut().unwrap().remove("command");
+        assert!(validate_required_fields(&spec).is_err());
+    }
+
+    #[test]
+    fn validate_required_fields_legacy_missing_replications_fails() {
+        let mut spec = legacy_experiment_base();
+        spec["design"].as_object_mut().unwrap().remove("replications");
+        assert!(validate_required_fields(&spec).is_err());
+    }
+
+    #[test]
+    fn validate_required_fields_legacy_missing_network_mode_fails() {
+        let mut spec = legacy_experiment_base();
+        spec["runtime"]["policy"]["network"].as_object_mut().unwrap().remove("mode");
+        assert!(validate_required_fields(&spec).is_err());
+    }
+
+    #[test]
+    fn reject_legacy_fields_dataset_section() {
+        let spec = json!({"dataset": {"path": "data.jsonl"}});
+        let err = reject_legacy_fields_in_dx_authoring(&spec).expect_err("should reject /dataset");
+        assert!(err.to_string().contains("/dataset"), "unexpected error: {}", err);
+    }
+
+    #[test]
+    fn reject_legacy_fields_design_section() {
+        let spec = json!({"design": {"replications": 2}});
+        let err = reject_legacy_fields_in_dx_authoring(&spec).expect_err("should reject /design");
+        assert!(err.to_string().contains("/design"), "unexpected error: {}", err);
+    }
+
+    #[test]
+    fn reject_legacy_fields_runtime_section() {
+        let spec = json!({"runtime": {"image": "img"}});
+        let err = reject_legacy_fields_in_dx_authoring(&spec).expect_err("should reject /runtime");
+        assert!(err.to_string().contains("/runtime"), "unexpected error: {}", err);
+    }
+
+    #[test]
+    fn reject_legacy_fields_metrics_section() {
+        let spec = json!({"metrics": {"accuracy": true}});
+        let err = reject_legacy_fields_in_dx_authoring(&spec).expect_err("should reject /metrics");
+        assert!(err.to_string().contains("/metrics"), "unexpected error: {}", err);
+    }
+
+    #[test]
+    fn reject_legacy_fields_variant_plan_section() {
+        let spec = json!({"variant_plan": [{"id": "v1"}]});
+        let err = reject_legacy_fields_in_dx_authoring(&spec).expect_err("should reject /variant_plan");
+        assert!(err.to_string().contains("/variant_plan"), "unexpected error: {}", err);
+    }
+
+    #[test]
+    fn reject_legacy_fields_baseline_variant_id() {
+        let spec = json!({"baseline": {"variant_id": "b1"}});
+        let err = reject_legacy_fields_in_dx_authoring(&spec).expect_err("should reject /baseline/variant_id");
+        assert!(err.to_string().contains("/baseline/variant_id"), "unexpected error: {}", err);
+    }
+
+    #[test]
+    fn reject_legacy_fields_benchmark_object() {
+        let spec = json!({"benchmark": {"name": "b1"}});
+        let err = reject_legacy_fields_in_dx_authoring(&spec).expect_err("should reject /benchmark object");
+        assert!(err.to_string().contains("/benchmark"), "unexpected error: {}", err);
+    }
+
+    #[test]
+    fn reject_legacy_fields_null_values_allowed() {
+        let spec = json!({"dataset": null, "design": null, "runtime": null, "metrics": null, "variant_plan": null});
+        assert!(reject_legacy_fields_in_dx_authoring(&spec).is_ok());
+    }
+
+    #[test]
+    fn reject_legacy_fields_multiple_detected() {
+        let spec = json!({"dataset": {"path": "x"}, "design": {"replications": 1}, "runtime": {"image": "y"}});
+        let err = reject_legacy_fields_in_dx_authoring(&spec).expect_err("should reject multiple");
+        let msg = err.to_string();
+        assert!(msg.contains("/dataset") && msg.contains("/design") && msg.contains("/runtime"));
+    }
+
+    // ───────────────────────────────────────────────────────────────────
+    // Batch 4: Fork/Resume/Replay Selectors & Checkpoints
+    // ───────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn parse_fork_selector_checkpoint_valid() {
+        match parse_fork_selector("checkpoint:cp1").unwrap() {
+            ForkSelector::Checkpoint(name) => assert_eq!(name, "cp1"),
+            _ => panic!("expected Checkpoint"),
+        }
+    }
+
+    #[test]
+    fn parse_fork_selector_step_valid() {
+        match parse_fork_selector("step:42").unwrap() {
+            ForkSelector::Step(s) => assert_eq!(s, 42),
+            _ => panic!("expected Step"),
+        }
+    }
+
+    #[test]
+    fn parse_fork_selector_event_seq_valid() {
+        match parse_fork_selector("event_seq:100").unwrap() {
+            ForkSelector::EventSeq(s) => assert_eq!(s, 100),
+            _ => panic!("expected EventSeq"),
+        }
+    }
+
+    #[test]
+    fn parse_fork_selector_missing_colon_fails() {
+        assert!(parse_fork_selector("checkpoint_name").is_err());
+    }
+
+    #[test]
+    fn parse_fork_selector_unknown_kind_fails() {
+        match parse_fork_selector("snapshot:x") {
+            Ok(_) => panic!("should fail for unknown kind"),
+            Err(err) => assert!(err.to_string().contains("checkpoint|step|event_seq")),
+        }
+    }
+
+    #[test]
+    fn parse_fork_selector_step_non_integer_fails() {
+        assert!(parse_fork_selector("step:abc").is_err());
+    }
+
+    #[test]
+    fn parse_fork_selector_event_seq_non_integer_fails() {
+        assert!(parse_fork_selector("event_seq:xyz").is_err());
+    }
+
+    #[test]
+    fn parse_fork_selector_step_negative_fails() {
+        assert!(parse_fork_selector("step:-1").is_err());
+    }
+
+    #[test]
+    fn parse_fork_selector_checkpoint_with_colons() {
+        match parse_fork_selector("checkpoint:a:b:c").unwrap() {
+            ForkSelector::Checkpoint(name) => assert_eq!(name, "a:b:c"),
+            _ => panic!("expected Checkpoint"),
+        }
+    }
+
+    #[test]
+    fn parse_fork_selector_step_zero_accepted() {
+        match parse_fork_selector("step:0").unwrap() {
+            ForkSelector::Step(s) => assert_eq!(s, 0),
+            _ => panic!("expected Step(0)"),
+        }
+    }
+
+    #[test]
+    fn parse_fork_selector_checkpoint_with_slashes() {
+        match parse_fork_selector("checkpoint:/path/to/cp").unwrap() {
+            ForkSelector::Checkpoint(name) => assert_eq!(name, "/path/to/cp"),
+            _ => panic!("expected Checkpoint"),
+        }
+    }
+
+    #[test]
+    fn parse_fork_selector_empty_checkpoint_value_fails() {
+        assert!(parse_fork_selector("checkpoint:").is_err());
+    }
+
+    #[test]
+    fn parse_fork_selector_whitespace_checkpoint_value_fails() {
+        assert!(parse_fork_selector("checkpoint:   ").is_err());
+    }
+
+    #[test]
+    fn parse_fork_selector_large_step_value() {
+        match parse_fork_selector("step:999999999").unwrap() {
+            ForkSelector::Step(s) => assert_eq!(s, 999999999),
+            _ => panic!("expected Step"),
+        }
+    }
+
+    #[test]
+    fn parse_fork_selector_empty_string_fails() {
+        assert!(parse_fork_selector("").is_err());
+    }
+
+    #[test]
+    fn resolve_selector_checkpoint_by_name_finds_match() {
+        let root = TempDirGuard::new("resolve_cp_name");
+        let trial_dir = root.path.join("trial_1");
+        let state_dir = trial_dir.join("state");
+        ensure_dir(&state_dir).unwrap();
+        let cp_path = format!("{}/checkpoint_1.json", AGENTLAB_CONTRACT_STATE_DIR);
+        fs::write(state_dir.join("checkpoint_1.json"), "{}").unwrap();
+        let output = json!({"checkpoints": [{"logical_name": "cp1", "path": &cp_path, "step": 1}]});
+        let result = resolve_selector_checkpoint(&ForkSelector::Checkpoint("cp1".to_string()), Some(&output), &trial_dir, true).unwrap();
+        assert!(result.is_some());
+    }
+
+    #[test]
+    fn resolve_selector_checkpoint_by_name_no_match_strict_fails() {
+        let root = TempDirGuard::new("resolve_cp_strict_fail");
+        let trial_dir = root.path.join("trial_1");
+        ensure_dir(&trial_dir).unwrap();
+        let output = json!({"checkpoints": []});
+        let err = resolve_selector_checkpoint(&ForkSelector::Checkpoint("missing".to_string()), Some(&output), &trial_dir, true).expect_err("strict should fail");
+        assert!(err.to_string().contains("strict_source_unavailable"));
+    }
+
+    #[test]
+    fn resolve_selector_checkpoint_by_name_no_match_nonstrict_returns_none() {
+        let root = TempDirGuard::new("resolve_cp_nonstrict");
+        let trial_dir = root.path.join("trial_1");
+        ensure_dir(&trial_dir).unwrap();
+        let output = json!({"checkpoints": []});
+        let result = resolve_selector_checkpoint(&ForkSelector::Checkpoint("missing".to_string()), Some(&output), &trial_dir, false).unwrap();
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn resolve_selector_checkpoint_by_step_highest_lte() {
+        let root = TempDirGuard::new("resolve_cp_step");
+        let trial_dir = root.path.join("trial_1");
+        let state_dir = trial_dir.join("state");
+        ensure_dir(&state_dir).unwrap();
+        let cp5_path = format!("{}/cp5.json", AGENTLAB_CONTRACT_STATE_DIR);
+        fs::write(state_dir.join("cp5.json"), "{}").unwrap();
+        let output = json!({"checkpoints": [
+            {"logical_name": "cp3", "path": &format!("{}/cp3.json", AGENTLAB_CONTRACT_STATE_DIR), "step": 3},
+            {"logical_name": "cp5", "path": &cp5_path, "step": 5},
+            {"logical_name": "cp8", "path": &format!("{}/cp8.json", AGENTLAB_CONTRACT_STATE_DIR), "step": 8}
+        ]});
+        let result = resolve_selector_checkpoint(&ForkSelector::Step(5), Some(&output), &trial_dir, false).unwrap();
+        assert!(result.is_some());
+        assert!(result.unwrap().contains("cp5"));
+    }
+
+    #[test]
+    fn resolve_selector_checkpoint_by_step_no_qualifying_strict_fails() {
+        let root = TempDirGuard::new("resolve_cp_step_strict");
+        let trial_dir = root.path.join("trial_1");
+        ensure_dir(&trial_dir).unwrap();
+        let output = json!({"checkpoints": [
+            {"logical_name": "cp3", "path": "/state/cp3.json", "step": 3},
+            {"logical_name": "cp5", "path": "/state/cp5.json", "step": 5}
+        ]});
+        assert!(resolve_selector_checkpoint(&ForkSelector::Step(1), Some(&output), &trial_dir, true).is_err());
+    }
+
+    #[test]
+    fn resolve_selector_checkpoint_by_event_seq_highest_lte() {
+        let root = TempDirGuard::new("resolve_cp_event_seq");
+        let trial_dir = root.path.join("trial_1");
+        let state_dir = trial_dir.join("state");
+        ensure_dir(&state_dir).unwrap();
+        let cp_path = format!("{}/cp10.json", AGENTLAB_CONTRACT_STATE_DIR);
+        fs::write(state_dir.join("cp10.json"), "{}").unwrap();
+        let output = json!({"checkpoints": [
+            {"logical_name": "cp5", "path": &format!("{}/cp5.json", AGENTLAB_CONTRACT_STATE_DIR), "step": 5},
+            {"logical_name": "cp10", "path": &cp_path, "step": 10},
+            {"logical_name": "cp20", "path": &format!("{}/cp20.json", AGENTLAB_CONTRACT_STATE_DIR), "step": 20}
+        ]});
+        let result = resolve_selector_checkpoint(&ForkSelector::EventSeq(15), Some(&output), &trial_dir, false).unwrap();
+        assert!(result.is_some());
+        assert!(result.unwrap().contains("cp10"));
+    }
+
+    #[test]
+    fn resolve_selector_checkpoint_no_output_strict_fails() {
+        let root = TempDirGuard::new("resolve_cp_no_output_strict");
+        let trial_dir = root.path.join("trial_1");
+        ensure_dir(&trial_dir).unwrap();
+        assert!(resolve_selector_checkpoint(&ForkSelector::Checkpoint("any".to_string()), None, &trial_dir, true).is_err());
+    }
+
+    #[test]
+    fn resolve_selector_checkpoint_no_output_nonstrict_returns_none() {
+        let root = TempDirGuard::new("resolve_cp_no_output_nonstrict");
+        let trial_dir = root.path.join("trial_1");
+        ensure_dir(&trial_dir).unwrap();
+        assert!(resolve_selector_checkpoint(&ForkSelector::Checkpoint("any".to_string()), None, &trial_dir, false).unwrap().is_none());
+    }
+
+    #[test]
+    fn resolve_selector_checkpoint_empty_checkpoints_strict_fails() {
+        let root = TempDirGuard::new("resolve_cp_empty_strict");
+        let trial_dir = root.path.join("trial_1");
+        ensure_dir(&trial_dir).unwrap();
+        assert!(resolve_selector_checkpoint(&ForkSelector::Step(5), Some(&json!({"checkpoints": []})), &trial_dir, true).is_err());
+    }
+
+    #[test]
+    fn resolve_selector_checkpoint_empty_checkpoints_nonstrict_returns_none() {
+        let root = TempDirGuard::new("resolve_cp_empty_nonstrict");
+        let trial_dir = root.path.join("trial_1");
+        ensure_dir(&trial_dir).unwrap();
+        assert!(resolve_selector_checkpoint(&ForkSelector::Step(5), Some(&json!({"checkpoints": []})), &trial_dir, false).unwrap().is_none());
+    }
+
+    #[test]
+    fn adapter_control_ack_received_missing_file_returns_false() {
+        let root = TempDirGuard::new("ack_missing");
+        assert!(!adapter_control_ack_received(&root.path.join("events.jsonl"), "pause", "v1").unwrap());
+    }
+
+    #[test]
+    fn adapter_control_ack_received_wrong_action_returns_false() {
+        let root = TempDirGuard::new("ack_wrong_action");
+        let events_path = root.path.join("events.jsonl");
+        fs::write(&events_path, r#"{"event_type":"control_ack","action_observed":"resume","control_version":"v1"}"#).unwrap();
+        assert!(!adapter_control_ack_received(&events_path, "pause", "v1").unwrap());
+    }
+
+    #[test]
+    fn adapter_control_ack_received_wrong_version_returns_false() {
+        let root = TempDirGuard::new("ack_wrong_version");
+        let events_path = root.path.join("events.jsonl");
+        fs::write(&events_path, r#"{"event_type":"control_ack","action_observed":"pause","control_version":"v2"}"#).unwrap();
+        assert!(!adapter_control_ack_received(&events_path, "pause", "v1").unwrap());
+    }
+
+    #[test]
+    fn adapter_control_ack_received_skips_invalid_json_lines() {
+        let root = TempDirGuard::new("ack_invalid_json");
+        let events_path = root.path.join("events.jsonl");
+        fs::write(&events_path, "not valid json\n{\"event_type\":\"control_ack\",\"action_observed\":\"pause\",\"control_version\":\"v1\"}\n").unwrap();
+        assert!(adapter_control_ack_received(&events_path, "pause", "v1").unwrap());
+    }
+
+    #[test]
+    fn adapter_control_ack_received_skips_empty_lines() {
+        let root = TempDirGuard::new("ack_empty_lines");
+        let events_path = root.path.join("events.jsonl");
+        fs::write(&events_path, "\n\n{\"event_type\":\"control_ack\",\"action_observed\":\"pause\",\"control_version\":\"v1\"}\n\n").unwrap();
+        assert!(adapter_control_ack_received(&events_path, "pause", "v1").unwrap());
+    }
+
+    #[test]
+    fn adapter_control_ack_received_skips_non_control_ack_events() {
+        let root = TempDirGuard::new("ack_other_events");
+        let events_path = root.path.join("events.jsonl");
+        fs::write(&events_path, "{\"event_type\":\"step\",\"data\":\"x\"}\n{\"event_type\":\"control_ack\",\"action_observed\":\"pause\",\"control_version\":\"v1\"}\n").unwrap();
+        assert!(adapter_control_ack_received(&events_path, "pause", "v1").unwrap());
+    }
+
+    #[test]
+    fn read_control_seq_missing_file_returns_zero() {
+        let root = TempDirGuard::new("ctrl_seq_missing");
+        assert_eq!(read_control_seq(&root.path.join("control.json")).unwrap(), 0);
+    }
+
+    #[test]
+    fn read_control_seq_missing_seq_field_returns_zero() {
+        let root = TempDirGuard::new("ctrl_seq_no_field");
+        let path = root.path.join("control.json");
+        atomic_write_json_pretty(&path, &json!({"status": "running"})).unwrap();
+        assert_eq!(read_control_seq(&path).unwrap(), 0);
+    }
+
+    #[test]
+    fn read_control_seq_reads_valid_seq() {
+        let root = TempDirGuard::new("ctrl_seq_valid");
+        let path = root.path.join("control.json");
+        atomic_write_json_pretty(&path, &json!({"seq": 42})).unwrap();
+        assert_eq!(read_control_seq(&path).unwrap(), 42);
+    }
+
+    #[test]
+    fn apply_binding_overrides_adds_new_keys() {
+        let mut input = json!({"bindings": {"existing": "value"}});
+        let mut overrides = BTreeMap::new();
+        overrides.insert("new_key".to_string(), json!("new_value"));
+        apply_binding_overrides(&mut input, &overrides).unwrap();
+        assert_eq!(input["bindings"]["new_key"], json!("new_value"));
+    }
+
+    #[test]
+    fn apply_binding_overrides_overwrites_existing() {
+        let mut input = json!({"bindings": {"key": "old"}});
+        let mut overrides = BTreeMap::new();
+        overrides.insert("key".to_string(), json!("new"));
+        apply_binding_overrides(&mut input, &overrides).unwrap();
+        assert_eq!(input["bindings"]["key"], json!("new"));
+    }
+
+    #[test]
+    fn apply_binding_overrides_preserves_untouched_keys() {
+        let mut input = json!({"bindings": {"keep": "this", "change": "old"}});
+        let mut overrides = BTreeMap::new();
+        overrides.insert("change".to_string(), json!("new"));
+        apply_binding_overrides(&mut input, &overrides).unwrap();
+        assert_eq!(input["bindings"]["keep"], json!("this"));
+        assert_eq!(input["bindings"]["change"], json!("new"));
+    }
+
+    #[test]
+    fn apply_binding_overrides_empty_map_is_noop() {
+        let mut input = json!({"bindings": {"key": "value"}});
+        let original = input.clone();
+        apply_binding_overrides(&mut input, &BTreeMap::new()).unwrap();
+        assert_eq!(input, original);
+    }
+
+    #[test]
+    fn apply_binding_overrides_creates_bindings_object_if_missing() {
+        let mut input = json!({"other": "data"});
+        let mut overrides = BTreeMap::new();
+        overrides.insert("key".to_string(), json!("value"));
+        apply_binding_overrides(&mut input, &overrides).unwrap();
+        assert_eq!(input["bindings"]["key"], json!("value"));
+    }
+
+    #[test]
+    fn apply_binding_overrides_nested_key() {
+        let mut input = json!({"bindings": {}});
+        let mut overrides = BTreeMap::new();
+        overrides.insert("nested.deep.key".to_string(), json!(42));
+        apply_binding_overrides(&mut input, &overrides).unwrap();
+        assert_eq!(input["bindings"]["nested"]["deep"]["key"], json!(42));
+    }
+
+    // ───────────────────────────────────────────────────────────────────
+    // Batch 5: Policy Parsing & Scheduling Edge Cases
+    // ───────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn schedule_variant_sequential_multi_replication() {
+        let slots = build_trial_schedule(2, 3, 2, SchedulingPolicy::VariantSequential, 0);
+        assert_eq!(slots.len(), 12);
+        assert!(slots[..6].iter().all(|s| s.variant_idx == 0));
+        assert!(slots[6..].iter().all(|s| s.variant_idx == 1));
+    }
+
+    #[test]
+    fn schedule_paired_interleaved_multi_replication() {
+        let slots = build_trial_schedule(2, 3, 2, SchedulingPolicy::PairedInterleaved, 0);
+        assert_eq!(slots.len(), 12);
+        assert_eq!(slots[0].task_idx, 0);
+        assert_eq!(slots[0].variant_idx, 0);
+    }
+
+    #[test]
+    fn schedule_randomized_large_is_deterministic_with_seed() {
+        let a = build_trial_schedule(5, 10, 3, SchedulingPolicy::Randomized, 12345);
+        let b = build_trial_schedule(5, 10, 3, SchedulingPolicy::Randomized, 12345);
+        assert_eq!(a.len(), 150);
+        for (i, (sa, sb)) in a.iter().zip(b.iter()).enumerate() {
+            assert_eq!((sa.variant_idx, sa.task_idx, sa.repl_idx), (sb.variant_idx, sb.task_idx, sb.repl_idx), "mismatch at slot {}", i);
+        }
+    }
+
+    #[test]
+    fn schedule_randomized_zero_seed_still_deterministic() {
+        let a = build_trial_schedule(2, 3, 1, SchedulingPolicy::Randomized, 0);
+        let b = build_trial_schedule(2, 3, 1, SchedulingPolicy::Randomized, 0);
+        for (sa, sb) in a.iter().zip(b.iter()) {
+            assert_eq!((sa.variant_idx, sa.task_idx, sa.repl_idx), (sb.variant_idx, sb.task_idx, sb.repl_idx));
+        }
+    }
+
+    #[test]
+    fn schedule_randomized_max_seed_does_not_overflow() {
+        let slots = build_trial_schedule(2, 2, 1, SchedulingPolicy::Randomized, u64::MAX);
+        assert_eq!(slots.len(), 4);
+    }
+
+    #[test]
+    fn schedule_single_variant_many_tasks() {
+        let slots = build_trial_schedule(1, 100, 1, SchedulingPolicy::VariantSequential, 0);
+        assert_eq!(slots.len(), 100);
+        assert!(slots.iter().all(|s| s.variant_idx == 0));
+    }
+
+    #[test]
+    fn schedule_many_variants_single_task() {
+        let slots = build_trial_schedule(50, 1, 1, SchedulingPolicy::VariantSequential, 0);
+        assert_eq!(slots.len(), 50);
+        for (i, slot) in slots.iter().enumerate() {
+            assert_eq!(slot.variant_idx, i);
+        }
+    }
+
+    #[test]
+    fn schedule_slot_count_equals_product() {
+        for policy in [SchedulingPolicy::VariantSequential, SchedulingPolicy::PairedInterleaved, SchedulingPolicy::Randomized] {
+            let slots = build_trial_schedule(3, 4, 2, policy, 42);
+            assert_eq!(slots.len(), 3 * 4 * 2, "policy {:?}", policy);
+        }
+    }
+
+    #[test]
+    fn schedule_randomized_different_seeds_produce_different_orders() {
+        let a = build_trial_schedule(3, 5, 1, SchedulingPolicy::Randomized, 111);
+        let b = build_trial_schedule(3, 5, 1, SchedulingPolicy::Randomized, 222);
+        let same = a.iter().zip(b.iter()).all(|(sa, sb)| sa.variant_idx == sb.variant_idx && sa.task_idx == sb.task_idx);
+        assert!(!same, "different seeds should produce different orderings");
+    }
+
+    #[test]
+    fn schedule_variant_sequential_order_is_variant_first() {
+        let slots = build_trial_schedule(2, 3, 1, SchedulingPolicy::VariantSequential, 0);
+        assert_eq!((slots[0].variant_idx, slots[0].task_idx), (0, 0));
+        assert_eq!((slots[1].variant_idx, slots[1].task_idx), (0, 1));
+        assert_eq!((slots[2].variant_idx, slots[2].task_idx), (0, 2));
+        assert_eq!((slots[3].variant_idx, slots[3].task_idx), (1, 0));
+    }
+
+    #[test]
+    fn schedule_paired_interleaved_order_is_task_first() {
+        let slots = build_trial_schedule(2, 3, 1, SchedulingPolicy::PairedInterleaved, 0);
+        assert_eq!((slots[0].task_idx, slots[0].variant_idx), (0, 0));
+        assert_eq!((slots[1].task_idx, slots[1].variant_idx), (0, 1));
+        assert_eq!((slots[2].task_idx, slots[2].variant_idx), (1, 0));
+    }
+
+    #[test]
+    fn parse_policies_retry_on_empty_array() {
+        let spec = json!({"design": {"policies": {"retry": {"max_attempts": 3, "retry_on": []}}}});
+        let config = parse_policies(&spec);
+        assert_eq!(config.retry_max_attempts, 3);
+        assert!(config.retry_on.is_empty());
+    }
+
+    #[test]
+    fn parse_policies_retry_on_multiple_triggers() {
+        let spec = json!({"design": {"policies": {"retry": {"max_attempts": 2, "retry_on": ["error", "timeout"]}}}});
+        let config = parse_policies(&spec);
+        assert_eq!(config.retry_on.len(), 2);
+    }
+
+    #[test]
+    fn parse_policies_concurrency_max_in_flight() {
+        let spec = json!({"design": {"policies": {"concurrency": {"max_in_flight_per_variant": 4}}}});
+        assert_eq!(parse_policies(&spec).concurrency.max_in_flight_per_variant, Some(4));
+    }
+
+    #[test]
+    fn parse_policies_concurrency_require_chain_lease() {
+        let spec = json!({"design": {"policies": {"concurrency": {"require_chain_lease": false}}}});
+        assert!(!parse_policies(&spec).concurrency.require_chain_lease);
+    }
+
+    #[test]
+    fn parse_policies_task_boundary_require_workspace_materialization_false() {
+        let spec = json!({"design": {"policies": {"task_boundary": {"require_workspace_materialization": false}}}});
+        assert!(!parse_policies(&spec).task_boundary.require_workspace_materialization);
+    }
+
+    #[test]
+    fn parse_policies_pruning_max_consecutive_failures() {
+        let spec = json!({"design": {"policies": {"pruning": {"max_consecutive_failures": 5}}}});
+        assert_eq!(parse_policies(&spec).pruning_max_consecutive_failures, Some(5));
+    }
+
+    #[test]
+    fn parse_policies_pruning_default_none() {
+        assert!(parse_policies(&json!({"design": {"policies": {}}})).pruning_max_consecutive_failures.is_none());
+    }
+
+    #[test]
+    fn parse_policies_scheduling_paired_interleaved() {
+        assert_eq!(parse_policies(&json!({"design": {"policies": {"scheduling": "paired_interleaved"}}})).scheduling, SchedulingPolicy::PairedInterleaved);
+    }
+
+    #[test]
+    fn parse_policies_scheduling_randomized() {
+        assert_eq!(parse_policies(&json!({"design": {"policies": {"scheduling": "randomized"}}})).scheduling, SchedulingPolicy::Randomized);
+    }
+
+    #[test]
+    fn parse_policies_scheduling_default_variant_sequential() {
+        assert_eq!(parse_policies(&json!({"design": {"policies": {}}})).scheduling, SchedulingPolicy::VariantSequential);
+    }
+
+    #[test]
+    fn parse_policies_no_policies_section_uses_defaults() {
+        let config = parse_policies(&json!({}));
+        assert_eq!(config.scheduling, SchedulingPolicy::VariantSequential);
+        assert_eq!(config.retry_max_attempts, 1);
+        assert!(config.retry_on.is_empty());
+    }
+
+    #[test]
+    fn parse_policies_retry_max_attempts() {
+        assert_eq!(parse_policies(&json!({"design": {"policies": {"retry": {"max_attempts": 5}}}})).retry_max_attempts, 5);
+    }
+
+    #[test]
+    fn should_retry_outcome_error_always_retried_default() {
+        assert!(should_retry_outcome("error", "0", &[]));
+    }
+
+    #[test]
+    fn should_retry_outcome_success_never_retried() {
+        assert!(!should_retry_outcome("success", "0", &[]));
+    }
+
+    #[test]
+    fn should_retry_outcome_timeout_with_timeout_trigger() {
+        assert!(should_retry_outcome("timeout", "0", &["timeout".to_string()]));
+    }
+
+    #[test]
+    fn should_retry_outcome_timeout_without_trigger() {
+        assert!(!should_retry_outcome("timeout", "0", &["error".to_string()]));
+    }
+
+    #[test]
+    fn should_retry_outcome_failure_with_failure_trigger() {
+        assert!(should_retry_outcome("completed", "1", &["failure".to_string()]));
+    }
+
+    #[test]
+    fn should_retry_outcome_nonzero_exit_default_retried() {
+        assert!(should_retry_outcome("completed", "1", &[]));
+    }
+
+    #[test]
+    fn should_retry_outcome_error_with_error_trigger() {
+        assert!(should_retry_outcome("error", "0", &["error".to_string()]));
+    }
+
+    #[test]
+    fn should_retry_outcome_error_without_error_trigger() {
+        assert!(!should_retry_outcome("error", "0", &["timeout".to_string()]));
+    }
+
+    #[test]
+    fn should_retry_outcome_success_with_triggers_never_retried() {
+        assert!(!should_retry_outcome("success", "0", &["error".to_string(), "timeout".to_string()]));
+    }
+
+    #[test]
+    fn normalize_schedule_progress_fills_missing_attempt() {
+        let mut progress = ScheduleProgress {
+            schema_version: String::new(), run_id: "run_001".to_string(),
+            total_slots: 1, next_schedule_index: 1, next_trial_index: 1,
+            schedule: vec![], completed_slots: vec![SlotCompletion {
+                schedule_index: 0, trial_id: "trial_1".to_string(),
+                status: "completed".to_string(), slot_commit_id: "abc".to_string(), attempt: 0,
+            }],
+            pruned_variants: vec![], consecutive_failures: BTreeMap::new(),
+            use_container: false, updated_at: String::new(),
+        };
+        normalize_schedule_progress(&mut progress);
+        assert_eq!(progress.completed_slots[0].attempt, 1);
+    }
+
+    #[test]
+    fn normalize_schedule_progress_fills_missing_commit_id() {
+        let mut progress = ScheduleProgress {
+            schema_version: String::new(), run_id: "run_001".to_string(),
+            total_slots: 1, next_schedule_index: 1, next_trial_index: 1,
+            schedule: vec![], completed_slots: vec![SlotCompletion {
+                schedule_index: 0, trial_id: "trial_1".to_string(),
+                status: "completed".to_string(), slot_commit_id: "".to_string(), attempt: 1,
+            }],
+            pruned_variants: vec![], consecutive_failures: BTreeMap::new(),
+            use_container: false, updated_at: String::new(),
+        };
+        normalize_schedule_progress(&mut progress);
+        assert!(progress.completed_slots[0].slot_commit_id.starts_with("legacy_"));
+    }
+
+    #[test]
+    fn normalize_schedule_progress_sets_schema_version() {
+        let mut progress = ScheduleProgress {
+            schema_version: "old".to_string(), run_id: "run_001".to_string(),
+            total_slots: 0, next_schedule_index: 0, next_trial_index: 0,
+            schedule: vec![], completed_slots: vec![], pruned_variants: vec![],
+            consecutive_failures: BTreeMap::new(), use_container: false, updated_at: String::new(),
+        };
+        normalize_schedule_progress(&mut progress);
+        assert_eq!(progress.schema_version, "schedule_progress_v2");
+    }
+
+    #[test]
+    fn load_schedule_progress_rejects_v1_schema() {
+        let root = TempDirGuard::new("sched_v1");
+        let run_dir = root.path.join("run");
+        ensure_dir(&run_dir.join("runtime")).unwrap();
+        let progress = json!({"schema_version": "schedule_progress_v1", "run_id": "run_001", "total_slots": 0, "next_schedule_index": 0, "next_trial_index": 0, "schedule": [], "completed_slots": [], "pruned_variants": [], "consecutive_failures": {}, "use_container": false, "updated_at": ""});
+        atomic_write_json_pretty(&schedule_progress_path(&run_dir), &progress).unwrap();
+        assert!(load_schedule_progress(&run_dir).unwrap_err().to_string().contains("unsupported"));
+    }
+
+    #[test]
+    fn write_and_load_schedule_progress_roundtrip() {
+        let root = TempDirGuard::new("sched_roundtrip");
+        let run_dir = root.path.join("run");
+        ensure_dir(&run_dir.join("runtime")).unwrap();
+        let progress = ScheduleProgress {
+            schema_version: "schedule_progress_v2".to_string(), run_id: "run_001".to_string(),
+            total_slots: 6, next_schedule_index: 3, next_trial_index: 3,
+            schedule: vec![TrialSlot { variant_idx: 0, task_idx: 0, repl_idx: 0 }],
+            completed_slots: vec![SlotCompletion { schedule_index: 0, trial_id: "trial_1".to_string(), status: "completed".to_string(), slot_commit_id: "abc123".to_string(), attempt: 1 }],
+            pruned_variants: vec![], consecutive_failures: BTreeMap::new(), use_container: false, updated_at: "2024-01-01T00:00:00Z".to_string(),
+        };
+        write_schedule_progress(&run_dir, &progress).unwrap();
+        let loaded = load_schedule_progress(&run_dir).unwrap();
+        assert_eq!(loaded.run_id, "run_001");
+        assert_eq!(loaded.total_slots, 6);
+    }
+
+    #[test]
+    fn schedule_progress_path_uses_runtime_dir() {
+        assert_eq!(schedule_progress_path(&PathBuf::from("/tmp/run_001")), PathBuf::from("/tmp/run_001/runtime/schedule_progress.json"));
+    }
+
+    #[test]
+    fn legacy_slot_commit_id_deterministic() {
+        let slot = SlotCompletion { schedule_index: 0, trial_id: "trial_1".to_string(), status: "completed".to_string(), slot_commit_id: String::new(), attempt: 1 };
+        assert_eq!(legacy_slot_commit_id("run_001", &slot), legacy_slot_commit_id("run_001", &slot));
+    }
+
+    #[test]
+    fn legacy_slot_commit_id_different_for_different_slots() {
+        let a = SlotCompletion { schedule_index: 0, trial_id: "trial_1".to_string(), status: "completed".to_string(), slot_commit_id: String::new(), attempt: 1 };
+        let b = SlotCompletion { schedule_index: 1, trial_id: "trial_2".to_string(), status: "completed".to_string(), slot_commit_id: String::new(), attempt: 1 };
+        assert_ne!(legacy_slot_commit_id("run_001", &a), legacy_slot_commit_id("run_001", &b));
+    }
+
+    #[test]
+    fn default_slot_attempt_returns_one() {
+        assert_eq!(default_slot_attempt(), 1);
+    }
+
+    #[test]
+    fn active_trials_use_worker_control_plane_all_qualified() {
+        let mut active = HashMap::new();
+        active.insert("trial_1".to_string(), RunControlActiveTrial { trial_id: "trial_1".to_string(), worker_id: "worker_a".to_string(), schedule_idx: Some(0), variant_id: None, started_at: None, control: None });
+        assert!(active_trials_use_worker_control_plane(&active, &["trial_1".to_string()]));
+    }
+
+    #[test]
+    fn active_trials_use_worker_control_plane_some_have_control() {
+        let mut active = HashMap::new();
+        active.insert("trial_1".to_string(), RunControlActiveTrial {
+            trial_id: "trial_1".to_string(), worker_id: "worker_a".to_string(), schedule_idx: Some(0), variant_id: None, started_at: None,
+            control: Some(ActiveAdapterControl { adapter_id: BUILTIN_COMMAND_ADAPTER_ID.to_string(), adapter_version: BUILTIN_COMMAND_ADAPTER_VERSION.to_string(), command_path: "/tmp/control".to_string(), events_path: Some("/tmp/events".to_string()) }),
+        });
+        assert!(!active_trials_use_worker_control_plane(&active, &["trial_1".to_string()]));
+    }
+
+    #[test]
+    fn active_trials_use_worker_control_plane_empty_targets() {
+        assert!(!active_trials_use_worker_control_plane(&HashMap::new(), &[]));
+    }
+
+    #[test]
+    fn active_trials_use_worker_control_plane_unknown_worker() {
+        let mut active = HashMap::new();
+        active.insert("trial_1".to_string(), RunControlActiveTrial { trial_id: "trial_1".to_string(), worker_id: RUN_CONTROL_UNKNOWN_WORKER_ID.to_string(), schedule_idx: Some(0), variant_id: None, started_at: None, control: None });
+        assert!(!active_trials_use_worker_control_plane(&active, &["trial_1".to_string()]));
+    }
+
+    #[test]
+    fn active_trials_use_worker_control_plane_missing_from_map() {
+        assert!(!active_trials_use_worker_control_plane(&HashMap::new(), &["trial_1".to_string()]));
+    }
+
+    // ───────────────────────────────────────────────────────────────────
+    // Batch 6: Variant Resolution & Runtime Profiles
+    // ───────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn variant_digest_deterministic() {
+        let v = Variant { id: "v1".to_string(), bindings: json!({"key": "value"}), args: vec![], env: BTreeMap::new(), image: None, runtime_overrides: None };
+        assert_eq!(variant_digest(&v).unwrap(), variant_digest(&v).unwrap());
+    }
+
+    #[test]
+    fn variant_digest_changes_with_bindings() {
+        let v1 = Variant { id: "v1".to_string(), bindings: json!({"key": "a"}), args: vec![], env: BTreeMap::new(), image: None, runtime_overrides: None };
+        let v2 = Variant { id: "v1".to_string(), bindings: json!({"key": "b"}), args: vec![], env: BTreeMap::new(), image: None, runtime_overrides: None };
+        assert_ne!(variant_digest(&v1).unwrap(), variant_digest(&v2).unwrap());
+    }
+
+    #[test]
+    fn variant_digest_changes_with_env() {
+        let mut env1 = BTreeMap::new(); env1.insert("FOO".to_string(), "bar".to_string());
+        let mut env2 = BTreeMap::new(); env2.insert("FOO".to_string(), "baz".to_string());
+        let v1 = Variant { id: "v1".to_string(), bindings: json!({}), args: vec![], env: env1, image: None, runtime_overrides: None };
+        let v2 = Variant { id: "v1".to_string(), bindings: json!({}), args: vec![], env: env2, image: None, runtime_overrides: None };
+        assert_ne!(variant_digest(&v1).unwrap(), variant_digest(&v2).unwrap());
+    }
+
+    #[test]
+    fn variant_digest_changes_with_image() {
+        let v1 = Variant { id: "v1".to_string(), bindings: json!({}), args: vec![], env: BTreeMap::new(), image: Some("img:v1".to_string()), runtime_overrides: None };
+        let v2 = Variant { id: "v1".to_string(), bindings: json!({}), args: vec![], env: BTreeMap::new(), image: Some("img:v2".to_string()), runtime_overrides: None };
+        assert_ne!(variant_digest(&v1).unwrap(), variant_digest(&v2).unwrap());
+    }
+
+    #[test]
+    fn find_variant_by_id_finds_match() {
+        let variants = vec![
+            Variant { id: "baseline".to_string(), bindings: json!({}), args: vec![], env: BTreeMap::new(), image: None, runtime_overrides: None },
+            Variant { id: "treatment".to_string(), bindings: json!({"temp": 0.5}), args: vec![], env: BTreeMap::new(), image: None, runtime_overrides: None },
+        ];
+        assert_eq!(find_variant_by_id(&variants, "treatment").unwrap().id, "treatment");
+    }
+
+    #[test]
+    fn find_variant_by_id_empty_id_returns_first() {
+        let variants = vec![Variant { id: "baseline".to_string(), bindings: json!({}), args: vec![], env: BTreeMap::new(), image: None, runtime_overrides: None }];
+        assert_eq!(find_variant_by_id(&variants, "").unwrap().id, "baseline");
+    }
+
+    #[test]
+    fn find_variant_by_id_missing_fails() {
+        let variants = vec![Variant { id: "baseline".to_string(), bindings: json!({}), args: vec![], env: BTreeMap::new(), image: None, runtime_overrides: None }];
+        assert!(find_variant_by_id(&variants, "missing").is_err());
+    }
+
+    #[test]
+    fn resolve_variant_plan_single_baseline_only() {
+        let spec = json!({"baseline": {"variant_id": "baseline", "bindings": {"x": 1}}});
+        let (variants, baseline_id) = resolve_variant_plan(&spec).unwrap();
+        assert_eq!(baseline_id, "baseline");
+        assert_eq!(variants.len(), 1);
+    }
+
+    #[test]
+    fn resolve_variant_plan_baseline_plus_treatments() {
+        let spec = json!({"baseline": {"variant_id": "baseline", "bindings": {}}, "variant_plan": [{"variant_id": "v1", "bindings": {"key": "a"}}, {"variant_id": "v2", "bindings": {"key": "b"}}]});
+        let (variants, _) = resolve_variant_plan(&spec).unwrap();
+        assert_eq!(variants.len(), 3);
+    }
+
+    #[test]
+    fn resolve_variant_plan_variant_bindings_preserved() {
+        let spec = json!({"baseline": {"variant_id": "baseline", "bindings": {"temp": 0.5}}, "variant_plan": [{"variant_id": "v1", "bindings": {"temp": 0.9}}]});
+        let (variants, _) = resolve_variant_plan(&spec).unwrap();
+        assert_eq!(variants[0].bindings["temp"], json!(0.5));
+        assert_eq!(variants[1].bindings["temp"], json!(0.9));
+    }
+
+    #[test]
+    fn resolve_variant_plan_empty_bindings_default_to_object() {
+        let spec = json!({"baseline": {"variant_id": "baseline"}});
+        let (variants, _) = resolve_variant_plan(&spec).unwrap();
+        assert!(variants[0].bindings.is_object());
+    }
+
+    // ───────────────────────────────────────────────────────────────────
+    // Batch 7: Run State & Leasing
+    // ───────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn operation_lease_is_stale_expired_returns_true() {
+        let record = OperationLeaseRecord { schema_version: "v1".to_string(), operation_id: "op1".to_string(), op_type: "run".to_string(), owner_pid: 12345, owner_host: "localhost".to_string(), acquired_at: "2024-01-01T00:00:00Z".to_string(), expires_at: "2024-01-01T00:05:00Z".to_string(), stale_takeover_of: None };
+        let now = chrono::DateTime::parse_from_rfc3339("2024-01-01T00:10:00Z").unwrap().with_timezone(&Utc);
+        assert!(operation_lease_is_stale(&record, now));
+    }
+
+    #[test]
+    fn operation_lease_is_stale_fresh_returns_false() {
+        let record = OperationLeaseRecord { schema_version: "v1".to_string(), operation_id: "op1".to_string(), op_type: "run".to_string(), owner_pid: 12345, owner_host: "localhost".to_string(), acquired_at: "2024-01-01T00:00:00Z".to_string(), expires_at: "2024-01-01T00:10:00Z".to_string(), stale_takeover_of: None };
+        let now = chrono::DateTime::parse_from_rfc3339("2024-01-01T00:05:00Z").unwrap().with_timezone(&Utc);
+        assert!(!operation_lease_is_stale(&record, now));
+    }
+
+    #[test]
+    fn engine_lease_is_stale_expired_returns_true() {
+        let record = EngineLeaseRecord { schema_version: "v1".to_string(), run_id: "run_001".to_string(), owner_id: "o1".to_string(), pid: 12345, hostname: "localhost".to_string(), started_at: "2024-01-01T00:00:00Z".to_string(), heartbeat_at: "2024-01-01T00:00:00Z".to_string(), expires_at: "2024-01-01T00:05:00Z".to_string(), epoch: 0 };
+        let now = chrono::DateTime::parse_from_rfc3339("2024-01-01T00:10:00Z").unwrap().with_timezone(&Utc);
+        assert!(engine_lease_is_stale(&record, now));
+    }
+
+    #[test]
+    fn engine_lease_is_stale_fresh_returns_false() {
+        let record = EngineLeaseRecord { schema_version: "v1".to_string(), run_id: "run_001".to_string(), owner_id: "o1".to_string(), pid: 12345, hostname: "localhost".to_string(), started_at: "2024-01-01T00:00:00Z".to_string(), heartbeat_at: "2024-01-01T00:00:00Z".to_string(), expires_at: "2024-01-01T00:10:00Z".to_string(), epoch: 0 };
+        let now = chrono::DateTime::parse_from_rfc3339("2024-01-01T00:05:00Z").unwrap().with_timezone(&Utc);
+        assert!(!engine_lease_is_stale(&record, now));
+    }
+
+    #[test]
+    fn write_run_control_v2_running_status() {
+        let root = TempDirGuard::new("run_ctrl_running");
+        let run_dir = root.path.join("run");
+        ensure_dir(&run_dir.join("runtime")).unwrap();
+        write_run_control_v2(&run_dir, "run_001", "running", &[], None).unwrap();
+        let loaded = load_json_file(&run_control_path(&run_dir)).unwrap();
+        assert_eq!(loaded["status"], "running");
+    }
+
+    #[test]
+    fn write_run_control_v2_paused_with_label() {
+        let root = TempDirGuard::new("run_ctrl_paused");
+        let run_dir = root.path.join("run");
+        ensure_dir(&run_dir.join("runtime")).unwrap();
+        let pause = RunControlPauseMetadata { label: "user_pause".to_string(), requested_at: "2024-01-01T00:00:00Z".to_string(), requested_by: None };
+        write_run_control_v2(&run_dir, "run_001", "paused", &[], Some(&pause)).unwrap();
+        let loaded = load_json_file(&run_control_path(&run_dir)).unwrap();
+        assert_eq!(loaded["status"], "paused");
+        assert_eq!(loaded["pause"]["label"], "user_pause");
+    }
+
+    #[test]
+    fn write_run_control_v2_active_trials_serialized() {
+        let root = TempDirGuard::new("run_ctrl_active");
+        let run_dir = root.path.join("run");
+        ensure_dir(&run_dir.join("runtime")).unwrap();
+        let trials = vec![RunControlActiveTrial { trial_id: "trial_1".to_string(), worker_id: "worker_a".to_string(), schedule_idx: Some(0), variant_id: Some("baseline".to_string()), started_at: Some("2024-01-01T00:00:00Z".to_string()), control: None }];
+        write_run_control_v2(&run_dir, "run_001", "running", &trials, None).unwrap();
+        let loaded = load_json_file(&run_control_path(&run_dir)).unwrap();
+        let active = loaded["active_trials"].as_object().unwrap();
+        assert_eq!(active.len(), 1);
+        assert_eq!(active["trial_1"]["trial_id"], "trial_1");
+    }
+
+    #[test]
+    fn write_run_control_v2_schema_version() {
+        let root = TempDirGuard::new("run_ctrl_schema");
+        let run_dir = root.path.join("run");
+        ensure_dir(&run_dir.join("runtime")).unwrap();
+        write_run_control_v2(&run_dir, "run_001", "running", &[], None).unwrap();
+        assert_eq!(load_json_file(&run_control_path(&run_dir)).unwrap()["schema_version"], "run_control_v2");
+    }
+
+    #[test]
+    fn write_run_control_v2_run_id_persisted() {
+        let root = TempDirGuard::new("run_ctrl_id");
+        let run_dir = root.path.join("run");
+        ensure_dir(&run_dir.join("runtime")).unwrap();
+        write_run_control_v2(&run_dir, "my_run_123", "running", &[], None).unwrap();
+        assert_eq!(load_json_file(&run_control_path(&run_dir)).unwrap()["run_id"], "my_run_123");
+    }
+
+    #[test]
+    fn write_run_control_v2_updated_at_present() {
+        let root = TempDirGuard::new("run_ctrl_updated");
+        let run_dir = root.path.join("run");
+        ensure_dir(&run_dir.join("runtime")).unwrap();
+        write_run_control_v2(&run_dir, "run_001", "running", &[], None).unwrap();
+        assert!(!load_json_file(&run_control_path(&run_dir)).unwrap()["updated_at"].as_str().unwrap().is_empty());
+    }
+
+    #[test]
+    fn write_trial_state_running() {
+        let root = TempDirGuard::new("trial_state_running");
+        write_trial_state(&root.path, "trial_1", "running", None, None, None).unwrap();
+        let loaded = load_json_file(&root.path.join("trial_state.json")).unwrap();
+        assert_eq!(loaded["status"], "running");
+        assert_eq!(loaded["trial_id"], "trial_1");
+    }
+
+    #[test]
+    fn write_trial_state_paused_with_label() {
+        let root = TempDirGuard::new("trial_state_paused");
+        write_trial_state(&root.path, "trial_1", "paused", Some("checkpoint_pause"), None, None).unwrap();
+        let loaded = load_json_file(&root.path.join("trial_state.json")).unwrap();
+        assert_eq!(loaded["pause_label"], "checkpoint_pause");
+    }
+
+    #[test]
+    fn write_trial_state_completed() {
+        let root = TempDirGuard::new("trial_state_completed");
+        write_trial_state(&root.path, "trial_1", "completed", None, None, None).unwrap();
+        assert_eq!(load_json_file(&root.path.join("trial_state.json")).unwrap()["status"], "completed");
+    }
+
+    #[test]
+    fn write_trial_state_failed_with_exit_reason() {
+        let root = TempDirGuard::new("trial_state_failed");
+        write_trial_state(&root.path, "trial_1", "failed", None, None, Some("timeout")).unwrap();
+        let loaded = load_json_file(&root.path.join("trial_state.json")).unwrap();
+        assert_eq!(loaded["exit_reason"], "timeout");
+    }
+
+    #[test]
+    fn write_trial_state_schema_version() {
+        let root = TempDirGuard::new("trial_state_schema");
+        write_trial_state(&root.path, "trial_1", "running", None, None, None).unwrap();
+        assert_eq!(load_json_file(&root.path.join("trial_state.json")).unwrap()["schema_version"], "trial_state_v1");
+    }
+
+    #[test]
+    fn write_trial_state_with_checkpoint() {
+        let root = TempDirGuard::new("trial_state_cp");
+        write_trial_state(&root.path, "trial_1", "paused", None, Some("checkpoint_5"), None).unwrap();
+        assert_eq!(load_json_file(&root.path.join("trial_state.json")).unwrap()["checkpoint_selected"], "checkpoint_5");
+    }
+
+    #[test]
+    fn run_control_guard_marks_failed_on_drop() {
+        let root = TempDirGuard::new("guard_drop_fail");
+        let run_dir = root.path.join("run");
+        ensure_dir(&run_dir.join("runtime")).unwrap();
+        { let _guard = RunControlGuard::new(&run_dir, "run_001"); }
+        assert_eq!(load_json_file(&run_control_path(&run_dir)).unwrap()["status"], "failed");
+    }
+
+    #[test]
+    fn run_control_guard_complete_prevents_drop_fail() {
+        let root = TempDirGuard::new("guard_complete");
+        let run_dir = root.path.join("run");
+        ensure_dir(&run_dir.join("runtime")).unwrap();
+        { let mut guard = RunControlGuard::new(&run_dir, "run_001"); guard.complete("completed").unwrap(); }
+        assert_eq!(load_json_file(&run_control_path(&run_dir)).unwrap()["status"], "completed");
+    }
+
+    #[test]
+    fn trial_state_guard_marks_aborted_on_drop() {
+        let root = TempDirGuard::new("trial_guard_drop");
+        { let _guard = TrialStateGuard::new(&root.path, "trial_1"); }
+        let loaded = load_json_file(&root.path.join("trial_state.json")).unwrap();
+        assert_eq!(loaded["status"], "failed");
+        assert_eq!(loaded["exit_reason"], "aborted");
+    }
+
+    #[test]
+    fn trial_state_guard_complete_prevents_drop_abort() {
+        let root = TempDirGuard::new("trial_guard_complete");
+        { let mut guard = TrialStateGuard::new(&root.path, "trial_1"); guard.complete("completed", None).unwrap(); }
+        assert_eq!(load_json_file(&root.path.join("trial_state.json")).unwrap()["status"], "completed");
+    }
+
+    #[test]
+    fn create_unique_run_dir_creates_expected_structure() {
+        let root = TempDirGuard::new("unique_run");
+        let (run_id, run_dir) = create_unique_run_dir(&root.path).unwrap();
+        assert!(run_dir.exists());
+        assert!(run_id.starts_with("run_"));
+    }
+
+    #[test]
+    fn create_unique_run_dir_unique_ids() {
+        let root = TempDirGuard::new("unique_run_ids");
+        let (id_a, _) = create_unique_run_dir(&root.path).unwrap();
+        let (id_b, _) = create_unique_run_dir(&root.path).unwrap();
+        assert_ne!(id_a, id_b);
+    }
+
+    #[test]
+    fn run_control_path_correct() {
+        assert_eq!(run_control_path(&PathBuf::from("/tmp/run_001")), PathBuf::from("/tmp/run_001/runtime/run_control.json"));
+    }
+
+    #[test]
+    fn run_session_state_path_correct() {
+        assert_eq!(run_session_state_path(&PathBuf::from("/tmp/run_001")), PathBuf::from("/tmp/run_001/runtime/run_session_state.json"));
+    }
+
+    #[test]
+    fn write_run_session_state_roundtrip() {
+        let root = TempDirGuard::new("session_roundtrip");
+        let run_dir = root.path.join("run");
+        ensure_dir(&run_dir.join("runtime")).unwrap();
+        let behavior = RunBehavior { setup_command: Some("echo setup".to_string()), network_mode_override: Some("bridge".to_string()), require_network_none: false };
+        let execution = RunExecutionOptions { executor: Some(ExecutorKind::LocalDocker), materialize: Some(MaterializationMode::Full) };
+        write_run_session_state(&run_dir, "run_001", &behavior, &execution).unwrap();
+        let loaded = load_run_session_state(&run_dir).unwrap();
+        assert_eq!(loaded.run_id, "run_001");
+        assert_eq!(loaded.schema_version, "run_session_state_v1");
+    }
+
+    #[test]
+    fn run_session_state_preserves_behavior() {
+        let root = TempDirGuard::new("session_behavior");
+        let run_dir = root.path.join("run");
+        ensure_dir(&run_dir.join("runtime")).unwrap();
+        let behavior = RunBehavior { setup_command: Some("echo hi".to_string()), network_mode_override: Some("host".to_string()), require_network_none: true };
+        write_run_session_state(&run_dir, "run_002", &behavior, &RunExecutionOptions { executor: None, materialize: None }).unwrap();
+        let loaded = load_run_session_state(&run_dir).unwrap();
+        assert_eq!(loaded.behavior.setup_command, Some("echo hi".to_string()));
+        assert!(loaded.behavior.require_network_none);
+    }
+
+    #[test]
+    fn run_session_state_preserves_execution_options() {
+        let root = TempDirGuard::new("session_execution");
+        let run_dir = root.path.join("run");
+        ensure_dir(&run_dir.join("runtime")).unwrap();
+        let behavior = RunBehavior { setup_command: None, network_mode_override: None, require_network_none: false };
+        let execution = RunExecutionOptions { executor: Some(ExecutorKind::LocalProcess), materialize: Some(MaterializationMode::MetadataOnly) };
+        write_run_session_state(&run_dir, "run_003", &behavior, &execution).unwrap();
+        assert_eq!(load_run_session_state(&run_dir).unwrap().execution.executor, Some(ExecutorKind::LocalProcess));
+    }
+
+    #[test]
+    fn run_control_active_trials_parses_v2() {
+        let control = json!({"schema_version": "run_control_v2", "active_trials": {"trial_1": {"trial_id": "trial_1", "worker_id": "worker_a", "schedule_idx": 0, "control": null}}});
+        let trials = run_control_active_trials(&control);
+        assert_eq!(trials.len(), 1);
+        assert_eq!(trials[0].trial_id, "trial_1");
+    }
+
+    #[test]
+    fn run_control_active_trials_empty_when_none() {
+        assert!(run_control_active_trials(&json!({"schema_version": "run_control_v2"})).is_empty());
+    }
+
+    // ───────────────────────────────────────────────────────────────────
+    // Batch 8-10: Build Package, Benchmark, Worker Backend, Utilities
+    // ───────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn atomic_write_bytes_creates_file() {
+        let root = TempDirGuard::new("aw_bytes_create");
+        let path = root.path.join("test.bin");
+        atomic_write_bytes(&path, b"hello").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"hello");
+    }
+
+    #[test]
+    fn atomic_write_bytes_overwrites_existing() {
+        let root = TempDirGuard::new("aw_bytes_overwrite");
+        let path = root.path.join("test.bin");
+        atomic_write_bytes(&path, b"old").unwrap();
+        atomic_write_bytes(&path, b"new").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"new");
+    }
+
+    #[test]
+    fn atomic_write_bytes_creates_parent_dirs() {
+        let root = TempDirGuard::new("aw_parent");
+        let path = root.path.join("nested").join("deep").join("file.txt");
+        atomic_write_bytes(&path, b"content").unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"content");
+    }
+
+    #[test]
+    fn atomic_write_json_pretty_roundtrip() {
+        let root = TempDirGuard::new("aw_json_roundtrip");
+        let path = root.path.join("test.json");
+        let value = json!({"key": "value", "number": 42});
+        atomic_write_json_pretty(&path, &value).unwrap();
+        assert_eq!(load_json_file(&path).unwrap(), value);
+    }
+
+    #[test]
+    fn load_json_file_missing_fails() {
+        let root = TempDirGuard::new("load_json_missing");
+        assert!(load_json_file(&root.path.join("missing.json")).is_err());
+    }
+
+    #[test]
+    fn load_json_file_invalid_json_fails() {
+        let root = TempDirGuard::new("load_json_invalid");
+        let path = root.path.join("bad.json");
+        fs::write(&path, "not valid json {{{").unwrap();
+        assert!(load_json_file(&path).is_err());
+    }
+
+    #[test]
+    fn load_json_file_valid_roundtrip() {
+        let root = TempDirGuard::new("load_json_valid");
+        let path = root.path.join("data.json");
+        let value = json!({"array": [1, 2, 3], "nested": {"key": "value"}});
+        atomic_write_json_pretty(&path, &value).unwrap();
+        assert_eq!(load_json_file(&path).unwrap(), value);
+    }
+
+    #[test]
+    fn set_json_pointer_value_creates_nested() {
+        let mut root = json!({});
+        set_json_pointer_value(&mut root, "/a/b/c", json!("deep")).unwrap();
+        assert_eq!(root["a"]["b"]["c"], json!("deep"));
+    }
+
+    #[test]
+    fn set_json_pointer_value_overwrites_existing() {
+        let mut root = json!({"a": {"b": "old"}});
+        set_json_pointer_value(&mut root, "/a/b", json!("new")).unwrap();
+        assert_eq!(root["a"]["b"], json!("new"));
+    }
+
+    #[test]
+    fn set_json_pointer_value_replaces_root() {
+        let mut root = json!({"old": "data"});
+        set_json_pointer_value(&mut root, "", json!("replaced")).unwrap();
+        assert_eq!(root, json!("replaced"));
+    }
+
+    #[test]
+    fn set_json_pointer_value_invalid_pointer_fails() {
+        assert!(set_json_pointer_value(&mut json!({}), "no_slash", json!(1)).is_err());
+    }
+
+    #[test]
+    fn set_json_pointer_value_deep_nested_creates_intermediates() {
+        let mut root = json!({});
+        set_json_pointer_value(&mut root, "/a/b/c/d", json!(42)).unwrap();
+        assert_eq!(root["a"]["b"]["c"]["d"], json!(42));
+    }
+
+    #[test]
+    fn is_worker_backend_capacity_error_matches_prefix() {
+        assert!(is_worker_backend_capacity_error(&anyhow::anyhow!("{}in_flight=4, max=4", LOCAL_WORKER_CAPACITY_ERROR_PREFIX)));
+    }
+
+    #[test]
+    fn is_worker_backend_capacity_error_matches_at_capacity() {
+        assert!(is_worker_backend_capacity_error(&anyhow::anyhow!("worker at capacity")));
+    }
+
+    #[test]
+    fn is_worker_backend_capacity_error_rejects_other() {
+        assert!(!is_worker_backend_capacity_error(&anyhow::anyhow!("network timeout")));
+    }
+
+    #[test]
+    fn copy_path_into_package_file() {
+        let root = TempDirGuard::new("copy_pkg_file");
+        let src = root.path.join("source.txt");
+        let dst = root.path.join("dest").join("source.txt");
+        fs::write(&src, "content").unwrap();
+        copy_path_into_package(&src, &dst).unwrap();
+        assert_eq!(fs::read_to_string(&dst).unwrap(), "content");
+    }
+
+    #[test]
+    fn copy_path_into_package_dir() {
+        let root = TempDirGuard::new("copy_pkg_dir");
+        let src_dir = root.path.join("source_dir");
+        ensure_dir(&src_dir).unwrap();
+        fs::write(src_dir.join("file.txt"), "content").unwrap();
+        let dst_dir = root.path.join("dest_dir");
+        copy_path_into_package(&src_dir, &dst_dir).unwrap();
+        assert_eq!(fs::read_to_string(dst_dir.join("file.txt")).unwrap(), "content");
+    }
+
+    #[test]
+    fn stage_source_into_package_absolute_path() {
+        let root = TempDirGuard::new("stage_abs");
+        let exp_dir = root.path.join("exp");
+        let pkg_dir = root.path.join("pkg");
+        ensure_dir(&exp_dir).unwrap();
+        ensure_dir(&pkg_dir).unwrap();
+        let src = root.path.join("artifact.tar");
+        fs::write(&src, "data").unwrap();
+        let mut copies = BTreeMap::new();
+        let mut counter = 0usize;
+        let rel = stage_source_into_package(src.to_str().unwrap(), &exp_dir, &pkg_dir, "agent_builds", "build", &mut copies, &mut counter).unwrap();
+        assert!(!rel.is_empty());
+        assert_eq!(counter, 1);
+    }
+
+    #[test]
+    fn stage_source_into_package_relative_path() {
+        let root = TempDirGuard::new("stage_rel");
+        let exp_dir = root.path.join("exp");
+        ensure_dir(&exp_dir).unwrap();
+        fs::write(exp_dir.join("agent.tar"), "data").unwrap();
+        let pkg_dir = root.path.join("pkg");
+        ensure_dir(&pkg_dir).unwrap();
+        let mut copies = BTreeMap::new();
+        let mut counter = 0usize;
+        assert!(!stage_source_into_package("agent.tar", &exp_dir, &pkg_dir, "agent_builds", "build", &mut copies, &mut counter).unwrap().is_empty());
+    }
+
+    #[test]
+    fn stage_source_into_package_missing_source_fails() {
+        let root = TempDirGuard::new("stage_missing");
+        let exp_dir = root.path.join("exp");
+        let pkg_dir = root.path.join("pkg");
+        ensure_dir(&exp_dir).unwrap();
+        ensure_dir(&pkg_dir).unwrap();
+        let mut copies = BTreeMap::new();
+        let mut counter = 0usize;
+        assert!(stage_source_into_package("nonexistent.tar", &exp_dir, &pkg_dir, "agent_builds", "build", &mut copies, &mut counter).is_err());
+    }
+
+    #[test]
+    fn stage_source_into_package_directory_copied() {
+        let root = TempDirGuard::new("stage_dir");
+        let exp_dir = root.path.join("exp");
+        ensure_dir(&exp_dir).unwrap();
+        let src_dir = exp_dir.join("agent_dir");
+        ensure_dir(&src_dir).unwrap();
+        fs::write(src_dir.join("main.py"), "print('hello')").unwrap();
+        let pkg_dir = root.path.join("pkg");
+        ensure_dir(&pkg_dir).unwrap();
+        let mut copies = BTreeMap::new();
+        let mut counter = 0usize;
+        let rel = stage_source_into_package("agent_dir", &exp_dir, &pkg_dir, "agent_builds", "build", &mut copies, &mut counter).unwrap();
+        assert!(pkg_dir.join(rel.trim_start_matches('/')).exists());
+    }
+
+    #[test]
+    fn stage_source_deduplicates_same_source() {
+        let root = TempDirGuard::new("stage_dedup");
+        let exp_dir = root.path.join("exp");
+        ensure_dir(&exp_dir).unwrap();
+        fs::write(exp_dir.join("artifact.tar"), "data").unwrap();
+        let pkg_dir = root.path.join("pkg");
+        ensure_dir(&pkg_dir).unwrap();
+        let mut copies = BTreeMap::new();
+        let mut counter = 0usize;
+        let rel1 = stage_source_into_package("artifact.tar", &exp_dir, &pkg_dir, "agent_builds", "build", &mut copies, &mut counter).unwrap();
+        let rel2 = stage_source_into_package("artifact.tar", &exp_dir, &pkg_dir, "agent_builds", "build", &mut copies, &mut counter).unwrap();
+        assert_eq!(rel1, rel2);
+        assert_eq!(counter, 1);
+    }
+
+    #[test]
+    fn normalize_task_prompt_aliases_no_aliases_noop() {
+        let task = json!({"input": {"prompt": "hello"}, "metadata": "x"});
+        let result = normalize_task_prompt_aliases(&task);
+        assert_eq!(result["input"]["prompt"], "hello");
+    }
+
+    #[test]
+    fn materialize_workspace_files_utf8() {
+        let (_root, paths) = create_trial_paths_fixture("mat_utf8");
+        let files = vec![WorkspaceFileSpec { path: "hello.txt".to_string(), content: "hello world".to_string(), encoding: None, executable: false }];
+        materialize_workspace_files(&paths, &files).unwrap();
+        assert_eq!(fs::read_to_string(paths.workspace.join("hello.txt")).unwrap(), "hello world");
+    }
+
+    #[test]
+    fn materialize_workspace_files_base64() {
+        let (_root, paths) = create_trial_paths_fixture("mat_b64");
+        let encoded = BASE64_STANDARD.encode(b"binary content");
+        let files = vec![WorkspaceFileSpec { path: "data.bin".to_string(), content: encoded, encoding: Some("base64".to_string()), executable: false }];
+        materialize_workspace_files(&paths, &files).unwrap();
+        assert_eq!(fs::read(paths.workspace.join("data.bin")).unwrap(), b"binary content");
+    }
+
+    #[test]
+    fn materialize_workspace_files_creates_parent_dirs() {
+        let (_root, paths) = create_trial_paths_fixture("mat_nested");
+        let files = vec![WorkspaceFileSpec { path: "deep/nested/dir/file.txt".to_string(), content: "nested".to_string(), encoding: None, executable: false }];
+        materialize_workspace_files(&paths, &files).unwrap();
+        assert_eq!(fs::read_to_string(paths.workspace.join("deep").join("nested").join("dir").join("file.txt")).unwrap(), "nested");
+    }
+
+    #[test]
+    fn materialize_workspace_files_empty_list() {
+        let (_root, paths) = create_trial_paths_fixture("mat_empty");
+        materialize_workspace_files(&paths, &[]).unwrap();
+    }
+
+    #[test]
+    fn replay_grade_for_integration_cli_basic() {
+        assert_eq!(replay_grade_for_integration("cli_basic"), "best_effort");
+    }
+
+    #[test]
+    fn replay_grade_for_integration_sdk_full() {
+        assert_eq!(replay_grade_for_integration("sdk_full"), "strict");
+    }
+
+    #[test]
+    fn replay_grade_for_integration_sdk_control() {
+        assert_eq!(replay_grade_for_integration("sdk_control"), "checkpointed");
+    }
+
+    #[test]
+    fn replay_grade_for_integration_cli_events() {
+        assert_eq!(replay_grade_for_integration("cli_events"), "best_effort");
+    }
+
+    #[test]
+    fn replay_grade_for_integration_otel() {
+        assert_eq!(replay_grade_for_integration("otel"), "best_effort");
+    }
+
+    #[test]
+    fn replay_grade_for_integration_unknown_level() {
+        assert_eq!(replay_grade_for_integration("something_unknown"), "best_effort");
+    }
+
+    // ── Batch 6 extension: resolve_variant_plan ──
+
+    #[test]
+    fn resolve_variant_plan_legacy_baseline_plus_two_treatments() {
+        let exp = json!({
+            "baseline": { "variant_id": "ctrl", "bindings": { "lr": 0.01 } },
+            "variant_plan": [
+                { "variant_id": "fast", "bindings": { "lr": 0.1 } },
+                { "variant_id": "slow", "bindings": { "lr": 0.001 } }
+            ]
+        });
+        let (variants, baseline_id) = resolve_variant_plan(&exp).unwrap();
+        assert_eq!(baseline_id, "ctrl");
+        assert_eq!(variants.len(), 3);
+        assert_eq!(variants[0].id, "ctrl");
+        assert_eq!(variants[1].id, "fast");
+        assert_eq!(variants[2].id, "slow");
+        assert_eq!(variants[1].bindings["lr"], json!(0.1));
+    }
+
+    #[test]
+    fn resolve_variant_plan_legacy_no_variant_plan_returns_baseline_only() {
+        let exp = json!({
+            "baseline": { "variant_id": "base", "bindings": { "x": 1 } }
+        });
+        let (variants, baseline_id) = resolve_variant_plan(&exp).unwrap();
+        assert_eq!(baseline_id, "base");
+        assert_eq!(variants.len(), 1);
+    }
+
+    #[test]
+    fn resolve_variant_plan_legacy_variant_bindings_default_to_empty_object() {
+        let exp = json!({
+            "baseline": { "variant_id": "b" },
+            "variant_plan": [{ "variant_id": "v1" }]
+        });
+        let (variants, _) = resolve_variant_plan(&exp).unwrap();
+        assert!(variants[1].bindings.is_object());
+        assert_eq!(variants[1].bindings.as_object().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn resolve_variant_plan_legacy_variant_array_bindings_fails() {
+        let exp = json!({
+            "baseline": { "variant_id": "b" },
+            "variant_plan": [{ "variant_id": "v1", "bindings": [1, 2] }]
+        });
+        assert!(resolve_variant_plan(&exp).is_err());
+    }
+
+    #[test]
+    fn resolve_variant_plan_missing_baseline_variant_id_fails() {
+        let exp = json!({ "baseline": { "bindings": {} } });
+        assert!(resolve_variant_plan(&exp).is_err());
+    }
+
+    #[test]
+    fn resolve_variant_plan_legacy_runtime_overrides_attached() {
+        let exp = json!({
+            "baseline": { "variant_id": "b", "runtime_overrides": { "agent": { "timeout_ms": 5000 } } },
+            "variant_plan": []
+        });
+        let (variants, _) = resolve_variant_plan(&exp).unwrap();
+        assert!(variants[0].runtime_overrides.is_some());
+        assert_eq!(
+            variants[0].runtime_overrides.as_ref().unwrap().pointer("/agent/timeout_ms"),
+            Some(&json!(5000))
+        );
+    }
+
+    #[test]
+    fn resolve_variant_plan_legacy_runtime_overrides_must_be_object() {
+        let exp = json!({
+            "baseline": { "variant_id": "b", "runtime_overrides": "bad" }
+        });
+        assert!(resolve_variant_plan(&exp).is_err());
+    }
+
+    #[test]
+    fn resolve_variant_plan_variant_without_id_fails() {
+        let exp = json!({
+            "baseline": { "variant_id": "b" },
+            "variant_plan": [{ "bindings": {} }]
+        });
+        assert!(resolve_variant_plan(&exp).is_err());
+    }
+
+    #[test]
+    fn resolve_variant_plan_variant_uses_config_alias_for_bindings() {
+        let exp = json!({
+            "baseline": { "variant_id": "b" },
+            "variant_plan": [{ "variant_id": "v1", "config": { "k": "v" } }]
+        });
+        let (variants, _) = resolve_variant_plan(&exp).unwrap();
+        assert_eq!(variants[1].bindings["k"], json!("v"));
+    }
+
+    #[test]
+    fn resolve_variant_plan_legacy_baseline_image_promotes_to_runtime_override() {
+        let exp = json!({
+            "baseline": { "variant_id": "b", "image": "custom:latest" }
+        });
+        let (variants, _) = resolve_variant_plan(&exp).unwrap();
+        assert!(variants[0].runtime_overrides.is_some());
+        assert_eq!(
+            variants[0].runtime_overrides.as_ref().unwrap().pointer("/agent/image"),
+            Some(&json!("custom:latest"))
+        );
+    }
+
+    // ── Batch 6 extension: build_runtime_contract_env ──
+
+    #[test]
+    fn build_runtime_contract_env_legacy_includes_all_agentlab_keys() {
+        let input = json!({
+            "ids": { "trial_id": "t1", "variant_id": "v1", "task_id": "task_a", "repl_idx": 2 },
+            "task": { "image": "myimg:1" },
+            "policy": { "timeout_ms": 30000 }
+        });
+        let io = PreparedTrialIo {
+            output_host: PathBuf::from("/out"),
+            events_host: PathBuf::from("/events"),
+            task_path: "/agentlab/in/task.json".to_string(),
+            bindings_path: "/agentlab/in/bindings.json".to_string(),
+            dependencies_path: "/agentlab/deps".to_string(),
+            policy_path: "/agentlab/in/policy.json".to_string(),
+            result_path: "/agentlab/out/result.json".to_string(),
+            trajectory_path: "/agentlab/out/trajectory.jsonl".to_string(),
+        };
+        let env = build_runtime_contract_env("run_1", &input, &io, Some(30000), false);
+        assert_eq!(env.get(AGENTLAB_ENV_RUN_ID).unwrap(), "run_1");
+        assert_eq!(env.get(AGENTLAB_ENV_TRIAL_ID).unwrap(), "t1");
+        assert_eq!(env.get(AGENTLAB_ENV_VARIANT_ID).unwrap(), "v1");
+        assert_eq!(env.get(AGENTLAB_ENV_TASK_ID).unwrap(), "task_a");
+        assert_eq!(env.get(AGENTLAB_ENV_REPL_IDX).unwrap(), "2");
+        assert_eq!(env.get(AGENTLAB_ENV_TIMEOUT_MS).unwrap(), "30000");
+        assert_eq!(env.get(AGENTLAB_ENV_TASK_PATH).unwrap(), "/agentlab/in/task.json");
+        assert!(env.contains_key(AGENTLAB_ENV_TASK_IMAGE));
+    }
+
+    #[test]
+    fn build_runtime_contract_env_clean_contract_returns_empty() {
+        let input = json!({ "ids": { "trial_id": "t1" } });
+        let io = PreparedTrialIo {
+            output_host: PathBuf::from("/out"),
+            events_host: PathBuf::from("/events"),
+            task_path: "/in/task.json".to_string(),
+            bindings_path: "/in/bindings.json".to_string(),
+            dependencies_path: "/deps".to_string(),
+            policy_path: "/in/policy.json".to_string(),
+            result_path: "/out/result.json".to_string(),
+            trajectory_path: "/out/trajectory.jsonl".to_string(),
+        };
+        let env = build_runtime_contract_env("run_1", &input, &io, Some(5000), true);
+        assert!(env.is_empty());
+    }
+
+    #[test]
+    fn build_runtime_contract_env_no_timeout_omits_key() {
+        let input = json!({ "ids": { "trial_id": "t1" } });
+        let io = PreparedTrialIo {
+            output_host: PathBuf::from("/out"),
+            events_host: PathBuf::from("/events"),
+            task_path: "/in/task.json".to_string(),
+            bindings_path: "/in/bindings.json".to_string(),
+            dependencies_path: "/deps".to_string(),
+            policy_path: "/in/policy.json".to_string(),
+            result_path: "/out/result.json".to_string(),
+            trajectory_path: "/out/trajectory.jsonl".to_string(),
+        };
+        let env = build_runtime_contract_env("run_1", &input, &io, None, false);
+        assert!(!env.contains_key(AGENTLAB_ENV_TIMEOUT_MS));
+    }
+
+    #[test]
+    fn build_runtime_contract_env_no_task_image_omits_key() {
+        let input = json!({ "ids": { "trial_id": "t1" }, "task": {} });
+        let io = PreparedTrialIo {
+            output_host: PathBuf::from("/out"),
+            events_host: PathBuf::from("/events"),
+            task_path: "/in/task.json".to_string(),
+            bindings_path: "/in/bindings.json".to_string(),
+            dependencies_path: "/deps".to_string(),
+            policy_path: "/in/policy.json".to_string(),
+            result_path: "/out/result.json".to_string(),
+            trajectory_path: "/out/trajectory.jsonl".to_string(),
+        };
+        let env = build_runtime_contract_env("run_1", &input, &io, None, false);
+        assert!(!env.contains_key(AGENTLAB_ENV_TASK_IMAGE));
+    }
+
+    // ── Batch 6 extension: resolve_trial_timeout_ms ──
+
+    #[test]
+    fn resolve_trial_timeout_ms_reads_policy_field() {
+        let input = json!({ "policy": { "timeout_ms": 60000 } });
+        assert_eq!(resolve_trial_timeout_ms(&input, None), Some(60000));
+    }
+
+    #[test]
+    fn resolve_trial_timeout_ms_falls_back_to_invocation_default() {
+        let input = json!({ "policy": {} });
+        assert_eq!(resolve_trial_timeout_ms(&input, Some(30000)), Some(30000));
+    }
+
+    #[test]
+    fn resolve_trial_timeout_ms_prefers_input_over_default() {
+        let input = json!({ "policy": { "timeout_ms": 10000 } });
+        assert_eq!(resolve_trial_timeout_ms(&input, Some(99999)), Some(10000));
+    }
+
+    #[test]
+    fn resolve_trial_timeout_ms_both_missing_returns_none() {
+        let input = json!({});
+        assert_eq!(resolve_trial_timeout_ms(&input, None), None);
+    }
+
+    // ── Batch 8: load_experiment_input ──
+
+    #[test]
+    fn load_experiment_input_directory_without_manifest_fails() {
+        let guard = TempDirGuard::new("load_exp_no_manifest");
+        let err = load_experiment_input(&guard.path, None).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("manifest.json"), "expected manifest error, got: {msg}");
+    }
+
+    #[test]
+    fn load_experiment_input_missing_file_fails() {
+        let path = Path::new("/nonexistent/experiment.yaml");
+        assert!(load_experiment_input(path, None).is_err());
+    }
+
+    #[test]
+    fn load_experiment_input_manifest_rejects_overrides() {
+        let guard = TempDirGuard::new("load_exp_manifest_overrides");
+        let manifest = guard.path.join("manifest.json");
+        let overrides = guard.path.join("overrides.json");
+        fs::write(&manifest, r#"{"resolved_experiment":{}}"#).unwrap();
+        fs::write(&overrides, "{}").unwrap();
+        let err = load_experiment_input(&manifest, Some(&overrides)).unwrap_err();
+        assert!(err.to_string().contains("overrides are not supported"));
+    }
+
+    #[test]
+    fn load_experiment_input_directory_package_with_manifest_loads() {
+        let guard = TempDirGuard::new("load_exp_pkg");
+        let manifest = guard.path.join("manifest.json");
+        fs::write(&manifest, r#"{"resolved_experiment":{"version":"1.0","experiment":{"id":"e1"}}}"#).unwrap();
+        let loaded = load_experiment_input(&guard.path, None).unwrap();
+        assert_eq!(loaded.json_value.pointer("/version"), Some(&json!("1.0")));
+        assert_eq!(loaded.json_value.pointer("/experiment/id"), Some(&json!("e1")));
+    }
+
+    #[test]
+    fn load_experiment_input_directory_package_rejects_overrides() {
+        let guard = TempDirGuard::new("load_exp_pkg_overrides");
+        let manifest = guard.path.join("manifest.json");
+        let overrides = guard.path.join("overrides.json");
+        fs::write(&manifest, r#"{"resolved_experiment":{}}"#).unwrap();
+        fs::write(&overrides, "{}").unwrap();
+        let err = load_experiment_input(&guard.path, Some(&overrides)).unwrap_err();
+        assert!(err.to_string().contains("overrides are not supported"));
+    }
+
+    // ── Batch 9 extension: build_benchmark_summary ──
+
+    #[test]
+    fn build_benchmark_summary_empty_scores_creates_valid_summary() {
+        let manifest = json!({
+            "adapter_id": "bench_adapter",
+            "benchmark": { "name": "my_bench", "split": "test" },
+            "evaluator": { "type": "script" }
+        });
+        let summary = build_benchmark_summary("run_1", &manifest, &[]).unwrap();
+        assert_eq!(summary["schema_version"], "benchmark_summary_v1");
+        assert_eq!(summary["run_id"], "run_1");
+        assert_eq!(summary["benchmark"]["adapter_id"], "bench_adapter");
+        assert_eq!(summary["benchmark"]["name"], "my_bench");
+        assert_eq!(summary["totals"]["trials"], 0);
+        assert_eq!(summary["variants"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn build_benchmark_summary_groups_by_variant() {
+        let manifest = json!({
+            "adapter_id": "ba",
+            "benchmark": { "name": "b", "split": "val" },
+            "evaluator": { "type": "script" }
+        });
+        let scores = vec![
+            json!({ "verdict": "pass", "ids": { "variant_id": "A" }, "primary_metric_name": "acc", "primary_metric_value": 0.9 }),
+            json!({ "verdict": "fail", "ids": { "variant_id": "A" }, "primary_metric_name": "acc", "primary_metric_value": 0.3 }),
+            json!({ "verdict": "pass", "ids": { "variant_id": "B" }, "primary_metric_name": "acc", "primary_metric_value": 1.0 }),
+        ];
+        let summary = build_benchmark_summary("r1", &manifest, &scores).unwrap();
+        assert_eq!(summary["totals"]["trials"], 3);
+        assert_eq!(summary["totals"]["pass"], 2);
+        assert_eq!(summary["totals"]["fail"], 1);
+        let variants = summary["variants"].as_array().unwrap();
+        assert_eq!(variants.len(), 2);
+        // Variants sorted by BTreeMap key ordering: A then B
+        assert_eq!(variants[0]["variant_id"], "A");
+        assert_eq!(variants[0]["total"], 2);
+        assert_eq!(variants[0]["pass"], 1);
+        assert_eq!(variants[0]["fail"], 1);
+        assert_eq!(variants[1]["variant_id"], "B");
+        assert_eq!(variants[1]["total"], 1);
+        assert_eq!(variants[1]["pass"], 1);
+    }
+
+    #[test]
+    fn build_benchmark_summary_missing_manifest_evaluator_fails() {
+        let manifest = json!({
+            "adapter_id": "ba",
+            "benchmark": { "name": "b", "split": "t" }
+        });
+        assert!(build_benchmark_summary("r", &manifest, &[]).is_err());
+    }
+
+    #[test]
+    fn build_benchmark_summary_missing_adapter_id_fails() {
+        let manifest = json!({
+            "benchmark": { "name": "b", "split": "t" },
+            "evaluator": {}
+        });
+        assert!(build_benchmark_summary("r", &manifest, &[]).is_err());
+    }
+
+    // ── Batch 10: DeterministicCommitter ──
+
+    #[test]
+    fn deterministic_committer_from_empty_progress() {
+        let progress = ScheduleProgress {
+            schema_version: "schedule_progress_v2".to_string(),
+            run_id: "r1".to_string(),
+            total_slots: 10,
+            next_schedule_index: 0,
+            next_trial_index: 1,
+            schedule: Vec::new(),
+            completed_slots: Vec::new(),
+            pruned_variants: Vec::new(),
+            consecutive_failures: BTreeMap::new(),
+            use_container: false,
+            updated_at: Utc::now().to_rfc3339(),
+        };
+        let committer = DeterministicCommitter::from_progress(&progress, &[]);
+        assert_eq!(committer.next_commit_idx, 0);
+        assert!(committer.committed_keys.is_empty());
+        assert!(committer.pending_by_schedule.is_empty());
+    }
+
+    #[test]
+    fn deterministic_committer_from_progress_with_completed_slots() {
+        let progress = ScheduleProgress {
+            schema_version: "schedule_progress_v2".to_string(),
+            run_id: "r1".to_string(),
+            total_slots: 10,
+            next_schedule_index: 3,
+            next_trial_index: 4,
+            schedule: Vec::new(),
+            completed_slots: vec![
+                SlotCompletion { schedule_index: 0, trial_id: "trial_1".into(), status: "completed".into(), slot_commit_id: "c1".into(), attempt: 1 },
+                SlotCompletion { schedule_index: 1, trial_id: "trial_2".into(), status: "completed".into(), slot_commit_id: "c2".into(), attempt: 1 },
+                SlotCompletion { schedule_index: 2, trial_id: "trial_3".into(), status: "failed".into(), slot_commit_id: "c3".into(), attempt: 1 },
+            ],
+            pruned_variants: Vec::new(),
+            consecutive_failures: BTreeMap::new(),
+            use_container: false,
+            updated_at: Utc::now().to_rfc3339(),
+        };
+        let committer = DeterministicCommitter::from_progress(&progress, &[]);
+        assert_eq!(committer.next_commit_idx, 3);
+        assert_eq!(committer.committed_keys.len(), 3);
+    }
+
+    #[test]
+    fn deterministic_committer_enqueue_skipped_at_next_idx() {
+        let progress = ScheduleProgress {
+            schema_version: "schedule_progress_v2".to_string(),
+            run_id: "r".to_string(),
+            total_slots: 5,
+            next_schedule_index: 0,
+            next_trial_index: 1,
+            schedule: Vec::new(),
+            completed_slots: Vec::new(),
+            pruned_variants: Vec::new(),
+            consecutive_failures: BTreeMap::new(),
+            use_container: false,
+            updated_at: Utc::now().to_rfc3339(),
+        };
+        let mut committer = DeterministicCommitter::from_progress(&progress, &[]);
+        let enqueued = committer.enqueue_skipped(0).unwrap();
+        assert!(enqueued);
+        assert_eq!(committer.pending_by_schedule.len(), 1);
+    }
+
+    #[test]
+    fn deterministic_committer_enqueue_duplicate_returns_false() {
+        let progress = ScheduleProgress {
+            schema_version: "schedule_progress_v2".to_string(),
+            run_id: "r".to_string(),
+            total_slots: 5,
+            next_schedule_index: 0,
+            next_trial_index: 1,
+            schedule: Vec::new(),
+            completed_slots: Vec::new(),
+            pruned_variants: Vec::new(),
+            consecutive_failures: BTreeMap::new(),
+            use_container: false,
+            updated_at: Utc::now().to_rfc3339(),
+        };
+        let mut committer = DeterministicCommitter::from_progress(&progress, &[]);
+        committer.enqueue_skipped(0).unwrap();
+        let second = committer.enqueue_skipped(0).unwrap();
+        assert!(!second, "duplicate enqueue should return false");
+    }
+
+    #[test]
+    fn deterministic_committer_enqueue_stale_index_errors() {
+        let progress = ScheduleProgress {
+            schema_version: "schedule_progress_v2".to_string(),
+            run_id: "r".to_string(),
+            total_slots: 5,
+            next_schedule_index: 5,
+            next_trial_index: 6,
+            schedule: Vec::new(),
+            completed_slots: Vec::new(),
+            pruned_variants: Vec::new(),
+            consecutive_failures: BTreeMap::new(),
+            use_container: false,
+            updated_at: Utc::now().to_rfc3339(),
+        };
+        let mut committer = DeterministicCommitter::from_progress(&progress, &[]);
+        let err = committer.enqueue_skipped(2).unwrap_err();
+        assert!(err.to_string().contains("stale completion"));
+    }
+
+    #[test]
+    fn deterministic_committer_commit_key_for_slot_completion_deterministic() {
+        let slot = SlotCompletion {
+            schedule_index: 7,
+            trial_id: "trial_8".to_string(),
+            status: "completed".to_string(),
+            slot_commit_id: "xyz".to_string(),
+            attempt: 1,
+        };
+        let key = DeterministicCommitter::commit_key_for_slot_completion(&slot);
+        assert_eq!(key, "7:trial_8:completed");
+    }
+
+    // ── Batch 10: highest_attempt_by_schedule ──
+
+    #[test]
+    fn highest_attempt_by_schedule_empty_returns_empty() {
+        let result = highest_attempt_by_schedule(&[]);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn highest_attempt_by_schedule_tracks_max_attempt_per_index() {
+        let records = vec![
+            SlotCommitRecord {
+                schema_version: "v1".to_string(),
+                record_type: "slot_commit".to_string(),
+                run_id: "r1".to_string(),
+                schedule_idx: 0,
+                slot_commit_id: "c1".to_string(),
+                trial_id: "t1".to_string(),
+                slot_status: "completed".to_string(),
+                attempt: 1,
+                recorded_at: Utc::now().to_rfc3339(),
+                payload_digest: None,
+                expected_rows: None,
+                written_rows: None,
+                facts_fsync_completed: None,
+                runtime_fsync_completed: None,
+            },
+            SlotCommitRecord {
+                schema_version: "v1".to_string(),
+                record_type: "slot_commit".to_string(),
+                run_id: "r1".to_string(),
+                schedule_idx: 0,
+                slot_commit_id: "c2".to_string(),
+                trial_id: "t1".to_string(),
+                slot_status: "failed".to_string(),
+                attempt: 3,
+                recorded_at: Utc::now().to_rfc3339(),
+                payload_digest: None,
+                expected_rows: None,
+                written_rows: None,
+                facts_fsync_completed: None,
+                runtime_fsync_completed: None,
+            },
+            SlotCommitRecord {
+                schema_version: "v1".to_string(),
+                record_type: "slot_commit".to_string(),
+                run_id: "r1".to_string(),
+                schedule_idx: 1,
+                slot_commit_id: "c3".to_string(),
+                trial_id: "t2".to_string(),
+                slot_status: "completed".to_string(),
+                attempt: 2,
+                recorded_at: Utc::now().to_rfc3339(),
+                payload_digest: None,
+                expected_rows: None,
+                written_rows: None,
+                facts_fsync_completed: None,
+                runtime_fsync_completed: None,
+            },
+        ];
+        let result = highest_attempt_by_schedule(&records);
+        assert_eq!(*result.get(&0).unwrap(), 3);
+        assert_eq!(*result.get(&1).unwrap(), 2);
+    }
+
+    // ── Batch 10: output_peer_path ──
+
+    #[test]
+    fn output_peer_path_replaces_filename() {
+        assert_eq!(
+            output_peer_path("/agentlab/out/result.json", "prediction.json"),
+            "/agentlab/out/prediction.json"
+        );
+    }
+
+    #[test]
+    fn output_peer_path_no_parent_returns_filename() {
+        assert_eq!(output_peer_path("result.json", "prediction.json"), "prediction.json");
+    }
+
+    // ── Batch 10: find_project_root ──
+
+    #[test]
+    fn find_project_root_returns_parent_of_dot_lab() {
+        let guard = TempDirGuard::new("find_root_lab");
+        let lab_dir = guard.path.join(".lab");
+        fs::create_dir_all(&lab_dir).unwrap();
+        let result = find_project_root(&lab_dir);
+        assert_eq!(result, guard.path);
+    }
+
+    #[test]
+    fn find_project_root_no_dot_lab_returns_input() {
+        let guard = TempDirGuard::new("find_root_none");
+        let result = find_project_root(&guard.path);
+        assert_eq!(result, guard.path);
+    }
+
+    // ── Batch 10: slot_commit_journal_path ──
+
+    #[test]
+    fn slot_commit_journal_path_correct_structure() {
+        let path = slot_commit_journal_path(Path::new("/runs/run_1"));
+        assert_eq!(path, PathBuf::from("/runs/run_1/runtime/slot_commit_journal.jsonl"));
+    }
 }
