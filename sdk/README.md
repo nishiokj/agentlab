@@ -143,7 +143,6 @@ For each trial, runner prepares and mounts:
 3. `/agentlab/deps` (read-write): staged dependency files
 4. `/agentlab/out` (read-write): `result.json`, optional `trajectory.jsonl`
 5. `/agentlab/state` (read-write): runner internal state and metadata
-6. `/dataset` (read-only): dataset copy for the trial
 
 If task boundaries include `mount_references`, dataset packs are additionally mounted read-only to their declared paths.
 

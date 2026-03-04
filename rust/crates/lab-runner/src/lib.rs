@@ -4,8 +4,7 @@ use base64::Engine as _;
 use chrono::Utc;
 use lab_core::{
     canonical_json_digest, ensure_dir, runner_runtime_host_paths, sha256_bytes, sha256_file,
-    ArtifactStore, RunnerRuntimeHostPaths, AGENTLAB_AGENTLABD_START_REQUEST_PATH,
-    AGENTLAB_AGENTLABD_START_RESPONSE_PATH, AGENTLAB_BINDINGS_PATH, AGENTLAB_CONTRACT_DEPS_DIR,
+    ArtifactStore, RunnerRuntimeHostPaths, AGENTLAB_BINDINGS_PATH, AGENTLAB_CONTRACT_DEPS_DIR,
     AGENTLAB_CONTRACT_IN_DIR, AGENTLAB_CONTRACT_OUT_DIR, AGENTLAB_CONTRACT_STATE_DIR,
     AGENTLAB_CONTRACT_WORKSPACE_DIR, AGENTLAB_CONTROL_PATH, AGENTLAB_DEPENDENCIES_PATH,
     AGENTLAB_ENV_BINDINGS_PATH, AGENTLAB_ENV_DEPENDENCIES_PATH, AGENTLAB_ENV_POLICY_PATH,
@@ -2528,7 +2527,6 @@ pub fn replay_trial(run_dir: &Path, trial_id: &str, strict: bool) -> Result<Repl
     let task_boundary = parse_task_boundary_from_trial_input(&input)?;
     validate_task_boundary_workspace_materialization(&task_boundary, &policy_config.task_boundary)?;
 
-    let dataset_src = first_file_in_dir(&parent_trial_dir.join("dataset"))?;
     let replay_trial_dir = replay_dir.join("trial_1");
     ensure_dir(&replay_trial_dir)?;
     write_trial_state(
@@ -2546,7 +2544,7 @@ pub fn replay_trial(run_dir: &Path, trial_id: &str, strict: bool) -> Result<Repl
     } else {
         project_root.clone()
     };
-    let trial_paths = TrialPaths::new(&replay_trial_dir, &workspace_src, &dataset_src)?;
+    let trial_paths = TrialPaths::new(&replay_trial_dir, &workspace_src)?;
     trial_paths.prepare(true)?;
     stage_dependencies_for_trial(&agent_runtime, &trial_paths)?;
     materialize_workspace_files(&trial_paths, &task_boundary.workspace_files)?;
@@ -2648,19 +2646,6 @@ pub fn replay_trial(run_dir: &Path, trial_id: &str, strict: bool) -> Result<Repl
         replay_grade,
         harness_status: status,
     })
-}
-
-fn first_file_in_dir(dir: &Path) -> Result<PathBuf> {
-    if !dir.exists() {
-        return Err(anyhow!("directory not found: {}", dir.display()));
-    }
-    for entry in fs::read_dir(dir)? {
-        let entry = entry?;
-        if entry.file_type()?.is_file() {
-            return Ok(entry.path());
-        }
-    }
-    Err(anyhow!("no files found in {}", dir.display()))
 }
 
 fn replay_grade_for_integration(level: &str) -> &'static str {
@@ -2804,7 +2789,6 @@ fn fork_trial_inner(
     let task_boundary = parse_task_boundary_from_trial_input(&input)?;
     validate_task_boundary_workspace_materialization(&task_boundary, &policy_config.task_boundary)?;
 
-    let dataset_src = first_file_in_dir(&parent_trial_dir.join("dataset"))?;
     let fork_trial_dir = fork_dir.join("trial_1");
     ensure_dir(&fork_trial_dir)?;
     write_trial_state(
@@ -2831,7 +2815,7 @@ fn fork_trial_inner(
     } else {
         project_root.clone()
     };
-    let trial_paths = TrialPaths::new(&fork_trial_dir, &workspace_src, &dataset_src)?;
+    let trial_paths = TrialPaths::new(&fork_trial_dir, &workspace_src)?;
     trial_paths.prepare(true)?;
     stage_dependencies_for_trial(&agent_runtime, &trial_paths)?;
     materialize_workspace_files(&trial_paths, &task_boundary.workspace_files)?;
@@ -5387,7 +5371,7 @@ impl TrialExecutor {
         run_id: &str,
         workload_type: &str,
         project_root: &Path,
-        dataset_path: &Path,
+        _dataset_path: &Path,
         variants: &[Variant],
         tasks: &[Value],
         schedule_idx: usize,
@@ -5476,7 +5460,7 @@ impl TrialExecutor {
         write_trial_state(&trial_dir, &trial_id, "running", None, None, None)?;
         let mut trial_guard = TrialStateGuard::new(&trial_dir, &trial_id);
 
-        let trial_paths = TrialPaths::new(&trial_dir, project_root, dataset_path)?;
+        let trial_paths = TrialPaths::new(&trial_dir, project_root)?;
         trial_paths.prepare(false)?;
         stage_dependencies_for_trial(agent_runtime, &trial_paths)?;
         if container_mode
@@ -12739,16 +12723,14 @@ struct TrialPaths {
     workspace: PathBuf,
     state: PathBuf,
     deps: PathBuf,
-    dataset: PathBuf,
     out: PathBuf,
     tmp: PathBuf,
     runtime: RunnerRuntimeHostPaths,
-    dataset_src: PathBuf,
     exp_dir: PathBuf,
 }
 
 impl TrialPaths {
-    fn new(trial_dir: &Path, exp_dir: &Path, dataset_src: &Path) -> Result<Self> {
+    fn new(trial_dir: &Path, exp_dir: &Path) -> Result<Self> {
         let runtime = runner_runtime_host_paths(trial_dir);
         Ok(Self {
             trial_dir: trial_dir.to_path_buf(),
@@ -12756,11 +12738,9 @@ impl TrialPaths {
             workspace: runtime.workspace_dir.clone(),
             state: runtime.state_dir.clone(),
             deps: runtime.deps_dir.clone(),
-            dataset: trial_dir.join("dataset"),
             out: runtime.out_dir.clone(),
             tmp: runtime.tmp_dir.clone(),
             runtime,
-            dataset_src: dataset_src.to_path_buf(),
             exp_dir: exp_dir.to_path_buf(),
         })
     }
@@ -12770,7 +12750,6 @@ impl TrialPaths {
         ensure_dir(&self.workspace)?;
         ensure_dir(&self.state)?;
         ensure_dir(&self.deps)?;
-        ensure_dir(&self.dataset)?;
         ensure_dir(&self.out)?;
         ensure_dir(&self.tmp)?;
         if seed_workspace_from_exp_dir {
@@ -12798,10 +12777,6 @@ impl TrialPaths {
                 ],
             )?;
         }
-        fs::copy(
-            &self.dataset_src,
-            self.dataset.join(self.dataset_src.file_name().unwrap()),
-        )?;
         Ok(())
     }
 }
@@ -13638,10 +13613,6 @@ fn append_container_sandbox_args(
                 ]);
             }
         }
-        cmd.args([
-            "-v",
-            &format!("{}:/dataset:ro", request.trial_paths.dataset.display()),
-        ]);
         for mount in request.dynamic_mounts {
             cmd.args([
                 "-v",
@@ -14495,8 +14466,6 @@ fn prepare_io_paths(
         input_host,
         output_host,
         events_host,
-        agentlabd_start_request_host,
-        agentlabd_start_response_host,
     ) = if container_mode {
         (
             DEFAULT_CONTAINER_TASK_PATH.to_string(),
@@ -14514,8 +14483,6 @@ fn prepare_io_paths(
             resolve_trial_io_host_path(DEFAULT_CONTAINER_TRIAL_INPUT_PATH, paths, true)?,
             resolve_trial_io_host_path(DEFAULT_CONTAINER_RESULT_PATH, paths, true)?,
             resolve_trial_io_host_path(DEFAULT_CONTAINER_TRAJECTORY_PATH, paths, true)?,
-            resolve_trial_io_host_path(AGENTLAB_AGENTLABD_START_REQUEST_PATH, paths, true)?,
-            resolve_trial_io_host_path(AGENTLAB_AGENTLABD_START_RESPONSE_PATH, paths, true)?,
         )
     } else {
         let task_host = paths.runtime.task.clone();
@@ -14543,8 +14510,6 @@ fn prepare_io_paths(
             input_host,
             output_host,
             events_host,
-            paths.runtime.agentlabd_start_request.clone(),
-            paths.runtime.agentlabd_start_response.clone(),
         )
     };
 
@@ -14593,17 +14558,6 @@ fn prepare_io_paths(
     if trajectory_host.exists() {
         let _ = fs::remove_file(&trajectory_host);
     }
-    if let Some(parent) = agentlabd_start_request_host.parent() {
-        ensure_dir(parent)?;
-    }
-    if let Some(parent) = agentlabd_start_response_host.parent() {
-        ensure_dir(parent)?;
-    }
-    if agentlabd_start_response_host.exists() {
-        let _ = fs::remove_file(&agentlabd_start_response_host);
-    }
-
-    let _ = (agentlabd_start_request_host, agentlabd_start_response_host);
 
     Ok(PreparedTrialIo {
         output_host,
@@ -14737,7 +14691,6 @@ fn write_state_inventory(
             json!({"name": "workspace", "path": AGENTLAB_CONTRACT_WORKSPACE_DIR, "writable": true}),
             json!({"name": "state", "path": AGENTLAB_CONTRACT_STATE_DIR, "writable": true}),
             json!({"name": "deps", "path": AGENTLAB_CONTRACT_DEPS_DIR, "writable": true}),
-            json!({"name": "dataset", "path": "/dataset", "writable": false}),
             json!({"name": "out", "path": AGENTLAB_CONTRACT_OUT_DIR, "writable": true}),
             json!({"name": "tmp", "path": "/tmp", "writable": true}),
         ]
@@ -14747,7 +14700,6 @@ fn write_state_inventory(
             json!({"name": "workspace", "path": paths.workspace.to_string_lossy(), "writable": true}),
             json!({"name": "state", "path": paths.state.to_string_lossy(), "writable": true}),
             json!({"name": "deps", "path": paths.deps.to_string_lossy(), "writable": true}),
-            json!({"name": "dataset", "path": paths.dataset.to_string_lossy(), "writable": false}),
             json!({"name": "out", "path": paths.out.to_string_lossy(), "writable": true}),
             json!({"name": "tmp", "path": paths.tmp.to_string_lossy(), "writable": true}),
         ]
@@ -14805,12 +14757,12 @@ fn apply_materialization_policy(trial_dir: &Path, mode: MaterializationMode) -> 
     match mode {
         MaterializationMode::Full => return Ok(()),
         MaterializationMode::OutputsOnly => {
-            for dir_name in ["workspace", "dataset", "state", "tmp", "artifacts"] {
+            for dir_name in ["workspace", "state", "tmp", "artifacts"] {
                 remove_path_if_exists(&trial_dir.join(dir_name))?;
             }
         }
         MaterializationMode::MetadataOnly | MaterializationMode::None => {
-            for dir_name in ["workspace", "dataset", "state", "tmp", "artifacts", "out"] {
+            for dir_name in ["workspace", "state", "tmp", "artifacts", "out"] {
                 remove_path_if_exists(&trial_dir.join(dir_name))?;
             }
             remove_path_if_exists(&trial_dir.join("trial_input.json"))?;
@@ -15224,19 +15176,12 @@ mod tests {
         ensure_dir(&trial_dir).expect("trial dir");
         ensure_dir(&trial_dir.join("workspace")).expect("workspace");
         ensure_dir(&trial_dir.join("state")).expect("state");
-        ensure_dir(&trial_dir.join("dataset")).expect("dataset");
 
         fs::write(
             trial_dir.join("workspace").join("fixture.txt"),
             "workspace fixture",
         )
         .expect("workspace fixture");
-        fs::write(
-            trial_dir.join("dataset").join("tasks.jsonl"),
-            "{\"id\":\"task_1\"}\n",
-        )
-        .expect("dataset file");
-
         let trial_input = json!({
             "schema_version": "agent_task_v1",
             "ids": { "trial_id": trial_id, "variant_id": "base", "task_id": "task_1", "repl_idx": 0 },
@@ -15250,7 +15195,6 @@ mod tests {
                 "paths": {
                     "workspace": trial_dir.join("workspace").to_string_lossy().to_string(),
                     "state": trial_dir.join("state").to_string_lossy().to_string(),
-                    "dataset": trial_dir.join("dataset").to_string_lossy().to_string(),
                     "out": trial_dir.join("out").to_string_lossy().to_string(),
                     "tmp": trial_dir.join("tmp").to_string_lossy().to_string()
                 },
@@ -15392,11 +15336,9 @@ mod tests {
         let exp_dir = root.path.join("exp");
         ensure_dir(&exp_dir).expect("exp dir");
         fs::write(exp_dir.join("README.md"), "fixture").expect("exp fixture");
-        let dataset_src = root.path.join("tasks.jsonl");
-        fs::write(&dataset_src, "{\"id\":\"task_1\"}\n").expect("dataset");
         let trial_dir = root.path.join("trial_1");
         ensure_dir(&trial_dir).expect("trial");
-        let paths = TrialPaths::new(&trial_dir, &exp_dir, &dataset_src).expect("trial paths");
+        let paths = TrialPaths::new(&trial_dir, &exp_dir).expect("trial paths");
         paths.prepare(true).expect("prepare");
         (root, paths)
     }
@@ -15916,11 +15858,9 @@ mod tests {
         let exp_dir = root.path.join("exp");
         ensure_dir(&exp_dir).expect("exp");
         fs::write(exp_dir.join("fixture.txt"), "fixture").expect("exp fixture");
-        let dataset_src = root.path.join("tasks.jsonl");
-        fs::write(&dataset_src, "{\"id\":\"task_1\"}\n").expect("dataset");
         let trial_dir = root.path.join("trial_1");
         ensure_dir(&trial_dir).expect("trial");
-        let paths = TrialPaths::new(&trial_dir, &exp_dir, &dataset_src).expect("paths");
+        let paths = TrialPaths::new(&trial_dir, &exp_dir).expect("paths");
         paths.prepare(true).expect("prepare");
 
         let source_db = root.path.join("graphd.db");
@@ -19122,11 +19062,9 @@ mod tests {
         let exp_dir = root.path.join("exp");
         ensure_dir(&exp_dir).expect("exp dir");
         fs::write(exp_dir.join("README.md"), "fixture").expect("exp fixture");
-        let dataset_src = root.path.join("tasks.jsonl");
-        fs::write(&dataset_src, "{\"id\":\"task_1\"}\n").expect("dataset");
         let trial_dir = root.path.join("trial_1");
         ensure_dir(&trial_dir).expect("trial");
-        let paths = TrialPaths::new(&trial_dir, &exp_dir, &dataset_src).expect("trial paths");
+        let paths = TrialPaths::new(&trial_dir, &exp_dir).expect("trial paths");
         paths.prepare(true).expect("prepare");
 
         let files = vec![
@@ -19191,11 +19129,9 @@ mod tests {
         let exp_dir = root.path.join("exp");
         ensure_dir(&exp_dir).expect("exp");
         fs::write(exp_dir.join("harness.sh"), "#!/bin/sh\n").expect("harness");
-        let dataset_src = root.path.join("tasks.jsonl");
-        fs::write(&dataset_src, "{\"id\":\"task_1\"}\n").expect("dataset");
         let trial_dir = root.path.join("trial_1");
         ensure_dir(&trial_dir).expect("trial");
-        let paths = TrialPaths::new(&trial_dir, &exp_dir, &dataset_src).expect("paths");
+        let paths = TrialPaths::new(&trial_dir, &exp_dir).expect("paths");
         paths.prepare(true).expect("prepare");
 
         let json_value = json!({

@@ -19,10 +19,6 @@ pub const AGENTLAB_DEPENDENCIES_PATH: &str = "/agentlab/in/dependencies.json";
 pub const AGENTLAB_POLICY_PATH: &str = "/agentlab/in/policy.json";
 pub const AGENTLAB_RESULT_PATH: &str = "/agentlab/out/result.json";
 pub const AGENTLAB_TRAJECTORY_PATH: &str = "/agentlab/out/trajectory.jsonl";
-pub const AGENTLAB_AGENTLABD_START_REQUEST_PATH: &str =
-    "/agentlab/state/agentlabd_start_trial.request.json";
-pub const AGENTLAB_AGENTLABD_START_RESPONSE_PATH: &str =
-    "/agentlab/state/agentlabd_start_trial.response.json";
 pub const HARNESS_IN_DIR: &str = "/in";
 pub const HARNESS_OUT_DIR: &str = "/out";
 pub const HARNESS_TASK_PATH: &str = "/in/task.json";
@@ -59,10 +55,6 @@ pub struct RunnerRuntimeHostPaths {
     pub trial_output: PathBuf,
     pub trial_events: PathBuf,
     pub control: PathBuf,
-    pub entrypoint: PathBuf,
-    pub harness_invocation: PathBuf,
-    pub agentlabd_start_request: PathBuf,
-    pub agentlabd_start_response: PathBuf,
 }
 
 pub fn runner_runtime_host_paths(trial_dir: &Path) -> RunnerRuntimeHostPaths {
@@ -88,10 +80,6 @@ pub fn runner_runtime_host_paths(trial_dir: &Path) -> RunnerRuntimeHostPaths {
         trial_output: out_dir.join("trial_output.json"),
         trial_events: state_dir.join("events.jsonl"),
         control: state_dir.join("lab_control.json"),
-        entrypoint: state_dir.join("agentlab_bin").join("entrypoint"),
-        harness_invocation: in_dir.join("harness_invocation.json"),
-        agentlabd_start_request: state_dir.join("agentlabd_start_trial.request.json"),
-        agentlabd_start_response: state_dir.join("agentlabd_start_trial.response.json"),
     }
 }
 
