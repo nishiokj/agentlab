@@ -60,6 +60,10 @@ limit: 20
 agent:
   artifact: rex-minimal-linux-dir
   command: [rex, run, --dangerous]
+  default_config: overrides/defaults.bench-lmstudio-headless.json
+  provider_env:
+    - provider: z.ai-coder
+      env: ZAI_CODER_API_KEY
   io: { input: --input-file, output: --output }
   env:
     MEMORY_DAEMON_URL: ""
@@ -91,7 +95,10 @@ DX authoring notes:
 
 1. Built-in benchmark registry currently supports `benchmark: bench_v0`.
 2. `agent.artifact` resolves short names from `.lab/agents/`.
-3. In DX mode, legacy fields (`dataset`, `design`, `runtime`, `variant_plan`, `baseline.variant_id`) are rejected.
+3. `agent.default_config` stages the file (if needed) and appends `--config /agentlab/deps/<file>` when command does not already set `--config`.
+4. `agent.provider_env` appends `--provider-env provider=ENV` and auto-adds those env vars to `agent.env_from_host`.
+5. If staged config files include `.config/...` and `agent.env.HOME` is unset, HOME defaults to `/agentlab/deps` for runtime auth lookup.
+6. In DX mode, legacy fields (`dataset`, `design`, `runtime`, `variant_plan`, `baseline.variant_id`) are rejected.
 
 ## Runtime Contract
 

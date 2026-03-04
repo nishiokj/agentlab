@@ -19,6 +19,7 @@ import sys
 from pathlib import Path
 
 import click
+import yaml
 
 from bench.config import BenchConfig
 
@@ -174,6 +175,17 @@ def new_task(ctx: click.Context, task_id: str, repo: str, suite: str) -> None:
         click.echo(f"Task already exists: {target_dir}", err=True)
         sys.exit(1)
     shutil.copytree(template_dir, target_dir)
+
+    task_yaml = target_dir / "task.yaml"
+    if task_yaml.exists():
+        data = yaml.safe_load(task_yaml.read_text()) or {}
+        data["task_id"] = task_id
+        data["repo_id"] = repo
+        data["repo_snapshot"] = f"{repo}/src.tar.zst"
+        if not data.get("baseline_injection_patch"):
+            data["baseline_injection_patch"] = "injection.patch"
+        task_yaml.write_text(yaml.safe_dump(data, sort_keys=False))
+
     click.echo(f"Created task at {target_dir}")
 
 

@@ -4008,6 +4008,100 @@ fn parse_dx_arg_map(value: Option<&Value>, field: &str) -> Result<Value> {
     Ok(Value::Array(mapped))
 }
 
+fn parse_dx_provider_env(value: Option<&Value>, field: &str) -> Result<Vec<(String, String)>> {
+    let Some(raw) = value else {
+        return Ok(Vec::new());
+    };
+    let items = raw
+        .as_array()
+        .ok_or_else(|| anyhow!("{} must be an array", field))?;
+    let mut mappings = Vec::with_capacity(items.len());
+    for (idx, item) in items.iter().enumerate() {
+        if let Some(raw_mapping) = item.as_str() {
+            let trimmed = raw_mapping.trim();
+            let mut parts = trimmed.splitn(2, '=');
+            let provider = parts.next().unwrap_or("").trim();
+            let env_name = parts.next().unwrap_or("").trim();
+            if provider.is_empty() || env_name.is_empty() {
+                return Err(anyhow!(
+                    "{}[{}] must be 'provider=ENV_NAME' or {{provider, env}}",
+                    field,
+                    idx
+                ));
+            }
+            mappings.push((provider.to_string(), env_name.to_string()));
+            continue;
+        }
+
+        let obj = item
+            .as_object()
+            .ok_or_else(|| anyhow!("{}[{}] must be a string or object", field, idx))?;
+        let provider = obj
+            .get("provider")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .ok_or_else(|| anyhow!("{}[{}].provider must be a non-empty string", field, idx))?;
+        let env_name = obj
+            .get("env")
+            .or_else(|| obj.get("env_name"))
+            .or_else(|| obj.get("envName"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .ok_or_else(|| {
+                anyhow!(
+                    "{}[{}].env (or .env_name/.envName) must be a non-empty string",
+                    field,
+                    idx
+                )
+            })?;
+        mappings.push((provider.to_string(), env_name.to_string()));
+    }
+    Ok(mappings)
+}
+
+fn command_contains_flag(command: &[String], flag: &str) -> bool {
+    command.iter().any(|part| part == flag)
+}
+
+fn command_contains_flag_value(command: &[String], flag: &str, value: &str) -> bool {
+    command
+        .windows(2)
+        .any(|window| window[0] == flag && window[1] == value)
+}
+
+fn append_flag_value_once(command: &mut Vec<String>, flag: &str, value: String) {
+    if command_contains_flag_value(command, flag, &value) {
+        return;
+    }
+    command.push(flag.to_string());
+    command.push(value);
+}
+
+fn deps_destination_for_config_file(file: &str) -> String {
+    let destination_rel = Path::new(file)
+        .to_string_lossy()
+        .to_string()
+        .replace('\\', "/");
+    format!("{}/{}", AGENTLAB_CONTRACT_DEPS_DIR, destination_rel)
+}
+
+fn ensure_home_for_staged_auth_files(env: &mut BTreeMap<String, String>, config_files: &[String]) {
+    if env.contains_key("HOME") {
+        return;
+    }
+    let needs_home = config_files.iter().any(|file| {
+        let normalized = file.replace('\\', "/");
+        normalized.starts_with(".config/")
+            || normalized.starts_with(".codex/")
+            || normalized.starts_with(".nova/")
+    });
+    if needs_home {
+        env.insert("HOME".to_string(), AGENTLAB_CONTRACT_DEPS_DIR.to_string());
+    }
+}
+
 fn parse_dx_workspace_patches_raw(
     raw: Option<&Value>,
     field_prefix: &str,
@@ -4227,7 +4321,7 @@ fn parse_dx_agent_build(
         ));
     }
     let artifact_digest = compute_artifact_content_digest(&artifact_path)?;
-    let command =
+    let mut command =
         parse_dx_command_field_named(root.get("command"), &format!("{}.command", root_name))?;
 
     let io_input_arg = root
@@ -4246,8 +4340,8 @@ fn parse_dx_agent_build(
         .filter(|v| !v.is_empty())
         .unwrap_or("--output")
         .to_string();
-    let env = parse_string_map_field(root.get("env"), &format!("{}.env", root_name))?;
-    let env_from_host = parse_string_array_field(
+    let mut env = parse_string_map_field(root.get("env"), &format!("{}.env", root_name))?;
+    let mut env_from_host = parse_string_array_field(
         root.get("env_from_host"),
         &format!("{}.env_from_host", root_name),
     )?;
@@ -4256,20 +4350,46 @@ fn parse_dx_agent_build(
         &format!("{}.arg_map", root_name),
     )?;
 
-    let config_files = parse_string_array_field(
+    let mut config_files = parse_string_array_field(
         root.get("config_files"),
         &format!("{}.config_files", root_name),
     )?;
+    if let Some(default_config) = parse_optional_nonempty_string(
+        root.get("default_config"),
+        &format!("{}.default_config", root_name),
+    )? {
+        if !config_files.iter().any(|entry| entry == &default_config) {
+            config_files.push(default_config.clone());
+        }
+        if !command_contains_flag(&command, "--config") {
+            append_flag_value_once(
+                &mut command,
+                "--config",
+                deps_destination_for_config_file(&default_config),
+            );
+        }
+    }
+    for (provider, env_name) in parse_dx_provider_env(
+        root.get("provider_env"),
+        &format!("{}.provider_env", root_name),
+    )? {
+        if !env_from_host.iter().any(|entry| entry == &env_name) {
+            env_from_host.push(env_name.clone());
+        }
+        append_flag_value_once(
+            &mut command,
+            "--provider-env",
+            format!("{}={}", provider, env_name),
+        );
+    }
+    ensure_home_for_staged_auth_files(&mut env, &config_files);
+
     let mut file_staging = Vec::new();
     for file in &config_files {
         let source = resolve_dx_config_file_path(file, exp_dir, project_root);
-        let destination_rel = Path::new(file)
-            .to_string_lossy()
-            .to_string()
-            .replace('\\', "/");
         file_staging.push(json!({
             "source_from_host": source.to_string_lossy().to_string(),
-            "destination_path": format!("{}/{}", AGENTLAB_CONTRACT_DEPS_DIR, destination_rel),
+            "destination_path": deps_destination_for_config_file(file),
             "required": true,
             "read_only": true
         }));
@@ -4311,7 +4431,7 @@ fn runtime_override_for_variant_build(
             "command": build.command.clone(),
             "image_source": "per_task",
             "artifact": build.artifact_path.to_string_lossy().to_string(),
-            "artifact_digest": format!("sha256:{}", build.artifact_digest),
+            "artifact_digest": build.artifact_digest.clone(),
             "artifact_resolved_path": build.artifact_path.to_string_lossy().to_string(),
             "io": {
                 "input_arg": build.io_input_arg.clone(),
@@ -4719,7 +4839,7 @@ fn normalize_experiment_authoring(
         ));
     }
     let agent_artifact_digest = compute_artifact_content_digest(&agent_artifact_path)?;
-    let agent_command = parse_dx_command_field(agent_root.pointer("/command"))?;
+    let mut agent_command = parse_dx_command_field(agent_root.pointer("/command"))?;
 
     let io_input_arg = agent_root
         .pointer("/io/input")
@@ -4737,8 +4857,8 @@ fn normalize_experiment_authoring(
         .filter(|v| !v.is_empty())
         .unwrap_or("--output")
         .to_string();
-    let agent_env = parse_string_map_field(agent_root.pointer("/env"), "agent.env")?;
-    let agent_env_from_host =
+    let mut agent_env = parse_string_map_field(agent_root.pointer("/env"), "agent.env")?;
+    let mut agent_env_from_host =
         parse_string_array_field(agent_root.pointer("/env_from_host"), "agent.env_from_host")?;
     let bindings_to_args = parse_dx_arg_map(
         agent_root
@@ -4747,18 +4867,43 @@ fn normalize_experiment_authoring(
         "agent.arg_map",
     )?;
 
-    let config_files =
+    let mut config_files =
         parse_string_array_field(agent_root.pointer("/config_files"), "agent.config_files")?;
+    if let Some(default_config) = parse_optional_nonempty_string(
+        agent_root.pointer("/default_config"),
+        "agent.default_config",
+    )? {
+        if !config_files.iter().any(|entry| entry == &default_config) {
+            config_files.push(default_config.clone());
+        }
+        if !command_contains_flag(&agent_command, "--config") {
+            append_flag_value_once(
+                &mut agent_command,
+                "--config",
+                deps_destination_for_config_file(&default_config),
+            );
+        }
+    }
+    for (provider, env_name) in
+        parse_dx_provider_env(agent_root.pointer("/provider_env"), "agent.provider_env")?
+    {
+        if !agent_env_from_host.iter().any(|entry| entry == &env_name) {
+            agent_env_from_host.push(env_name.clone());
+        }
+        append_flag_value_once(
+            &mut agent_command,
+            "--provider-env",
+            format!("{}={}", provider, env_name),
+        );
+    }
+    ensure_home_for_staged_auth_files(&mut agent_env, &config_files);
+
     let mut file_staging = Vec::new();
     for file in config_files {
         let source = resolve_dx_config_file_path(&file, exp_dir, project_root);
-        let destination_rel = Path::new(&file)
-            .to_string_lossy()
-            .to_string()
-            .replace('\\', "/");
         file_staging.push(json!({
             "source_from_host": source.to_string_lossy().to_string(),
-            "destination_path": format!("{}/{}", AGENTLAB_CONTRACT_DEPS_DIR, destination_rel),
+            "destination_path": deps_destination_for_config_file(&file),
             "required": true,
             "read_only": true
         }));
@@ -4870,7 +5015,7 @@ fn normalize_experiment_authoring(
                 "command": agent_command,
                 "image_source": "per_task",
                 "artifact": agent_artifact_path.to_string_lossy().to_string(),
-                "artifact_digest": format!("sha256:{}", agent_artifact_digest),
+                "artifact_digest": agent_artifact_digest,
                 "artifact_resolved_path": agent_artifact_path.to_string_lossy().to_string(),
                 "io": {
                     "input_arg": io_input_arg,
@@ -12621,8 +12766,12 @@ fn validate_agent_artifact_pin(runtime_agent: &AgentRuntimeConfig) -> Result<()>
             .trim()
             .strip_prefix("sha256:")
             .unwrap_or(expected_digest);
-        let actual = compute_artifact_content_digest(artifact)?;
-        if !expected.eq_ignore_ascii_case(&actual) {
+        let actual_full = compute_artifact_content_digest(artifact)?;
+        let actual = actual_full
+            .trim()
+            .strip_prefix("sha256:")
+            .unwrap_or(actual_full.as_str());
+        if !expected.eq_ignore_ascii_case(actual) {
             return Err(anyhow!(
                 "runtime.agent.artifact digest mismatch: expected sha256:{}, got sha256:{}",
                 expected,
@@ -13807,6 +13956,37 @@ fn agent_artifact_cache_lock() -> &'static Mutex<()> {
     LOCK.get_or_init(|| Mutex::new(()))
 }
 
+fn repair_agent_artifact_layout(unpacked_dir: &Path) -> Result<()> {
+    let packages_root = unpacked_dir.join("packages");
+    let nested_packages_root = packages_root.join("packages");
+    if !packages_root.is_dir() || !nested_packages_root.is_dir() {
+        return Ok(());
+    }
+
+    for entry in fs::read_dir(&nested_packages_root)? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let shim_path = packages_root.join(&name);
+        if shim_path.exists() {
+            continue;
+        }
+        let nested_rel = Path::new("packages").join(&name);
+        let nested_abs = packages_root.join(&nested_rel);
+        if !nested_abs.exists() {
+            continue;
+        }
+        symlink(&nested_rel, &shim_path).map_err(|err| {
+            anyhow!(
+                "failed to create artifact layout shim {} -> {}: {}",
+                shim_path.display(),
+                nested_rel.display(),
+                err
+            )
+        })?;
+    }
+    Ok(())
+}
+
 fn resolve_agent_artifact_mount_dir(artifact: &Path) -> Result<PathBuf> {
     if artifact.is_dir() {
         return Ok(fs::canonicalize(artifact).unwrap_or_else(|_| artifact.to_path_buf()));
@@ -13840,14 +14020,18 @@ fn resolve_agent_artifact_mount_dir(artifact: &Path) -> Result<PathBuf> {
     };
 
     let digest = sha256_file(&artifact_path)?;
+    // Docker `-v` uses ':' as a delimiter in mount specs, so the host path
+    // component must be colon-free.
+    let digest_path_component = digest.replace(':', "_");
     let cache_root = artifact_path
         .parent()
         .unwrap_or_else(|| Path::new("."))
         .join(".agentlab_artifact_cache");
     ensure_dir(&cache_root)?;
-    let unpacked_dir = cache_root.join(&digest);
+    let unpacked_dir = cache_root.join(&digest_path_component);
     let ready_marker = unpacked_dir.join(".agentlab_ready");
     if ready_marker.exists() {
+        repair_agent_artifact_layout(&unpacked_dir)?;
         return Ok(unpacked_dir);
     }
 
@@ -13855,6 +14039,7 @@ fn resolve_agent_artifact_mount_dir(artifact: &Path) -> Result<PathBuf> {
         .lock()
         .map_err(|_| anyhow!("agent artifact cache lock poisoned"))?;
     if ready_marker.exists() {
+        repair_agent_artifact_layout(&unpacked_dir)?;
         return Ok(unpacked_dir);
     }
 
@@ -13863,7 +14048,7 @@ fn resolve_agent_artifact_mount_dir(artifact: &Path) -> Result<PathBuf> {
     }
     let staging_dir = cache_root.join(format!(
         "{}.tmp.{}.{}",
-        digest,
+        digest_path_component,
         std::process::id(),
         Utc::now().timestamp_micros()
     ));
@@ -13896,6 +14081,7 @@ fn resolve_agent_artifact_mount_dir(artifact: &Path) -> Result<PathBuf> {
             err
         ));
     }
+    repair_agent_artifact_layout(&unpacked_dir)?;
     fs::write(&ready_marker, digest.as_bytes())?;
     Ok(unpacked_dir)
 }
@@ -15053,6 +15239,36 @@ mod tests {
         ]
     }
 
+    fn legacy_contract_runtime_fixture() -> AgentRuntimeConfig {
+        AgentRuntimeConfig {
+            adapter_ref: AgentAdapterRef::default(),
+            command_raw: vec!["sh".to_string(), "-lc".to_string(), "echo ok".to_string()],
+            container_image: Some("img:latest".to_string()),
+            image_source: ImageSource::Global,
+            agent_artifact: None,
+            agent_artifact_digest: None,
+            agent_artifact_resolved_path: None,
+            io: AgentRuntimeIoConfig {
+                input_arg: "--input".to_string(),
+                output_arg: "--output".to_string(),
+            },
+            clean_contract_v1: false,
+            integration_level: "cli_basic".to_string(),
+            launch_mode: AgentLaunchMode::File,
+            env: BTreeMap::new(),
+            env_from_host: vec![],
+            bindings_to_args: Vec::new(),
+            workspace_patches: Vec::new(),
+            trajectory_path: None,
+            causal_extraction: None,
+            default_timeout_ms: None,
+            tracing_mode: None,
+            force_container: true,
+            dependency_file_staging: Vec::new(),
+            dependency_services: Vec::new(),
+        }
+    }
+
     #[test]
     fn adapter_registry_supports_prebuilt_codex_and_rex_jesus() {
         let codex = adapter_registry_entry(&AgentAdapterRef {
@@ -15398,6 +15614,18 @@ mod tests {
     }
 
     #[test]
+    fn contract_path_mapper_rejects_legacy_dataset_runtime_io_paths_in_container_mode() {
+        let (_root, paths) = create_trial_paths_fixture("agentlab_contract_mapper_dataset_legacy");
+        let err = resolve_trial_io_host_path("/dataset/tasks.jsonl", &paths, true)
+            .expect_err("reject legacy dataset runtime io path");
+        assert!(
+            err.to_string().contains("unsupported container mount path"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[test]
     fn contract_path_mapper_resolves_event_paths_and_rejects_invalid_roots() {
         let (_root, paths) = create_trial_paths_fixture("agentlab_contract_mapper_events");
         let trial_dir = paths.in_dir.parent().expect("trial dir").to_path_buf();
@@ -15422,6 +15650,93 @@ mod tests {
                 .contains("unsupported runtime event path for trial"),
             "unexpected error: {}",
             err
+        );
+    }
+
+    #[test]
+    fn write_state_inventory_container_excludes_legacy_dataset_mount() {
+        let (_root, paths) = create_trial_paths_fixture("agentlab_state_inventory_container");
+        let runtime = legacy_contract_runtime_fixture();
+        let experiment = json!({
+            "version": "0.3",
+            "design": { "sanitization_profile": "hermetic_functional" },
+            "runtime": { "policy": { "network": { "mode": "none", "allowed_hosts": [] } } }
+        });
+        write_state_inventory(
+            &paths.trial_dir,
+            &experiment,
+            &runtime,
+            true,
+            &paths,
+            "sha256:test",
+            "none",
+            "runtime_agent",
+        )
+        .expect("write state inventory");
+        let inventory = load_json_file(&paths.trial_dir.join("state_inventory.json"))
+            .expect("load state inventory");
+        let mounts = inventory
+            .pointer("/mounts")
+            .and_then(|v| v.as_array())
+            .expect("mounts");
+        let names = mounts
+            .iter()
+            .filter_map(|row| row.get("name").and_then(|v| v.as_str()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            names,
+            vec!["in", "workspace", "state", "deps", "out", "tmp"]
+        );
+        assert!(
+            !mounts.iter().any(|row| {
+                row.get("path").and_then(|v| v.as_str()) == Some("/dataset")
+                    || row.get("name").and_then(|v| v.as_str()) == Some("dataset")
+            }),
+            "legacy dataset mount unexpectedly present: {:?}",
+            mounts
+        );
+    }
+
+    #[test]
+    fn write_state_inventory_local_excludes_legacy_dataset_mount() {
+        let (_root, paths) = create_trial_paths_fixture("agentlab_state_inventory_local");
+        let runtime = legacy_contract_runtime_fixture();
+        let experiment = json!({
+            "version": "0.3",
+            "design": { "sanitization_profile": "hermetic_functional" },
+            "runtime": { "policy": { "network": { "mode": "none", "allowed_hosts": [] } } }
+        });
+        write_state_inventory(
+            &paths.trial_dir,
+            &experiment,
+            &runtime,
+            false,
+            &paths,
+            "sha256:test",
+            "full",
+            "runtime_agent",
+        )
+        .expect("write state inventory");
+        let inventory = load_json_file(&paths.trial_dir.join("state_inventory.json"))
+            .expect("load state inventory");
+        let mounts = inventory
+            .pointer("/mounts")
+            .and_then(|v| v.as_array())
+            .expect("mounts");
+        let names = mounts
+            .iter()
+            .filter_map(|row| row.get("name").and_then(|v| v.as_str()))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            names,
+            vec!["in", "workspace", "state", "deps", "out", "tmp"]
+        );
+        assert!(
+            !mounts
+                .iter()
+                .any(|row| row.get("name").and_then(|v| v.as_str()) == Some("dataset")),
+            "legacy dataset mount unexpectedly present: {:?}",
+            mounts
         );
     }
 
@@ -16117,6 +16432,37 @@ mod tests {
             err.to_string().contains("strict_source_unavailable"),
             "unexpected error: {}",
             err
+        );
+    }
+
+    #[test]
+    fn replay_trial_succeeds_without_legacy_dataset_trial_dir() {
+        let (_root, run_dir) =
+            create_run_dir("agentlab_replay_no_legacy_dataset_trial_dir", "run_1");
+        write_resolved_experiment_local_process(&run_dir, "cli_events");
+        fs::write(run_dir.join("tasks.jsonl"), "{\"id\":\"task_1\"}\n").expect("dataset");
+        let parent_trial_dir = seed_parent_trial(&run_dir, "trial_1", json!([]), "completed", None);
+        assert!(
+            !parent_trial_dir.join("dataset").exists(),
+            "hard cutover: parent trial should not carry legacy dataset dir"
+        );
+
+        let replay = replay_trial(&run_dir, "trial_1", false)
+            .expect("replay should not require legacy trial dataset dir");
+        let replay_trial_dir = replay.replay_dir.join("trial_1");
+        assert!(
+            replay_trial_dir.join("trial_input.json").exists(),
+            "replay trial input missing at {}",
+            replay_trial_dir.display()
+        );
+        assert!(
+            replay_trial_dir.join("trial_state.json").exists(),
+            "replay trial state missing at {}",
+            replay_trial_dir.display()
+        );
+        assert!(
+            !replay_trial_dir.join("dataset").exists(),
+            "hard cutover: replay should not materialize legacy dataset dir"
         );
     }
 
@@ -20207,6 +20553,11 @@ mod tests {
 
         let first_mount = resolve_agent_artifact_mount_dir(&artifact_tar).expect("first unpack");
         assert!(
+            !first_mount.to_string_lossy().contains(':'),
+            "artifact mount cache path must be colon-safe for docker bind mounts: {}",
+            first_mount.display()
+        );
+        assert!(
             first_mount.join("agent.txt").exists(),
             "unpacked artifact payload missing"
         );
@@ -20220,6 +20571,62 @@ mod tests {
         assert!(
             second_mount.join(".agentlab_ready").exists(),
             "cached artifact should include ready marker"
+        );
+    }
+
+    #[test]
+    fn inv04_agent_artifact_mount_cache_repairs_nested_packages_layout() {
+        let root = TempDirGuard::new("agentlab_inv04_artifact_layout_repair");
+        let artifact_src = root.path.join("artifact_src");
+        ensure_dir(&artifact_src.join("node_modules")).expect("node_modules dir");
+        ensure_dir(&artifact_src.join("packages").join("packages").join("infra").join("comms-bus"))
+            .expect("nested comms-bus dir");
+        fs::write(
+            artifact_src
+                .join("packages")
+                .join("packages")
+                .join("infra")
+                .join("comms-bus")
+                .join("package.json"),
+            "{}",
+        )
+        .expect("package marker");
+        symlink(
+            Path::new("../packages/infra/comms-bus"),
+            artifact_src.join("node_modules").join("comms-bus"),
+        )
+        .expect("broken layout symlink");
+
+        let artifact_tar = root.path.join("agent-runtime.tar.gz");
+        let tar_status = Command::new("tar")
+            .args([
+                "-czf",
+                artifact_tar.to_string_lossy().as_ref(),
+                "-C",
+                artifact_src.to_string_lossy().as_ref(),
+                ".",
+            ])
+            .status()
+            .expect("create tar");
+        assert!(tar_status.success(), "failed to create artifact tarball");
+
+        let mount_dir = resolve_agent_artifact_mount_dir(&artifact_tar).expect("mount dir");
+        assert!(
+            mount_dir
+                .join("packages")
+                .join("infra")
+                .join("comms-bus")
+                .join("package.json")
+                .exists(),
+            "expected compatibility shim at packages/infra"
+        );
+        assert!(
+            mount_dir
+                .join("node_modules")
+                .join("comms-bus")
+                .join("package.json")
+                .exists(),
+            "node_modules/comms-bus symlink should resolve after repair"
         );
     }
 
@@ -20338,6 +20745,14 @@ mod tests {
             "export const P='B';\n",
         )
         .expect("patch B");
+        fs::write(
+            overrides_dir.join("defaults.bench-lmstudio-headless.json"),
+            "{\n  \"models\": {\"default\": \"\"}\n}\n",
+        )
+        .expect("defaults config");
+        let codex_auth_dir = overrides_dir.join(".config").join("nova");
+        ensure_dir(&codex_auth_dir).expect("codex auth dir");
+        fs::write(codex_auth_dir.join("codex-auth.json"), "{}\n").expect("codex auth");
         root
     }
 
@@ -20390,8 +20805,10 @@ mod tests {
                     "id": "rex_default",
                     "artifact": "rex-minimal-linux-dir",
                     "command": ["rex", "run", "--dangerous"],
+                    "default_config": "defaults.bench-lmstudio-headless.json",
                     "io": { "input": "--input-file", "output": "--output" },
                     "config_files": ["providers.a.ts"],
+                    "provider_env": ["z.ai-coder=ZAI_CODER_API_KEY"],
                     "workspace_patches": {
                         "providers.a.ts": "packages/core/types/src/providers.ts"
                     },
@@ -20404,8 +20821,10 @@ mod tests {
                     "id": "rex_alt",
                     "artifact": "rex-minimal-linux-dir",
                     "command": ["rex", "run", "--alternate"],
+                    "default_config": "defaults.bench-lmstudio-headless.json",
                     "io": { "input": "--input-file", "output": "--output" },
                     "config_files": ["providers.b.ts"],
+                    "provider_env": [{ "provider": "anthropic", "env": "ANTHROPIC_API_KEY" }],
                     "workspace_patches": {
                         "providers.b.ts": "packages/core/types/src/providers.ts"
                     },
@@ -20490,6 +20909,88 @@ mod tests {
     }
 
     #[test]
+    fn normalize_authoring_supports_first_class_provider_env_and_default_config() {
+        let root = create_dx_authoring_fixture("agentlab_dx_first_class_agent_fields");
+        let spec = json!({
+            "experiment": {
+                "id": "bench_v0_first_class_agent_fields",
+                "name": "Bench v0 First-Class Agent Fields",
+                "tags": ["bench-v0", "dx"]
+            },
+            "benchmark": "bench_v0",
+            "agent": {
+                "artifact": "rex-minimal-linux-dir",
+                "command": ["rex", "run", "--dangerous"],
+                "default_config": "defaults.bench-lmstudio-headless.json",
+                "provider_env": [{ "provider": "z.ai-coder", "env": "ZAI_CODER_API_KEY" }],
+                "config_files": [".config/nova/codex-auth.json"]
+            },
+            "baseline": {
+                "id": "glm_5",
+                "bindings": { "model_provider": "z.ai-coder", "model": "glm-5" }
+            }
+        });
+        let resolved =
+            normalize_experiment_authoring(spec, &root.path, &root.path).expect("normalize");
+
+        let command = resolved
+            .pointer("/runtime/agent/command")
+            .and_then(Value::as_array)
+            .expect("runtime command array");
+        let command_tokens = command.iter().filter_map(Value::as_str).collect::<Vec<_>>();
+        assert!(
+            command_tokens.windows(2).any(|w| w[0] == "--config"
+                && w[1] == "/agentlab/deps/defaults.bench-lmstudio-headless.json"),
+            "command missing first-class --config injection: {:?}",
+            command_tokens
+        );
+        assert!(
+            command_tokens
+                .windows(2)
+                .any(|w| w[0] == "--provider-env" && w[1] == "z.ai-coder=ZAI_CODER_API_KEY"),
+            "command missing first-class --provider-env injection: {:?}",
+            command_tokens
+        );
+        assert_eq!(
+            resolved
+                .pointer("/runtime/agent/env_from_host/0")
+                .and_then(Value::as_str)
+                .unwrap_or(""),
+            "ZAI_CODER_API_KEY"
+        );
+        assert_eq!(
+            resolved
+                .pointer("/runtime/agent/env/HOME")
+                .and_then(Value::as_str)
+                .unwrap_or(""),
+            AGENTLAB_CONTRACT_DEPS_DIR
+        );
+
+        let staging = resolved
+            .pointer("/runtime/dependencies/file_staging")
+            .and_then(Value::as_array)
+            .expect("file staging");
+        let destinations = staging
+            .iter()
+            .filter_map(|row| row.get("destination_path").and_then(Value::as_str))
+            .collect::<Vec<_>>();
+        assert!(
+            destinations
+                .iter()
+                .any(|v| *v == "/agentlab/deps/defaults.bench-lmstudio-headless.json"),
+            "missing default config staging: {:?}",
+            destinations
+        );
+        assert!(
+            destinations
+                .iter()
+                .any(|v| *v == "/agentlab/deps/.config/nova/codex-auth.json"),
+            "missing codex auth staging: {:?}",
+            destinations
+        );
+    }
+
+    #[test]
     fn normalize_authoring_supports_agent_builds_and_variant_agent_refs() {
         let root = create_dx_authoring_fixture("agentlab_dx_v2_agent_builds");
         let spec = minimal_new_dx_spec();
@@ -20519,10 +21020,39 @@ mod tests {
         );
         assert_eq!(
             resolved
+                .pointer("/runtime/agent/env_from_host/0")
+                .and_then(Value::as_str)
+                .unwrap_or(""),
+            "ZAI_CODER_API_KEY"
+        );
+        assert_eq!(
+            resolved
                 .pointer("/variant_plan/0/variant_id")
                 .and_then(Value::as_str)
                 .unwrap_or(""),
             "sonnet"
+        );
+        let baseline_command = resolved
+            .pointer("/runtime/agent/command")
+            .and_then(Value::as_array)
+            .expect("baseline command");
+        let baseline_tokens = baseline_command
+            .iter()
+            .filter_map(Value::as_str)
+            .collect::<Vec<_>>();
+        assert!(
+            baseline_tokens.windows(2).any(|w| {
+                w[0] == "--config" && w[1] == "/agentlab/deps/defaults.bench-lmstudio-headless.json"
+            }),
+            "baseline command missing --config injection: {:?}",
+            baseline_tokens
+        );
+        assert!(
+            baseline_tokens
+                .windows(2)
+                .any(|w| w[0] == "--provider-env" && w[1] == "z.ai-coder=ZAI_CODER_API_KEY"),
+            "baseline command missing --provider-env injection: {:?}",
+            baseline_tokens
         );
         assert_eq!(
             resolved
@@ -20538,12 +21068,51 @@ mod tests {
                 .unwrap_or(""),
             "us"
         );
+        assert_eq!(
+            resolved
+                .pointer("/variant_plan/0/runtime_overrides/agent/env_from_host/0")
+                .and_then(Value::as_str)
+                .unwrap_or(""),
+            "ANTHROPIC_API_KEY"
+        );
+        let override_command = resolved
+            .pointer("/variant_plan/0/runtime_overrides/agent/command")
+            .and_then(Value::as_array)
+            .expect("override command");
+        let override_tokens = override_command
+            .iter()
+            .filter_map(Value::as_str)
+            .collect::<Vec<_>>();
+        assert!(
+            override_tokens.windows(2).any(|w| {
+                w[0] == "--config" && w[1] == "/agentlab/deps/defaults.bench-lmstudio-headless.json"
+            }),
+            "variant override command missing --config injection: {:?}",
+            override_tokens
+        );
+        assert!(
+            override_tokens
+                .windows(2)
+                .any(|w| w[0] == "--provider-env" && w[1] == "anthropic=ANTHROPIC_API_KEY"),
+            "variant override command missing --provider-env injection: {:?}",
+            override_tokens
+        );
     }
 
     #[test]
     fn build_experiment_package_rewrites_runtime_sources() {
         let root = create_dx_authoring_fixture("agentlab_build_package");
-        let spec = minimal_new_dx_spec();
+        let mut spec = minimal_new_dx_spec();
+        if let Some(builds) = spec
+            .pointer_mut("/agent_builds")
+            .and_then(Value::as_array_mut)
+        {
+            for build in builds {
+                if let Some(obj) = build.as_object_mut() {
+                    obj.remove("provider_env");
+                }
+            }
+        }
         let spec_path = root.path.join("experiment.yaml");
         fs::write(&spec_path, serde_yaml::to_string(&spec).expect("yaml")).expect("write spec");
 
@@ -20689,6 +21258,98 @@ mod tests {
             err.to_string().contains("legacy/removed fields"),
             "unexpected error: {}",
             err
+        );
+    }
+
+    #[test]
+    fn p0_container_mount_args_exclude_legacy_dataset_mount() {
+        let (root, paths) = create_trial_paths_fixture("agentlab_p0_no_dataset_mount");
+        let runtime = legacy_contract_runtime_fixture();
+        let runtime_env = BTreeMap::new();
+        let overrides = BTreeMap::new();
+        let io_paths = PreparedTrialIo {
+            output_host: paths.out.join("result.json"),
+            events_host: paths.state.join("events.jsonl"),
+            task_path: AGENTLAB_TASK_PATH.to_string(),
+            bindings_path: AGENTLAB_BINDINGS_PATH.to_string(),
+            dependencies_path: AGENTLAB_DEPENDENCIES_PATH.to_string(),
+            policy_path: AGENTLAB_POLICY_PATH.to_string(),
+            result_path: AGENTLAB_RESULT_PATH.to_string(),
+            trajectory_path: AGENTLAB_TRAJECTORY_PATH.to_string(),
+        };
+        let runtime_experiment = json!({
+            "runtime": {
+                "policy": {
+                    "sandbox": {
+                        "root_read_only": true,
+                        "hardening": {
+                            "no_new_privileges": true,
+                            "drop_all_caps": true
+                        }
+                    }
+                }
+            }
+        });
+        let dynamic_mounts = vec![ResolvedMountReference {
+            host_path: root.path.join("fixture-pack"),
+            mount_path: format!("{}/dataset_pack", AGENTLAB_CONTRACT_WORKSPACE_DIR),
+        }];
+        fs::write(&dynamic_mounts[0].host_path, "fixture").expect("fixture pack");
+        let request = AdapterRunRequest {
+            runtime_experiment: &runtime_experiment,
+            runtime: &runtime,
+            variant_args: &[],
+            runtime_env: &runtime_env,
+            runtime_overrides_env: &overrides,
+            container_mode: true,
+            trial_paths: &paths,
+            dynamic_mounts: &dynamic_mounts,
+            io_paths: &io_paths,
+            network_mode: "none",
+            setup_command: None,
+            benchmark_adapter: None,
+            benchmark_grading_enabled: false,
+            run_id: "run_1",
+            task_image: None,
+            task_workspace: None,
+            agent_artifact: None,
+        };
+        let mut cmd = Command::new("docker");
+        append_container_sandbox_args(&mut cmd, &request, Some(AGENTLAB_CONTRACT_WORKSPACE_DIR));
+        let args = cmd
+            .get_args()
+            .map(|value| value.to_string_lossy().to_string())
+            .collect::<Vec<_>>();
+        let mounts = args
+            .windows(2)
+            .filter(|pair| pair[0] == "-v")
+            .map(|pair| pair[1].to_string())
+            .collect::<Vec<_>>();
+        assert!(
+            mounts
+                .iter()
+                .any(|mount| mount.contains(&format!(":{}:ro", AGENTLAB_CONTRACT_IN_DIR))),
+            "missing in-dir mount: {:?}",
+            mounts
+        );
+        assert!(
+            mounts
+                .iter()
+                .any(|mount| mount.contains(&format!(":{}", AGENTLAB_CONTRACT_WORKSPACE_DIR))),
+            "missing workspace mount: {:?}",
+            mounts
+        );
+        assert!(
+            mounts
+                .iter()
+                .any(|mount| mount.contains(&format!(":{}", AGENTLAB_CONTRACT_STATE_DIR))),
+            "missing state mount: {:?}",
+            mounts
+        );
+        assert!(
+            !mounts.iter().any(|mount| mount.contains(":/dataset:")),
+            "legacy /dataset mount should not be present: {:?}",
+            mounts
         );
     }
 
@@ -20972,4 +21633,5 @@ mod tests {
             "canonical fixture must not contain shell cp glue"
         );
     }
+
 }
