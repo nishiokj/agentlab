@@ -1,0 +1,3 @@
+canonical_file=.lab/experiments/bench_v0_qwen35b_a3b_only.yaml
+check_no_opt_agent_bin=PASS
+check_no_cp_hack=PASS

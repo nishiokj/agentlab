@@ -128,6 +128,9 @@ pub fn list_views(run_dir: &Path) -> Result<Vec<String>> {
     let list_sql = "SELECT view_name AS table_name
                     FROM duckdb_views()
                     WHERE schema_name = 'main'
+                      AND view_name NOT LIKE 'duckdb_%'
+                      AND view_name NOT LIKE 'sqlite_%'
+                      AND view_name NOT LIKE 'pragma_%'
                     ORDER BY view_name";
     let table = match query_run_with_materialized_db(&context, list_sql) {
         Ok(table) => table,
@@ -618,7 +621,51 @@ SELECT
     try_cast(json_extract(row_json, '$.attempt') AS BIGINT) AS attempt,
     try_cast(json_extract(row_json, '$.row_seq') AS BIGINT) AS row_seq,
     json_extract_string(row_json, '$.variant_id') AS variant_id,
-    json_extract_string(row_json, '$.event_type') AS event_type
+    json_extract_string(row_json, '$.task_id') AS task_id,
+    try_cast(json_extract(row_json, '$.repl_idx') AS BIGINT) AS repl_idx,
+    try_cast(json_extract(row_json, '$.seq') AS BIGINT) AS seq,
+    json_extract_string(row_json, '$.event_type') AS event_type,
+    json_extract_string(row_json, '$.ts') AS ts,
+    try_cast(
+        coalesce(
+            json_extract(row_json, '$.step_index'),
+            json_extract(row_json, '$.payload.step_index')
+        ) AS BIGINT
+    ) AS step_index,
+    try_cast(
+        coalesce(
+            json_extract(row_json, '$.turn_index'),
+            json_extract(row_json, '$.payload.turn_index')
+        ) AS BIGINT
+    ) AS turn_index,
+    coalesce(
+        json_extract_string(row_json, '$.call_id'),
+        json_extract_string(row_json, '$.payload.call_id')
+    ) AS call_id,
+    coalesce(
+        json_extract_string(row_json, '$.model.identity'),
+        json_extract_string(row_json, '$.payload.model.identity')
+    ) AS model_identity,
+    coalesce(
+        json_extract_string(row_json, '$.tool.name'),
+        json_extract_string(row_json, '$.payload.tool.name')
+    ) AS tool_name,
+    coalesce(
+        json_extract_string(row_json, '$.outcome.status'),
+        json_extract_string(row_json, '$.payload.outcome.status')
+    ) AS outcome_status,
+    try_cast(
+        coalesce(
+            json_extract(row_json, '$.usage.tokens_in'),
+            json_extract(row_json, '$.payload.usage.tokens_in')
+        ) AS DOUBLE
+    ) AS usage_tokens_in,
+    try_cast(
+        coalesce(
+            json_extract(row_json, '$.usage.tokens_out'),
+            json_extract(row_json, '$.payload.usage.tokens_out')
+        ) AS DOUBLE
+    ) AS usage_tokens_out
 FROM filtered;
 
 CREATE OR REPLACE VIEW variant_snapshots AS
@@ -678,7 +725,13 @@ SELECT
     event_type,
     count(*) AS count
 FROM events
-GROUP BY run_id, trial_id, variant_id, event_type;
+GROUP BY run_id, trial_id, variant_id, event_type
+ORDER BY
+    run_id,
+    variant_id,
+    try_cast(regexp_extract(trial_id, '([0-9]+)$', 1) AS BIGINT) NULLS LAST,
+    trial_id,
+    event_type;
 
 CREATE OR REPLACE VIEW event_counts_by_variant AS
 SELECT
@@ -687,7 +740,8 @@ SELECT
     event_type,
     count(*) AS count
 FROM events
-GROUP BY run_id, variant_id, event_type;
+GROUP BY run_id, variant_id, event_type
+ORDER BY run_id, variant_id, event_type;
 
 CREATE OR REPLACE VIEW variant_summary AS
 SELECT
@@ -972,6 +1026,17 @@ ORDER BY t.run_id, t.variant_id, t.task_id;
 #[cfg(feature = "duckdb_engine")]
 fn execute_select_query(conn: &Connection, sql: &str) -> Result<QueryTable> {
     let normalized = normalize_sql(sql)?;
+    let describe_sql = format!("DESCRIBE SELECT * FROM ({}) AS __q", normalized);
+    let mut columns: Vec<String> = Vec::new();
+    if let Ok(mut describe_stmt) = conn.prepare(&describe_sql) {
+        if let Ok(mut describe_rows) = describe_stmt.query([]) {
+            while let Ok(Some(row)) = describe_rows.next() {
+                if let Ok(name) = row.get::<_, String>(0) {
+                    columns.push(name);
+                }
+            }
+        }
+    }
 
     let row_json_sql = format!(
         "SELECT to_json(__q) AS row_json FROM ({}) AS __q",
@@ -984,8 +1049,7 @@ fn execute_select_query(conn: &Connection, sql: &str) -> Result<QueryTable> {
         .query([])
         .with_context(|| format!("failed to execute query: {}", normalized))?;
 
-    let mut columns: Vec<String> = Vec::new();
-    let mut seen_columns: BTreeSet<String> = BTreeSet::new();
+    let mut seen_columns: BTreeSet<String> = columns.iter().cloned().collect();
     let mut parsed_rows: Vec<Value> = Vec::new();
 
     while let Some(row) = rows.next()? {

@@ -19,7 +19,7 @@ Use these names consistently in docs, code comments, and UX.
 
 | Primitive | Definition | Owner |
 | --- | --- | --- |
-| `Experiment` | Declarative config: dataset + design + runtime + policy. | User |
+| `Experiment` | Declarative config: DX authoring (`benchmark + agent + baseline + variants + overrides`) normalized to internal dataset/design/runtime/policy. | User |
 | `Task` | One dataset row (`task_jsonl_v1`). | Dataset provider |
 | `Variant` | Bindings/image override applied across tasks. | Experiment design |
 | `Trial` | `Task x Variant x Replication` execution unit. | Runner |
@@ -46,44 +46,52 @@ The following are intentionally not public primitives:
 - In-memory state machine structure.
 - Patch-spec and migration doc internals.
 
-## Minimal Experiment Shape
+## Minimal DX Experiment Shape
 
 ```yaml
-version: "0.5"
 experiment:
-  id: exp_local
-  workload_type: agent_runtime
+  id: bench_v0_qwen35b_a3b_only
+  name: "Bench v0: Qwen3.5 35B A3B (LM Studio)"
+  tags: [bench-v0, single-variant, lmstudio, qwen3.5-35b-a3b]
 
-dataset:
-  provider: local_jsonl
-  path: tasks.jsonl
-  schema_version: task_jsonl_v1
+benchmark: bench_v0
+limit: 20
 
-design:
-  comparison: paired
-  replications: 1
-  max_concurrency: 1
+agent:
+  artifact: rex-minimal-linux-dir
+  command: [rex, run, --dangerous]
+  io: { input: --input-file, output: --output }
+  env:
+    MEMORY_DAEMON_URL: ""
+  config_files:
+    - overrides/defaults.bench-lmstudio-headless.json
+    - overrides/providers.lmstudio-docker.ts
+    - overrides/providers.lmstudio-docker.js
+  workspace_patches:
+    overrides/providers.lmstudio-docker.ts: packages/core/types/src/providers.ts
+    overrides/providers.lmstudio-docker.js: packages/core/types/dist/providers.js
+  bindings_to_args:
+    - binding: model_provider
+      flag: --provider
+    - binding: model
+      flag: --model
 
 baseline:
-  variant_id: base
-  bindings: {}
+  id: qwen_35b_a3b
+  bindings:
+    model_provider: lmstudio
+    model: qwen3.5-35b-a3b
 
-variant_plan: []
-
-runtime:
-  agent:
-    command: ["python", "./examples/clean_harness/harness.py"]
-    image: python:3.11-slim
-    io:
-      input_arg: "{path}"
-      output_arg: "{path}"
-  policy:
-    timeout_ms: 600000
-    network:
-      mode: none
-    sandbox:
-      mode: container
+overrides:
+  network: full
+  root_read_only: false
 ```
+
+DX authoring notes:
+
+1. Built-in benchmark registry currently supports `benchmark: bench_v0`.
+2. `agent.artifact` resolves short names from `.lab/agents/`.
+3. In DX mode, legacy fields (`dataset`, `design`, `runtime`, `variant_plan`, `baseline.variant_id`) are rejected.
 
 ## Runtime Contract
 
@@ -122,24 +130,26 @@ cargo build --manifest-path rust/Cargo.toml -p lab-cli --release
 # check runner crate
 cargo check --manifest-path rust/Cargo.toml -p lab-runner
 
-# initialize local config
-rust/target/release/lab-cli init
+# create a DX experiment file using the "Minimal DX Experiment Shape" above
+mkdir -p .lab/experiments
+$EDITOR .lab/experiments/bench_v0_qwen35b_a3b_only.yaml
 
 # validate environment + resolved plan
-rust/target/release/lab-cli preflight .lab/experiment.yaml
-rust/target/release/lab-cli describe .lab/experiment.yaml --json
+rust/target/release/lab-cli preflight .lab/experiments/bench_v0_qwen35b_a3b_only.yaml
+rust/target/release/lab-cli describe .lab/experiments/bench_v0_qwen35b_a3b_only.yaml --json
 
 # run with Docker
-rust/target/release/lab-cli run .lab/experiment.yaml --executor local_docker
+rust/target/release/lab-cli run .lab/experiments/bench_v0_qwen35b_a3b_only.yaml --executor local_docker
 
 # fallback without Docker
-rust/target/release/lab-cli run .lab/experiment.yaml --executor local_process
+rust/target/release/lab-cli run .lab/experiments/bench_v0_qwen35b_a3b_only.yaml --executor local_process
 ```
 
 Notes:
 
 1. If `preflight` reports `container_ready=false`, use `local_process` or start Docker.
-2. If `local_process` fails with `No such file or directory (os error 2)` and command is `python`, switch to `python3` in your experiment.
+2. If `local_process` fails with command-not-found for `rex`, verify `agent.artifact` resolves under `.lab/agents/` and the artifact contains an executable `bin/rex`.
+3. If `preflight` reports missing config files, place them under `.lab/experiments/overrides/` or use absolute paths.
 
 ## Run Outputs (Contract-Level)
 
@@ -174,4 +184,3 @@ Key outputs:
 - `docs/AGENTLAB_ONBOARDING.md`: hands-on onboarding flow.
 - `docs/ARCHITECTURE.md`: boundary diagrams and architecture.
 - `docs/USAGE.md`: benchmark task tooling usage.
-

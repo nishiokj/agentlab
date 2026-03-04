@@ -24,14 +24,14 @@ use serde_json::Value;
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::env;
 use std::fs;
-use std::io::Write;
+use std::io::{BufRead, BufReader, Read, Write};
 #[cfg(unix)]
 use std::os::unix::fs::symlink;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Output, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -59,13 +59,24 @@ const BENCHMARK_PREDICTION_FILENAME: &str = "benchmark_prediction.json";
 const BENCHMARK_SCORE_FILENAME: &str = "benchmark_score.json";
 const BENCHMARK_GRADE_ERROR_FILENAME: &str = "benchmark_grade_error.txt";
 const AGENT_ARTIFACT_UNPACK_COMMAND: &str =
-    "tar --warning=no-unknown-keyword --no-same-owner --no-same-permissions -xzf /opt/agent.tar.gz -C /opt/agent && rm -f /opt/agent.tar.gz";
+    "tar -xzf /opt/agent.tar.gz -C /opt/agent && rm -f /opt/agent.tar.gz";
+const AGENT_ARTIFACT_PATH_ENV_VALUE: &str =
+    "PATH=/opt/agent/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 const BENCHMARK_GRADING_POLICY_EXIT_CODE: i32 = 125;
 const AGENTLAB_LOCAL_WORKER_MAX_IN_FLIGHT_ENV: &str = "AGENTLAB_LOCAL_WORKER_MAX_IN_FLIGHT";
 const AGENTLAB_MIN_FREE_BYTES_ENV: &str = "AGENTLAB_MIN_FREE_BYTES";
+const AGENTLAB_MAX_RUN_BYTES_ENV: &str = "AGENTLAB_MAX_RUN_BYTES";
+const AGENTLAB_PROGRESS_LOG_ENV: &str = "AGENTLAB_PROGRESS_LOG";
+const AGENTLAB_PREFLIGHT_IMAGE_PROBE_PARALLELISM_ENV: &str =
+    "AGENTLAB_PREFLIGHT_IMAGE_PROBE_PARALLELISM";
 const DEFAULT_MIN_FREE_BYTES: u64 = 20 * 1024 * 1024 * 1024;
+const DEFAULT_PREFLIGHT_IMAGE_PROBE_PARALLELISM: usize = 2;
+const MAX_PREFLIGHT_IMAGE_PROBE_PARALLELISM: usize = 8;
 const LOCAL_WORKER_CAPACITY_ERROR_PREFIX: &str = "local worker backend at capacity:";
 const LOCAL_WORKER_MAX_COMPLETIONS_PER_POLL: usize = 256;
+const RUNTIME_DISK_HEADROOM_CHECK_INTERVAL_SECONDS: u64 = 1;
+const RUNTIME_RUN_SIZE_CHECK_INTERVAL_SECONDS: u64 = 5;
+const RUN_DIR_CREATE_MAX_ATTEMPTS: usize = 64;
 const CANONICAL_TRIAL_RESULT_FILENAME: &str = "result.json";
 const PARALLEL_WORKER_CONTROL_SCHEMA_V1: &str = "parallel_worker_control_v1";
 const PARALLEL_WORKER_CONTROL_RESPONSE_COMPLETED: &str = "completed";
@@ -90,6 +101,142 @@ const BUILTIN_COMMAND_ADAPTER_VERSION: &str = "v1";
 const PREBUILT_CODEX_ADAPTER_ID: &str = "prebuilt.codex_cli";
 const PREBUILT_REX_JESUS_ADAPTER_ID: &str = "prebuilt.rex_jesus";
 const PREBUILT_AGENT_ADAPTER_VERSION: &str = "v1";
+
+fn parse_bool_env(value: &str) -> Option<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Some(true),
+        "0" | "false" | "no" | "off" => Some(false),
+        _ => None,
+    }
+}
+
+fn progress_logs_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        if let Ok(value) = env::var(AGENTLAB_PROGRESS_LOG_ENV) {
+            if let Some(parsed) = parse_bool_env(&value) {
+                return parsed;
+            }
+        }
+        !cfg!(test)
+    })
+}
+
+fn emit_progress_log(scope: &str, message: impl AsRef<str>) {
+    if !progress_logs_enabled() {
+        return;
+    }
+    eprintln!("[{}] {}", scope, message.as_ref());
+    let _ = std::io::stderr().flush();
+}
+
+fn emit_preflight_log(message: impl AsRef<str>) {
+    emit_progress_log("preflight", message);
+}
+
+fn emit_run_log(run_id: &str, message: impl AsRef<str>) {
+    emit_progress_log("run", format!("{}: {}", run_id, message.as_ref()));
+}
+
+fn should_emit_image_probe_progress(index: usize, total: usize) -> bool {
+    if total <= 5 {
+        return true;
+    }
+    index == 1 || index == total || index % 5 == 0
+}
+
+fn parse_parallelism(raw: &str) -> Option<usize> {
+    raw.trim().parse::<usize>().ok().and_then(|value| {
+        if value == 0 {
+            None
+        } else {
+            Some(value.min(MAX_PREFLIGHT_IMAGE_PROBE_PARALLELISM))
+        }
+    })
+}
+
+fn preflight_image_probe_parallelism() -> usize {
+    match env::var(AGENTLAB_PREFLIGHT_IMAGE_PROBE_PARALLELISM_ENV) {
+        Ok(raw) => parse_parallelism(&raw).unwrap_or(DEFAULT_PREFLIGHT_IMAGE_PROBE_PARALLELISM),
+        Err(_) => DEFAULT_PREFLIGHT_IMAGE_PROBE_PARALLELISM,
+    }
+}
+
+fn run_bounded_image_probes<T, F>(images: &[String], label: &str, probe: F) -> Vec<T>
+where
+    T: Send,
+    F: Fn(usize, &str) -> T + Sync,
+{
+    if images.is_empty() {
+        return Vec::new();
+    }
+    let configured = preflight_image_probe_parallelism();
+    let parallelism = configured.min(images.len()).max(1);
+    if parallelism <= 1 || images.len() <= 1 {
+        return images
+            .iter()
+            .enumerate()
+            .map(|(idx, image)| probe(idx, image))
+            .collect();
+    }
+    emit_preflight_log(format!(
+        "{}: bounded probe parallelism={}",
+        label, parallelism
+    ));
+    let next_index = AtomicUsize::new(0);
+    let results = Mutex::new(
+        std::iter::repeat_with(|| None)
+            .take(images.len())
+            .collect::<Vec<Option<T>>>(),
+    );
+    thread::scope(|scope| {
+        for _ in 0..parallelism {
+            let results_ref = &results;
+            let next_index_ref = &next_index;
+            let probe_ref = &probe;
+            scope.spawn(move || loop {
+                let idx = next_index_ref.fetch_add(1, Ordering::SeqCst);
+                if idx >= images.len() {
+                    break;
+                }
+                let result = probe_ref(idx, &images[idx]);
+                let mut guard = results_ref
+                    .lock()
+                    .expect("preflight image probe results lock poisoned");
+                guard[idx] = Some(result);
+            });
+        }
+    });
+    let collected = results
+        .into_inner()
+        .expect("preflight image probe results lock poisoned");
+    collected
+        .into_iter()
+        .map(|entry| entry.expect("preflight image probe result missing"))
+        .collect()
+}
+
+fn emit_slot_commit_progress(
+    run_id: &str,
+    completed_slots: usize,
+    total_slots: usize,
+    schedule_idx: usize,
+    trial_id: &str,
+    slot_status: &str,
+) {
+    let pct = if total_slots == 0 {
+        100.0
+    } else {
+        (completed_slots as f64 / total_slots as f64) * 100.0
+    };
+    emit_run_log(
+        run_id,
+        format!(
+            "progress {}/{} ({:.1}%) slot={} trial={} status={}",
+            completed_slots, total_slots, pct, schedule_idx, trial_id, slot_status
+        ),
+    );
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct AgentAdapterRef {
@@ -285,6 +432,37 @@ fn parse_local_worker_capacity_ceiling_from_env() -> Result<Option<usize>> {
         Err(err) => Err(anyhow!(
             "failed reading {}: {}",
             AGENTLAB_LOCAL_WORKER_MAX_IN_FLIGHT_ENV,
+            err
+        )),
+    }
+}
+
+fn parse_max_run_bytes_from_env() -> Result<Option<u64>> {
+    match env::var(AGENTLAB_MAX_RUN_BYTES_ENV) {
+        Ok(raw) => {
+            let trimmed = raw.trim();
+            if trimmed.is_empty() {
+                return Ok(None);
+            }
+            let parsed = trimmed.parse::<u64>().map_err(|_| {
+                anyhow!(
+                    "{} must be a positive integer when set (got: {})",
+                    AGENTLAB_MAX_RUN_BYTES_ENV,
+                    raw
+                )
+            })?;
+            if parsed == 0 {
+                return Err(anyhow!(
+                    "{} must be > 0 when set",
+                    AGENTLAB_MAX_RUN_BYTES_ENV
+                ));
+            }
+            Ok(Some(parsed))
+        }
+        Err(env::VarError::NotPresent) => Ok(None),
+        Err(err) => Err(anyhow!(
+            "failed reading {}: {}",
+            AGENTLAB_MAX_RUN_BYTES_ENV,
             err
         )),
     }
@@ -1680,6 +1858,41 @@ pub fn find_project_root(experiment_dir: &Path) -> PathBuf {
     experiment_dir.to_path_buf()
 }
 
+fn create_unique_run_dir(project_root: &Path) -> Result<(String, PathBuf)> {
+    let runs_dir = project_root.join(".lab").join("runs");
+    ensure_dir(&runs_dir)?;
+    static RUN_ID_COUNTER: AtomicU64 = AtomicU64::new(1);
+
+    for _ in 0..RUN_DIR_CREATE_MAX_ATTEMPTS {
+        let now = Utc::now();
+        let seq = RUN_ID_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let run_id = format!(
+            "run_{}_{:06}_{:06}",
+            now.format("%Y%m%d_%H%M%S"),
+            now.timestamp_subsec_micros(),
+            seq % 1_000_000
+        );
+        let run_dir = runs_dir.join(&run_id);
+        match fs::create_dir(&run_dir) {
+            Ok(_) => return Ok((run_id, run_dir)),
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(err) => {
+                return Err(anyhow!(
+                    "failed to create run directory {}: {}",
+                    run_dir.display(),
+                    err
+                ))
+            }
+        }
+    }
+
+    Err(anyhow!(
+        "failed to allocate a unique run directory under {} after {} attempts",
+        runs_dir.display(),
+        RUN_DIR_CREATE_MAX_ATTEMPTS
+    ))
+}
+
 #[derive(Debug, Clone)]
 pub struct ExperimentSummary {
     pub exp_id: String,
@@ -2323,6 +2536,7 @@ pub fn replay_trial(run_dir: &Path, trial_id: &str, strict: bool) -> Result<Repl
     trial_paths.prepare(true)?;
     stage_dependencies_for_trial(&agent_runtime, &trial_paths)?;
     materialize_workspace_files(&trial_paths, &task_boundary.workspace_files)?;
+    stage_workspace_patches_for_trial(&agent_runtime, &trial_paths)?;
 
     set_json_pointer_value(
         &mut input,
@@ -2607,6 +2821,7 @@ fn fork_trial_inner(
     trial_paths.prepare(true)?;
     stage_dependencies_for_trial(&agent_runtime, &trial_paths)?;
     materialize_workspace_files(&trial_paths, &task_boundary.workspace_files)?;
+    stage_workspace_patches_for_trial(&agent_runtime, &trial_paths)?;
 
     set_json_pointer_value(
         &mut input,
@@ -3655,6 +3870,1028 @@ fn is_clean_contract_experiment(json_value: &Value) -> bool {
     experiment_version_string(json_value).as_deref() == Some("1.0")
 }
 
+fn is_dx_contract_authoring(json_value: &Value) -> bool {
+    json_value.pointer("/agent").is_some()
+        || json_value.pointer("/overrides").is_some()
+        || json_value.pointer("/baseline/id").is_some()
+        || matches!(json_value.pointer("/benchmark"), Some(Value::String(_)))
+        || json_value.pointer("/variants").is_some()
+}
+
+fn resolve_default_owner() -> String {
+    let owner_from_git = Command::new("git")
+        .args(["config", "--get", "user.name"])
+        .output()
+        .ok()
+        .filter(|out| out.status.success())
+        .and_then(|out| String::from_utf8(out.stdout).ok())
+        .map(|name| name.trim().to_string())
+        .filter(|name| !name.is_empty());
+    owner_from_git
+        .or_else(|| {
+            std::env::var("USER")
+                .ok()
+                .map(|user| user.trim().to_string())
+        })
+        .filter(|owner| !owner.is_empty())
+        .unwrap_or_else(|| "unknown".to_string())
+}
+
+fn tokenize_command_string(raw: &str) -> Result<Vec<String>> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut in_single = false;
+    let mut in_double = false;
+    let mut escaped = false;
+
+    for ch in raw.chars() {
+        if escaped {
+            current.push(ch);
+            escaped = false;
+            continue;
+        }
+        if in_single {
+            if ch == '\'' {
+                in_single = false;
+            } else {
+                current.push(ch);
+            }
+            continue;
+        }
+        if in_double {
+            if ch == '"' {
+                in_double = false;
+            } else if ch == '\\' {
+                escaped = true;
+            } else {
+                current.push(ch);
+            }
+            continue;
+        }
+        match ch {
+            '\\' => escaped = true,
+            '\'' => in_single = true,
+            '"' => in_double = true,
+            c if c.is_whitespace() => {
+                if !current.is_empty() {
+                    tokens.push(std::mem::take(&mut current));
+                }
+            }
+            _ => current.push(ch),
+        }
+    }
+    if escaped || in_single || in_double {
+        return Err(anyhow!("agent.command has unclosed quote/escape"));
+    }
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+    if tokens.is_empty() {
+        return Err(anyhow!("agent.command must not be empty"));
+    }
+    Ok(tokens)
+}
+
+fn parse_dx_command_field_named(value: Option<&Value>, field: &str) -> Result<Vec<String>> {
+    match value {
+        Some(Value::String(raw)) => tokenize_command_string(raw),
+        Some(Value::Array(_)) => {
+            let parts = parse_string_array_field(value, field)?;
+            if parts.is_empty() {
+                return Err(anyhow!("{} must not be empty", field));
+            }
+            Ok(parts)
+        }
+        Some(_) => Err(anyhow!("{} must be a string or string[]", field)),
+        None => Err(anyhow!("{} is required", field)),
+    }
+}
+
+fn parse_dx_command_field(value: Option<&Value>) -> Result<Vec<String>> {
+    parse_dx_command_field_named(value, "agent.command")
+}
+
+fn parse_dx_arg_map(value: Option<&Value>, field: &str) -> Result<Value> {
+    let Some(raw) = value else {
+        return Ok(json!([]));
+    };
+    let items = raw
+        .as_array()
+        .ok_or_else(|| anyhow!("{} must be an array", field))?;
+    let mut mapped = Vec::with_capacity(items.len());
+    for (idx, item) in items.iter().enumerate() {
+        let obj = item
+            .as_object()
+            .ok_or_else(|| anyhow!("{}[{}] must be an object", field, idx))?;
+        let key = obj
+            .get("key")
+            .or_else(|| obj.get("binding"))
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .ok_or_else(|| {
+                anyhow!(
+                    "{}[{}].key (or legacy .binding) must be a non-empty string",
+                    field,
+                    idx
+                )
+            })?;
+        let flag = obj
+            .get("flag")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .ok_or_else(|| anyhow!("{}[{}].flag must be a non-empty string", field, idx))?;
+        mapped.push(json!({
+            "binding": key,
+            "flag": flag,
+        }));
+    }
+    Ok(Value::Array(mapped))
+}
+
+fn parse_dx_workspace_patches_raw(
+    raw: Option<&Value>,
+    field_prefix: &str,
+    exp_dir: &Path,
+    project_root: &Path,
+) -> Result<Vec<Value>> {
+    let Some(raw) = raw else {
+        return Ok(Vec::new());
+    };
+    let mut patches = Vec::new();
+    match raw {
+        Value::Object(map) => {
+            let mut ordered: BTreeMap<String, String> = BTreeMap::new();
+            for (source, target) in map {
+                let target = target.as_str().ok_or_else(|| {
+                    anyhow!("{}['{}'] must be a string", field_prefix, source)
+                })?;
+                ordered.insert(source.clone(), target.to_string());
+            }
+            for (source, target) in ordered {
+                let _ = validate_workspace_relative_path(&target).map_err(|e| {
+                    anyhow!("{} target '{}' is invalid: {}", field_prefix, target, e)
+                })?;
+                patches.push(json!({
+                    "source_from_host": resolve_dx_config_file_path(&source, exp_dir, project_root).to_string_lossy().to_string(),
+                    "target_path": target
+                }));
+            }
+        }
+        Value::Array(items) => {
+            for (idx, item) in items.iter().enumerate() {
+                let obj = item
+                    .as_object()
+                    .ok_or_else(|| anyhow!("{}[{}] must be an object", field_prefix, idx))?;
+                let source = obj.get("source").and_then(Value::as_str).ok_or_else(|| {
+                    anyhow!("{}[{}].source missing", field_prefix, idx)
+                })?;
+                let target = obj.get("target").and_then(Value::as_str).ok_or_else(|| {
+                    anyhow!("{}[{}].target missing", field_prefix, idx)
+                })?;
+                let _ = validate_workspace_relative_path(target).map_err(|e| {
+                    anyhow!(
+                        "{}[{}].target '{}' is invalid: {}",
+                        field_prefix,
+                        idx,
+                        target,
+                        e
+                    )
+                })?;
+                patches.push(json!({
+                    "source_from_host": resolve_dx_config_file_path(source, exp_dir, project_root).to_string_lossy().to_string(),
+                    "target_path": target
+                }));
+            }
+        }
+        _ => {
+            return Err(anyhow!(
+                "{} must be an object or an array",
+                field_prefix
+            ))
+        }
+    }
+    Ok(patches)
+}
+
+fn resolve_dx_artifact_path(raw: &str, exp_dir: &Path, project_root: &Path) -> PathBuf {
+    let trimmed = raw.trim();
+    let candidate = Path::new(trimmed);
+    if candidate.is_absolute() {
+        return normalize_path(candidate);
+    }
+    if trimmed.starts_with("./") || trimmed.starts_with("../") || trimmed.contains('/') {
+        return normalize_path(&exp_dir.join(candidate));
+    }
+
+    let agents_root = project_root.join(".lab").join("agents");
+    let direct = agents_root.join(trimmed);
+    if direct.exists() {
+        return normalize_path(&direct);
+    }
+    for ext in [".tar.gz", ".tgz", ".tar"] {
+        let with_ext = agents_root.join(format!("{}{}", trimmed, ext));
+        if with_ext.exists() {
+            return normalize_path(&with_ext);
+        }
+    }
+    normalize_path(&direct)
+}
+
+fn resolve_dx_config_file_path(raw: &str, exp_dir: &Path, project_root: &Path) -> PathBuf {
+    let trimmed = raw.trim();
+    let source = Path::new(trimmed);
+    if source.is_absolute() {
+        return normalize_path(source);
+    }
+    let exp_relative = normalize_path(&exp_dir.join(source));
+    if exp_relative.exists() {
+        return exp_relative;
+    }
+    let overrides_base = project_root
+        .join(".lab")
+        .join("experiments")
+        .join("overrides");
+    normalize_path(&overrides_base.join(source))
+}
+
+fn compute_artifact_content_digest(path: &Path) -> Result<String> {
+    if path.is_file() {
+        return sha256_file(path);
+    }
+    if !path.is_dir() {
+        return Err(anyhow!(
+            "artifact path must be a file or directory: {}",
+            path.display()
+        ));
+    }
+
+    let mut lines = Vec::new();
+    for entry in walkdir::WalkDir::new(path)
+        .into_iter()
+        .filter_map(|e| e.ok())
+    {
+        let p = entry.path();
+        if p == path {
+            continue;
+        }
+        let rel = p
+            .strip_prefix(path)
+            .unwrap_or(p)
+            .to_string_lossy()
+            .replace('\\', "/");
+        let meta = fs::symlink_metadata(p)?;
+        if meta.file_type().is_symlink() {
+            let target = fs::read_link(p)
+                .map(|v| v.to_string_lossy().to_string())
+                .unwrap_or_else(|_| "<unreadable>".to_string());
+            lines.push(format!("L {} -> {}", rel, target));
+        } else if meta.is_dir() {
+            lines.push(format!("D {}", rel));
+        } else if meta.is_file() {
+            lines.push(format!("F {} {}", rel, sha256_file(p)?));
+        }
+    }
+    lines.sort();
+    Ok(sha256_bytes(lines.join("\n").as_bytes()))
+}
+
+fn parse_dx_workspace_patches(
+    json_value: &Value,
+    exp_dir: &Path,
+    project_root: &Path,
+) -> Result<Vec<Value>> {
+    parse_dx_workspace_patches_raw(
+        json_value.pointer("/agent/workspace_patches"),
+        "agent.workspace_patches",
+        exp_dir,
+        project_root,
+    )
+}
+
+#[derive(Debug, Clone)]
+struct DxResolvedAgentBuild {
+    id: String,
+    artifact_raw: String,
+    artifact_path: PathBuf,
+    artifact_digest: String,
+    command: Vec<String>,
+    io_input_arg: String,
+    io_output_arg: String,
+    env: BTreeMap<String, String>,
+    env_from_host: Vec<String>,
+    bindings_to_args: Value,
+    config_files: Vec<String>,
+    workspace_patches_raw: Option<Value>,
+    file_staging: Vec<Value>,
+    workspace_patches_resolved: Vec<Value>,
+}
+
+#[derive(Debug, Clone)]
+struct DxVariantSpec {
+    id: String,
+    baseline: bool,
+    agent_ref: String,
+    config: Value,
+    env: BTreeMap<String, String>,
+}
+
+fn uses_new_variant_agent_model(json_value: &Value) -> bool {
+    if matches!(json_value.pointer("/agent_builds"), Some(Value::Array(_))) {
+        return true;
+    }
+    let Some(Value::Array(variants)) = json_value.pointer("/variants") else {
+        return false;
+    };
+    variants.iter().any(|variant| {
+        variant.get("agent_ref").is_some()
+            || variant.get("config").is_some()
+            || variant.get("baseline").is_some()
+    })
+}
+
+fn parse_dx_agent_build(
+    root: &Value,
+    root_name: &str,
+    id: String,
+    exp_dir: &Path,
+    project_root: &Path,
+) -> Result<DxResolvedAgentBuild> {
+    let artifact_raw = root
+        .get("artifact")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .ok_or_else(|| anyhow!("{}.artifact is required", root_name))?
+        .to_string();
+    let artifact_path = resolve_dx_artifact_path(&artifact_raw, exp_dir, project_root);
+    if !artifact_path.exists() {
+        return Err(anyhow!(
+            "{}.artifact resolved path does not exist: {}",
+            root_name,
+            artifact_path.display()
+        ));
+    }
+    let artifact_digest = compute_artifact_content_digest(&artifact_path)?;
+    let command = parse_dx_command_field_named(root.get("command"), &format!("{}.command", root_name))?;
+
+    let io_input_arg = root
+        .pointer("/io/input")
+        .or_else(|| root.pointer("/io/input_arg"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .unwrap_or("--input-file")
+        .to_string();
+    let io_output_arg = root
+        .pointer("/io/output")
+        .or_else(|| root.pointer("/io/output_arg"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .unwrap_or("--output")
+        .to_string();
+    let env = parse_string_map_field(root.get("env"), &format!("{}.env", root_name))?;
+    let env_from_host =
+        parse_string_array_field(root.get("env_from_host"), &format!("{}.env_from_host", root_name))?;
+    let bindings_to_args = parse_dx_arg_map(
+        root.get("arg_map").or_else(|| root.get("bindings_to_args")),
+        &format!("{}.arg_map", root_name),
+    )?;
+
+    let config_files =
+        parse_string_array_field(root.get("config_files"), &format!("{}.config_files", root_name))?;
+    let mut file_staging = Vec::new();
+    for file in &config_files {
+        let source = resolve_dx_config_file_path(file, exp_dir, project_root);
+        let destination_rel = Path::new(file)
+            .to_string_lossy()
+            .to_string()
+            .replace('\\', "/");
+        file_staging.push(json!({
+            "source_from_host": source.to_string_lossy().to_string(),
+            "destination_path": format!("{}/{}", AGENTLAB_CONTRACT_DEPS_DIR, destination_rel),
+            "required": true,
+            "read_only": true
+        }));
+    }
+    let workspace_patches_raw = root.get("workspace_patches").cloned();
+    let workspace_patches_resolved = parse_dx_workspace_patches_raw(
+        workspace_patches_raw.as_ref(),
+        &format!("{}.workspace_patches", root_name),
+        exp_dir,
+        project_root,
+    )?;
+    Ok(DxResolvedAgentBuild {
+        id,
+        artifact_raw,
+        artifact_path,
+        artifact_digest,
+        command,
+        io_input_arg,
+        io_output_arg,
+        env,
+        env_from_host,
+        bindings_to_args,
+        config_files,
+        workspace_patches_raw,
+        file_staging,
+        workspace_patches_resolved,
+    })
+}
+
+fn runtime_override_for_variant_build(
+    build: &DxResolvedAgentBuild,
+    variant_env: &BTreeMap<String, String>,
+) -> Value {
+    let mut merged_env = build.env.clone();
+    for (key, value) in variant_env {
+        merged_env.insert(key.clone(), value.clone());
+    }
+    json!({
+        "agent": {
+            "command": build.command,
+            "image_source": "per_task",
+            "artifact": build.artifact_path.to_string_lossy().to_string(),
+            "artifact_digest": format!("sha256:{}", build.artifact_digest),
+            "artifact_resolved_path": build.artifact_path.to_string_lossy().to_string(),
+            "io": {
+                "input_arg": build.io_input_arg,
+                "output_arg": build.io_output_arg
+            },
+            "env": merged_env,
+            "env_from_host": build.env_from_host,
+            "arg_map": build.bindings_to_args,
+            "bindings_to_args": build.bindings_to_args,
+            "workspace_patches": build.workspace_patches_resolved
+        },
+        "dependencies": {
+            "file_staging": build.file_staging,
+            "services": []
+        }
+    })
+}
+
+fn rewrite_new_variant_agent_model(
+    json_value: &Value,
+    exp_dir: &Path,
+    project_root: &Path,
+) -> Result<Value> {
+    let mut rewritten = json_value.clone();
+    let mut builds_by_id: BTreeMap<String, DxResolvedAgentBuild> = BTreeMap::new();
+
+    if let Some(agent_builds) = json_value.pointer("/agent_builds") {
+        let items = agent_builds
+            .as_array()
+            .ok_or_else(|| anyhow!("agent_builds must be an array"))?;
+        if items.is_empty() {
+            return Err(anyhow!("agent_builds must include at least one build"));
+        }
+        for (idx, item) in items.iter().enumerate() {
+            let item_obj = item
+                .as_object()
+                .ok_or_else(|| anyhow!("agent_builds[{}] must be an object", idx))?;
+            let id = item_obj
+                .get("id")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .ok_or_else(|| anyhow!("agent_builds[{}].id is required", idx))?
+                .to_string();
+            if builds_by_id.contains_key(&id) {
+                return Err(anyhow!("agent_builds contains duplicate id '{}'", id));
+            }
+            let parsed = parse_dx_agent_build(
+                item,
+                &format!("agent_builds[{}]", idx),
+                id.clone(),
+                exp_dir,
+                project_root,
+            )?;
+            builds_by_id.insert(id, parsed);
+        }
+    } else {
+        let legacy_agent = json_value
+            .pointer("/agent")
+            .ok_or_else(|| anyhow!("agent_builds is required when agent section is missing"))?;
+        let parsed = parse_dx_agent_build(
+            legacy_agent,
+            "agent",
+            "default".to_string(),
+            exp_dir,
+            project_root,
+        )?;
+        builds_by_id.insert("default".to_string(), parsed);
+    }
+
+    let variants = json_value
+        .pointer("/variants")
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow!("variants must be an array"))?;
+    if variants.is_empty() {
+        return Err(anyhow!("variants must include at least one entry"));
+    }
+
+    let default_build_ref = if builds_by_id.len() == 1 {
+        builds_by_id.keys().next().cloned()
+    } else {
+        None
+    };
+
+    let mut parsed_variants = Vec::with_capacity(variants.len());
+    for (idx, item) in variants.iter().enumerate() {
+        let id = item
+            .get("id")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .ok_or_else(|| anyhow!("variants[{}].id is required", idx))?
+            .to_string();
+        let baseline = item
+            .get("baseline")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        let config = item
+            .get("config")
+            .or_else(|| item.get("bindings"))
+            .cloned()
+            .unwrap_or_else(|| json!({}));
+        if !config.is_object() {
+            return Err(anyhow!("variants[{}].config must be an object", idx));
+        }
+        let env = parse_string_map_field(item.get("env"), &format!("variants[{}].env", idx))?;
+        let agent_ref = item
+            .get("agent_ref")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .map(ToString::to_string)
+            .or_else(|| default_build_ref.clone())
+            .ok_or_else(|| {
+                anyhow!(
+                    "variants[{}].agent_ref is required when multiple agent_builds are declared",
+                    idx
+                )
+            })?;
+        if !builds_by_id.contains_key(&agent_ref) {
+            return Err(anyhow!(
+                "variants[{}].agent_ref '{}' does not match any agent_builds[].id",
+                idx,
+                agent_ref
+            ));
+        }
+        parsed_variants.push(DxVariantSpec {
+            id,
+            baseline,
+            agent_ref,
+            config,
+            env,
+        });
+    }
+
+    let baseline_indices = parsed_variants
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, variant)| variant.baseline.then_some(idx))
+        .collect::<Vec<_>>();
+    let baseline_idx = if baseline_indices.len() == 1 {
+        baseline_indices[0]
+    } else if baseline_indices.is_empty() && parsed_variants.len() == 1 {
+        0
+    } else if baseline_indices.is_empty() {
+        return Err(anyhow!(
+            "exactly one variants[].baseline=true is required when more than one variant is declared"
+        ));
+    } else {
+        return Err(anyhow!(
+            "exactly one variants[].baseline=true is required (found {})",
+            baseline_indices.len()
+        ));
+    };
+
+    let baseline_variant = parsed_variants[baseline_idx].clone();
+    let baseline_build = builds_by_id
+        .get(&baseline_variant.agent_ref)
+        .ok_or_else(|| anyhow!("internal error: baseline agent build missing"))?;
+
+    let mut baseline_agent_env = baseline_build.env.clone();
+    for (key, value) in &baseline_variant.env {
+        baseline_agent_env.insert(key.clone(), value.clone());
+    }
+    let baseline_agent = {
+        let mut agent = json!({
+            "artifact": baseline_build.artifact_raw,
+            "command": baseline_build.command,
+            "io": {
+                "input": baseline_build.io_input_arg,
+                "output": baseline_build.io_output_arg,
+            },
+            "env": baseline_agent_env,
+            "env_from_host": baseline_build.env_from_host,
+            "bindings_to_args": baseline_build.bindings_to_args,
+            "arg_map": baseline_build.bindings_to_args,
+            "config_files": baseline_build.config_files,
+        });
+        if let Some(workspace_patches_raw) = baseline_build.workspace_patches_raw.clone() {
+            set_json_pointer_value(&mut agent, "/workspace_patches", workspace_patches_raw)?;
+        }
+        agent
+    };
+    set_json_pointer_value(&mut rewritten, "/agent", baseline_agent)?;
+    set_json_pointer_value(
+        &mut rewritten,
+        "/baseline",
+        json!({
+            "id": baseline_variant.id,
+            "bindings": baseline_variant.config,
+        }),
+    )?;
+
+    let mut treatment_variants = Vec::new();
+    for (idx, variant) in parsed_variants.iter().enumerate() {
+        if idx == baseline_idx {
+            continue;
+        }
+        let mut entry = json!({
+            "id": variant.id,
+            "bindings": variant.config,
+            "agent_ref": variant.agent_ref,
+        });
+        let variant_build = builds_by_id
+            .get(&variant.agent_ref)
+            .ok_or_else(|| anyhow!("internal error: missing build for variant {}", variant.id))?;
+        if variant.agent_ref != baseline_variant.agent_ref || !variant.env.is_empty() {
+            set_json_pointer_value(
+                &mut entry,
+                "/runtime_overrides",
+                runtime_override_for_variant_build(variant_build, &variant.env),
+            )?;
+        }
+        treatment_variants.push(entry);
+    }
+    set_json_pointer_value(&mut rewritten, "/variants", Value::Array(treatment_variants))?;
+    if rewritten.pointer("/agent_builds").is_some() {
+        set_json_pointer_value(&mut rewritten, "/agent_builds", Value::Null)?;
+    }
+    Ok(rewritten)
+}
+
+fn reject_legacy_fields_in_dx_authoring(json_value: &Value) -> Result<()> {
+    let mut removed = Vec::new();
+    let checks = [
+        (
+            "/dataset",
+            "removed: benchmark registry owns dataset/provider/schema wiring",
+        ),
+        (
+            "/design",
+            "removed: use top-level DX fields (limit/concurrency/overrides)",
+        ),
+        ("/runtime", "removed: use top-level agent + overrides"),
+        (
+            "/metrics",
+            "removed: benchmark-owned + runner-owned metrics are resolved automatically",
+        ),
+        (
+            "/variant_plan",
+            "removed: use /variants in DX authoring surface",
+        ),
+        (
+            "/baseline/variant_id",
+            "removed: use /baseline/id in DX authoring surface",
+        ),
+    ];
+    for (pointer, reason) in checks {
+        if !matches!(json_value.pointer(pointer), None | Some(Value::Null)) {
+            removed.push(format!("{} ({})", pointer, reason));
+        }
+    }
+    if matches!(json_value.pointer("/benchmark"), Some(Value::Object(_))) {
+        removed.push("/benchmark object (removed: use benchmark: <name>)".to_string());
+    }
+    if !removed.is_empty() {
+        return Err(anyhow!(
+            "legacy/removed fields are not allowed in DX authoring:\n{}",
+            removed
+                .iter()
+                .map(|line| format!("  - {}", line))
+                .collect::<Vec<_>>()
+                .join("\n")
+        ));
+    }
+    Ok(())
+}
+
+fn normalize_experiment_authoring(
+    json_value: Value,
+    exp_dir: &Path,
+    project_root: &Path,
+) -> Result<Value> {
+    if !is_dx_contract_authoring(&json_value) {
+        return Ok(json_value);
+    }
+    reject_legacy_fields_in_dx_authoring(&json_value)?;
+
+    let experiment_id = json_value
+        .pointer("/experiment/id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .ok_or_else(|| anyhow!("experiment.id is required"))?
+        .to_string();
+    let experiment_name = json_value
+        .pointer("/experiment/name")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(ToString::to_string)
+        .unwrap_or_else(|| experiment_id.clone());
+    let experiment_description = json_value
+        .pointer("/experiment/description")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(ToString::to_string);
+    let experiment_tags =
+        parse_string_array_field(json_value.pointer("/experiment/tags"), "experiment.tags")?;
+    let owner = json_value
+        .pointer("/experiment/owner")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(ToString::to_string)
+        .unwrap_or_else(resolve_default_owner);
+
+    let benchmark_name = json_value
+        .pointer("/benchmark")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .ok_or_else(|| anyhow!("benchmark is required and must be a non-empty string"))?;
+    if benchmark_name != "bench_v0" {
+        return Err(anyhow!(
+            "unknown benchmark '{}': only built-in benchmark 'bench_v0' is currently supported",
+            benchmark_name
+        ));
+    }
+
+    let baseline_id = json_value
+        .pointer("/baseline/id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .ok_or_else(|| anyhow!("baseline.id is required"))?
+        .to_string();
+    let baseline_bindings = json_value
+        .pointer("/baseline/bindings")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    if !baseline_bindings.is_object() {
+        return Err(anyhow!("baseline.bindings must be an object"));
+    }
+
+    let mut variant_plan = Vec::new();
+    if let Some(items) = json_value.pointer("/variants") {
+        let arr = items
+            .as_array()
+            .ok_or_else(|| anyhow!("variants must be an array"))?;
+        for (idx, item) in arr.iter().enumerate() {
+            let id = item
+                .get("id")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .ok_or_else(|| anyhow!("variants[{}].id is required", idx))?;
+            let bindings = item.get("bindings").cloned().unwrap_or_else(|| json!({}));
+            if !bindings.is_object() {
+                return Err(anyhow!("variants[{}].bindings must be an object", idx));
+            }
+            variant_plan.push(json!({
+                "variant_id": id,
+                "bindings": bindings
+            }));
+        }
+    }
+
+    let has_variant_plan = !variant_plan.is_empty();
+    let comparison = if has_variant_plan { "paired" } else { "none" };
+    let scheduling = if has_variant_plan {
+        "paired_interleaved"
+    } else {
+        "variant_sequential"
+    };
+
+    let agent_root = json_value
+        .pointer("/agent")
+        .ok_or_else(|| anyhow!("agent section is required"))?;
+    let agent_artifact_raw = agent_root
+        .pointer("/artifact")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .ok_or_else(|| anyhow!("agent.artifact is required"))?;
+    let agent_artifact_path = resolve_dx_artifact_path(agent_artifact_raw, exp_dir, project_root);
+    if !agent_artifact_path.exists() {
+        return Err(anyhow!(
+            "agent.artifact resolved path does not exist: {}",
+            agent_artifact_path.display()
+        ));
+    }
+    let agent_artifact_digest = compute_artifact_content_digest(&agent_artifact_path)?;
+    let agent_command = parse_dx_command_field(agent_root.pointer("/command"))?;
+
+    let io_input_arg = agent_root
+        .pointer("/io/input")
+        .or_else(|| agent_root.pointer("/io/input_arg"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .unwrap_or("--input-file")
+        .to_string();
+    let io_output_arg = agent_root
+        .pointer("/io/output")
+        .or_else(|| agent_root.pointer("/io/output_arg"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .unwrap_or("--output")
+        .to_string();
+    let agent_env = parse_string_map_field(agent_root.pointer("/env"), "agent.env")?;
+    let agent_env_from_host =
+        parse_string_array_field(agent_root.pointer("/env_from_host"), "agent.env_from_host")?;
+    let bindings_to_args = agent_root
+        .pointer("/bindings_to_args")
+        .cloned()
+        .unwrap_or_else(|| json!([]));
+
+    let config_files =
+        parse_string_array_field(agent_root.pointer("/config_files"), "agent.config_files")?;
+    let mut file_staging = Vec::new();
+    for file in config_files {
+        let source = resolve_dx_config_file_path(&file, exp_dir, project_root);
+        let destination_rel = Path::new(&file)
+            .to_string_lossy()
+            .to_string()
+            .replace('\\', "/");
+        file_staging.push(json!({
+            "source_from_host": source.to_string_lossy().to_string(),
+            "destination_path": format!("{}/{}", AGENTLAB_CONTRACT_DEPS_DIR, destination_rel),
+            "required": true,
+            "read_only": true
+        }));
+    }
+    let workspace_patches = parse_dx_workspace_patches(&json_value, exp_dir, project_root)?;
+
+    let timeout_ms = json_value
+        .pointer("/timeout_ms")
+        .or_else(|| json_value.pointer("/agent/timeout_ms"))
+        .and_then(Value::as_u64)
+        .unwrap_or(600_000);
+    let network_mode = json_value
+        .pointer("/overrides/network")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .unwrap_or("none")
+        .to_string();
+    if network_mode != "none" && network_mode != "full" && network_mode != "allowlist_enforced" {
+        return Err(anyhow!(
+            "overrides.network must be one of: none, full, allowlist_enforced (got '{}')",
+            network_mode
+        ));
+    }
+    let root_read_only = json_value
+        .pointer("/overrides/root_read_only")
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+
+    let limit = json_value.pointer("/limit").and_then(Value::as_u64);
+    let replications = json_value
+        .pointer("/replications")
+        .and_then(Value::as_u64)
+        .unwrap_or(1)
+        .max(1);
+    let random_seed = json_value
+        .pointer("/random_seed")
+        .and_then(Value::as_u64)
+        .unwrap_or(1);
+    let max_concurrency = json_value
+        .pointer("/concurrency")
+        .and_then(Value::as_u64)
+        .unwrap_or(1)
+        .max(1);
+
+    let dataset_path = project_root
+        .join(".lab")
+        .join("experiments")
+        .join("data")
+        .join("bench_v0.task_boundary_v2.jsonl");
+
+    let mut resolved = json!({
+        "version": "0.5",
+        "experiment": {
+            "id": experiment_id,
+            "name": experiment_name,
+            "owner": owner,
+            "workload_type": "agent_runtime",
+            "tags": experiment_tags
+        },
+        "dataset": {
+            "provider": "local_jsonl",
+            "path": dataset_path.to_string_lossy().to_string(),
+            "schema_version": "task_boundary_v2",
+            "suite_id": "bench_v0",
+            "split_id": "test"
+        },
+        "design": {
+            "sanitization_profile": "hermetic_functional",
+            "comparison": comparison,
+            "replications": replications,
+            "random_seed": random_seed,
+            "shuffle_tasks": true,
+            "max_concurrency": max_concurrency,
+            "policies": {
+                "scheduling": scheduling,
+                "retry": {
+                    "max_attempts": 1
+                }
+            }
+        },
+        "metrics": [
+            { "id": "duration_ms", "source": "runner", "weight": 0, "primary": false },
+            { "id": "turn_count", "source": "runner", "weight": 0, "primary": false },
+            { "id": "resolved", "source": "output", "json_pointer": "/metrics/resolved", "weight": 1, "direction": "maximize", "primary": true },
+            { "id": "hidden_cases_passed", "source": "output", "json_pointer": "/metrics/hidden_cases_passed", "weight": 0, "primary": false },
+            { "id": "hidden_cases_total", "source": "output", "json_pointer": "/metrics/hidden_cases_total", "weight": 0, "primary": false }
+        ],
+        "baseline": {
+            "variant_id": baseline_id,
+            "bindings": baseline_bindings
+        },
+        "benchmark": {
+            "policy": {
+                "task_model": "independent",
+                "evaluator_mode": "custom",
+                "scoring_lifecycle": "predict_then_score",
+                "chain_failure_policy": "continue_with_flag"
+            },
+            "adapter": {
+                "command": [
+                    "python3",
+                    "/opt/bench/bench_benchmark_adapter.py"
+                ]
+            }
+        },
+        "runtime": {
+            "agent": {
+                "command": agent_command,
+                "image_source": "per_task",
+                "artifact": agent_artifact_path.to_string_lossy().to_string(),
+                "artifact_digest": format!("sha256:{}", agent_artifact_digest),
+                "artifact_resolved_path": agent_artifact_path.to_string_lossy().to_string(),
+                "io": {
+                    "input_arg": io_input_arg,
+                    "output_arg": io_output_arg
+                },
+                "env": agent_env,
+                "env_from_host": agent_env_from_host,
+                "bindings_to_args": bindings_to_args,
+                "workspace_patches": workspace_patches
+            },
+            "dependencies": {
+                "file_staging": file_staging,
+                "services": []
+            },
+            "policy": {
+                "timeout_ms": timeout_ms,
+                "sandbox": {
+                    "mode": "container",
+                    "root_read_only": root_read_only
+                },
+                "network": {
+                    "mode": network_mode,
+                    "allowed_hosts": []
+                }
+            }
+        },
+        "validity": {
+            "fail_on_state_leak": true,
+            "fail_on_profile_invariant_violation": true
+        }
+    });
+    if let Some(description) = experiment_description {
+        set_json_pointer_value(&mut resolved, "/experiment/description", json!(description))?;
+    }
+    if let Some(limit) = limit {
+        set_json_pointer_value(&mut resolved, "/dataset/limit", json!(limit))?;
+    }
+    if !variant_plan.is_empty() {
+        set_json_pointer_value(&mut resolved, "/variant_plan", Value::Array(variant_plan))?;
+    }
+    Ok(resolved)
+}
+
 fn experiment_workload_type(json_value: &Value) -> Result<String> {
     if let Some(value) = json_value
         .pointer("/experiment/workload_type")
@@ -4052,9 +5289,11 @@ fn load_jsonl_value_rows(path: &Path) -> Result<Vec<Value>> {
     if !path.exists() {
         return Ok(Vec::new());
     }
-    let raw = fs::read_to_string(path)?;
     let mut rows = Vec::new();
-    for line in raw.lines() {
+    let file = fs::File::open(path)?;
+    let reader = BufReader::new(file);
+    for line in reader.lines() {
+        let line = line?;
         let trimmed = line.trim();
         if trimmed.is_empty() {
             continue;
@@ -4226,6 +5465,7 @@ impl TrialExecutor {
         }
 
         materialize_workspace_files(&trial_paths, &task_boundary.workspace_files)?;
+        stage_workspace_patches_for_trial(agent_runtime, &trial_paths)?;
         let dynamic_mounts = resolve_task_mounts(
             project_root,
             &task_boundary.mount_references,
@@ -4427,14 +5667,6 @@ impl TrialExecutor {
             };
             let proc_result = adapter.run_trial(&run_request)?;
             status = proc_result.status;
-            atomic_write_bytes(
-                &trial_dir.join("harness_stdout.log"),
-                proc_result.stdout.as_bytes(),
-            )?;
-            atomic_write_bytes(
-                &trial_dir.join("harness_stderr.log"),
-                proc_result.stderr.as_bytes(),
-            )?;
 
             if let Some(receiver) = otel_receiver {
                 let records = receiver.records();
@@ -5113,6 +6345,14 @@ impl RunCoordinator {
         next_progress.updated_at = Utc::now().to_rfc3339();
         write_schedule_progress(run_dir, &next_progress)?;
         *schedule_progress = next_progress;
+        emit_slot_commit_progress(
+            &schedule_progress.run_id,
+            schedule_progress.next_schedule_index,
+            schedule_progress.total_slots,
+            schedule_idx,
+            "-",
+            "skipped_pruned",
+        );
         slot_attempts.insert(schedule_idx, attempt);
         Ok(())
     }
@@ -5294,6 +6534,14 @@ impl RunCoordinator {
         write_schedule_progress(run_dir, &next_progress)?;
 
         *schedule_progress = next_progress;
+        emit_slot_commit_progress(
+            &schedule_progress.run_id,
+            schedule_progress.next_schedule_index,
+            schedule_progress.total_slots,
+            schedule_idx,
+            &trial_result.trial_id,
+            &trial_result.slot_status,
+        );
         *consecutive_failures = next_consecutive_failures;
         *pruned_variants = next_pruned_variants;
         slot_attempts.insert(schedule_idx, attempt);
@@ -5959,6 +7207,12 @@ fn execute_schedule_engine_parallel(
     }
     let dispatch_capacity = local_backend.effective_max_in_flight();
     let backend: Box<dyn WorkerBackend> = Box::new(local_backend);
+    let min_free_bytes = resolve_min_free_bytes()?;
+    let max_run_bytes = parse_max_run_bytes_from_env()?;
+    let disk_check_interval = Duration::from_secs(RUNTIME_DISK_HEADROOM_CHECK_INTERVAL_SECONDS);
+    let run_size_check_interval = Duration::from_secs(RUNTIME_RUN_SIZE_CHECK_INTERVAL_SECONDS);
+    let mut last_disk_check = Instant::now() - disk_check_interval;
+    let mut last_run_size_check = Instant::now() - run_size_check_interval;
 
     let journal_records = load_slot_commit_records(run_dir)?;
     let mut committer = DeterministicCommitter::from_progress(schedule_progress, &journal_records);
@@ -6015,6 +7269,17 @@ fn execute_schedule_engine_parallel(
     )?;
 
     while committer.next_commit_idx < schedule.len() || !in_flight.is_empty() {
+        if last_disk_check.elapsed() >= disk_check_interval {
+            enforce_runtime_disk_headroom(run_dir, min_free_bytes)?;
+            last_disk_check = Instant::now();
+        }
+        if let Some(max_bytes) = max_run_bytes {
+            if last_run_size_check.elapsed() >= run_size_check_interval {
+                enforce_runtime_run_size_budget(run_dir, max_bytes)?;
+                last_run_size_check = Instant::now();
+            }
+        }
+
         if let Some(outcome) = process_parallel_worker_control_request(
             run_dir,
             run_id,
@@ -6296,15 +7561,18 @@ fn run_experiment_with_behavior(
     if let Some(overrides_path) = overrides_path {
         json_value = apply_experiment_overrides(json_value, overrides_path, &project_root)?;
     }
+    json_value = normalize_experiment_authoring(json_value, &exp_dir, &project_root)?;
     validate_required_fields(&json_value)?;
     let workload_type = experiment_workload_type(&json_value)?;
 
     let execution = normalize_execution_options(&execution);
     let materialize_mode = execution.materialize.unwrap_or(MaterializationMode::Full);
 
-    let run_id = format!("run_{}", Utc::now().format("%Y%m%d_%H%M%S"));
-    let run_dir = project_root.join(".lab").join("runs").join(&run_id);
-    ensure_dir(&run_dir)?;
+    let (run_id, run_dir) = create_unique_run_dir(&project_root)?;
+    emit_run_log(
+        &run_id,
+        format!("created run directory {}", run_dir.display()),
+    );
     write_run_control_v2(&run_dir, &run_id, "running", &[], None)?;
     write_run_session_state(&run_dir, &run_id, &behavior, &execution)?;
     let _engine_lease_guard = start_engine_lease_heartbeat(&run_dir, &run_id)?;
@@ -6335,6 +7603,16 @@ fn run_experiment_with_behavior(
         .pointer("/design/replications")
         .and_then(|v| v.as_u64())
         .ok_or_else(|| anyhow!("missing /design/replications"))? as usize;
+    emit_run_log(
+        &run_id,
+        format!(
+            "resolved experiment: tasks={} variants={} replications={} total_trials={}",
+            tasks.len(),
+            variants.len(),
+            replications,
+            tasks.len() * variants.len() * replications
+        ),
+    );
 
     let trials_dir = run_dir.join("trials");
     ensure_dir(&trials_dir)?;
@@ -6365,6 +7643,11 @@ fn run_experiment_with_behavior(
 
     // Preflight checks — abort before trial execution if anything is fatally wrong
     {
+        emit_run_log(
+            &run_id,
+            "starting preflight checks (Docker probes can take a while for per-task images)",
+        );
+        let preflight_started = Instant::now();
         let checks = collect_preflight_checks(
             &json_value,
             &exp_dir,
@@ -6382,14 +7665,37 @@ fn run_experiment_with_behavior(
             checks,
         };
 
-        // Print warnings even when passing
+        let mut passed_count = 0usize;
+        let mut warning_count = 0usize;
+        let mut failed_count = 0usize;
         for check in &preflight.checks {
-            if matches!(check.severity, PreflightSeverity::Warning)
-                && (!check.passed || check.message.contains("will be"))
-            {
-                eprintln!("[WARN] {}: {}", check.name, check.message);
-            }
+            let status = if check.passed {
+                passed_count += 1;
+                "PASS"
+            } else {
+                match check.severity {
+                    PreflightSeverity::Error => {
+                        failed_count += 1;
+                        "FAIL"
+                    }
+                    PreflightSeverity::Warning => {
+                        warning_count += 1;
+                        "WARN"
+                    }
+                }
+            };
+            emit_preflight_log(format!("[{}] {}: {}", status, check.name, check.message));
         }
+        emit_run_log(
+            &run_id,
+            format!(
+                "preflight finished in {:.1}s (passed={}, warnings={}, failed={})",
+                preflight_started.elapsed().as_secs_f32(),
+                passed_count,
+                warning_count,
+                failed_count
+            ),
+        );
 
         if !preflight.passed {
             // Clean up the partial run directory before aborting
@@ -6419,6 +7725,14 @@ fn run_experiment_with_behavior(
         random_seed,
     );
     write_resolved_schedule(&run_dir, &schedule)?;
+    emit_run_log(
+        &run_id,
+        format!(
+            "starting schedule execution: slots={} max_concurrency={}",
+            schedule.len(),
+            max_concurrency.max(1)
+        ),
+    );
 
     // Per-variant consecutive failure tracking (for pruning)
     let mut consecutive_failures: BTreeMap<usize, usize> = BTreeMap::new();
@@ -6471,6 +7785,10 @@ fn run_experiment_with_behavior(
     )?;
     run_sink.flush()?;
     if schedule_outcome != ScheduleEngineOutcome::Completed {
+        emit_run_log(
+            &run_id,
+            format!("schedule execution halted with {:?}", schedule_outcome),
+        );
         run_guard.disarm();
         return Ok(RunResult { run_dir, run_id });
     }
@@ -6508,6 +7826,7 @@ fn run_experiment_with_behavior(
     );
     write_attestation(&run_dir, att)?;
     run_guard.complete("completed")?;
+    emit_run_log(&run_id, "run completed");
 
     Ok(RunResult { run_dir, run_id })
 }
@@ -6534,6 +7853,7 @@ pub fn describe_experiment_with_overrides(
     if let Some(overrides_path) = overrides_path {
         json_value = apply_experiment_overrides(json_value, overrides_path, &project_root)?;
     }
+    json_value = normalize_experiment_authoring(json_value, &exp_dir, &project_root)?;
     validate_required_fields(&json_value)?;
 
     let dataset_path = resolve_dataset_path(&json_value, &exp_dir)?;
@@ -6693,6 +8013,8 @@ impl std::fmt::Display for PreflightReport {
 }
 
 pub fn preflight_experiment(path: &Path, overrides_path: Option<&Path>) -> Result<PreflightReport> {
+    emit_preflight_log(format!("resolving experiment {}", path.display()));
+    let preflight_started = Instant::now();
     let exp_dir = path
         .parent()
         .unwrap_or(Path::new("."))
@@ -6707,12 +8029,23 @@ pub fn preflight_experiment(path: &Path, overrides_path: Option<&Path>) -> Resul
     if let Some(overrides_path) = overrides_path {
         json_value = apply_experiment_overrides(json_value, overrides_path, &project_root)?;
     }
+    json_value = normalize_experiment_authoring(json_value, &exp_dir, &project_root)?;
     validate_required_fields(&json_value)?;
 
     let dataset_path = resolve_dataset_path(&json_value, &exp_dir)?;
     let tasks = load_tasks(&dataset_path, &json_value)?;
     let (variants, _baseline_id) = resolve_variant_plan(&json_value)?;
+    emit_preflight_log(format!(
+        "resolved {} task(s) and {} variant(s); running checks",
+        tasks.len(),
+        variants.len()
+    ));
+    emit_preflight_log(format!(
+        "[PROFILE] config_resolution (yaml parse + dataset load + variant resolve) took {:.3}s",
+        preflight_started.elapsed().as_secs_f64()
+    ));
     let benchmark_config = parse_benchmark_config(&json_value);
+    let _runtime_resolve_t = Instant::now();
     let mut variant_runtime_profiles = Vec::with_capacity(variants.len());
     for variant in &variants {
         variant_runtime_profiles.push(resolve_variant_runtime_profile(
@@ -6724,6 +8057,11 @@ pub fn preflight_experiment(path: &Path, overrides_path: Option<&Path>) -> Resul
             &RunExecutionOptions::default(),
         )?);
     }
+    emit_preflight_log(format!(
+        "[PROFILE] runtime_profile_resolution ({} variants) took {:.3}s",
+        variants.len(),
+        _runtime_resolve_t.elapsed().as_secs_f64()
+    ));
     let checks = collect_preflight_checks(
         &json_value,
         &exp_dir,
@@ -6737,6 +8075,21 @@ pub fn preflight_experiment(path: &Path, overrides_path: Option<&Path>) -> Resul
     let passed = checks
         .iter()
         .all(|c| c.passed || matches!(c.severity, PreflightSeverity::Warning));
+    let failed_count = checks
+        .iter()
+        .filter(|check| !check.passed && matches!(check.severity, PreflightSeverity::Error))
+        .count();
+    let warning_count = checks
+        .iter()
+        .filter(|check| !check.passed && matches!(check.severity, PreflightSeverity::Warning))
+        .count();
+    emit_preflight_log(format!(
+        "completed {} checks in {:.1}s (warnings={}, failures={})",
+        checks.len(),
+        preflight_started.elapsed().as_secs_f32(),
+        warning_count,
+        failed_count
+    ));
 
     Ok(PreflightReport { passed, checks })
 }
@@ -6809,16 +8162,18 @@ fn check_benchmark_grader_reachable_for_variants(
     variants: &[Variant],
     variant_runtime_profiles: &[VariantRuntimeProfile],
     tasks: &[Value],
+    per_task_scan: Option<&PerTaskImageScanResult>,
     is_clean: bool,
 ) -> Vec<PreflightCheck> {
     if variants.is_empty() || variant_runtime_profiles.is_empty() {
         return Vec::new();
     }
     if benchmark_config.adapter.is_none() || is_clean {
-        return vec![check_benchmark_grader_reachable(
+        return vec![check_benchmark_grader_reachable_with_scan(
             benchmark_config,
             &variant_runtime_profiles[0],
             tasks,
+            per_task_scan,
             is_clean,
         )];
     }
@@ -6841,10 +8196,11 @@ fn check_benchmark_grader_reachable_for_variants(
     let mut checks = Vec::new();
     for indices in grouped.values() {
         let representative = indices[0];
-        let mut check = check_benchmark_grader_reachable(
+        let mut check = check_benchmark_grader_reachable_with_scan(
             benchmark_config,
             &variant_runtime_profiles[representative],
             tasks,
+            per_task_scan,
             is_clean,
         );
         let variant_ids = indices
@@ -6861,6 +8217,8 @@ fn check_container_ready_for_variants(
     variants: &[Variant],
     variant_runtime_profiles: &[VariantRuntimeProfile],
     tasks: &[Value],
+    per_task_scan: Option<&PerTaskImageScanResult>,
+    skip_shell_probe: bool,
 ) -> Vec<PreflightCheck> {
     if variants.is_empty() || variant_runtime_profiles.is_empty() {
         return Vec::new();
@@ -6878,8 +8236,12 @@ fn check_container_ready_for_variants(
     let mut checks = Vec::new();
     for indices in grouped.values() {
         let representative = indices[0];
-        let mut scoped_checks =
-            check_container_ready(&variant_runtime_profiles[representative], tasks);
+        let mut scoped_checks = check_container_ready(
+            &variant_runtime_profiles[representative],
+            tasks,
+            per_task_scan,
+            skip_shell_probe,
+        );
         let variant_ids = indices
             .iter()
             .filter_map(|idx| variants.get(*idx).map(|variant| variant.id.clone()))
@@ -6929,6 +8291,72 @@ fn collect_per_task_images_for_preflight(tasks: &[Value]) -> PerTaskImageScanRes
     }
     result.unique_images.sort();
     result
+}
+
+fn resolve_preflight_images(
+    check_name: &'static str,
+    runtime_profile: &VariantRuntimeProfile,
+    tasks: &[Value],
+    per_task_scan: Option<&PerTaskImageScanResult>,
+    missing_global_image_message: &'static str,
+) -> Result<Vec<String>, PreflightCheck> {
+    match runtime_profile.agent_runtime.image_source {
+        ImageSource::Global => match runtime_profile.agent_runtime.container_image.as_deref() {
+            Some(image) => Ok(vec![image.to_string()]),
+            None => Err(PreflightCheck {
+                name: check_name,
+                passed: false,
+                severity: PreflightSeverity::Error,
+                message: missing_global_image_message.to_string(),
+            }),
+        },
+        ImageSource::PerTask => {
+            let owned_scan;
+            let scan = if let Some(scan) = per_task_scan {
+                scan
+            } else {
+                owned_scan = collect_per_task_images_for_preflight(tasks);
+                &owned_scan
+            };
+            if !scan.parse_errors.is_empty() {
+                return Err(PreflightCheck {
+                    name: check_name,
+                    passed: false,
+                    severity: PreflightSeverity::Error,
+                    message: format!(
+                        "failed to parse task image boundary rows: {}",
+                        format_preview(&scan.parse_errors, 3)
+                    ),
+                });
+            }
+            if !scan.missing_task_ids.is_empty() {
+                return Err(PreflightCheck {
+                    name: check_name,
+                    passed: false,
+                    severity: PreflightSeverity::Error,
+                    message: format!(
+                        "tasks missing task.image in per-task mode: {}",
+                        format_preview(&scan.missing_task_ids, 5)
+                    ),
+                });
+            }
+            if scan.unique_images.is_empty() {
+                return Err(PreflightCheck {
+                    name: check_name,
+                    passed: false,
+                    severity: PreflightSeverity::Error,
+                    message: "no task images found in dataset for per-task image mode".to_string(),
+                });
+            }
+            Ok(scan.unique_images.clone())
+        }
+    }
+}
+
+fn has_blocking_preflight_error(checks: &[PreflightCheck], name: &str) -> bool {
+    checks.iter().any(|check| {
+        check.name == name && !check.passed && matches!(check.severity, PreflightSeverity::Error)
+    })
 }
 
 fn resolve_min_free_bytes() -> Result<u64> {
@@ -7000,6 +8428,48 @@ fn free_bytes_for_path(path: &Path) -> Result<u64> {
         )
     })?;
     Ok(available_kb.saturating_mul(1024))
+}
+
+fn dir_size_bytes(path: &Path) -> Result<u64> {
+    if !path.exists() {
+        return Ok(0);
+    }
+    let mut total = 0u64;
+    let walker = walkdir::WalkDir::new(path).into_iter();
+    for entry in walker {
+        let entry = entry?;
+        if !entry.file_type().is_file() {
+            continue;
+        }
+        total = total.saturating_add(entry.metadata()?.len());
+    }
+    Ok(total)
+}
+
+fn enforce_runtime_disk_headroom(probe_path: &Path, min_free_bytes: u64) -> Result<()> {
+    let available = free_bytes_for_path(probe_path)?;
+    if available < min_free_bytes {
+        return Err(anyhow!(
+            "runtime disk headroom breached at '{}': required={} available={}",
+            probe_path.display(),
+            min_free_bytes,
+            available
+        ));
+    }
+    Ok(())
+}
+
+fn enforce_runtime_run_size_budget(run_dir: &Path, max_run_bytes: u64) -> Result<()> {
+    let used = dir_size_bytes(run_dir)?;
+    if used > max_run_bytes {
+        return Err(anyhow!(
+            "runtime run size budget exceeded at '{}': max={} used={}",
+            run_dir.display(),
+            max_run_bytes,
+            used
+        ));
+    }
+    Ok(())
 }
 
 fn check_disk_headroom_with_threshold(probe_path: &Path, min_free_bytes: u64) -> PreflightCheck {
@@ -7291,29 +8761,93 @@ fn collect_preflight_checks(
         return checks;
     }
     let is_clean = is_clean_contract_experiment(json_value);
+    let needs_per_task_scan = variant_runtime_profiles.iter().any(|profile| {
+        profile.container_mode && profile.agent_runtime.image_source == ImageSource::PerTask
+    });
+    let per_task_scan = if needs_per_task_scan {
+        Some(collect_per_task_images_for_preflight(tasks))
+    } else {
+        None
+    };
+    let skip_container_shell_probe = benchmark_config.adapter.is_some() && !is_clean;
 
     // Structural checks (probe_trial_input, dataset_task_ids) are now
     // validated at build time in build_swebench_curated_ab_experiment.mjs.
     // Only machine-state-dependent checks remain here.
-    checks.push(check_disk_headroom(disk_probe_path));
-    checks.push(check_provider_model_wiring(
-        json_value,
-        variants,
-        variant_runtime_profiles,
-    ));
-    checks.extend(check_benchmark_grader_reachable_for_variants(
-        benchmark_config,
-        variants,
-        variant_runtime_profiles,
-        tasks,
-        is_clean,
-    ));
-    checks.extend(check_container_ready_for_variants(
-        variants,
-        variant_runtime_profiles,
-        tasks,
-    ));
-    checks.extend(check_dependency_files_exist(json_value, exp_dir));
+
+    // PROFILING: throwaway stage timing
+    macro_rules! timed_check {
+        ($label:expr, $body:expr) => {{
+            let _t = Instant::now();
+            let result = $body;
+            emit_preflight_log(format!(
+                "[PROFILE] {} took {:.3}s",
+                $label,
+                _t.elapsed().as_secs_f64()
+            ));
+            result
+        }};
+    }
+
+    emit_preflight_log("running check: disk_headroom");
+    timed_check!(
+        "disk_headroom",
+        checks.push(check_disk_headroom(disk_probe_path))
+    );
+    emit_preflight_log("running check: provider_model_wiring");
+    timed_check!(
+        "provider_model_wiring",
+        checks.push(check_provider_model_wiring(
+            json_value,
+            variants,
+            variant_runtime_profiles,
+        ))
+    );
+    emit_preflight_log("running check: container_ready");
+    timed_check!(
+        "container_ready",
+        checks.extend(check_container_ready_for_variants(
+            variants,
+            variant_runtime_profiles,
+            tasks,
+            per_task_scan.as_ref(),
+            skip_container_shell_probe,
+        ))
+    );
+    if has_blocking_preflight_error(&checks, "container_ready") {
+        checks.push(PreflightCheck {
+            name: "benchmark_grader_reachable",
+            passed: true,
+            severity: PreflightSeverity::Warning,
+            message: "skipped because container_ready reported blocking failures".to_string(),
+        });
+    } else {
+        emit_preflight_log("running check: benchmark_grader_reachable");
+        timed_check!(
+            "benchmark_grader_reachable",
+            checks.extend(check_benchmark_grader_reachable_for_variants(
+                benchmark_config,
+                variants,
+                variant_runtime_profiles,
+                tasks,
+                per_task_scan.as_ref(),
+                is_clean,
+            ))
+        );
+    }
+    emit_preflight_log("running check: dependency_files_exist");
+    timed_check!(
+        "dependency_files_exist",
+        checks.extend(check_dependency_files_exist(json_value, exp_dir))
+    );
+    emit_preflight_log("running check: workspace_patch_sources_exist");
+    timed_check!(
+        "workspace_patch_sources_exist",
+        checks.extend(check_workspace_patch_sources_exist(
+            variants,
+            variant_runtime_profiles,
+        ))
+    );
     checks
 }
 
@@ -7416,6 +8950,22 @@ fn check_benchmark_grader_reachable(
     tasks: &[Value],
     is_clean: bool,
 ) -> PreflightCheck {
+    check_benchmark_grader_reachable_with_scan(
+        benchmark_config,
+        runtime_profile,
+        tasks,
+        None,
+        is_clean,
+    )
+}
+
+fn check_benchmark_grader_reachable_with_scan(
+    benchmark_config: &BenchmarkConfig,
+    runtime_profile: &VariantRuntimeProfile,
+    tasks: &[Value],
+    per_task_scan: Option<&PerTaskImageScanResult>,
+    is_clean: bool,
+) -> PreflightCheck {
     let name = "benchmark_grader_reachable";
 
     let adapter = match benchmark_config.adapter.as_ref() {
@@ -7451,53 +9001,15 @@ fn check_benchmark_grader_reachable(
         };
     }
 
-    let images = match runtime_profile.agent_runtime.image_source {
-        ImageSource::Global => match runtime_profile.agent_runtime.container_image.as_deref() {
-            Some(image) => vec![image.to_string()],
-            None => {
-                return PreflightCheck {
-                    name,
-                    passed: false,
-                    severity: PreflightSeverity::Error,
-                    message: "benchmark adapter configured but no container image specified"
-                        .to_string(),
-                };
-            }
-        },
-        ImageSource::PerTask => {
-            let scan = collect_per_task_images_for_preflight(tasks);
-            if !scan.parse_errors.is_empty() {
-                return PreflightCheck {
-                    name,
-                    passed: false,
-                    severity: PreflightSeverity::Error,
-                    message: format!(
-                        "failed to parse task image boundary rows: {}",
-                        format_preview(&scan.parse_errors, 3)
-                    ),
-                };
-            }
-            if !scan.missing_task_ids.is_empty() {
-                return PreflightCheck {
-                    name,
-                    passed: false,
-                    severity: PreflightSeverity::Error,
-                    message: format!(
-                        "tasks missing task.image in per-task mode: {}",
-                        format_preview(&scan.missing_task_ids, 5)
-                    ),
-                };
-            }
-            if scan.unique_images.is_empty() {
-                return PreflightCheck {
-                    name,
-                    passed: false,
-                    severity: PreflightSeverity::Error,
-                    message: "no task images found in dataset for per-task image mode".to_string(),
-                };
-            }
-            scan.unique_images
-        }
+    let images = match resolve_preflight_images(
+        name,
+        runtime_profile,
+        tasks,
+        per_task_scan,
+        "benchmark adapter configured but no container image specified",
+    ) {
+        Ok(images) => images,
+        Err(check) => return check,
     };
 
     // Render templates in the grader binary name using placeholder env.
@@ -7511,6 +9023,14 @@ fn check_benchmark_grader_reachable(
         .first()
         .map(|value| value.as_str())
         .unwrap_or("");
+    let resolved_script_path = rendered_cmd.get(1).and_then(|value| {
+        let trimmed = value.trim();
+        if !trimmed.is_empty() && Path::new(trimmed).is_absolute() {
+            Some(trimmed.to_string())
+        } else {
+            None
+        }
+    });
     if resolved_binary.trim().is_empty() {
         return PreflightCheck {
             name,
@@ -7520,60 +9040,195 @@ fn check_benchmark_grader_reachable(
         };
     }
 
-    let mut failures = Vec::new();
-    for image in &images {
-        match Command::new("docker")
-            .args([
-                "run",
-                "--rm",
-                "--entrypoint",
-                "which",
-                image,
-                resolved_binary,
-            ])
-            .output()
-        {
-            Ok(out) if out.status.success() => {}
-            Ok(out) => failures.push(format!("{} ({})", image, output_error_detail(&out))),
-            Err(err) => failures.push(format!("{} ({})", image, err)),
+    emit_preflight_log(format!(
+        "benchmark_grader_reachable: probing {} image(s) for binary '{}'",
+        images.len(),
+        resolved_binary
+    ));
+    #[derive(Default)]
+    struct GraderProbeOutcome {
+        shell_failure: Option<String>,
+        binary_failure: Option<String>,
+        script_failure: Option<String>,
+    }
+
+    let probe_outcomes =
+        run_bounded_image_probes(&images, "benchmark_grader_reachable", |idx, image| {
+            if should_emit_image_probe_progress(idx + 1, images.len()) {
+                emit_preflight_log(format!(
+                    "benchmark_grader_reachable: image {}/{} ({})",
+                    idx + 1,
+                    images.len(),
+                    image
+                ));
+            }
+            let mut outcome = GraderProbeOutcome::default();
+            let mut shell_probe = format!(
+                "command -v {} >/dev/null 2>&1",
+                shell_quote(resolved_binary)
+            );
+            if let Some(script_path) = resolved_script_path.as_deref() {
+                shell_probe.push_str(&format!(" && test -f {}", shell_quote(script_path)));
+            }
+            let shell_probe_failure = match Command::new("docker")
+                .args([
+                    "run",
+                    "--rm",
+                    "--entrypoint",
+                    "/bin/sh",
+                    image,
+                    "-lc",
+                    &shell_probe,
+                ])
+                .output()
+            {
+                Ok(out) if out.status.success() => return outcome,
+                Ok(out) => output_error_detail(&out),
+                Err(err) => err.to_string(),
+            };
+
+            let binary_ok = match Command::new("docker")
+                .args([
+                    "run",
+                    "--rm",
+                    "--entrypoint",
+                    "which",
+                    image,
+                    resolved_binary,
+                ])
+                .output()
+            {
+                Ok(out) if out.status.success() => true,
+                Ok(out) => {
+                    outcome.binary_failure =
+                        Some(format!("{} ({})", image, output_error_detail(&out)));
+                    false
+                }
+                Err(err) => {
+                    outcome.binary_failure = Some(format!("{} ({})", image, err));
+                    false
+                }
+            };
+            if !binary_ok {
+                return outcome;
+            }
+
+            if let Some(script_path) = resolved_script_path.as_deref() {
+                let script_probe = format!("test -f {}", shell_quote(script_path));
+                match Command::new("docker")
+                    .args([
+                        "run",
+                        "--rm",
+                        "--entrypoint",
+                        "/bin/sh",
+                        image,
+                        "-lc",
+                        &script_probe,
+                    ])
+                    .output()
+                {
+                    Ok(out) if out.status.success() => {}
+                    Ok(out) => {
+                        outcome.script_failure =
+                            Some(format!("{} ({})", image, output_error_detail(&out)));
+                    }
+                    Err(err) => outcome.script_failure = Some(format!("{} ({})", image, err)),
+                }
+            } else {
+                outcome.shell_failure = Some(format!("{} ({})", image, shell_probe_failure));
+            }
+            outcome
+        });
+
+    let mut shell_failures = Vec::new();
+    let mut binary_failures = Vec::new();
+    let mut script_failures = Vec::new();
+    for outcome in probe_outcomes {
+        if let Some(failure) = outcome.shell_failure {
+            shell_failures.push(failure);
+        }
+        if let Some(failure) = outcome.binary_failure {
+            binary_failures.push(failure);
+        }
+        if let Some(failure) = outcome.script_failure {
+            script_failures.push(failure);
         }
     }
 
-    if failures.is_empty() {
+    if !shell_failures.is_empty() {
         return PreflightCheck {
             name,
-            passed: true,
+            passed: false,
             severity: PreflightSeverity::Error,
-            message: if images.len() == 1 {
-                format!(
-                    "grader binary '{}' found in image '{}'",
-                    resolved_binary, images[0]
-                )
-            } else {
-                format!(
-                    "grader binary '{}' found in all {} required images",
-                    resolved_binary,
-                    images.len()
-                )
-            },
+            message: format!(
+                "/bin/sh not available in required images: {} — grader probe cannot execute",
+                format_preview(&shell_failures, 3)
+            ),
         };
     }
 
+    if !binary_failures.is_empty() {
+        return PreflightCheck {
+            name,
+            passed: false,
+            severity: PreflightSeverity::Error,
+            message: format!(
+                "grader binary '{}' not found in required images: {}",
+                resolved_binary,
+                format_preview(&binary_failures, 3)
+            ),
+        };
+    }
+    if !script_failures.is_empty() {
+        return PreflightCheck {
+            name,
+            passed: false,
+            severity: PreflightSeverity::Error,
+            message: format!(
+                "grader script path '{}' not found in required images: {}",
+                resolved_script_path.as_deref().unwrap_or("<none>"),
+                format_preview(&script_failures, 3)
+            ),
+        };
+    }
     PreflightCheck {
         name,
-        passed: false,
+        passed: true,
         severity: PreflightSeverity::Error,
-        message: format!(
-            "grader binary '{}' not found in required images: {}",
-            resolved_binary,
-            format_preview(&failures, 3)
-        ),
+        message: if let Some(script_path) = resolved_script_path.as_deref() {
+            if images.len() == 1 {
+                format!(
+                    "grader command '{}' + script '{}' reachable in image '{}'",
+                    resolved_binary, script_path, images[0]
+                )
+            } else {
+                format!(
+                    "grader command '{}' + script '{}' reachable in all {} required images",
+                    resolved_binary,
+                    script_path,
+                    images.len()
+                )
+            }
+        } else if images.len() == 1 {
+            format!(
+                "grader binary '{}' found in image '{}'",
+                resolved_binary, images[0]
+            )
+        } else {
+            format!(
+                "grader binary '{}' found in all {} required images",
+                resolved_binary,
+                images.len()
+            )
+        },
     }
 }
 
 fn check_container_ready(
     runtime_profile: &VariantRuntimeProfile,
     tasks: &[Value],
+    per_task_scan: Option<&PerTaskImageScanResult>,
+    skip_shell_probe: bool,
 ) -> Vec<PreflightCheck> {
     let name = "container_ready";
 
@@ -7587,8 +9242,27 @@ fn check_container_ready(
     }
 
     let mut checks = Vec::new();
+    let active_container_context = Command::new("docker")
+        .args(["context", "show"])
+        .output()
+        .ok()
+        .and_then(|out| {
+            if out.status.success() {
+                let value = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                if value.is_empty() {
+                    None
+                } else {
+                    Some(value)
+                }
+            } else {
+                None
+            }
+        });
 
     // Check Docker daemon reachability
+    let _docker_total = Instant::now();
+    let _docker_daemon_t = Instant::now();
+    emit_preflight_log("container_ready: checking Docker daemon reachability");
     let docker_ok = match std::process::Command::new("docker")
         .arg("info")
         .stdout(std::process::Stdio::null())
@@ -7600,7 +9274,11 @@ fn check_container_ready(
                 name,
                 passed: true,
                 severity: PreflightSeverity::Error,
-                message: "Docker daemon is reachable".to_string(),
+                message: if let Some(context) = active_container_context.as_deref() {
+                    format!("Docker daemon is reachable (context='{}')", context)
+                } else {
+                    "Docker daemon is reachable".to_string()
+                },
             });
             true
         }
@@ -7616,72 +9294,53 @@ fn check_container_ready(
         }
     };
 
+    emit_preflight_log(format!(
+        "[PROFILE] container_ready/daemon_check took {:.3}s",
+        _docker_daemon_t.elapsed().as_secs_f64()
+    ));
+
     if !docker_ok {
         return checks;
     }
 
-    let images = match runtime_profile.agent_runtime.image_source {
-        ImageSource::PerTask => {
-            let scan = collect_per_task_images_for_preflight(tasks);
-            if !scan.parse_errors.is_empty() {
-                checks.push(PreflightCheck {
-                    name,
-                    passed: false,
-                    severity: PreflightSeverity::Error,
-                    message: format!(
-                        "failed to parse task image boundary rows: {}",
-                        format_preview(&scan.parse_errors, 3)
-                    ),
-                });
-                return checks;
-            }
-            if !scan.missing_task_ids.is_empty() {
-                checks.push(PreflightCheck {
-                    name,
-                    passed: false,
-                    severity: PreflightSeverity::Error,
-                    message: format!(
-                        "tasks missing task.image in per-task mode: {}",
-                        format_preview(&scan.missing_task_ids, 5)
-                    ),
-                });
-                return checks;
-            }
-            if scan.unique_images.is_empty() {
-                checks.push(PreflightCheck {
-                    name,
-                    passed: false,
-                    severity: PreflightSeverity::Error,
-                    message: "no task images found in dataset for per-task image mode".to_string(),
-                });
-                return checks;
-            }
-            scan.unique_images
+    let images = match resolve_preflight_images(
+        name,
+        runtime_profile,
+        tasks,
+        per_task_scan,
+        "no container image resolved for container execution",
+    ) {
+        Ok(images) => images,
+        Err(check) => {
+            checks.push(check);
+            return checks;
         }
-        ImageSource::Global => runtime_profile
-            .agent_runtime
-            .container_image
-            .clone()
-            .map(|image| vec![image])
-            .unwrap_or_default(),
     };
 
-    if images.is_empty() {
-        checks.push(PreflightCheck {
-            name,
-            passed: false,
-            severity: PreflightSeverity::Error,
-            message: "no container image resolved for container execution".to_string(),
-        });
-        return checks;
-    }
-
+    emit_preflight_log(format!(
+        "container_ready: probing {} image(s) for availability",
+        images.len()
+    ));
+    let _image_probe_t = Instant::now();
     let mut missing_images = Vec::new();
-    for image in &images {
+    for (idx, image) in images.iter().enumerate() {
+        if should_emit_image_probe_progress(idx + 1, images.len()) {
+            emit_preflight_log(format!(
+                "container_ready: image availability {}/{} ({})",
+                idx + 1,
+                images.len(),
+                image
+            ));
+        }
         if let Err(err) = ensure_container_image_ready(image) {
             missing_images.push(format!("{} ({})", image, err));
         }
     }
+    emit_preflight_log(format!(
+        "[PROFILE] container_ready/image_probe ({} images) took {:.3}s",
+        images.len(),
+        _image_probe_t.elapsed().as_secs_f64()
+    ));
     if !missing_images.is_empty() {
         checks.push(PreflightCheck {
             name,
@@ -7708,25 +9367,61 @@ fn check_container_ready(
         },
     });
 
-    let mut shell_missing = Vec::new();
-    for image in &images {
-        match Command::new("docker")
-            .args([
-                "run",
-                "--rm",
-                "--entrypoint",
-                "/bin/sh",
-                image,
-                "-c",
-                "exit 0",
-            ])
-            .output()
-        {
-            Ok(out) if out.status.success() => {}
-            Ok(out) => shell_missing.push(format!("{} ({})", image, output_error_detail(&out))),
-            Err(err) => shell_missing.push(format!("{} ({})", image, err)),
-        }
+    if skip_shell_probe {
+        checks.push(PreflightCheck {
+            name,
+            passed: true,
+            severity: PreflightSeverity::Error,
+            message: "shell probe deferred to benchmark_grader_reachable".to_string(),
+        });
+        emit_preflight_log(format!(
+            "[PROFILE] container_ready/total took {:.3}s",
+            _docker_total.elapsed().as_secs_f64()
+        ));
+        return checks;
     }
+
+    let mut shell_missing = Vec::new();
+    emit_preflight_log(format!(
+        "container_ready: probing /bin/sh in {} image(s)",
+        images.len()
+    ));
+    let _shell_probe_t = Instant::now();
+    let shell_probe_failures =
+        run_bounded_image_probes(&images, "container_ready/shell_probe", |idx, image| {
+            if should_emit_image_probe_progress(idx + 1, images.len()) {
+                emit_preflight_log(format!(
+                    "container_ready: shell probe {}/{} ({})",
+                    idx + 1,
+                    images.len(),
+                    image
+                ));
+            }
+            match Command::new("docker")
+                .args([
+                    "run",
+                    "--rm",
+                    "--entrypoint",
+                    "/bin/sh",
+                    image,
+                    "-c",
+                    "exit 0",
+                ])
+                .output()
+            {
+                Ok(out) if out.status.success() => None,
+                Ok(out) => Some(format!("{} ({})", image, output_error_detail(&out))),
+                Err(err) => Some(format!("{} ({})", image, err)),
+            }
+        });
+    for failure in shell_probe_failures.into_iter().flatten() {
+        shell_missing.push(failure);
+    }
+    emit_preflight_log(format!(
+        "[PROFILE] container_ready/shell_probe ({} images) took {:.3}s",
+        images.len(),
+        _shell_probe_t.elapsed().as_secs_f64()
+    ));
     if shell_missing.is_empty() {
         checks.push(PreflightCheck {
             name,
@@ -7750,6 +9445,10 @@ fn check_container_ready(
         });
     }
 
+    emit_preflight_log(format!(
+        "[PROFILE] container_ready/total took {:.3}s",
+        _docker_total.elapsed().as_secs_f64()
+    ));
     checks
 }
 
@@ -7812,6 +9511,55 @@ fn check_dependency_files_exist(json_value: &Value, exp_dir: &Path) -> Vec<Prefl
         });
     }
 
+    checks
+}
+
+fn check_workspace_patch_sources_exist(
+    variants: &[Variant],
+    variant_runtime_profiles: &[VariantRuntimeProfile],
+) -> Vec<PreflightCheck> {
+    let name = "workspace_patch_sources_exist";
+    if variants.is_empty() || variant_runtime_profiles.is_empty() {
+        return Vec::new();
+    }
+    let mut checks = Vec::new();
+    let mut any_patch = false;
+    for (idx, profile) in variant_runtime_profiles.iter().enumerate() {
+        let variant_id = variants
+            .get(idx)
+            .map(|v| v.id.clone())
+            .unwrap_or_else(|| format!("variant_{}", idx));
+        for patch in &profile.agent_runtime.workspace_patches {
+            any_patch = true;
+            let exists = patch.source_from_host.exists();
+            checks.push(PreflightCheck {
+                name,
+                passed: exists,
+                severity: PreflightSeverity::Error,
+                message: if exists {
+                    format!(
+                        "variant '{}': workspace patch source exists: {}",
+                        variant_id,
+                        patch.source_from_host.display()
+                    )
+                } else {
+                    format!(
+                        "variant '{}': workspace patch source missing: {}",
+                        variant_id,
+                        patch.source_from_host.display()
+                    )
+                },
+            });
+        }
+    }
+    if !any_patch {
+        checks.push(PreflightCheck {
+            name,
+            passed: true,
+            severity: PreflightSeverity::Error,
+            message: "no workspace_patches configured".to_string(),
+        });
+    }
     checks
 }
 
@@ -8184,13 +9932,16 @@ fn read_jsonl_records(path: &Path) -> Result<Vec<Value>> {
     if !path.exists() {
         return Ok(Vec::new());
     }
-    let data = fs::read_to_string(path)?;
     let mut rows = Vec::new();
-    for line in data.lines() {
-        if line.trim().is_empty() {
+    let file = fs::File::open(path)?;
+    let reader = BufReader::new(file);
+    for line in reader.lines() {
+        let line = line?;
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
             continue;
         }
-        rows.push(serde_json::from_str::<Value>(line)?);
+        rows.push(serde_json::from_str::<Value>(trimmed)?);
     }
     Ok(rows)
 }
@@ -8227,12 +9978,15 @@ fn validate_jsonl_against_schema(schema_name: &str, path: &Path) -> Result<()> {
         ));
     }
     let schema = compile_schema(schema_name)?;
-    let data = fs::read_to_string(path)?;
-    for (idx, line) in data.lines().enumerate() {
-        if line.trim().is_empty() {
+    let file = fs::File::open(path)?;
+    let reader = BufReader::new(file);
+    for (idx, line) in reader.lines().enumerate() {
+        let line = line?;
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
             continue;
         }
-        let value: Value = serde_json::from_str(line)
+        let value: Value = serde_json::from_str(trimmed)
             .map_err(|e| anyhow!("invalid json line {} in {}: {}", idx + 1, path.display(), e))?;
         match schema.validate(&value) {
             Ok(_) => {}
@@ -9229,40 +10983,51 @@ fn resolve_dataset_path(json_value: &Value, exp_dir: &Path) -> Result<PathBuf> {
 }
 
 fn load_tasks(path: &Path, json_value: &Value) -> Result<Vec<Value>> {
-    let data = fs::read_to_string(path)?;
-    let mut tasks = Vec::new();
-    for line in data.lines() {
-        if line.trim().is_empty() {
-            continue;
-        }
-        let task: Value = serde_json::from_str(line)?;
-        tasks.push(task);
-    }
-    if let Some(limit) = json_value
+    let limit = json_value
         .pointer("/dataset/limit")
         .and_then(|v| v.as_u64())
-    {
-        tasks.truncate(limit as usize);
+        .map(|v| v as usize);
+    if limit == Some(0) {
+        return Ok(Vec::new());
+    }
+    let file = fs::File::open(path)?;
+    let reader = BufReader::new(file);
+    let mut tasks = Vec::new();
+    for line in reader.lines() {
+        let line = line?;
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if limit.is_some_and(|max| tasks.len() >= max) {
+            break;
+        }
+        let task: Value = serde_json::from_str(trimmed)?;
+        tasks.push(task);
     }
     Ok(tasks)
 }
 
 fn count_tasks(path: &Path, json_value: &Value) -> Result<usize> {
-    let data = fs::read_to_string(path)?;
+    let limit = json_value
+        .pointer("/dataset/limit")
+        .and_then(|v| v.as_u64())
+        .map(|v| v as usize);
+    if limit == Some(0) {
+        return Ok(0);
+    }
+    let file = fs::File::open(path)?;
+    let reader = BufReader::new(file);
     let mut count = 0usize;
-    for line in data.lines() {
+    for line in reader.lines() {
+        let line = line?;
         if line.trim().is_empty() {
             continue;
         }
-        count += 1;
-        if let Some(limit) = json_value
-            .pointer("/dataset/limit")
-            .and_then(|v| v.as_u64())
-        {
-            if count >= limit as usize {
-                break;
-            }
+        if limit.is_some_and(|max| count >= max) {
+            break;
         }
+        count += 1;
     }
     Ok(count)
 }
@@ -9803,6 +11568,43 @@ fn stage_dependencies_for_trial(
     Ok(())
 }
 
+fn ensure_workspace_patch_target_safe(workspace_root: &Path, rel: &Path) -> Result<()> {
+    let mut current = workspace_root.to_path_buf();
+    for component in rel.components() {
+        current.push(component.as_os_str());
+        if !current.exists() {
+            continue;
+        }
+        let meta = fs::symlink_metadata(&current)?;
+        if meta.file_type().is_symlink() {
+            return Err(anyhow!(
+                "workspace patch target '{}' traverses symlink path '{}'",
+                rel.display(),
+                current.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn stage_workspace_patches_for_trial(
+    runtime_agent: &AgentRuntimeConfig,
+    paths: &TrialPaths,
+) -> Result<()> {
+    for (idx, patch) in runtime_agent.workspace_patches.iter().enumerate() {
+        let rel = validate_workspace_relative_path(&patch.target_path)?;
+        ensure_workspace_patch_target_safe(&paths.workspace, &rel)?;
+        let dst = paths.workspace.join(rel);
+        copy_staged_host_file(
+            &patch.source_from_host,
+            &dst,
+            true,
+            &format!("workspace_patch#{}", idx),
+        )?;
+    }
+    Ok(())
+}
+
 fn task_boundary_ext_value(task_boundary: &TaskBoundaryMaterialization) -> Option<Value> {
     if task_boundary.workspace_files.is_empty()
         && task_boundary.mount_references.is_empty()
@@ -9827,6 +11629,18 @@ struct DependencyFileStagingSpec {
     read_only: bool,
 }
 
+#[derive(Debug, Clone)]
+struct BindingArgProjectionSpec {
+    binding: String,
+    flag: String,
+}
+
+#[derive(Debug, Clone)]
+struct WorkspacePatchSpec {
+    source_from_host: PathBuf,
+    target_path: String,
+}
+
 #[derive(Clone)]
 struct AgentRuntimeIoConfig {
     input_arg: String,
@@ -9840,12 +11654,16 @@ struct AgentRuntimeConfig {
     container_image: Option<String>,
     image_source: ImageSource,
     agent_artifact: Option<PathBuf>,
+    agent_artifact_digest: Option<String>,
+    agent_artifact_resolved_path: Option<PathBuf>,
     io: AgentRuntimeIoConfig,
     clean_contract_v1: bool,
     integration_level: String,
     launch_mode: AgentLaunchMode,
     env: BTreeMap<String, String>,
     env_from_host: Vec<String>,
+    bindings_to_args: Vec<BindingArgProjectionSpec>,
+    workspace_patches: Vec<WorkspacePatchSpec>,
     trajectory_path: Option<String>,
     causal_extraction: Option<String>,
     default_timeout_ms: Option<u64>,
@@ -10026,6 +11844,140 @@ fn parse_dependency_file_staging(
     }
 }
 
+fn parse_bindings_to_args(value: Option<&Value>) -> Result<Vec<BindingArgProjectionSpec>> {
+    let Some(raw) = value else {
+        return Ok(Vec::new());
+    };
+    let items = raw
+        .as_array()
+        .ok_or_else(|| anyhow!("runtime.agent.bindings_to_args must be an array"))?;
+    let mut parsed = Vec::with_capacity(items.len());
+    for (idx, item) in items.iter().enumerate() {
+        let obj = item
+            .as_object()
+            .ok_or_else(|| anyhow!("runtime.agent.bindings_to_args[{}] must be an object", idx))?;
+        let binding = obj
+            .get("binding")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .ok_or_else(|| {
+                anyhow!(
+                    "runtime.agent.bindings_to_args[{}].binding must be a non-empty string",
+                    idx
+                )
+            })?;
+        let flag = obj
+            .get("flag")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .ok_or_else(|| {
+                anyhow!(
+                    "runtime.agent.bindings_to_args[{}].flag must be a non-empty string",
+                    idx
+                )
+            })?;
+        parsed.push(BindingArgProjectionSpec {
+            binding: binding.to_string(),
+            flag: flag.to_string(),
+        });
+    }
+    Ok(parsed)
+}
+
+fn parse_workspace_patches(
+    value: Option<&Value>,
+    exp_dir: &Path,
+) -> Result<Vec<WorkspacePatchSpec>> {
+    let Some(raw) = value else {
+        return Ok(Vec::new());
+    };
+    let items = raw
+        .as_array()
+        .ok_or_else(|| anyhow!("runtime.agent.workspace_patches must be an array"))?;
+    let mut parsed = Vec::with_capacity(items.len());
+    for (idx, item) in items.iter().enumerate() {
+        let obj = item
+            .as_object()
+            .ok_or_else(|| anyhow!("runtime.agent.workspace_patches[{}] must be an object", idx))?;
+        let source_raw = obj
+            .get("source_from_host")
+            .and_then(Value::as_str)
+            .ok_or_else(|| {
+                anyhow!(
+                    "runtime.agent.workspace_patches[{}].source_from_host missing",
+                    idx
+                )
+            })?;
+        let target_path = obj
+            .get("target_path")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|v| !v.is_empty())
+            .ok_or_else(|| {
+                anyhow!(
+                    "runtime.agent.workspace_patches[{}].target_path missing",
+                    idx
+                )
+            })?;
+        let _ = validate_workspace_relative_path(target_path).map_err(|e| {
+            anyhow!(
+                "runtime.agent.workspace_patches[{}].target_path '{}' invalid: {}",
+                idx,
+                target_path,
+                e
+            )
+        })?;
+        parsed.push(WorkspacePatchSpec {
+            source_from_host: resolve_host_path_from_spec(source_raw, exp_dir)?,
+            target_path: target_path.to_string(),
+        });
+    }
+    Ok(parsed)
+}
+
+fn binding_lookup<'a>(bindings: &'a Value, key: &str) -> Option<&'a Value> {
+    if key.trim().is_empty() {
+        return None;
+    }
+    let pointer = format!("/{}", key.split('.').collect::<Vec<_>>().join("/"));
+    bindings.pointer(&pointer)
+}
+
+fn project_bindings_to_args(
+    bindings: &Value,
+    specs: &[BindingArgProjectionSpec],
+) -> Result<Vec<String>> {
+    if specs.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut projected = Vec::with_capacity(specs.len() * 2);
+    for spec in specs {
+        let value = binding_lookup(bindings, &spec.binding).ok_or_else(|| {
+            anyhow!(
+                "missing required binding key '{}' for runtime.agent.bindings_to_args",
+                spec.binding
+            )
+        })?;
+        let token = match value {
+            Value::String(v) => v.clone(),
+            Value::Number(v) => v.to_string(),
+            Value::Bool(v) => v.to_string(),
+            _ => {
+                return Err(anyhow!(
+                    "binding '{}' must resolve to string|number|bool (got {})",
+                    spec.binding,
+                    value_type_name(value)
+                ));
+            }
+        };
+        projected.push(spec.flag.clone());
+        projected.push(token);
+    }
+    Ok(projected)
+}
+
 fn resolve_agent_runtime(json_value: &Value, exp_dir: &Path) -> Result<AgentRuntimeConfig> {
     if is_clean_contract_experiment(json_value) {
         let runtime_root = json_value
@@ -10052,6 +12004,8 @@ fn resolve_agent_runtime(json_value: &Value, exp_dir: &Path) -> Result<AgentRunt
             container_image: Some(container_image),
             image_source: ImageSource::Global,
             agent_artifact: None,
+            agent_artifact_digest: None,
+            agent_artifact_resolved_path: None,
             io: AgentRuntimeIoConfig {
                 input_arg: DEFAULT_CLEAN_TASK_PATH.to_string(),
                 output_arg: DEFAULT_CLEAN_RESULT_PATH.to_string(),
@@ -10061,6 +12015,8 @@ fn resolve_agent_runtime(json_value: &Value, exp_dir: &Path) -> Result<AgentRunt
             launch_mode,
             env: BTreeMap::new(),
             env_from_host: Vec::new(),
+            bindings_to_args: Vec::new(),
+            workspace_patches: Vec::new(),
             trajectory_path: None,
             causal_extraction: None,
             default_timeout_ms,
@@ -10119,8 +12075,25 @@ fn resolve_agent_runtime(json_value: &Value, exp_dir: &Path) -> Result<AgentRunt
         .filter(|s| !s.is_empty());
     let image_source = ImageSource::parse(agent.pointer("/image_source").and_then(|v| v.as_str()))?;
     let agent_artifact =
-        parse_optional_nonempty_string(agent.pointer("/artifact"), "runtime.agent.artifact")?
-            .map(|p| normalize_path(&exp_dir.join(p)));
+        parse_optional_nonempty_string(agent.pointer("/artifact"), "runtime.agent.artifact")?.map(
+            |p| {
+                let raw = p.trim();
+                if raw.starts_with("./") || raw.starts_with("../") || raw.contains('/') {
+                    normalize_path(&exp_dir.join(raw))
+                } else {
+                    resolve_dx_artifact_path(raw, exp_dir, exp_dir)
+                }
+            },
+        );
+    let agent_artifact_digest = parse_optional_nonempty_string(
+        agent.pointer("/artifact_digest"),
+        "runtime.agent.artifact_digest",
+    )?;
+    let agent_artifact_resolved_path = parse_optional_nonempty_string(
+        agent.pointer("/artifact_resolved_path"),
+        "runtime.agent.artifact_resolved_path",
+    )?
+    .map(PathBuf::from);
     if image_source == ImageSource::PerTask && agent_artifact.is_none() {
         return Err(anyhow!(
             "runtime.agent.artifact is required when runtime.agent.image_source='per_task'"
@@ -10146,6 +12119,8 @@ fn resolve_agent_runtime(json_value: &Value, exp_dir: &Path) -> Result<AgentRunt
         agent.pointer("/env_from_host"),
         "runtime.agent.env_from_host",
     )?;
+    let bindings_to_args = parse_bindings_to_args(agent.pointer("/bindings_to_args"))?;
+    let workspace_patches = parse_workspace_patches(agent.pointer("/workspace_patches"), exp_dir)?;
     let input_arg = agent
         .pointer("/io/input_arg")
         .and_then(|v| v.as_str())
@@ -10174,6 +12149,8 @@ fn resolve_agent_runtime(json_value: &Value, exp_dir: &Path) -> Result<AgentRunt
         container_image,
         image_source,
         agent_artifact,
+        agent_artifact_digest,
+        agent_artifact_resolved_path,
         io: AgentRuntimeIoConfig {
             input_arg,
             output_arg,
@@ -10183,6 +12160,8 @@ fn resolve_agent_runtime(json_value: &Value, exp_dir: &Path) -> Result<AgentRunt
         launch_mode,
         env,
         env_from_host,
+        bindings_to_args,
+        workspace_patches,
         trajectory_path,
         causal_extraction,
         default_timeout_ms,
@@ -10207,6 +12186,38 @@ fn resolve_agent_runtime_env(
         merged.insert(key.clone(), value);
     }
     Ok(merged)
+}
+
+fn validate_agent_artifact_pin(runtime_agent: &AgentRuntimeConfig) -> Result<()> {
+    let Some(artifact) = runtime_agent.agent_artifact.as_ref() else {
+        return Ok(());
+    };
+    if let Some(expected_path) = runtime_agent.agent_artifact_resolved_path.as_ref() {
+        let normalized = normalize_path(artifact);
+        let expected = normalize_path(expected_path);
+        if normalized != expected {
+            return Err(anyhow!(
+                "runtime.agent.artifact path mismatch: expected {}, got {}",
+                expected.display(),
+                normalized.display()
+            ));
+        }
+    }
+    if let Some(expected_digest) = runtime_agent.agent_artifact_digest.as_ref() {
+        let expected = expected_digest
+            .trim()
+            .strip_prefix("sha256:")
+            .unwrap_or(expected_digest);
+        let actual = compute_artifact_content_digest(artifact)?;
+        if !expected.eq_ignore_ascii_case(&actual) {
+            return Err(anyhow!(
+                "runtime.agent.artifact digest mismatch: expected sha256:{}, got sha256:{}",
+                expected,
+                actual
+            ));
+        }
+    }
+    Ok(())
 }
 
 #[derive(Clone)]
@@ -10235,6 +12246,7 @@ fn resolve_variant_runtime_profile(
     validate_required_fields(&variant_experiment)?;
 
     let mut agent_runtime = resolve_agent_runtime(&variant_experiment, project_root)?;
+    validate_agent_artifact_pin(&agent_runtime)?;
     let configured_network_mode = configured_network_mode(&variant_experiment)?;
     let effective_network_mode = behavior
         .network_mode_override
@@ -10272,10 +12284,15 @@ fn resolve_variant_runtime_profile(
     for (key, value) in &variant.env {
         agent_runtime_env.insert(key.clone(), value.clone());
     }
+    let mut variant_args = variant.args.clone();
+    variant_args.extend(project_bindings_to_args(
+        &variant.bindings,
+        &agent_runtime.bindings_to_args,
+    )?);
 
     Ok(VariantRuntimeProfile {
         experiment: variant_experiment,
-        variant_args: variant.args.clone(),
+        variant_args,
         agent_runtime,
         agent_runtime_env,
         invocation_source: "runtime_agent".to_string(),
@@ -10288,6 +12305,7 @@ fn resolve_variant_runtime_profile(
 }
 
 struct TrialPaths {
+    trial_dir: PathBuf,
     in_dir: PathBuf,
     workspace: PathBuf,
     state: PathBuf,
@@ -10304,6 +12322,7 @@ impl TrialPaths {
     fn new(trial_dir: &Path, exp_dir: &Path, dataset_src: &Path) -> Result<Self> {
         let runtime = runner_runtime_host_paths(trial_dir);
         Ok(Self {
+            trial_dir: trial_dir.to_path_buf(),
             in_dir: runtime.in_dir.clone(),
             workspace: runtime.workspace_dir.clone(),
             state: runtime.state_dir.clone(),
@@ -10691,8 +12710,6 @@ fn rel_to_run_dir(path: &Path, run_dir: &Path) -> String {
 
 struct ProcessRunResult {
     status: String,
-    stdout: String,
-    stderr: String,
 }
 
 struct PreparedTrialIo {
@@ -10951,7 +12968,15 @@ fn run_builtin_adapter_local(request: &AdapterRunRequest<'_>) -> Result<ProcessR
     for (key, value) in request.runtime_env {
         cmd.env(key, value);
     }
-    run_adapter_process(cmd, &request.io_paths.output_host, None)
+    let stdout_log_path = request.trial_paths.trial_dir.join("harness_stdout.log");
+    let stderr_log_path = request.trial_paths.trial_dir.join("harness_stderr.log");
+    run_adapter_process(
+        cmd,
+        &request.io_paths.output_host,
+        None,
+        &stdout_log_path,
+        &stderr_log_path,
+    )
 }
 
 fn resolve_benchmark_grader_command(request: &AdapterRunRequest<'_>) -> Option<Vec<String>> {
@@ -11206,13 +13231,23 @@ fn append_container_env_args(
     request: &AdapterRunRequest<'_>,
     workspace: Option<&str>,
 ) {
+    let mut path_overridden = false;
     for (key, value) in request.runtime_overrides_env {
+        if key == "PATH" {
+            path_overridden = true;
+        }
         cmd.arg("-e").arg(format!("{}={}", key, value));
     }
     if !request.runtime.clean_contract_v1 {
         for (key, value) in request.runtime_env {
+            if key == "PATH" {
+                path_overridden = true;
+            }
             cmd.arg("-e").arg(format!("{}={}", key, value));
         }
+    }
+    if request.agent_artifact.is_some() && !path_overridden {
+        cmd.arg("-e").arg(AGENT_ARTIFACT_PATH_ENV_VALUE);
     }
     if let Some(workspace) = workspace {
         cmd.arg("-e").arg(format!("WORKSPACE={}", workspace));
@@ -11295,7 +13330,15 @@ fn run_baked_container(
     append_container_env_args(&mut cmd, request, workspace);
     cmd.arg(image);
     append_container_entrypoint(&mut cmd, request, &command, grader_command);
-    run_adapter_process(cmd, &request.io_paths.output_host, None)
+    let stdout_log_path = request.trial_paths.trial_dir.join("harness_stdout.log");
+    let stderr_log_path = request.trial_paths.trial_dir.join("harness_stderr.log");
+    run_adapter_process(
+        cmd,
+        &request.io_paths.output_host,
+        None,
+        &stdout_log_path,
+        &stderr_log_path,
+    )
 }
 
 struct ContainerCleanupGuard {
@@ -11338,8 +13381,18 @@ fn ensure_container_image_ready(image: &str) -> Result<()> {
     if inspect_output.status.success() {
         return Ok(());
     }
+    emit_preflight_log(format!(
+        "container image '{}' not found locally; pulling",
+        image
+    ));
+    let pull_started = Instant::now();
     let pull_output = Command::new("docker").args(["pull", image]).output()?;
     if pull_output.status.success() {
+        emit_preflight_log(format!(
+            "pulled '{}' in {:.1}s",
+            image,
+            pull_started.elapsed().as_secs_f32()
+        ));
         return Ok(());
     }
     Err(anyhow!(
@@ -11494,6 +13547,7 @@ fn run_injected_container(
     artifact: &Path,
     workspace: Option<&str>,
 ) -> Result<ProcessRunResult> {
+    validate_agent_artifact_pin(request.runtime)?;
     if !artifact.exists() {
         return Err(anyhow!(
             "runtime.agent.artifact not found: {}",
@@ -11507,11 +13561,22 @@ fn run_injected_container(
         let mut cmd = Command::new("docker");
         cmd.arg("run").arg("--rm").args(["--pull", "never"]);
         append_container_sandbox_args(&mut cmd, request, workspace);
-        cmd.args(["-v", &format!("{}:/opt/agent:ro", artifact_mount_dir.display())]);
+        cmd.args([
+            "-v",
+            &format!("{}:/opt/agent:ro", artifact_mount_dir.display()),
+        ]);
         append_container_env_args(&mut cmd, request, workspace);
         cmd.arg(image);
         append_container_entrypoint(&mut cmd, request, &command, grader_command);
-        return run_adapter_process(cmd, &request.io_paths.output_host, None);
+        let stdout_log_path = request.trial_paths.trial_dir.join("harness_stdout.log");
+        let stderr_log_path = request.trial_paths.trial_dir.join("harness_stderr.log");
+        return run_adapter_process(
+            cmd,
+            &request.io_paths.output_host,
+            None,
+            &stdout_log_path,
+            &stderr_log_path,
+        );
     }
 
     let command = resolve_runtime_agent_command(request)?;
@@ -11564,7 +13629,15 @@ fn run_injected_container(
     append_container_env_args(&mut exec, request, workspace);
     exec.arg(&container_id);
     append_container_entrypoint(&mut exec, request, &command, grader_command);
-    run_adapter_process(exec, &request.io_paths.output_host, None)
+    let stdout_log_path = request.trial_paths.trial_dir.join("harness_stdout.log");
+    let stderr_log_path = request.trial_paths.trial_dir.join("harness_stderr.log");
+    run_adapter_process(
+        exec,
+        &request.io_paths.output_host,
+        None,
+        &stdout_log_path,
+        &stderr_log_path,
+    )
 }
 
 fn append_runtime_io_arg(command: &mut Vec<String>, arg_spec: &str, path: &str) -> Result<()> {
@@ -11598,8 +13671,8 @@ fn resolve_runtime_agent_command(request: &AdapterRunRequest<'_>) -> Result<Vec<
         return Err(anyhow!("resolved runtime.agent command is empty"));
     }
     let mut command = rendered;
+    command.extend(request.variant_args.iter().cloned());
     if request.runtime.clean_contract_v1 {
-        command.extend(request.variant_args.iter().cloned());
         command.push(request.io_paths.task_path.clone());
         command.push(request.io_paths.result_path.clone());
     } else {
@@ -11731,43 +13804,133 @@ fn validate_agent_runtime_command(
     Ok(())
 }
 
+fn ensure_clean_output_file(path: &Path, label: &str) -> Result<()> {
+    if !path.exists() {
+        if let Some(parent) = path.parent() {
+            ensure_dir(parent)?;
+        }
+        return Ok(());
+    }
+    if path.is_file() {
+        fs::remove_file(path)?;
+        if let Some(parent) = path.parent() {
+            ensure_dir(parent)?;
+        }
+        return Ok(());
+    }
+    Err(anyhow!("{} must be a file path: {}", label, path.display()))
+}
+
+fn copy_stream_to_file<R: Read>(mut reader: R, mut file: fs::File) -> Result<()> {
+    let mut buf = [0u8; 8192];
+    loop {
+        let n = reader.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        file.write_all(&buf[..n])?;
+    }
+    file.flush()?;
+    Ok(())
+}
+
+fn terminate_child_process(child: &mut std::process::Child) {
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
 fn run_adapter_process(
     mut cmd: Command,
     output_path: &Path,
     start_response_path: Option<&Path>,
+    stdout_log_path: &Path,
+    stderr_log_path: &Path,
 ) -> Result<ProcessRunResult> {
-    if output_path.exists() {
-        if output_path.is_file() {
-            fs::remove_file(output_path)?;
-        } else {
-            return Err(anyhow!(
-                "output path must be a file: {}",
-                output_path.display()
-            ));
-        }
-    }
+    ensure_clean_output_file(output_path, "output path")?;
+    ensure_clean_output_file(stdout_log_path, "stdout log path")?;
+    ensure_clean_output_file(stderr_log_path, "stderr log path")?;
 
     cmd.stdin(Stdio::null());
     cmd.stdout(Stdio::piped());
     cmd.stderr(Stdio::piped());
 
     let mut child = cmd.spawn()?;
+    let stdout_pipe = match child.stdout.take() {
+        Some(pipe) => pipe,
+        None => {
+            terminate_child_process(&mut child);
+            return Err(anyhow!("failed to capture child stdout pipe"));
+        }
+    };
+    let stderr_pipe = match child.stderr.take() {
+        Some(pipe) => pipe,
+        None => {
+            terminate_child_process(&mut child);
+            return Err(anyhow!("failed to capture child stderr pipe"));
+        }
+    };
+
+    let stdout_file = match fs::File::create(stdout_log_path) {
+        Ok(file) => file,
+        Err(err) => {
+            terminate_child_process(&mut child);
+            return Err(err.into());
+        }
+    };
+    let stderr_file = match fs::File::create(stderr_log_path) {
+        Ok(file) => file,
+        Err(err) => {
+            terminate_child_process(&mut child);
+            return Err(err.into());
+        }
+    };
+
+    let stdout_handle = match thread::Builder::new()
+        .name("agentlab-stdout-capture".to_string())
+        .spawn(move || copy_stream_to_file(stdout_pipe, stdout_file))
+    {
+        Ok(handle) => handle,
+        Err(err) => {
+            terminate_child_process(&mut child);
+            return Err(anyhow!("failed to spawn stdout capture thread: {}", err));
+        }
+    };
+    let stderr_handle = match thread::Builder::new()
+        .name("agentlab-stderr-capture".to_string())
+        .spawn(move || copy_stream_to_file(stderr_pipe, stderr_file))
+    {
+        Ok(handle) => handle,
+        Err(err) => {
+            terminate_child_process(&mut child);
+            let _ = stdout_handle.join();
+            return Err(anyhow!("failed to spawn stderr capture thread: {}", err));
+        }
+    };
+
     if let Some(path) = start_response_path {
-        wait_for_file(path, Duration::from_secs(10)).inspect_err(|_| {
-            let _ = child.kill();
-            let _ = child.wait();
-        })?;
+        if let Err(err) = wait_for_file(path, Duration::from_secs(10)) {
+            terminate_child_process(&mut child);
+            let _ = stdout_handle.join();
+            let _ = stderr_handle.join();
+            return Err(err);
+        }
     }
-    let output = child.wait_with_output()?;
+
+    let status = child.wait()?;
+    match stdout_handle.join() {
+        Ok(result) => result?,
+        Err(_) => return Err(anyhow!("stdout capture thread panicked")),
+    }
+    match stderr_handle.join() {
+        Ok(result) => result?,
+        Err(_) => return Err(anyhow!("stderr capture thread panicked")),
+    }
 
     Ok(ProcessRunResult {
-        status: output
-            .status
+        status: status
             .code()
             .map(|c| c.to_string())
             .unwrap_or_else(|| "signal".to_string()),
-        stdout: String::from_utf8_lossy(&output.stdout).to_string(),
-        stderr: String::from_utf8_lossy(&output.stderr).to_string(),
     })
 }
 
@@ -12250,13 +14413,16 @@ fn load_event_rows(
     task_id: &str,
     repl_idx: usize,
 ) -> Result<Vec<EventRow>> {
-    let data = fs::read_to_string(events_path)?;
     let mut rows = Vec::new();
-    for (seq, line) in data.lines().enumerate() {
-        if line.trim().is_empty() {
+    let file = fs::File::open(events_path)?;
+    let reader = BufReader::new(file);
+    for (seq, line) in reader.lines().enumerate() {
+        let line = line?;
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
             continue;
         }
-        let payload: Value = serde_json::from_str(line)?;
+        let payload: Value = serde_json::from_str(trimmed)?;
         let event_type = payload
             .get("event_type")
             .and_then(Value::as_str)
@@ -12466,7 +14632,7 @@ fn resolve_command_digest_target(command: &[String]) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::AtomicUsize;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     struct TempDirGuard {
         path: PathBuf,
@@ -13337,6 +15503,8 @@ mod tests {
             container_image: None,
             image_source: ImageSource::Global,
             agent_artifact: None,
+            agent_artifact_digest: None,
+            agent_artifact_resolved_path: None,
             io: AgentRuntimeIoConfig {
                 input_arg: "--input".to_string(),
                 output_arg: "--output".to_string(),
@@ -13346,6 +15514,8 @@ mod tests {
             launch_mode: AgentLaunchMode::File,
             env: BTreeMap::new(),
             env_from_host: vec![],
+            bindings_to_args: Vec::new(),
+            workspace_patches: Vec::new(),
             trajectory_path: None,
             causal_extraction: None,
             default_timeout_ms: None,
@@ -17112,6 +19282,160 @@ mod tests {
         assert!(check.passed, "disk check should pass for tiny threshold");
     }
 
+    #[test]
+    fn preflight_parse_parallelism_clamps_and_rejects_zero() {
+        assert_eq!(parse_parallelism("1"), Some(1));
+        assert_eq!(
+            parse_parallelism("128"),
+            Some(MAX_PREFLIGHT_IMAGE_PROBE_PARALLELISM)
+        );
+        assert_eq!(parse_parallelism("0"), None);
+        assert_eq!(parse_parallelism("abc"), None);
+    }
+
+    #[test]
+    fn preflight_bounded_probe_preserves_order_and_bounds_concurrency() {
+        let images = vec![
+            "img_a".to_string(),
+            "img_b".to_string(),
+            "img_c".to_string(),
+            "img_d".to_string(),
+            "img_e".to_string(),
+        ];
+        let in_flight = std::sync::Arc::new(AtomicUsize::new(0));
+        let max_in_flight = std::sync::Arc::new(AtomicUsize::new(0));
+        let results = run_bounded_image_probes(&images, "test_probe", |idx, image| {
+            let current = in_flight.fetch_add(1, Ordering::SeqCst) + 1;
+            max_in_flight.fetch_max(current, Ordering::SeqCst);
+            // Make completion order non-deterministic while checking stable output ordering.
+            std::thread::sleep(Duration::from_millis(((images.len() - idx) * 2) as u64));
+            in_flight.fetch_sub(1, Ordering::SeqCst);
+            format!("{}:{}", idx, image)
+        });
+
+        assert_eq!(
+            results,
+            vec![
+                "0:img_a".to_string(),
+                "1:img_b".to_string(),
+                "2:img_c".to_string(),
+                "3:img_d".to_string(),
+                "4:img_e".to_string(),
+            ]
+        );
+        let allowed_parallelism = preflight_image_probe_parallelism().min(images.len()).max(1);
+        assert!(
+            max_in_flight.load(Ordering::SeqCst) <= allowed_parallelism,
+            "bounded image probes exceeded allowed parallelism"
+        );
+    }
+
+    fn preflight_test_runtime_profile(
+        image_source: ImageSource,
+        container_image: Option<&str>,
+    ) -> VariantRuntimeProfile {
+        VariantRuntimeProfile {
+            experiment: json!({}),
+            variant_args: Vec::new(),
+            agent_runtime: AgentRuntimeConfig {
+                adapter_ref: AgentAdapterRef::default(),
+                command_raw: vec!["rex".to_string()],
+                container_image: container_image.map(|value| value.to_string()),
+                image_source,
+                agent_artifact: None,
+                agent_artifact_digest: None,
+                agent_artifact_resolved_path: None,
+                io: AgentRuntimeIoConfig {
+                    input_arg: "--input".to_string(),
+                    output_arg: "--output".to_string(),
+                },
+                clean_contract_v1: false,
+                integration_level: "cli_basic".to_string(),
+                launch_mode: AgentLaunchMode::File,
+                env: BTreeMap::new(),
+                env_from_host: Vec::new(),
+                bindings_to_args: Vec::new(),
+                workspace_patches: Vec::new(),
+                trajectory_path: None,
+                causal_extraction: None,
+                default_timeout_ms: None,
+                tracing_mode: None,
+                force_container: true,
+                dependency_file_staging: Vec::new(),
+                dependency_services: Vec::new(),
+            },
+            agent_runtime_env: BTreeMap::new(),
+            invocation_source: "test".to_string(),
+            invocation_default_timeout_ms: None,
+            executor_kind: ExecutorKind::LocalDocker,
+            container_mode: true,
+            configured_network_mode: "none".to_string(),
+            effective_network_mode: "none".to_string(),
+        }
+    }
+
+    #[test]
+    fn preflight_resolve_images_reports_missing_global_image() {
+        let profile = preflight_test_runtime_profile(ImageSource::Global, None);
+        let check = resolve_preflight_images(
+            "container_ready",
+            &profile,
+            &[],
+            None,
+            "global image missing",
+        )
+        .expect_err("missing global image should fail");
+        assert_eq!(check.name, "container_ready");
+        assert!(!check.passed);
+        assert!(check.message.contains("global image missing"));
+    }
+
+    #[test]
+    fn preflight_resolve_images_reports_per_task_scan_errors() {
+        let profile = preflight_test_runtime_profile(ImageSource::PerTask, None);
+        let scan = PerTaskImageScanResult {
+            unique_images: Vec::new(),
+            missing_task_ids: Vec::new(),
+            parse_errors: vec!["line 1: malformed".to_string()],
+        };
+        let check =
+            resolve_preflight_images("container_ready", &profile, &[], Some(&scan), "unused")
+                .expect_err("parse errors should fail");
+        assert!(!check.passed);
+        assert!(check
+            .message
+            .contains("failed to parse task image boundary rows"));
+    }
+
+    #[test]
+    fn preflight_blocking_error_filter_is_check_specific() {
+        let checks = vec![
+            PreflightCheck {
+                name: "container_ready",
+                passed: true,
+                severity: PreflightSeverity::Error,
+                message: "ok".to_string(),
+            },
+            PreflightCheck {
+                name: "benchmark_grader_reachable",
+                passed: false,
+                severity: PreflightSeverity::Warning,
+                message: "warn".to_string(),
+            },
+            PreflightCheck {
+                name: "container_ready",
+                passed: false,
+                severity: PreflightSeverity::Error,
+                message: "failed".to_string(),
+            },
+        ];
+        assert!(has_blocking_preflight_error(&checks, "container_ready"));
+        assert!(!has_blocking_preflight_error(
+            &checks,
+            "benchmark_grader_reachable"
+        ));
+    }
+
     fn inv07_spec_with_provider_env(
         provider_env: Value,
         runtime_env: Value,
@@ -17347,6 +19671,43 @@ mod tests {
     }
 
     #[test]
+    fn inv06_load_tasks_honors_zero_limit() {
+        let root = TempDirGuard::new("agentlab_inv06_load_tasks_limit_zero");
+        let dataset_path = root.path.join("tasks.jsonl");
+        fs::write(
+            &dataset_path,
+            "{\"id\":\"task_1\"}\n{\"id\":\"task_2\"}\n{\"id\":\"task_3\"}\n",
+        )
+        .expect("dataset");
+        let spec = json!({
+            "dataset": { "limit": 0 }
+        });
+
+        let tasks = load_tasks(&dataset_path, &spec).expect("load tasks");
+        assert!(
+            tasks.is_empty(),
+            "dataset.limit=0 should produce zero loaded tasks"
+        );
+    }
+
+    #[test]
+    fn inv06_count_tasks_honors_zero_limit() {
+        let root = TempDirGuard::new("agentlab_inv06_count_tasks_limit_zero");
+        let dataset_path = root.path.join("tasks.jsonl");
+        fs::write(
+            &dataset_path,
+            "{\"id\":\"task_1\"}\n{\"id\":\"task_2\"}\n{\"id\":\"task_3\"}\n",
+        )
+        .expect("dataset");
+        let spec = json!({
+            "dataset": { "limit": 0 }
+        });
+
+        let count = count_tasks(&dataset_path, &spec).expect("count tasks");
+        assert_eq!(count, 0, "dataset.limit=0 should produce zero task count");
+    }
+
+    #[test]
     fn inv05_workspace_diff_empty_detector_matches_snapshot_diff() {
         let snapshot_a = json!({
             "files": [
@@ -17478,8 +19839,8 @@ mod tests {
             "unpacked artifact payload missing"
         );
 
-        let second_mount =
-            resolve_agent_artifact_mount_dir(&artifact_tar).expect("second unpack should be cached");
+        let second_mount = resolve_agent_artifact_mount_dir(&artifact_tar)
+            .expect("second unpack should be cached");
         assert_eq!(
             first_mount, second_mount,
             "artifact mount path should be stable across repeated calls"
@@ -17572,5 +19933,516 @@ mod tests {
             "test -f /opt/agent/agent.txt",
         ]);
         run_checked_command(verify, "docker verify").expect("verify unpacked artifact");
+    }
+
+    fn create_dx_authoring_fixture(prefix: &str) -> TempDirGuard {
+        let root = TempDirGuard::new(prefix);
+        let dataset_dir = root.path.join(".lab").join("experiments").join("data");
+        ensure_dir(&dataset_dir).expect("dataset dir");
+        fs::write(
+            dataset_dir.join("bench_v0.task_boundary_v2.jsonl"),
+            r#"{"schema_version":"task_boundary_v2","task":{"id":"TASK001","image":"python:3.11-slim","workspace":"/agentlab/workspace"},"workspace_files":[],"mount_references":[]}"#,
+        )
+        .expect("dataset row");
+
+        let artifact_bin = root
+            .path
+            .join(".lab")
+            .join("agents")
+            .join("rex-minimal-linux-dir")
+            .join("bin");
+        ensure_dir(&artifact_bin).expect("artifact dir");
+        fs::write(artifact_bin.join("rex"), "#!/bin/sh\necho rex\n").expect("artifact binary");
+
+        let overrides_dir = root.path.join(".lab").join("experiments").join("overrides");
+        ensure_dir(&overrides_dir).expect("overrides dir");
+        fs::write(
+            overrides_dir.join("providers.a.ts"),
+            "export const P='A';\n",
+        )
+        .expect("patch A");
+        fs::write(
+            overrides_dir.join("providers.b.ts"),
+            "export const P='B';\n",
+        )
+        .expect("patch B");
+        root
+    }
+
+    fn minimal_dx_spec() -> Value {
+        json!({
+            "experiment": {
+                "id": "bench_v0_qwen35b_a3b_only",
+                "name": "Bench v0: Qwen3.5 35B A3B",
+                "tags": ["bench-v0", "single-variant"]
+            },
+            "benchmark": "bench_v0",
+            "limit": 20,
+            "agent": {
+                "artifact": "rex-minimal-linux-dir",
+                "command": ["rex", "run", "--dangerous"],
+                "io": { "input": "--input-file", "output": "--output" },
+                "env": { "MEMORY_DAEMON_URL": "" },
+                "config_files": ["providers.a.ts", "providers.b.ts"],
+                "workspace_patches": {
+                    "providers.a.ts": "packages/core/types/src/providers.ts",
+                    "providers.b.ts": "packages/core/types/src/providers.ts"
+                },
+                "bindings_to_args": [
+                    { "binding": "model_provider", "flag": "--provider" },
+                    { "binding": "model", "flag": "--model" }
+                ]
+            },
+            "baseline": {
+                "id": "qwen_35b_a3b",
+                "bindings": { "model_provider": "lmstudio", "model": "qwen3.5-35b-a3b" }
+            },
+            "overrides": {
+                "network": "full",
+                "root_read_only": false
+            }
+        })
+    }
+
+    #[test]
+    fn p0_i01_and_p0_i05_dx_registry_resolution_is_complete_and_deterministic() {
+        let root = create_dx_authoring_fixture("agentlab_p0_registry_resolution");
+        let spec = minimal_dx_spec();
+        let resolved_a =
+            normalize_experiment_authoring(spec.clone(), &root.path, &root.path).expect("first");
+        let resolved_b =
+            normalize_experiment_authoring(spec.clone(), &root.path, &root.path).expect("second");
+        assert_eq!(
+            resolved_a, resolved_b,
+            "normalized output must be deterministic"
+        );
+
+        assert_eq!(
+            resolved_a
+                .pointer("/dataset/suite_id")
+                .and_then(Value::as_str)
+                .unwrap_or(""),
+            "bench_v0"
+        );
+        assert_eq!(
+            resolved_a
+                .pointer("/benchmark/adapter/command/1")
+                .and_then(Value::as_str)
+                .unwrap_or(""),
+            "/opt/bench/bench_benchmark_adapter.py"
+        );
+        assert_eq!(
+            resolved_a
+                .pointer("/design/comparison")
+                .and_then(Value::as_str)
+                .unwrap_or(""),
+            "none"
+        );
+        assert_eq!(
+            resolved_a
+                .pointer("/design/policies/scheduling")
+                .and_then(Value::as_str)
+                .unwrap_or(""),
+            "variant_sequential"
+        );
+        let artifact_digest = resolved_a
+            .pointer("/runtime/agent/artifact_digest")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        assert!(
+            artifact_digest.starts_with("sha256:"),
+            "artifact digest missing: {}",
+            artifact_digest
+        );
+    }
+
+    #[test]
+    fn p0_i06_preflight_grader_reachability_fails_when_script_missing() {
+        let docker_ok = Command::new("docker")
+            .arg("info")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false);
+        if !docker_ok {
+            eprintln!("skipping p0_i06 test: docker daemon unavailable");
+            return;
+        }
+        ensure_container_image_ready("python:3.11-slim").expect("python image");
+
+        let benchmark_config = BenchmarkConfig {
+            policy: BenchmarkPolicyConfig::default(),
+            adapter: Some(BenchmarkAdapterConfig {
+                command: vec![
+                    "python3".to_string(),
+                    "/opt/bench/bench_benchmark_adapter.py".to_string(),
+                ],
+                manifest: None,
+            }),
+        };
+        let runtime_profile = VariantRuntimeProfile {
+            experiment: json!({}),
+            variant_args: Vec::new(),
+            agent_runtime: AgentRuntimeConfig {
+                adapter_ref: AgentAdapterRef::default(),
+                command_raw: vec!["rex".to_string()],
+                container_image: None,
+                image_source: ImageSource::PerTask,
+                agent_artifact: None,
+                agent_artifact_digest: None,
+                agent_artifact_resolved_path: None,
+                io: AgentRuntimeIoConfig {
+                    input_arg: "--input-file".to_string(),
+                    output_arg: "--output".to_string(),
+                },
+                clean_contract_v1: false,
+                integration_level: "cli_basic".to_string(),
+                launch_mode: AgentLaunchMode::File,
+                env: BTreeMap::new(),
+                env_from_host: Vec::new(),
+                bindings_to_args: Vec::new(),
+                workspace_patches: Vec::new(),
+                trajectory_path: None,
+                causal_extraction: None,
+                default_timeout_ms: None,
+                tracing_mode: None,
+                force_container: true,
+                dependency_file_staging: Vec::new(),
+                dependency_services: Vec::new(),
+            },
+            agent_runtime_env: BTreeMap::new(),
+            invocation_source: "test".to_string(),
+            invocation_default_timeout_ms: None,
+            executor_kind: ExecutorKind::LocalDocker,
+            container_mode: true,
+            configured_network_mode: "none".to_string(),
+            effective_network_mode: "none".to_string(),
+        };
+        let tasks = vec![json!({
+            "schema_version": "task_boundary_v2",
+            "task": {
+                "id": "TASK001",
+                "image": "python:3.11-slim",
+                "workspace": "/workspace"
+            },
+            "workspace_files": [],
+            "mount_references": []
+        })];
+
+        let check =
+            check_benchmark_grader_reachable(&benchmark_config, &runtime_profile, &tasks, false);
+        assert!(
+            !check.passed,
+            "preflight must fail when grader script path is missing from image"
+        );
+        assert!(
+            check
+                .message
+                .contains("grader script path '/opt/bench/bench_benchmark_adapter.py'"),
+            "unexpected message: {}",
+            check.message
+        );
+    }
+
+    #[test]
+    fn p0_i02_dx_authoring_rejects_legacy_fields() {
+        let root = create_dx_authoring_fixture("agentlab_p0_legacy_reject");
+        let mut spec = minimal_dx_spec();
+        set_json_pointer_value(&mut spec, "/dataset/path", json!("data/tasks.jsonl"))
+            .expect("inject legacy field");
+        let err = normalize_experiment_authoring(spec, &root.path, &root.path)
+            .expect_err("legacy field should fail");
+        assert!(
+            err.to_string().contains("/dataset"),
+            "unexpected error: {}",
+            err
+        );
+        assert!(
+            err.to_string().contains("legacy/removed fields"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn p0_i03_injected_container_env_includes_agent_path() {
+        let (_root, paths) = create_trial_paths_fixture("agentlab_p0_path_env");
+        let runtime = AgentRuntimeConfig {
+            adapter_ref: AgentAdapterRef::default(),
+            command_raw: vec!["rex".to_string(), "run".to_string()],
+            container_image: Some("image:latest".to_string()),
+            image_source: ImageSource::Global,
+            agent_artifact: Some(PathBuf::from("/tmp/agent-artifact")),
+            agent_artifact_digest: None,
+            agent_artifact_resolved_path: None,
+            io: AgentRuntimeIoConfig {
+                input_arg: "--input".to_string(),
+                output_arg: "--output".to_string(),
+            },
+            clean_contract_v1: false,
+            integration_level: "cli_basic".to_string(),
+            launch_mode: AgentLaunchMode::File,
+            env: BTreeMap::new(),
+            env_from_host: Vec::new(),
+            bindings_to_args: Vec::new(),
+            workspace_patches: Vec::new(),
+            trajectory_path: None,
+            causal_extraction: None,
+            default_timeout_ms: None,
+            tracing_mode: None,
+            force_container: true,
+            dependency_file_staging: Vec::new(),
+            dependency_services: Vec::new(),
+        };
+        let runtime_env = BTreeMap::new();
+        let overrides = BTreeMap::new();
+        let io_paths = PreparedTrialIo {
+            output_host: paths.out.join("result.json"),
+            events_host: paths.state.join("events.jsonl"),
+            task_path: AGENTLAB_TASK_PATH.to_string(),
+            bindings_path: AGENTLAB_BINDINGS_PATH.to_string(),
+            dependencies_path: AGENTLAB_DEPENDENCIES_PATH.to_string(),
+            policy_path: AGENTLAB_POLICY_PATH.to_string(),
+            result_path: AGENTLAB_RESULT_PATH.to_string(),
+            trajectory_path: AGENTLAB_TRAJECTORY_PATH.to_string(),
+        };
+        let empty_json = json!({});
+        let request = AdapterRunRequest {
+            runtime_experiment: &empty_json,
+            runtime: &runtime,
+            variant_args: &[],
+            runtime_env: &runtime_env,
+            runtime_overrides_env: &overrides,
+            container_mode: true,
+            trial_paths: &paths,
+            dynamic_mounts: &[],
+            io_paths: &io_paths,
+            network_mode: "none",
+            setup_command: None,
+            benchmark_adapter: None,
+            benchmark_grading_enabled: false,
+            run_id: "run_1",
+            task_image: None,
+            task_workspace: None,
+            agent_artifact: runtime.agent_artifact.as_deref(),
+        };
+        let mut cmd = Command::new("docker");
+        append_container_env_args(&mut cmd, &request, None);
+        let args = cmd
+            .get_args()
+            .map(|value| value.to_string_lossy().to_string())
+            .collect::<Vec<_>>();
+        assert!(
+            args.iter().any(|arg| arg == AGENT_ARTIFACT_PATH_ENV_VALUE),
+            "PATH injection env missing: {:?}",
+            args
+        );
+    }
+
+    #[test]
+    fn p0_i04_artifact_digest_pin_rejects_mutation() {
+        let root = TempDirGuard::new("agentlab_p0_artifact_digest_pin");
+        let artifact_dir = root.path.join("artifact");
+        ensure_dir(&artifact_dir).expect("artifact dir");
+        fs::write(artifact_dir.join("agent.txt"), "v1").expect("artifact v1");
+        let digest_before = compute_artifact_content_digest(&artifact_dir).expect("digest before");
+        fs::write(artifact_dir.join("agent.txt"), "v2").expect("artifact v2");
+        let runtime = AgentRuntimeConfig {
+            adapter_ref: AgentAdapterRef::default(),
+            command_raw: vec!["rex".to_string()],
+            container_image: Some("image".to_string()),
+            image_source: ImageSource::Global,
+            agent_artifact: Some(artifact_dir.clone()),
+            agent_artifact_digest: Some(format!("sha256:{}", digest_before)),
+            agent_artifact_resolved_path: Some(artifact_dir.clone()),
+            io: AgentRuntimeIoConfig {
+                input_arg: "--input".to_string(),
+                output_arg: "--output".to_string(),
+            },
+            clean_contract_v1: false,
+            integration_level: "cli_basic".to_string(),
+            launch_mode: AgentLaunchMode::File,
+            env: BTreeMap::new(),
+            env_from_host: Vec::new(),
+            bindings_to_args: Vec::new(),
+            workspace_patches: Vec::new(),
+            trajectory_path: None,
+            causal_extraction: None,
+            default_timeout_ms: None,
+            tracing_mode: None,
+            force_container: true,
+            dependency_file_staging: Vec::new(),
+            dependency_services: Vec::new(),
+        };
+        let err = validate_agent_artifact_pin(&runtime).expect_err("digest mismatch expected");
+        assert!(
+            err.to_string().contains("digest mismatch"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn p1_i01_missing_binding_keys_fail_projection() {
+        let variant_bindings = json!({ "model_provider": "lmstudio" });
+        let specs = vec![
+            BindingArgProjectionSpec {
+                binding: "model_provider".to_string(),
+                flag: "--provider".to_string(),
+            },
+            BindingArgProjectionSpec {
+                binding: "model".to_string(),
+                flag: "--model".to_string(),
+            },
+        ];
+        let err = project_bindings_to_args(&variant_bindings, &specs)
+            .expect_err("missing model binding should fail");
+        assert!(
+            err.to_string()
+                .contains("missing required binding key 'model'"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn p1_i02_binding_projection_order_is_deterministic() {
+        let bindings = json!({
+            "model_provider": "lmstudio",
+            "model": "qwen3.5-35b-a3b"
+        });
+        let specs = vec![
+            BindingArgProjectionSpec {
+                binding: "model_provider".to_string(),
+                flag: "--provider".to_string(),
+            },
+            BindingArgProjectionSpec {
+                binding: "model".to_string(),
+                flag: "--model".to_string(),
+            },
+        ];
+        let projected = project_bindings_to_args(&bindings, &specs).expect("projection");
+        assert_eq!(
+            projected,
+            vec![
+                "--provider".to_string(),
+                "lmstudio".to_string(),
+                "--model".to_string(),
+                "qwen3.5-35b-a3b".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn p1_i03_binding_projection_preserves_single_token_values() {
+        let bindings = json!({
+            "model_provider": "local provider",
+            "model": "qwen 35b a3b"
+        });
+        let specs = vec![
+            BindingArgProjectionSpec {
+                binding: "model_provider".to_string(),
+                flag: "--provider".to_string(),
+            },
+            BindingArgProjectionSpec {
+                binding: "model".to_string(),
+                flag: "--model".to_string(),
+            },
+        ];
+        let projected = project_bindings_to_args(&bindings, &specs).expect("projection");
+        assert_eq!(projected[1], "local provider");
+        assert_eq!(projected[3], "qwen 35b a3b");
+        assert_eq!(projected.len(), 4);
+    }
+
+    #[test]
+    fn p1_i04_workspace_patch_path_rejection() {
+        let root = TempDirGuard::new("agentlab_p1_workspace_patch_path_rejection");
+        let spec = json!([
+            {
+                "source_from_host": root.path.join("input.txt").to_string_lossy().to_string(),
+                "target_path": "../escape.txt"
+            }
+        ]);
+        let err = parse_workspace_patches(Some(&spec), &root.path)
+            .expect_err("path traversal must be rejected");
+        assert!(
+            err.to_string().contains("invalid"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn p1_i05_workspace_patch_ordering_overwrites_deterministically() {
+        let (_root, paths) = create_trial_paths_fixture("agentlab_p1_workspace_patch_order");
+        let source_a = paths.trial_dir.join("source_a.txt");
+        let source_b = paths.trial_dir.join("source_b.txt");
+        fs::write(&source_a, "A").expect("source A");
+        fs::write(&source_b, "B").expect("source B");
+
+        let runtime = AgentRuntimeConfig {
+            adapter_ref: AgentAdapterRef::default(),
+            command_raw: vec!["rex".to_string()],
+            container_image: None,
+            image_source: ImageSource::Global,
+            agent_artifact: None,
+            agent_artifact_digest: None,
+            agent_artifact_resolved_path: None,
+            io: AgentRuntimeIoConfig {
+                input_arg: "--input".to_string(),
+                output_arg: "--output".to_string(),
+            },
+            clean_contract_v1: false,
+            integration_level: "cli_basic".to_string(),
+            launch_mode: AgentLaunchMode::File,
+            env: BTreeMap::new(),
+            env_from_host: Vec::new(),
+            bindings_to_args: Vec::new(),
+            workspace_patches: vec![
+                WorkspacePatchSpec {
+                    source_from_host: source_a,
+                    target_path: "patched/provider.ts".to_string(),
+                },
+                WorkspacePatchSpec {
+                    source_from_host: source_b,
+                    target_path: "patched/provider.ts".to_string(),
+                },
+            ],
+            trajectory_path: None,
+            causal_extraction: None,
+            default_timeout_ms: None,
+            tracing_mode: None,
+            force_container: false,
+            dependency_file_staging: Vec::new(),
+            dependency_services: Vec::new(),
+        };
+
+        stage_workspace_patches_for_trial(&runtime, &paths).expect("stage patches");
+        let patched = fs::read_to_string(paths.workspace.join("patched").join("provider.ts"))
+            .expect("patched file");
+        assert_eq!(patched, "B");
+    }
+
+    #[test]
+    fn p0_i06_and_p1_i06_canonical_example_has_no_boundary_leaks_or_cp_hacks() {
+        let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../..")
+            .canonicalize()
+            .expect("repo root");
+        let canonical = repo_root
+            .join(".lab")
+            .join("experiments")
+            .join("bench_v0_qwen35b_a3b_only.yaml");
+        let content = fs::read_to_string(&canonical).expect("canonical experiment fixture");
+        assert!(
+            !content.contains("/opt/agent/bin/"),
+            "canonical fixture must not require internal /opt/agent/bin path"
+        );
+        assert!(
+            !content.contains("cp /agentlab/deps"),
+            "canonical fixture must not contain shell cp glue"
+        );
     }
 }

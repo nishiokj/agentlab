@@ -1,5 +1,8 @@
 # Experiments Reliability Hard-Gate Plan
 
+> Status: Reliability workstream reference. Treat as WS1 input to `docs/V1_BENCHMARK_MIGRATION_PLAN.md`.
+
+
 Date: 2026-03-02  
 Scope: `Experiments` package only (runner, adapters, schemas, CI gates).  
 Driver: follow-up to `POSTMORTEM_2026-03-02_bench_v0_experiment_runner_incident.md`.

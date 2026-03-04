@@ -1,0 +1,34 @@
+{
+  "schema_version": "dx_phase0_resolved_manifest_golden_v1",
+  "benchmark": "bench_v0",
+  "dataset": {
+    "provider": "local_jsonl",
+    "path_suffix": ".lab/experiments/data/bench_v0.task_boundary_v2.jsonl",
+    "schema_version": "task_boundary_v2",
+    "suite_id": "bench_v0",
+    "split_id": "test"
+  },
+  "design_defaults": {
+    "comparison": "none",
+    "replications": 1,
+    "random_seed": 1,
+    "shuffle_tasks": true,
+    "max_concurrency": 1,
+    "policies": {
+      "scheduling": "variant_sequential",
+      "retry": { "max_attempts": 1 }
+    }
+  },
+  "runtime": {
+    "agent": {
+      "image_source": "per_task",
+      "artifact": ".lab/agents/rex-minimal-linux-dir",
+      "artifact_digest": "sha256:2de5273c32c0f1c5c7a3400eb3cde93bd2dabb0bf4dec37db5a4d7727b408b29",
+      "io": { "input_arg": "--input-file", "output_arg": "--output" }
+    }
+  },
+  "benchmark_adapter_command": [
+    "python3",
+    "/opt/agent/bench/integration/agentlab/bench_benchmark_adapter.py"
+  ]
+}

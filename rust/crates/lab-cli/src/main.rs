@@ -183,12 +183,16 @@ enum Commands {
         view: Option<String>,
         #[arg(long)]
         all: bool,
-        #[arg(long, default_value_t = 100)]
-        limit: usize,
+        #[arg(long = "max-rows")]
+        max_rows: Option<usize>,
         #[arg(long)]
         json: bool,
         #[arg(long)]
         csv: bool,
+        #[arg(long, alias = "markdown")]
+        md: bool,
+        #[arg(long)]
+        html: bool,
     },
     #[command(about = "Live refresh for a view (defaults to run_progress)")]
     ViewsLive {
@@ -303,6 +307,239 @@ enum Commands {
     },
 }
 
+#[derive(Clone, Copy, Debug)]
+enum ViewQueryPlan {
+    Source(&'static str),
+    AbComparisonSummary,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct StandardViewDef {
+    name: &'static str,
+    purpose: &'static str,
+    plan: ViewQueryPlan,
+    aliases: &'static [&'static str],
+}
+
+#[derive(Clone, Debug)]
+enum ResolvedViewPlan {
+    Source(String),
+    AbComparisonSummary,
+}
+
+#[derive(Clone, Debug)]
+struct ResolvedView {
+    name: String,
+    source: Option<String>,
+    plan: ResolvedViewPlan,
+    standardize_ab_terms: bool,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TableRenderFormat {
+    Text,
+    Csv,
+    Markdown,
+    Html,
+}
+
+const STANDARD_VIEWS_CORE_ONLY: &[StandardViewDef] = &[
+    StandardViewDef {
+        name: "run_progress",
+        purpose: "Run-level completion and pass-rate snapshot.",
+        plan: ViewQueryPlan::Source("run_progress"),
+        aliases: &["status", "progress"],
+    },
+    StandardViewDef {
+        name: "variant_summary",
+        purpose: "Per-variant success and primary metric summary.",
+        plan: ViewQueryPlan::Source("variant_summary"),
+        aliases: &["variants", "summary_by_variant"],
+    },
+    StandardViewDef {
+        name: "task_variant_matrix",
+        purpose: "Task-by-variant pass rates for quick gap scanning.",
+        plan: ViewQueryPlan::Source("task_variant_matrix"),
+        aliases: &["task_matrix", "matrix"],
+    },
+];
+
+const STANDARD_VIEWS_AB_TEST: &[StandardViewDef] = &[
+    StandardViewDef {
+        name: "run_progress",
+        purpose: "Run-level completion and pass-rate snapshot.",
+        plan: ViewQueryPlan::Source("run_progress"),
+        aliases: &["status", "progress"],
+    },
+    StandardViewDef {
+        name: "variant_summary",
+        purpose: "Per-variant success and primary metric summary.",
+        plan: ViewQueryPlan::Source("variant_summary"),
+        aliases: &["variants", "summary_by_variant"],
+    },
+    StandardViewDef {
+        name: "comparison_summary",
+        purpose: "Single-row AB summary (rates, deltas, effect size, McNemar).",
+        plan: ViewQueryPlan::AbComparisonSummary,
+        aliases: &[
+            "summary",
+            "overview",
+            "paired_outcomes",
+            "paired_diffs",
+            "win_loss_tie",
+            "effect_size",
+            "mcnemar_contingency",
+            "task_diffs",
+        ],
+    },
+    StandardViewDef {
+        name: "task_outcomes",
+        purpose: "Task-level outcome/result side-by-side for variant_a vs variant_b.",
+        plan: ViewQueryPlan::Source("ab_task_outcomes"),
+        aliases: &[
+            "outcome_compare",
+            "ab_task_outcomes",
+            "task_outcome_compare",
+            "ab_task_table",
+        ],
+    },
+    StandardViewDef {
+        name: "task_metrics",
+        purpose: "Task-level metric deltas with aligned trials and outcome change.",
+        plan: ViewQueryPlan::Source("ab_task_metrics_side_by_side"),
+        aliases: &[
+            "task_compare",
+            "task_comparison",
+            "by_task",
+            "task_table",
+            "ab_task_metrics_side_by_side",
+        ],
+    },
+    StandardViewDef {
+        name: "turn_compare",
+        purpose: "Turn-level side-by-side comparison (model, status, token deltas).",
+        plan: ViewQueryPlan::Source("ab_turn_side_by_side"),
+        aliases: &[
+            "turn_diff",
+            "turn_compare",
+            "turn_side_by_side",
+            "trace_turns",
+            "ab_turn_side_by_side",
+        ],
+    },
+    StandardViewDef {
+        name: "trace",
+        purpose: "Trace row side-by-side comparison for event-level diagnostics.",
+        plan: ViewQueryPlan::Source("ab_trace_row_side_by_side"),
+        aliases: &[
+            "trace",
+            "trace_diff",
+            "trace_compare",
+            "trace_side_by_side",
+            "ab_trace_row_side_by_side",
+        ],
+    },
+];
+
+const STANDARD_VIEWS_MULTI_VARIANT: &[StandardViewDef] = &[
+    StandardViewDef {
+        name: "run_progress",
+        purpose: "Run-level completion and pass-rate snapshot.",
+        plan: ViewQueryPlan::Source("run_progress"),
+        aliases: &["status", "progress"],
+    },
+    StandardViewDef {
+        name: "variant_summary",
+        purpose: "Per-variant success and primary metric summary.",
+        plan: ViewQueryPlan::Source("variant_summary"),
+        aliases: &["variants", "summary_by_variant"],
+    },
+    StandardViewDef {
+        name: "variant_ranking",
+        purpose: "Ranking by pass-rate and primary metric vs reference variant.",
+        plan: ViewQueryPlan::Source("variant_ranking"),
+        aliases: &["ranking", "leaderboard"],
+    },
+    StandardViewDef {
+        name: "pairwise_compare",
+        purpose: "Pairwise win/loss/tie counts across variant pairs.",
+        plan: ViewQueryPlan::Source("pairwise_comparisons"),
+        aliases: &["pairwise", "pairwise_comparisons"],
+    },
+    StandardViewDef {
+        name: "task_variant_matrix",
+        purpose: "Task-by-variant pass rates for quick gap scanning.",
+        plan: ViewQueryPlan::Source("task_variant_matrix"),
+        aliases: &["task_matrix", "matrix", "heatmap"],
+    },
+];
+
+const STANDARD_VIEWS_PARAMETER_SWEEP: &[StandardViewDef] = &[
+    StandardViewDef {
+        name: "run_progress",
+        purpose: "Run-level completion and pass-rate snapshot.",
+        plan: ViewQueryPlan::Source("run_progress"),
+        aliases: &["status", "progress"],
+    },
+    StandardViewDef {
+        name: "variant_summary",
+        purpose: "Per-variant success and primary metric summary.",
+        plan: ViewQueryPlan::Source("variant_summary"),
+        aliases: &["variants", "summary_by_variant"],
+    },
+    StandardViewDef {
+        name: "config_ranking",
+        purpose: "Top configurations by primary metric and pass-rate.",
+        plan: ViewQueryPlan::Source("best_config"),
+        aliases: &["best_config", "ranking", "top_configs"],
+    },
+    StandardViewDef {
+        name: "parameter_effects",
+        purpose: "Average metric by parameter value.",
+        plan: ViewQueryPlan::Source("parameter_metric"),
+        aliases: &["parameter_metric", "parameter_impact"],
+    },
+    StandardViewDef {
+        name: "parameter_sensitivity",
+        purpose: "Variance/range sensitivity by parameter.",
+        plan: ViewQueryPlan::Source("sensitivity"),
+        aliases: &["sensitivity"],
+    },
+];
+
+const STANDARD_VIEWS_REGRESSION: &[StandardViewDef] = &[
+    StandardViewDef {
+        name: "run_progress",
+        purpose: "Run-level completion and pass-rate snapshot.",
+        plan: ViewQueryPlan::Source("run_progress"),
+        aliases: &["status", "progress"],
+    },
+    StandardViewDef {
+        name: "variant_summary",
+        purpose: "Per-variant success and primary metric summary.",
+        plan: ViewQueryPlan::Source("variant_summary"),
+        aliases: &["variants", "summary_by_variant"],
+    },
+    StandardViewDef {
+        name: "run_trend",
+        purpose: "Pass-rate trend per run and variant.",
+        plan: ViewQueryPlan::Source("pass_rate_trend"),
+        aliases: &["trend", "pass_rate_trend"],
+    },
+    StandardViewDef {
+        name: "flaky_tasks",
+        purpose: "Tasks with unstable outcomes across replications.",
+        plan: ViewQueryPlan::Source("flaky_tasks"),
+        aliases: &["flaky"],
+    },
+    StandardViewDef {
+        name: "failure_clusters",
+        purpose: "Failure concentration by task-group prefix.",
+        plan: ViewQueryPlan::Source("failure_clusters"),
+        aliases: &["clusters"],
+    },
+];
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let json_mode = command_json_mode(&cli.command);
@@ -333,12 +570,19 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
             overrides,
             json,
         } => {
+            if !json {
+                eprintln!("resolving experiment: {}", experiment.display());
+            }
             let summary =
                 lab_runner::describe_experiment_with_overrides(&experiment, overrides.as_deref())?;
             let execution = lab_runner::RunExecutionOptions {
                 executor: executor.map(Into::into),
                 materialize: materialize.map(Into::into),
             };
+            if !json {
+                print_summary(&summary);
+                eprintln!("launching run...");
+            }
             let result = lab_runner::run_experiment_with_options_and_overrides(
                 &experiment,
                 container,
@@ -359,7 +603,6 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
                     "post_run_stats": post_run
                 })));
             }
-            print_summary(&summary);
             println!("run_id: {}", result.run_id);
             println!("run_dir: {}", result.run_dir.display());
             try_print_post_run_stats(&result.run_dir, &result.run_id);
@@ -370,9 +613,16 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
             overrides,
             json,
         } => {
+            if !json {
+                eprintln!("resolving experiment: {}", experiment.display());
+            }
             let summary =
                 lab_runner::describe_experiment_with_overrides(&experiment, overrides.as_deref())?;
             let setup_for_json = setup.clone();
+            if !json {
+                print_summary(&summary);
+                eprintln!("launching dev run...");
+            }
             let result = lab_runner::run_experiment_dev_with_overrides(
                 &experiment,
                 setup.clone(),
@@ -391,7 +641,6 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
                     "post_run_stats": post_run
                 })));
             }
-            print_summary(&summary);
             if let Some(s) = &setup {
                 println!("dev_setup: {}", s);
             } else {
@@ -407,8 +656,15 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
             overrides,
             json,
         } => {
+            if !json {
+                eprintln!("resolving experiment: {}", experiment.display());
+            }
             let summary =
                 lab_runner::describe_experiment_with_overrides(&experiment, overrides.as_deref())?;
+            if !json {
+                print_summary(&summary);
+                eprintln!("launching strict experiment run...");
+            }
             let result = lab_runner::run_experiment_strict_with_overrides(
                 &experiment,
                 overrides.as_deref(),
@@ -424,7 +680,6 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
                     "post_run_stats": post_run
                 })));
             }
-            print_summary(&summary);
             println!("experiment_network_requirement: none");
             println!("run_id: {}", result.run_id);
             println!("run_dir: {}", result.run_dir.display());
@@ -622,12 +877,20 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
             run,
             view,
             all,
-            limit,
+            max_rows,
             json,
             csv,
+            md,
+            html,
         } => {
-            if json && csv {
-                return Err(anyhow::anyhow!("--json and --csv are mutually exclusive"));
+            let format_flags = [json, csv, md, html]
+                .into_iter()
+                .filter(|flag| *flag)
+                .count();
+            if format_flags > 1 {
+                return Err(anyhow::anyhow!(
+                    "--json, --csv, --md, and --html are mutually exclusive"
+                ));
             }
             if all && view.is_some() {
                 return Err(anyhow::anyhow!(
@@ -635,71 +898,119 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
                 ));
             }
             let run_dir = resolve_run_dir_arg(&run)?;
-            let view_set = lab_analysis::run_view_set(&run_dir)?.as_str().to_string();
-            let view_names = lab_analysis::list_views(&run_dir)?;
+            let run_view_set = lab_analysis::run_view_set(&run_dir)?;
+            let view_set = run_view_set.as_str().to_string();
+            let raw_view_names = lab_analysis::list_views(&run_dir)?;
+            let standard_views = standard_views_for_set(run_view_set);
+            let row_limit = max_rows.unwrap_or(0);
+            let render_format = table_render_format(csv, md, html);
 
             if all {
                 if json {
                     let mut payload = serde_json::Map::new();
-                    for name in &view_names {
-                        let table = lab_analysis::query_view(&run_dir, name, limit)?;
-                        payload.insert(name.clone(), query_table_to_json(&table));
+                    for def in standard_views {
+                        let resolved = resolved_view_from_def(run_view_set, def);
+                        let table = query_resolved_view(&run_dir, &resolved, row_limit)?;
+                        payload.insert(def.name.to_string(), query_table_to_json(&table));
                     }
                     return Ok(Some(json!({
                         "ok": true,
                         "command": "views",
                         "run_dir": run_dir.display().to_string(),
                         "view_set": view_set,
+                        "view_count": standard_views.len(),
+                        "raw_view_count": raw_view_names.len(),
                         "views": Value::Object(payload),
                     })));
                 }
-                if csv {
-                    for name in &view_names {
-                        let table = lab_analysis::query_view(&run_dir, name, limit)?;
+                let mut rendered: Vec<(ResolvedView, lab_analysis::QueryTable)> =
+                    Vec::with_capacity(standard_views.len());
+                for def in standard_views {
+                    let resolved = resolved_view_from_def(run_view_set, def);
+                    let table = query_resolved_view(&run_dir, &resolved, row_limit)?;
+                    rendered.push((resolved, table));
+                }
+                if matches!(render_format, TableRenderFormat::Csv) {
+                    for (_, table) in rendered {
                         print_query_table_csv(&table);
                     }
                     return Ok(None);
                 }
+                if matches!(render_format, TableRenderFormat::Markdown) {
+                    print_views_markdown_document(&run_dir, &view_set, &rendered);
+                    return Ok(None);
+                }
+                if matches!(render_format, TableRenderFormat::Html) {
+                    print_views_html_document(&run_dir, &view_set, &rendered);
+                    return Ok(None);
+                }
                 println!("run_dir: {}", run_dir.display());
                 println!("view_set: {}", view_set);
-                for name in &view_names {
-                    println!("\n== {} ==", name);
-                    let table = lab_analysis::query_view(&run_dir, name, limit)?;
-                    print_query_table(&table);
+                for (resolved, table) in rendered {
+                    println!("\n== {} ==", resolved.name);
+                    if !print_special_split_view(&resolved.name, &table) {
+                        print_query_table(&table);
+                    }
                 }
                 return Ok(None);
             }
 
             if let Some(view_name) = view {
-                let normalized = normalize_view_name(&view_name);
-                let table = lab_analysis::query_view(&run_dir, &normalized, limit)?;
+                let resolved = resolve_requested_view(run_view_set, &raw_view_names, &view_name)?;
+                let table = query_resolved_view(&run_dir, &resolved, row_limit)?;
                 if json {
                     return Ok(Some(json!({
                         "ok": true,
                         "command": "views",
                         "run_dir": run_dir.display().to_string(),
                         "view_set": view_set,
-                        "view": normalized,
+                        "view": resolved.name,
+                        "source_view": resolved.source,
                         "result": query_table_to_json(&table),
                     })));
                 }
-                if csv {
+                if matches!(render_format, TableRenderFormat::Csv) {
                     print_query_table_csv(&table);
+                    return Ok(None);
+                }
+                if matches!(render_format, TableRenderFormat::Markdown) {
+                    print_single_view_markdown(&run_dir, &view_set, &resolved, &table);
+                    return Ok(None);
+                }
+                if matches!(render_format, TableRenderFormat::Html) {
+                    print_single_view_html(&run_dir, &view_set, &resolved, &table);
                     return Ok(None);
                 }
                 println!("run_dir: {}", run_dir.display());
                 println!("view_set: {}", view_set);
-                println!("view: {}", normalized);
-                print_query_table(&table);
+                println!("view: {}", resolved.name);
+                if let Some(source) = resolved.source.as_deref() {
+                    if source != resolved.name {
+                        println!("source_view: {}", source);
+                    }
+                }
+                if !print_special_split_view(&resolved.name, &table) {
+                    print_query_table(&table);
+                }
                 return Ok(None);
             }
 
-            // View listing (no specific view selected)
+            // Standardized view listing (no specific view selected)
             let listing_table = lab_analysis::QueryTable {
-                columns: vec!["view_name".to_string()],
-                rows: view_names
+                columns: vec![
+                    "view_name".to_string(),
+                    "source_view".to_string(),
+                    "purpose".to_string(),
+                ],
+                rows: standard_views
                     .iter()
-                    .map(|n| vec![Value::String(n.clone())])
+                    .map(|def| {
+                        vec![
+                            Value::String(def.name.to_string()),
+                            Value::String(standard_view_source_label(def).to_string()),
+                            Value::String(def.purpose.to_string()),
+                        ]
+                    })
                     .collect(),
             };
             if json {
@@ -708,18 +1019,37 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
                     "command": "views",
                     "run_dir": run_dir.display().to_string(),
                     "view_set": view_set,
-                    "available_views": view_names,
+                    "available_views": standard_views.iter().map(|def| json!({
+                        "name": def.name,
+                        "source_view": standard_view_source_label(def),
+                        "purpose": def.purpose,
+                    })).collect::<Vec<_>>(),
+                    "raw_view_count": raw_view_names.len(),
                 })));
             }
-            if csv {
+            if matches!(render_format, TableRenderFormat::Csv) {
                 print_query_table_csv(&listing_table);
+                return Ok(None);
+            }
+            if matches!(render_format, TableRenderFormat::Markdown) {
+                print_table_markdown(&listing_table);
+                return Ok(None);
+            }
+            if matches!(render_format, TableRenderFormat::Html) {
+                print_table_html_document("available_views", &listing_table);
                 return Ok(None);
             }
             println!("run_dir: {}", run_dir.display());
             println!("view_set: {}", view_set);
-            for name in view_names {
-                println!("{}", name);
-            }
+            print_query_table(&listing_table);
+            let hidden = raw_view_names.len().saturating_sub(standard_views.len());
+            println!();
+            println!(
+                "standardized view surface: {} views ({} internal/raw views hidden by default)",
+                standard_views.len(),
+                hidden
+            );
+            println!("tip: use `lab query <run> \"SELECT * FROM <raw_view>\"` for raw internals");
         }
         Commands::ViewsLive {
             run,
@@ -731,13 +1061,17 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
         } => {
             let run_dir = resolve_run_dir_arg(&run)?;
             let sleep_interval = Duration::from_secs(interval_seconds.max(1));
-            let resolved_view = view
-                .as_deref()
-                .map(normalize_view_name)
-                .unwrap_or_else(|| "run_progress".to_string());
+            let run_view_set = lab_analysis::run_view_set(&run_dir)?;
+            let raw_view_names = lab_analysis::list_views(&run_dir)?;
+            let resolved_view = match view.as_deref() {
+                Some(requested) => {
+                    resolve_requested_view(run_view_set, &raw_view_names, requested)?
+                }
+                None => resolve_requested_view(run_view_set, &raw_view_names, "run_progress")?,
+            };
             let resolved_limit = limit.max(1);
             loop {
-                let table = lab_analysis::query_view(&run_dir, &resolved_view, resolved_limit)?;
+                let table = query_resolved_view(&run_dir, &resolved_view, resolved_limit)?;
                 if !no_clear {
                     print!("\x1B[2J\x1B[H");
                     let _ = std::io::stdout().flush();
@@ -745,14 +1079,21 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
                 println!("run_dir: {}", run_dir.display());
                 println!("status: {}", read_run_status(&run_dir));
                 println!("updated_unix_s: {}", unix_now_seconds());
-                println!("view: {}", resolved_view);
+                println!("view: {}", resolved_view.name);
+                if let Some(source) = resolved_view.source.as_deref() {
+                    if source != resolved_view.name {
+                        println!("source_view: {}", source);
+                    }
+                }
                 println!("limit: {}", resolved_limit);
                 println!(
                     "refresh_interval_seconds: {} (Ctrl-C to stop)",
                     sleep_interval.as_secs()
                 );
                 println!();
-                print_query_table(&table);
+                if !print_special_split_view(&resolved_view.name, &table) {
+                    print_query_table(&table);
+                }
 
                 if once {
                     break;
@@ -805,19 +1146,16 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
                     let _ = std::io::stdout().flush();
                 }
                 // Compact metadata header
-                let run_id = run_dir
-                    .file_name()
-                    .and_then(|v| v.to_str())
-                    .unwrap_or("?");
+                let run_id = run_dir.file_name().and_then(|v| v.to_str()).unwrap_or("?");
                 print!("run: {}  status: {}", run_id, read_run_status(&run_dir));
                 if !meta.experiment_id.is_empty() {
                     print!("  experiment: {}", meta.experiment_id);
                 }
                 println!();
                 if !meta.baseline_id.is_empty() {
-                    print!("baseline: {}", meta.baseline_id);
+                    print!("reference_variant: {}", meta.baseline_id);
                     if !meta.comparison.is_empty() {
-                        print!("  comparison: {}", meta.comparison);
+                        print!("  design_comparison: {}", meta.comparison);
                     }
                     println!();
                 }
@@ -825,10 +1163,7 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
                     println!("variants: {}", variants.join(", "));
                 }
                 if !once {
-                    println!(
-                        "refresh: {}s (Ctrl-C to stop)",
-                        sleep_interval.as_secs()
-                    );
+                    println!("refresh: {}s (Ctrl-C to stop)", sleep_interval.as_secs());
                 }
                 println!();
                 print_scoreboard_grouped_by_variant(&table, &variant_bindings);
@@ -993,7 +1328,9 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
             let Some(profile) = profile else {
                 println!("available profiles:");
                 println!("  - agent-eval  : single-variant agent evaluation in container mode");
-                println!("  - ab-test     : baseline vs treatment paired comparison");
+                println!(
+                    "  - ab-test     : paired two-variant comparison (variant_a vs variant_b)"
+                );
                 println!("  - sweep       : independent parameter sweep over variant_plan");
                 println!("  - regression  : fixed-suite pass-rate tracking over time");
                 println!("  - local-dev   : fast local iteration (single worker)");
@@ -1035,6 +1372,9 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
             overrides,
             json,
         } => {
+            if !json {
+                eprintln!("running preflight: {}", experiment.display());
+            }
             let report = lab_runner::preflight_experiment(&experiment, overrides.as_deref())?;
             if json {
                 return Ok(Some(json!({
@@ -1132,7 +1472,7 @@ validity:
             "version: \"0.5\"
 experiment:
   id: my_ab_test
-  name: Baseline vs Treatment
+  name: Paired Variant Comparison
   workload_type: agent_runtime
 dataset:
   suite_id: local_suite
@@ -1149,10 +1489,10 @@ design:
   shuffle_tasks: true
   max_concurrency: 1
 baseline:
-  variant_id: control
+  variant_id: variant_a
   bindings: {}
 variant_plan:
-  - variant_id: treatment
+  - variant_id: variant_b
     bindings:
       model: claude-4
 runtime:
@@ -1560,6 +1900,240 @@ fn resolve_project_root(start: &Path) -> PathBuf {
     start.to_path_buf()
 }
 
+fn table_render_format(csv: bool, md: bool, html: bool) -> TableRenderFormat {
+    if csv {
+        TableRenderFormat::Csv
+    } else if md {
+        TableRenderFormat::Markdown
+    } else if html {
+        TableRenderFormat::Html
+    } else {
+        TableRenderFormat::Text
+    }
+}
+
+fn standard_views_for_set(view_set: lab_analysis::ViewSet) -> &'static [StandardViewDef] {
+    match view_set {
+        lab_analysis::ViewSet::CoreOnly => STANDARD_VIEWS_CORE_ONLY,
+        lab_analysis::ViewSet::AbTest => STANDARD_VIEWS_AB_TEST,
+        lab_analysis::ViewSet::MultiVariant => STANDARD_VIEWS_MULTI_VARIANT,
+        lab_analysis::ViewSet::ParameterSweep => STANDARD_VIEWS_PARAMETER_SWEEP,
+        lab_analysis::ViewSet::Regression => STANDARD_VIEWS_REGRESSION,
+    }
+}
+
+fn standard_view_source_label(def: &StandardViewDef) -> &'static str {
+    match def.plan {
+        ViewQueryPlan::Source(source) => source,
+        ViewQueryPlan::AbComparisonSummary => "win_loss_tie+effect_size+mcnemar_contingency",
+    }
+}
+
+fn normalize_view_key(input: &str) -> String {
+    input.trim().replace('-', "_").to_ascii_lowercase()
+}
+
+fn find_raw_view_name(raw_view_names: &[String], key: &str) -> Option<String> {
+    raw_view_names
+        .iter()
+        .find(|name| normalize_view_key(name) == key)
+        .cloned()
+}
+
+fn resolved_view_from_def(view_set: lab_analysis::ViewSet, def: &StandardViewDef) -> ResolvedView {
+    match def.plan {
+        ViewQueryPlan::Source(source) => ResolvedView {
+            name: def.name.to_string(),
+            source: Some(source.to_string()),
+            plan: ResolvedViewPlan::Source(source.to_string()),
+            standardize_ab_terms: matches!(view_set, lab_analysis::ViewSet::AbTest),
+        },
+        ViewQueryPlan::AbComparisonSummary => ResolvedView {
+            name: def.name.to_string(),
+            source: Some(standard_view_source_label(def).to_string()),
+            plan: ResolvedViewPlan::AbComparisonSummary,
+            standardize_ab_terms: false,
+        },
+    }
+}
+
+fn resolve_requested_view(
+    view_set: lab_analysis::ViewSet,
+    raw_view_names: &[String],
+    requested: &str,
+) -> Result<ResolvedView> {
+    let normalized = normalize_view_key(requested);
+    if normalized.is_empty() {
+        return Err(anyhow::anyhow!("view name cannot be empty"));
+    }
+
+    for def in standard_views_for_set(view_set) {
+        if normalize_view_key(def.name) == normalized
+            || def
+                .aliases
+                .iter()
+                .any(|alias| normalize_view_key(alias) == normalized)
+        {
+            return Ok(resolved_view_from_def(view_set, def));
+        }
+    }
+
+    let legacy_key = normalize_view_name(requested);
+    if let Some(raw_name) = find_raw_view_name(raw_view_names, &legacy_key) {
+        return Ok(ResolvedView {
+            name: raw_name.clone(),
+            source: Some(raw_name.clone()),
+            plan: ResolvedViewPlan::Source(raw_name),
+            standardize_ab_terms: false,
+        });
+    }
+    if let Some(raw_name) = find_raw_view_name(raw_view_names, &normalized) {
+        return Ok(ResolvedView {
+            name: raw_name.clone(),
+            source: Some(raw_name.clone()),
+            plan: ResolvedViewPlan::Source(raw_name),
+            standardize_ab_terms: false,
+        });
+    }
+
+    let available = standard_views_for_set(view_set)
+        .iter()
+        .map(|def| def.name)
+        .collect::<Vec<_>>()
+        .join(", ");
+    Err(anyhow::anyhow!(format!(
+        "unknown view '{}'. standardized views for {}: {}",
+        requested,
+        view_set.as_str(),
+        available
+    )))
+}
+
+fn query_resolved_view(
+    run_dir: &Path,
+    resolved: &ResolvedView,
+    limit: usize,
+) -> Result<lab_analysis::QueryTable> {
+    let table = match &resolved.plan {
+        ResolvedViewPlan::Source(source) => query_source_view(run_dir, source, limit)?,
+        ResolvedViewPlan::AbComparisonSummary => query_ab_comparison_summary(run_dir)?,
+    };
+
+    if resolved.standardize_ab_terms {
+        return Ok(standardize_ab_table_columns(&table));
+    }
+    Ok(table)
+}
+
+fn query_source_view(
+    run_dir: &Path,
+    source_view: &str,
+    limit: usize,
+) -> Result<lab_analysis::QueryTable> {
+    if limit == 0 {
+        let sql = format!("SELECT * FROM {}", sql_identifier(source_view));
+        return lab_analysis::query_run(run_dir, &sql);
+    }
+    lab_analysis::query_view(run_dir, source_view, limit)
+}
+
+fn query_ab_comparison_summary(run_dir: &Path) -> Result<lab_analysis::QueryTable> {
+    let sql = "WITH delta AS (
+            SELECT
+                coalesce(max(CASE WHEN delta_type = 'regression' THEN n END), 0) AS variant_a_better_n,
+                coalesce(max(CASE WHEN delta_type = 'improvement' THEN n END), 0) AS variant_b_better_n,
+                coalesce(max(CASE WHEN delta_type = 'same' THEN n END), 0) AS same_outcome_n,
+                coalesce(max(CASE WHEN delta_type = 'changed' THEN n END), 0) AS changed_outcome_n,
+                coalesce(max(CASE WHEN delta_type = 'regression' THEN pct END), 0.0) AS variant_a_better_pct,
+                coalesce(max(CASE WHEN delta_type = 'improvement' THEN pct END), 0.0) AS variant_b_better_pct,
+                coalesce(max(CASE WHEN delta_type = 'same' THEN pct END), 0.0) AS same_outcome_pct,
+                coalesce(max(CASE WHEN delta_type = 'changed' THEN pct END), 0.0) AS changed_outcome_pct
+            FROM win_loss_tie
+        ),
+        effect AS (
+            SELECT
+                baseline_rate AS variant_a_rate,
+                treatment_rate AS variant_b_rate,
+                absolute_diff AS variant_b_minus_variant_a,
+                cohens_h,
+                magnitude
+            FROM effect_size
+        ),
+        mcnemar AS (
+            SELECT
+                both_pass,
+                base_only AS variant_a_only,
+                treat_only AS variant_b_only,
+                both_fail,
+                mcnemar_chi2
+            FROM mcnemar_contingency
+        )
+        SELECT
+            effect.variant_a_rate,
+            effect.variant_b_rate,
+            effect.variant_b_minus_variant_a,
+            delta.variant_a_better_n,
+            delta.variant_b_better_n,
+            delta.same_outcome_n,
+            delta.changed_outcome_n,
+            delta.variant_a_better_pct,
+            delta.variant_b_better_pct,
+            delta.same_outcome_pct,
+            delta.changed_outcome_pct,
+            mcnemar.both_pass,
+            mcnemar.variant_a_only,
+            mcnemar.variant_b_only,
+            mcnemar.both_fail,
+            mcnemar.mcnemar_chi2,
+            effect.cohens_h,
+            effect.magnitude
+        FROM effect
+        CROSS JOIN delta
+        CROSS JOIN mcnemar";
+    lab_analysis::query_run(run_dir, sql)
+}
+
+fn standardize_ab_table_columns(table: &lab_analysis::QueryTable) -> lab_analysis::QueryTable {
+    lab_analysis::QueryTable {
+        columns: table
+            .columns
+            .iter()
+            .map(|name| standardize_ab_column_name(name))
+            .collect(),
+        rows: table.rows.clone(),
+    }
+}
+
+fn standardize_ab_column_name(name: &str) -> String {
+    match name {
+        "baseline_id" | "a_variant_id" => "variant_a_id".to_string(),
+        "treatment_id" | "b_variant_id" => "variant_b_id".to_string(),
+        "treatment_variant_count" => "comparison_variant_count".to_string(),
+        "baseline_outcome" => "variant_a_outcome".to_string(),
+        "treatment_outcome" => "variant_b_outcome".to_string(),
+        "baseline_metric" => "variant_a_metric".to_string(),
+        "treatment_metric" => "variant_b_metric".to_string(),
+        "baseline_rate" => "variant_a_rate".to_string(),
+        "treatment_rate" => "variant_b_rate".to_string(),
+        "base_only" => "variant_a_only".to_string(),
+        "treat_only" => "variant_b_only".to_string(),
+        "a_trial_id" => "variant_a_trial_id".to_string(),
+        "b_trial_id" => "variant_b_trial_id".to_string(),
+        other => {
+            if let Some(rest) = other.strip_prefix("a_") {
+                return format!("variant_a_{}", rest);
+            }
+            if let Some(rest) = other.strip_prefix("b_") {
+                return format!("variant_b_{}", rest);
+            }
+            if let Some(rest) = other.strip_prefix("d_") {
+                return format!("delta_{}", rest);
+            }
+            other.to_string()
+        }
+    }
+}
+
 struct ScoreboardMeta {
     experiment_id: String,
     baseline_id: String,
@@ -1595,7 +2169,11 @@ fn read_scoreboard_metadata(run_dir: &Path) -> ScoreboardMeta {
     let comparison = resolved
         .pointer("/design/policies/comparison")
         .and_then(Value::as_str)
-        .or_else(|| resolved.pointer("/design/comparison").and_then(Value::as_str))
+        .or_else(|| {
+            resolved
+                .pointer("/design/comparison")
+                .and_then(Value::as_str)
+        })
         .unwrap_or("")
         .to_string();
 
@@ -2094,6 +2672,16 @@ fn normalize_view_name(input: &str) -> String {
     let normalized = input.trim().replace('-', "_");
     match normalized.as_str() {
         "paired_diffs" => "paired_outcomes".to_string(),
+        "task_compare" | "task_comparison" | "by_task" | "task_table" | "ab_task_table" => {
+            "ab_task_metrics_side_by_side".to_string()
+        }
+        "trace_diff" | "trace_compare" | "trace_side_by_side" => {
+            "ab_trace_row_side_by_side".to_string()
+        }
+        "turn_diff" | "turn_compare" | "turn_side_by_side" | "trace_turns" => {
+            "ab_turn_side_by_side".to_string()
+        }
+        "outcome_compare" => "ab_task_outcomes".to_string(),
         other => other.to_string(),
     }
 }
@@ -2195,7 +2783,472 @@ fn print_query_table(table: &lab_analysis::QueryTable) {
     }
 
     let term_w = terminal_width();
-    print_scoreboard_table(&filtered, term_w);
+    if should_chunk_query_table(&filtered, term_w) {
+        print_query_table_in_column_chunks(&filtered, term_w);
+    } else {
+        print_scoreboard_table(&filtered, term_w);
+    }
+}
+
+fn print_special_split_view(view_name: &str, table: &lab_analysis::QueryTable) -> bool {
+    match view_name {
+        "task_outcomes" | "ab_task_outcomes" => {
+            print_ab_task_outcomes_table(table);
+            true
+        }
+        "trace" | "trace_compare" | "ab_trace_row_side_by_side" => {
+            print_trace_compare_by_task(table);
+            true
+        }
+        "turn_compare" | "ab_turn_side_by_side" => {
+            print_variant_prefixed_tables(
+                table,
+                &["task_id", "repl_idx", "turn_index"],
+                "variant_a_",
+                "variant_b_",
+                "variant_a_turns",
+                "variant_b_turns",
+            );
+            true
+        }
+        _ => false,
+    }
+}
+
+fn print_ab_task_outcomes_table(table: &lab_analysis::QueryTable) {
+    let ordered = project_query_table_by_column_priority(
+        table,
+        &[
+            "task_id",
+            "variant_a_outcome",
+            "a_outcome",
+            "variant_b_outcome",
+            "b_outcome",
+            "variant_a_result_score",
+            "a_result_score",
+            "variant_b_result_score",
+            "b_result_score",
+            "variant_a_trial_id",
+            "a_trial_id",
+            "variant_b_trial_id",
+            "b_trial_id",
+            "delta_result_score",
+            "d_result_score",
+            "outcome_change",
+            "repl_idx",
+            "variant_a_id",
+            "a_variant_id",
+            "variant_b_id",
+            "b_variant_id",
+        ],
+    );
+    print_query_table_no_elision(&ordered);
+}
+
+#[derive(Clone, Debug)]
+struct TraceSection {
+    task_id: String,
+    repl_idx: String,
+    variant_a_id: String,
+    variant_b_id: String,
+    variant_a_trial_id: String,
+    variant_b_trial_id: String,
+    variant_a_table: lab_analysis::QueryTable,
+    variant_b_table: lab_analysis::QueryTable,
+}
+
+fn first_non_null_column_value(table: &lab_analysis::QueryTable, column_name: &str) -> String {
+    let Some(idx) = table.columns.iter().position(|c| c == column_name) else {
+        return String::new();
+    };
+    for row in &table.rows {
+        let value = row.get(idx).unwrap_or(&Value::Null);
+        match value {
+            Value::Null => {}
+            Value::String(s) if s.trim().is_empty() => {}
+            Value::String(s) => return s.to_string(),
+            other => return render_json_cell(other),
+        }
+    }
+    String::new()
+}
+
+fn build_trace_side_table(
+    table: &lab_analysis::QueryTable,
+    prefix: &str,
+) -> lab_analysis::QueryTable {
+    let desired = vec![
+        ("row_seq".to_string(), "row"),
+        (format!("{}event_type", prefix), "evt"),
+        (format!("{}turn_index", prefix), "turn"),
+        (format!("{}model", prefix), "model"),
+        (format!("{}tool", prefix), "tool"),
+        (format!("{}status", prefix), "st"),
+        (format!("{}call_id", prefix), "call"),
+    ];
+    let mut indices = Vec::new();
+    let mut columns = Vec::new();
+    let mut event_idx_in_projection = None;
+    for (column_name, short_name) in desired {
+        if let Some(idx) = table.columns.iter().position(|c| c == &column_name) {
+            if !indices.contains(&idx) {
+                if short_name == "evt" {
+                    event_idx_in_projection = Some(indices.len());
+                }
+                indices.push(idx);
+                columns.push(short_name.to_string());
+            }
+        }
+    }
+    let rows = table
+        .rows
+        .iter()
+        .map(|row| {
+            indices
+                .iter()
+                .map(|idx| row.get(*idx).cloned().unwrap_or(Value::Null))
+                .collect::<Vec<_>>()
+        })
+        .filter(|projected| {
+            // Drop rows where this side has no event payload at all.
+            // This removes FULL OUTER JOIN null spam when only the opposite variant emitted a row.
+            match event_idx_in_projection
+                .and_then(|idx| projected.get(idx))
+                .unwrap_or(&Value::Null)
+            {
+                Value::Null => false,
+                Value::String(s) if s.trim().is_empty() => false,
+                _ => true,
+            }
+        })
+        .collect::<Vec<_>>();
+    lab_analysis::QueryTable { columns, rows }
+}
+
+fn build_trace_sections(table: &lab_analysis::QueryTable) -> Vec<TraceSection> {
+    let task_col = table.columns.iter().position(|c| c == "task_id");
+    let repl_col = table.columns.iter().position(|c| c == "repl_idx");
+    let (Some(task_col), Some(repl_col)) = (task_col, repl_col) else {
+        return Vec::new();
+    };
+
+    let mut grouped: BTreeMap<(String, String), Vec<Vec<Value>>> = BTreeMap::new();
+    for row in &table.rows {
+        let task = row
+            .get(task_col)
+            .map(render_json_cell)
+            .unwrap_or_else(|| "unknown".to_string());
+        let repl = row
+            .get(repl_col)
+            .map(render_json_cell)
+            .unwrap_or_else(|| "unknown".to_string());
+        grouped.entry((task, repl)).or_default().push(row.clone());
+    }
+
+    grouped
+        .into_iter()
+        .map(|((task_id, repl_idx), rows)| {
+            let grouped_table = lab_analysis::QueryTable {
+                columns: table.columns.clone(),
+                rows,
+            };
+            TraceSection {
+                task_id,
+                repl_idx,
+                variant_a_id: first_non_null_column_value(&grouped_table, "variant_a_id"),
+                variant_b_id: first_non_null_column_value(&grouped_table, "variant_b_id"),
+                variant_a_trial_id: first_non_null_column_value(
+                    &grouped_table,
+                    "variant_a_trial_id",
+                ),
+                variant_b_trial_id: first_non_null_column_value(
+                    &grouped_table,
+                    "variant_b_trial_id",
+                ),
+                variant_a_table: build_trace_side_table(&grouped_table, "variant_a_"),
+                variant_b_table: build_trace_side_table(&grouped_table, "variant_b_"),
+            }
+        })
+        .collect()
+}
+
+fn print_trace_compare_by_task(table: &lab_analysis::QueryTable) {
+    let sections = build_trace_sections(table);
+    if sections.is_empty() {
+        print_query_table(table);
+        return;
+    }
+
+    for section in sections {
+        println!("== task={} repl={} ==", section.task_id, section.repl_idx);
+        if !section.variant_a_id.is_empty() || !section.variant_a_trial_id.is_empty() {
+            println!(
+                "variant_a: {}  trial: {}",
+                if section.variant_a_id.is_empty() {
+                    "unknown"
+                } else {
+                    section.variant_a_id.as_str()
+                },
+                if section.variant_a_trial_id.is_empty() {
+                    "unknown"
+                } else {
+                    section.variant_a_trial_id.as_str()
+                }
+            );
+        }
+        if !section.variant_b_id.is_empty() || !section.variant_b_trial_id.is_empty() {
+            println!(
+                "variant_b: {}  trial: {}",
+                if section.variant_b_id.is_empty() {
+                    "unknown"
+                } else {
+                    section.variant_b_id.as_str()
+                },
+                if section.variant_b_trial_id.is_empty() {
+                    "unknown"
+                } else {
+                    section.variant_b_trial_id.as_str()
+                }
+            );
+        }
+        println!();
+        println!("-- variant_a --");
+        print_query_table(&section.variant_a_table);
+        println!();
+        println!("-- variant_b --");
+        print_query_table(&section.variant_b_table);
+        println!();
+    }
+}
+
+fn print_query_table_no_elision(table: &lab_analysis::QueryTable) {
+    if table.columns.is_empty() {
+        println!("(ok)");
+        return;
+    }
+    let term_w = terminal_width();
+    if should_chunk_query_table(table, term_w) {
+        print_query_table_in_column_chunks(table, term_w);
+    } else {
+        print_scoreboard_table(table, term_w);
+    }
+}
+
+fn project_query_table_by_column_priority(
+    table: &lab_analysis::QueryTable,
+    priority_cols: &[&str],
+) -> lab_analysis::QueryTable {
+    let mut indices = Vec::new();
+    for name in priority_cols {
+        if let Some(idx) = table.columns.iter().position(|col| col == name) {
+            if !indices.contains(&idx) {
+                indices.push(idx);
+            }
+        }
+    }
+    for idx in 0..table.columns.len() {
+        if !indices.contains(&idx) {
+            indices.push(idx);
+        }
+    }
+    project_query_table_columns(table, &indices)
+}
+
+fn print_variant_prefixed_tables(
+    table: &lab_analysis::QueryTable,
+    shared_priority_cols: &[&str],
+    left_prefix: &str,
+    right_prefix: &str,
+    left_title: &str,
+    right_title: &str,
+) {
+    let mut shared_indices = Vec::new();
+    for &name in shared_priority_cols {
+        if let Some(idx) = table.columns.iter().position(|col| col == name) {
+            if !shared_indices.contains(&idx) {
+                shared_indices.push(idx);
+            }
+        }
+    }
+
+    let left_indices: Vec<usize> = table
+        .columns
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, col)| col.starts_with(left_prefix).then_some(idx))
+        .collect();
+    let right_indices: Vec<usize> = table
+        .columns
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, col)| col.starts_with(right_prefix).then_some(idx))
+        .collect();
+
+    if left_indices.is_empty() || right_indices.is_empty() {
+        print_query_table(table);
+        return;
+    }
+
+    let left_table = project_query_table_columns_with_prefix_trim(
+        table,
+        &shared_indices,
+        &left_indices,
+        left_prefix,
+    );
+    let right_table = project_query_table_columns_with_prefix_trim(
+        table,
+        &shared_indices,
+        &right_indices,
+        right_prefix,
+    );
+
+    println!("== {} ==", left_title);
+    print_query_table(&left_table);
+    println!();
+    println!("== {} ==", right_title);
+    print_query_table(&right_table);
+}
+
+fn project_query_table_columns_with_prefix_trim(
+    table: &lab_analysis::QueryTable,
+    shared_indices: &[usize],
+    side_indices: &[usize],
+    side_prefix: &str,
+) -> lab_analysis::QueryTable {
+    let mut combined_indices = shared_indices.to_vec();
+    combined_indices.extend(side_indices.iter().copied());
+
+    let columns = combined_indices
+        .iter()
+        .filter_map(|idx| table.columns.get(*idx))
+        .map(|col| {
+            col.strip_prefix(side_prefix)
+                .map(str::to_string)
+                .unwrap_or_else(|| col.clone())
+        })
+        .collect::<Vec<_>>();
+
+    let rows = table
+        .rows
+        .iter()
+        .map(|row| {
+            combined_indices
+                .iter()
+                .map(|idx| row.get(*idx).cloned().unwrap_or(Value::Null))
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+
+    lab_analysis::QueryTable { columns, rows }
+}
+
+fn should_chunk_query_table(table: &lab_analysis::QueryTable, term_w: usize) -> bool {
+    let col_count = table.columns.len();
+    if col_count <= 12 {
+        return false;
+    }
+    // If the minimum printable width is already over budget, avoid degenerate 3-4 char headers.
+    let min_required = col_count.saturating_mul(6) + col_count.saturating_sub(1).saturating_mul(2);
+    min_required > term_w || col_count > 18
+}
+
+fn print_query_table_in_column_chunks(table: &lab_analysis::QueryTable, term_w: usize) {
+    let anchor_indices = choose_query_table_anchor_indices(&table.columns);
+    let mut is_anchor = vec![false; table.columns.len()];
+    for idx in &anchor_indices {
+        if *idx < is_anchor.len() {
+            is_anchor[*idx] = true;
+        }
+    }
+    let trailing_indices: Vec<usize> = (0..table.columns.len())
+        .filter(|idx| !is_anchor[*idx])
+        .collect();
+
+    let anchor_count = anchor_indices.len().max(1);
+    // Keep chunk width readable: prefer fewer columns so headers remain distinguishable.
+    // Empirically, 4-6 total columns avoids "var." / "del." collisions.
+    let base_max_total_cols = if term_w < 120 {
+        4
+    } else if term_w < 170 {
+        5
+    } else {
+        6
+    };
+    let max_cols_for_readable = base_max_total_cols.max(anchor_count + 1);
+    let chunk_payload_cols = max_cols_for_readable.saturating_sub(anchor_count).max(1);
+    let total_chunks = trailing_indices.len().div_ceil(chunk_payload_cols).max(1);
+
+    if trailing_indices.is_empty() {
+        print_scoreboard_table(table, term_w);
+        return;
+    }
+
+    for (chunk_idx, payload_chunk) in trailing_indices.chunks(chunk_payload_cols).enumerate() {
+        if chunk_idx > 0 {
+            println!();
+        }
+        let mut selected_indices = anchor_indices.clone();
+        selected_indices.extend(payload_chunk.iter().copied());
+        selected_indices.sort_unstable();
+
+        let projected = project_query_table_columns(table, &selected_indices);
+        println!("-- column chunk {}/{} --", chunk_idx + 1, total_chunks);
+        print_scoreboard_table(&projected, term_w);
+    }
+}
+
+fn choose_query_table_anchor_indices(columns: &[String]) -> Vec<usize> {
+    let mut out = Vec::new();
+    let priorities = [
+        "task_id",
+        "repl_idx",
+        "turn_index",
+        "row_seq",
+        "variant_a_id",
+        "variant_b_id",
+        "variant_a_trial_id",
+        "variant_b_trial_id",
+        "trial_id",
+        "variant_id",
+    ];
+    for name in priorities {
+        if out.len() >= 3 {
+            break;
+        }
+        if let Some(idx) = columns.iter().position(|col| col == name) {
+            if !out.contains(&idx) {
+                out.push(idx);
+            }
+        }
+    }
+    if out.is_empty() {
+        out.push(0);
+        if columns.len() > 1 {
+            out.push(1);
+        }
+    }
+    out
+}
+
+fn project_query_table_columns(
+    table: &lab_analysis::QueryTable,
+    indices: &[usize],
+) -> lab_analysis::QueryTable {
+    let columns = indices
+        .iter()
+        .filter_map(|idx| table.columns.get(*idx).cloned())
+        .collect::<Vec<_>>();
+    let rows = table
+        .rows
+        .iter()
+        .map(|row| {
+            indices
+                .iter()
+                .map(|idx| row.get(*idx).cloned().unwrap_or(Value::Null))
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    lab_analysis::QueryTable { columns, rows }
 }
 
 fn csv_escape(value: &str) -> String {
@@ -2222,6 +3275,345 @@ fn print_query_table_csv(table: &lab_analysis::QueryTable) {
             .join(",");
         println!("{}", line);
     }
+}
+
+fn markdown_escape_cell(value: &str) -> String {
+    value
+        .replace('\\', "\\\\")
+        .replace('|', "\\|")
+        .replace('\r', "")
+        .replace('\n', "<br>")
+}
+
+fn render_query_table_markdown(table: &lab_analysis::QueryTable) -> String {
+    if table.columns.is_empty() {
+        return "(ok)".to_string();
+    }
+    let header = format!(
+        "| {} |",
+        table
+            .columns
+            .iter()
+            .map(|col| markdown_escape_cell(col))
+            .collect::<Vec<_>>()
+            .join(" | ")
+    );
+    let separator = format!(
+        "| {} |",
+        table
+            .columns
+            .iter()
+            .map(|_| "---")
+            .collect::<Vec<_>>()
+            .join(" | ")
+    );
+    let mut lines = vec![header, separator];
+    for row in &table.rows {
+        let cells = table
+            .columns
+            .iter()
+            .enumerate()
+            .map(|(idx, _)| {
+                let value = row.get(idx).unwrap_or(&Value::Null);
+                markdown_escape_cell(&render_json_cell(value))
+            })
+            .collect::<Vec<_>>();
+        lines.push(format!("| {} |", cells.join(" | ")));
+    }
+    lines.join("\n")
+}
+
+fn html_escape(value: &str) -> String {
+    value
+        .replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+        .replace('"', "&quot;")
+        .replace('\'', "&#39;")
+}
+
+fn render_query_table_html_fragment(table: &lab_analysis::QueryTable) -> String {
+    if table.columns.is_empty() {
+        return "<p>(ok)</p>".to_string();
+    }
+    let mut out = String::new();
+    out.push_str("<table><thead><tr>");
+    for col in &table.columns {
+        out.push_str("<th>");
+        out.push_str(&html_escape(col));
+        out.push_str("</th>");
+    }
+    out.push_str("</tr></thead><tbody>");
+    for row in &table.rows {
+        out.push_str("<tr>");
+        for (idx, _) in table.columns.iter().enumerate() {
+            let value = row.get(idx).unwrap_or(&Value::Null);
+            out.push_str("<td>");
+            out.push_str(&html_escape(&render_json_cell(value)));
+            out.push_str("</td>");
+        }
+        out.push_str("</tr>");
+    }
+    out.push_str("</tbody></table>");
+    out
+}
+
+fn print_table_markdown(table: &lab_analysis::QueryTable) {
+    println!("{}", render_query_table_markdown(table));
+}
+
+fn print_table_html_document(title: &str, table: &lab_analysis::QueryTable) {
+    println!(
+        "<!doctype html><html><head><meta charset=\"utf-8\"><title>{}</title><style>body{{font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace;padding:20px;line-height:1.4}}table{{border-collapse:collapse;width:100%}}th,td{{border:1px solid #bbb;padding:6px 8px;text-align:left;vertical-align:top}}th{{background:#f5f5f5;position:sticky;top:0}}tr:nth-child(even) td{{background:#fafafa}}</style></head><body><h1>{}</h1>{}</body></html>",
+        html_escape(title),
+        html_escape(title),
+        render_query_table_html_fragment(table)
+    );
+}
+
+fn is_trace_view(resolved: &ResolvedView) -> bool {
+    if resolved.name == "trace" || resolved.name == "trace_compare" {
+        return true;
+    }
+    matches!(
+        resolved.source.as_deref(),
+        Some("ab_trace_row_side_by_side")
+    )
+}
+
+fn render_trace_sections_markdown(table: &lab_analysis::QueryTable) -> Option<String> {
+    let sections = build_trace_sections(table);
+    if sections.is_empty() {
+        return None;
+    }
+    let mut out = String::new();
+    for section in sections {
+        out.push_str(&format!(
+            "### task `{}` repl `{}`\n\n",
+            markdown_escape_cell(&section.task_id),
+            markdown_escape_cell(&section.repl_idx)
+        ));
+        out.push_str(&format!(
+            "- variant_a: `{}`  trial: `{}`\n",
+            markdown_escape_cell(if section.variant_a_id.is_empty() {
+                "unknown"
+            } else {
+                section.variant_a_id.as_str()
+            }),
+            markdown_escape_cell(if section.variant_a_trial_id.is_empty() {
+                "unknown"
+            } else {
+                section.variant_a_trial_id.as_str()
+            })
+        ));
+        out.push_str(&format!(
+            "- variant_b: `{}`  trial: `{}`\n\n",
+            markdown_escape_cell(if section.variant_b_id.is_empty() {
+                "unknown"
+            } else {
+                section.variant_b_id.as_str()
+            }),
+            markdown_escape_cell(if section.variant_b_trial_id.is_empty() {
+                "unknown"
+            } else {
+                section.variant_b_trial_id.as_str()
+            })
+        ));
+        out.push_str("\n#### variant_a\n\n");
+        out.push_str(&render_query_table_markdown(&section.variant_a_table));
+        out.push_str("\n\n#### variant_b\n\n");
+        out.push_str(&render_query_table_markdown(&section.variant_b_table));
+        out.push_str("\n\n");
+    }
+    Some(out)
+}
+
+fn render_trace_sections_html(table: &lab_analysis::QueryTable) -> Option<String> {
+    let sections = build_trace_sections(table);
+    if sections.is_empty() {
+        return None;
+    }
+    let mut out = String::new();
+    for section in sections {
+        out.push_str("<section class=\"trace-task\">");
+        out.push_str("<h3>task <code>");
+        out.push_str(&html_escape(&section.task_id));
+        out.push_str("</code> repl <code>");
+        out.push_str(&html_escape(&section.repl_idx));
+        out.push_str("</code></h3>");
+        out.push_str("<p><strong>variant_a:</strong> <code>");
+        out.push_str(&html_escape(if section.variant_a_id.is_empty() {
+            "unknown"
+        } else {
+            section.variant_a_id.as_str()
+        }));
+        out.push_str("</code> <strong>trial:</strong> <code>");
+        out.push_str(&html_escape(if section.variant_a_trial_id.is_empty() {
+            "unknown"
+        } else {
+            section.variant_a_trial_id.as_str()
+        }));
+        out.push_str("</code></p>");
+        out.push_str("<p><strong>variant_b:</strong> <code>");
+        out.push_str(&html_escape(if section.variant_b_id.is_empty() {
+            "unknown"
+        } else {
+            section.variant_b_id.as_str()
+        }));
+        out.push_str("</code> <strong>trial:</strong> <code>");
+        out.push_str(&html_escape(if section.variant_b_trial_id.is_empty() {
+            "unknown"
+        } else {
+            section.variant_b_trial_id.as_str()
+        }));
+        out.push_str("</code></p>");
+        out.push_str("<div class=\"trace-grid\"><div><h4>variant_a</h4>");
+        out.push_str(&render_query_table_html_fragment(&section.variant_a_table));
+        out.push_str("</div><div><h4>variant_b</h4>");
+        out.push_str(&render_query_table_html_fragment(&section.variant_b_table));
+        out.push_str("</div></div></section>");
+    }
+    Some(out)
+}
+
+fn print_single_view_markdown(
+    run_dir: &Path,
+    view_set: &str,
+    resolved: &ResolvedView,
+    table: &lab_analysis::QueryTable,
+) {
+    println!("# lab view");
+    println!();
+    println!("run_dir: `{}`", run_dir.display());
+    println!();
+    println!("view_set: `{}`", view_set);
+    println!();
+    println!("view: `{}`", resolved.name);
+    if let Some(source) = resolved.source.as_deref() {
+        if source != resolved.name {
+            println!();
+            println!("source_view: `{}`", source);
+        }
+    }
+    println!();
+    if is_trace_view(resolved) {
+        if let Some(rendered) = render_trace_sections_markdown(table) {
+            println!("{}", rendered.trim_end());
+            return;
+        }
+    }
+    println!("{}", render_query_table_markdown(table));
+}
+
+fn print_single_view_html(
+    run_dir: &Path,
+    view_set: &str,
+    resolved: &ResolvedView,
+    table: &lab_analysis::QueryTable,
+) {
+    let mut out = String::new();
+    out.push_str(
+        "<!doctype html><html><head><meta charset=\"utf-8\"><title>lab view</title><style>body{font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace;padding:20px;line-height:1.4}table{border-collapse:collapse;width:100%}th,td{border:1px solid #bbb;padding:6px 8px;text-align:left;vertical-align:top}th{background:#f5f5f5;position:sticky;top:0}tr:nth-child(even) td{background:#fafafa}code{background:#f3f3f3;padding:1px 4px;border-radius:4px}.trace-grid{display:grid;grid-template-columns:1fr 1fr;gap:14px;align-items:start}.trace-task{margin-top:20px;padding-top:4px;border-top:1px solid #ddd}</style></head><body>",
+    );
+    out.push_str("<h1>lab view</h1>");
+    out.push_str("<p><strong>run_dir:</strong> <code>");
+    out.push_str(&html_escape(&run_dir.display().to_string()));
+    out.push_str("</code></p>");
+    out.push_str("<p><strong>view_set:</strong> <code>");
+    out.push_str(&html_escape(view_set));
+    out.push_str("</code></p>");
+    out.push_str("<p><strong>view:</strong> <code>");
+    out.push_str(&html_escape(&resolved.name));
+    out.push_str("</code></p>");
+    if let Some(source) = resolved.source.as_deref() {
+        if source != resolved.name {
+            out.push_str("<p><strong>source_view:</strong> <code>");
+            out.push_str(&html_escape(source));
+            out.push_str("</code></p>");
+        }
+    }
+    if is_trace_view(resolved) {
+        if let Some(rendered) = render_trace_sections_html(table) {
+            out.push_str(&rendered);
+        } else {
+            out.push_str(&render_query_table_html_fragment(table));
+        }
+    } else {
+        out.push_str(&render_query_table_html_fragment(table));
+    }
+    out.push_str("</body></html>");
+    println!("{}", out);
+}
+
+fn print_views_markdown_document(
+    run_dir: &Path,
+    view_set: &str,
+    rendered: &[(ResolvedView, lab_analysis::QueryTable)],
+) {
+    println!("# lab views");
+    println!();
+    println!("run_dir: `{}`", run_dir.display());
+    println!();
+    println!("view_set: `{}`", view_set);
+    for (resolved, table) in rendered {
+        println!();
+        println!("## {}", resolved.name);
+        if let Some(source) = resolved.source.as_deref() {
+            if source != resolved.name {
+                println!();
+                println!("source_view: `{}`", source);
+            }
+        }
+        println!();
+        if is_trace_view(resolved) {
+            if let Some(rendered) = render_trace_sections_markdown(table) {
+                println!("{}", rendered.trim_end());
+                continue;
+            }
+        }
+        println!("{}", render_query_table_markdown(table));
+    }
+}
+
+fn print_views_html_document(
+    run_dir: &Path,
+    view_set: &str,
+    rendered: &[(ResolvedView, lab_analysis::QueryTable)],
+) {
+    let mut out = String::new();
+    out.push_str(
+        "<!doctype html><html><head><meta charset=\"utf-8\"><title>lab views</title><style>body{font-family:ui-monospace,SFMono-Regular,Menlo,Monaco,Consolas,monospace;padding:20px;line-height:1.4}table{border-collapse:collapse;width:100%;margin-bottom:26px}th,td{border:1px solid #bbb;padding:6px 8px;text-align:left;vertical-align:top}th{background:#f5f5f5;position:sticky;top:0}tr:nth-child(even) td{background:#fafafa}code{background:#f3f3f3;padding:1px 4px;border-radius:4px}h2{margin-top:32px}.trace-grid{display:grid;grid-template-columns:1fr 1fr;gap:14px;align-items:start}.trace-task{margin-top:20px;padding-top:4px;border-top:1px solid #ddd}</style></head><body>",
+    );
+    out.push_str("<h1>lab views</h1>");
+    out.push_str("<p><strong>run_dir:</strong> <code>");
+    out.push_str(&html_escape(&run_dir.display().to_string()));
+    out.push_str("</code></p>");
+    out.push_str("<p><strong>view_set:</strong> <code>");
+    out.push_str(&html_escape(view_set));
+    out.push_str("</code></p>");
+    for (resolved, table) in rendered {
+        out.push_str("<h2>");
+        out.push_str(&html_escape(&resolved.name));
+        out.push_str("</h2>");
+        if let Some(source) = resolved.source.as_deref() {
+            if source != resolved.name {
+                out.push_str("<p><strong>source_view:</strong> <code>");
+                out.push_str(&html_escape(source));
+                out.push_str("</code></p>");
+            }
+        }
+        if is_trace_view(resolved) {
+            if let Some(rendered) = render_trace_sections_html(table) {
+                out.push_str(&rendered);
+            } else {
+                out.push_str(&render_query_table_html_fragment(table));
+            }
+        } else {
+            out.push_str(&render_query_table_html_fragment(table));
+        }
+    }
+    out.push_str("</body></html>");
+    println!("{}", out);
 }
 
 fn render_json_cell(value: &Value) -> String {
@@ -2586,5 +3978,358 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(&run_dir);
+    }
+
+    #[test]
+    fn normalize_view_name_supports_ab_aliases() {
+        assert_eq!(normalize_view_name("paired-diffs"), "paired_outcomes");
+        assert_eq!(
+            normalize_view_name("task-compare"),
+            "ab_task_metrics_side_by_side"
+        );
+        assert_eq!(
+            normalize_view_name("trace-diff"),
+            "ab_trace_row_side_by_side"
+        );
+        assert_eq!(normalize_view_name("turn-diff"), "ab_turn_side_by_side");
+        assert_eq!(normalize_view_name("outcome-compare"), "ab_task_outcomes");
+    }
+
+    #[test]
+    fn resolve_requested_view_maps_aliases_to_standard_ab_views() {
+        let raw = vec![
+            "run_progress".to_string(),
+            "ab_task_metrics_side_by_side".to_string(),
+            "ab_trace_row_side_by_side".to_string(),
+            "ab_turn_side_by_side".to_string(),
+        ];
+        let resolved = resolve_requested_view(lab_analysis::ViewSet::AbTest, &raw, "task-compare")
+            .expect("resolve task-compare");
+        assert_eq!(resolved.name, "task_metrics");
+        assert_eq!(
+            resolved.source.as_deref(),
+            Some("ab_task_metrics_side_by_side")
+        );
+
+        let resolved = resolve_requested_view(lab_analysis::ViewSet::AbTest, &raw, "trace-diff")
+            .expect("resolve trace-diff");
+        assert_eq!(resolved.name, "trace");
+        assert_eq!(
+            resolved.source.as_deref(),
+            Some("ab_trace_row_side_by_side")
+        );
+    }
+
+    #[test]
+    fn standardize_ab_column_name_rewrites_mixed_terms() {
+        assert_eq!(
+            standardize_ab_column_name("baseline_outcome"),
+            "variant_a_outcome"
+        );
+        assert_eq!(
+            standardize_ab_column_name("treatment_outcome"),
+            "variant_b_outcome"
+        );
+        assert_eq!(
+            standardize_ab_column_name("a_result_score"),
+            "variant_a_result_score"
+        );
+        assert_eq!(
+            standardize_ab_column_name("b_result_score"),
+            "variant_b_result_score"
+        );
+        assert_eq!(
+            standardize_ab_column_name("d_result_score"),
+            "delta_result_score"
+        );
+        assert_eq!(standardize_ab_column_name("a_variant_id"), "variant_a_id");
+        assert_eq!(standardize_ab_column_name("b_variant_id"), "variant_b_id");
+    }
+
+    #[test]
+    fn build_trace_sections_compacts_variant_columns() {
+        let table = lab_analysis::QueryTable {
+            columns: vec![
+                "task_id".to_string(),
+                "repl_idx".to_string(),
+                "variant_a_id".to_string(),
+                "variant_b_id".to_string(),
+                "variant_a_trial_id".to_string(),
+                "variant_b_trial_id".to_string(),
+                "row_seq".to_string(),
+                "variant_a_event_type".to_string(),
+                "variant_b_event_type".to_string(),
+                "variant_a_turn_index".to_string(),
+                "variant_b_turn_index".to_string(),
+                "variant_a_model".to_string(),
+                "variant_b_model".to_string(),
+                "variant_a_tool".to_string(),
+                "variant_b_tool".to_string(),
+                "variant_a_status".to_string(),
+                "variant_b_status".to_string(),
+                "variant_a_call_id".to_string(),
+                "variant_b_call_id".to_string(),
+            ],
+            rows: vec![vec![
+                Value::String("TASK001".to_string()),
+                json!(0),
+                Value::String("a".to_string()),
+                Value::String("b".to_string()),
+                Value::String("trial_a".to_string()),
+                Value::String("trial_b".to_string()),
+                json!(1),
+                Value::String("model_call_end".to_string()),
+                Value::String("tool_call_end".to_string()),
+                json!(0),
+                Value::Null,
+                Value::String("m-a".to_string()),
+                Value::Null,
+                Value::Null,
+                Value::String("Bash".to_string()),
+                Value::String("ok".to_string()),
+                Value::String("ok".to_string()),
+                Value::String("call-a".to_string()),
+                Value::String("call-b".to_string()),
+            ]],
+        };
+
+        let sections = build_trace_sections(&table);
+        assert_eq!(sections.len(), 1);
+        let section = &sections[0];
+        assert_eq!(section.task_id, "TASK001");
+        assert_eq!(section.repl_idx, "0");
+        assert_eq!(section.variant_a_id, "a");
+        assert_eq!(section.variant_b_id, "b");
+        assert_eq!(
+            section.variant_a_table.columns,
+            vec!["row", "evt", "turn", "model", "tool", "st", "call"]
+        );
+        assert_eq!(
+            section.variant_b_table.columns,
+            vec!["row", "evt", "turn", "model", "tool", "st", "call"]
+        );
+    }
+
+    #[test]
+    fn build_trace_sections_drops_null_only_side_rows() {
+        let table = lab_analysis::QueryTable {
+            columns: vec![
+                "task_id".to_string(),
+                "repl_idx".to_string(),
+                "variant_a_id".to_string(),
+                "variant_b_id".to_string(),
+                "variant_a_trial_id".to_string(),
+                "variant_b_trial_id".to_string(),
+                "row_seq".to_string(),
+                "variant_a_event_type".to_string(),
+                "variant_b_event_type".to_string(),
+                "variant_a_turn_index".to_string(),
+                "variant_b_turn_index".to_string(),
+                "variant_a_model".to_string(),
+                "variant_b_model".to_string(),
+                "variant_a_tool".to_string(),
+                "variant_b_tool".to_string(),
+                "variant_a_status".to_string(),
+                "variant_b_status".to_string(),
+                "variant_a_call_id".to_string(),
+                "variant_b_call_id".to_string(),
+            ],
+            rows: vec![
+                vec![
+                    Value::String("TASK001".to_string()),
+                    json!(0),
+                    Value::String("a".to_string()),
+                    Value::String("b".to_string()),
+                    Value::String("trial_a".to_string()),
+                    Value::String("trial_b".to_string()),
+                    json!(1),
+                    Value::String("model_call_end".to_string()),
+                    Value::Null,
+                    json!(0),
+                    Value::Null,
+                    Value::String("m-a".to_string()),
+                    Value::Null,
+                    Value::Null,
+                    Value::Null,
+                    Value::String("ok".to_string()),
+                    Value::Null,
+                    Value::String("call-a".to_string()),
+                    Value::Null,
+                ],
+                vec![
+                    Value::String("TASK001".to_string()),
+                    json!(0),
+                    Value::String("a".to_string()),
+                    Value::String("b".to_string()),
+                    Value::String("trial_a".to_string()),
+                    Value::String("trial_b".to_string()),
+                    json!(2),
+                    Value::Null,
+                    Value::String("tool_call_end".to_string()),
+                    Value::Null,
+                    Value::Null,
+                    Value::Null,
+                    Value::Null,
+                    Value::Null,
+                    Value::String("Bash".to_string()),
+                    Value::Null,
+                    Value::String("ok".to_string()),
+                    Value::Null,
+                    Value::String("call-b".to_string()),
+                ],
+            ],
+        };
+        let sections = build_trace_sections(&table);
+        assert_eq!(sections.len(), 1);
+        let section = &sections[0];
+        assert_eq!(section.variant_a_table.rows.len(), 1);
+        assert_eq!(section.variant_b_table.rows.len(), 1);
+    }
+
+    #[test]
+    fn trace_markdown_renderer_emits_pure_markdown() {
+        let table = lab_analysis::QueryTable {
+            columns: vec![
+                "task_id".to_string(),
+                "repl_idx".to_string(),
+                "variant_a_id".to_string(),
+                "variant_b_id".to_string(),
+                "variant_a_trial_id".to_string(),
+                "variant_b_trial_id".to_string(),
+                "row_seq".to_string(),
+                "variant_a_event_type".to_string(),
+                "variant_b_event_type".to_string(),
+                "variant_a_turn_index".to_string(),
+                "variant_b_turn_index".to_string(),
+                "variant_a_model".to_string(),
+                "variant_b_model".to_string(),
+                "variant_a_tool".to_string(),
+                "variant_b_tool".to_string(),
+                "variant_a_status".to_string(),
+                "variant_b_status".to_string(),
+                "variant_a_call_id".to_string(),
+                "variant_b_call_id".to_string(),
+            ],
+            rows: vec![vec![
+                Value::String("TASK001".to_string()),
+                json!(0),
+                Value::String("a".to_string()),
+                Value::String("b".to_string()),
+                Value::String("trial_a".to_string()),
+                Value::String("trial_b".to_string()),
+                json!(1),
+                Value::String("model_call_end".to_string()),
+                Value::String("model_call_end".to_string()),
+                json!(0),
+                json!(0),
+                Value::String("m-a".to_string()),
+                Value::String("m-b".to_string()),
+                Value::Null,
+                Value::Null,
+                Value::String("ok".to_string()),
+                Value::String("ok".to_string()),
+                Value::String("call-a".to_string()),
+                Value::String("call-b".to_string()),
+            ]],
+        };
+        let rendered = render_trace_sections_markdown(&table).expect("trace markdown");
+        assert!(rendered.contains("#### variant_a"));
+        assert!(rendered.contains("#### variant_b"));
+        assert!(!rendered.contains("<table>"));
+        assert!(!rendered.contains("<td"));
+    }
+
+    #[test]
+    fn choose_query_table_anchor_indices_prefers_task_context_columns() {
+        let columns = vec![
+            "delta_tokens_in".to_string(),
+            "task_id".to_string(),
+            "variant_b_outcome".to_string(),
+            "repl_idx".to_string(),
+            "turn_index".to_string(),
+            "variant_a_id".to_string(),
+            "variant_b_id".to_string(),
+        ];
+        let anchors = choose_query_table_anchor_indices(&columns);
+        assert_eq!(anchors, vec![1, 3, 4]);
+    }
+
+    #[test]
+    fn should_chunk_query_table_for_wide_views() {
+        let columns = (0..24)
+            .map(|idx| format!("col_{}", idx))
+            .collect::<Vec<_>>();
+        let table = lab_analysis::QueryTable {
+            columns,
+            rows: vec![vec![Value::String("x".to_string()); 24]],
+        };
+        assert!(should_chunk_query_table(&table, 120));
+        assert!(should_chunk_query_table(&table, 200));
+    }
+
+    #[test]
+    fn project_query_table_columns_with_prefix_trim_trims_variant_prefix() {
+        let table = lab_analysis::QueryTable {
+            columns: vec![
+                "task_id".to_string(),
+                "repl_idx".to_string(),
+                "variant_a_trial_id".to_string(),
+                "variant_a_event_type".to_string(),
+                "variant_b_trial_id".to_string(),
+            ],
+            rows: vec![vec![
+                Value::String("TASK001".to_string()),
+                json!(0),
+                Value::String("trial_1".to_string()),
+                Value::String("model_call_start".to_string()),
+                Value::String("trial_2".to_string()),
+            ]],
+        };
+
+        let projected =
+            project_query_table_columns_with_prefix_trim(&table, &[0, 1], &[2, 3], "variant_a_");
+        assert_eq!(
+            projected.columns,
+            vec![
+                "task_id".to_string(),
+                "repl_idx".to_string(),
+                "trial_id".to_string(),
+                "event_type".to_string(),
+            ]
+        );
+        assert_eq!(projected.rows.len(), 1);
+    }
+
+    #[test]
+    fn project_query_table_by_column_priority_reorders_and_keeps_remaining() {
+        let table = lab_analysis::QueryTable {
+            columns: vec![
+                "a_result_score".to_string(),
+                "task_id".to_string(),
+                "b_outcome".to_string(),
+                "a_outcome".to_string(),
+                "d_result_score".to_string(),
+            ],
+            rows: vec![vec![
+                json!(1.0),
+                Value::String("TASK001".to_string()),
+                Value::String("failure".to_string()),
+                Value::String("success".to_string()),
+                json!(-1.0),
+            ]],
+        };
+        let projected =
+            project_query_table_by_column_priority(&table, &["task_id", "a_outcome", "b_outcome"]);
+        assert_eq!(
+            projected.columns,
+            vec![
+                "task_id".to_string(),
+                "a_outcome".to_string(),
+                "b_outcome".to_string(),
+                "a_result_score".to_string(),
+                "d_result_score".to_string(),
+            ]
+        );
+        assert_eq!(projected.rows.len(), 1);
     }
 }
