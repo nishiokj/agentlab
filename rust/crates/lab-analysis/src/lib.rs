@@ -5,12 +5,16 @@ use duckdb::Connection;
 use include_dir::{include_dir, Dir};
 #[cfg(feature = "duckdb_engine")]
 use lab_core::ensure_dir;
+#[cfg(feature = "duckdb_engine")]
+use rusqlite::{params, Connection as SqliteConnection, OptionalExtension};
 use serde_json::Value;
 use std::collections::BTreeSet;
 use std::fs;
 use std::path::Path;
 #[cfg(feature = "duckdb_engine")]
 use std::path::PathBuf;
+#[cfg(feature = "duckdb_engine")]
+use std::time::{SystemTime, UNIX_EPOCH};
 
 #[cfg(feature = "duckdb_engine")]
 static VIEW_BUNDLES: Dir<'_> = include_dir!("$CARGO_MANIFEST_DIR/views");
@@ -88,11 +92,15 @@ struct ExperimentDesign {
 #[derive(Debug, Clone)]
 struct RunAnalysisContext {
     #[cfg(feature = "duckdb_engine")]
+    run_id: String,
+    #[cfg(feature = "duckdb_engine")]
     run_dir: PathBuf,
     #[cfg(feature = "duckdb_engine")]
     analysis_dir: PathBuf,
     #[cfg(feature = "duckdb_engine")]
     facts_dir: PathBuf,
+    #[cfg(feature = "duckdb_engine")]
+    sqlite_path: PathBuf,
     #[cfg(feature = "duckdb_engine")]
     comparison_policy: String,
     #[cfg(feature = "duckdb_engine")]
@@ -128,6 +136,9 @@ pub fn list_views(run_dir: &Path) -> Result<Vec<String>> {
     let list_sql = "SELECT view_name AS table_name
                     FROM duckdb_views()
                     WHERE schema_name = 'main'
+                      AND view_name NOT LIKE 'duckdb_%'
+                      AND view_name NOT LIKE 'sqlite_%'
+                      AND view_name NOT LIKE 'pragma_%'
                     ORDER BY view_name";
     let table = match query_run_with_materialized_db(&context, list_sql) {
         Ok(table) => table,
@@ -256,7 +267,17 @@ fn load_run_context(run_dir: &Path) -> Result<RunAnalysisContext> {
     #[cfg(feature = "duckdb_engine")]
     let analysis_dir = canonical.join("analysis");
     let facts_dir = canonical.join(FACTS_DIR);
+    #[cfg(feature = "duckdb_engine")]
+    let sqlite_path = canonical.join("run.sqlite");
     if !facts_dir.exists() {
+        #[cfg(feature = "duckdb_engine")]
+        if !sqlite_path.exists() {
+            return Err(anyhow!(
+                "run has neither facts files nor run.sqlite: {}",
+                canonical.display()
+            ));
+        }
+        #[cfg(not(feature = "duckdb_engine"))]
         return Err(anyhow!("run facts not found: {}", facts_dir.display()));
     }
     let resolved = read_resolved_experiment(&canonical)?;
@@ -267,11 +288,19 @@ fn load_run_context(run_dir: &Path) -> Result<RunAnalysisContext> {
     let view_set = view_set_for_design(&design);
     Ok(RunAnalysisContext {
         #[cfg(feature = "duckdb_engine")]
+        run_id: canonical
+            .file_name()
+            .and_then(|v| v.to_str())
+            .unwrap_or("run")
+            .to_string(),
+        #[cfg(feature = "duckdb_engine")]
         run_dir: canonical,
         #[cfg(feature = "duckdb_engine")]
         analysis_dir,
         #[cfg(feature = "duckdb_engine")]
         facts_dir,
+        #[cfg(feature = "duckdb_engine")]
+        sqlite_path,
         #[cfg(feature = "duckdb_engine")]
         comparison_policy: design.comparison,
         #[cfg(feature = "duckdb_engine")]
@@ -463,13 +492,7 @@ SELECT
     {} AS comparison_policy,
     {} AS scheduling_policy;
 ",
-        sql_literal(
-            context
-                .run_dir
-                .file_name()
-                .and_then(|v| v.to_str())
-                .unwrap_or("run")
-        ),
+        sql_literal(&context.run_id),
         sql_literal(context.view_set.as_str()),
         sql_literal(&context.comparison_policy),
         sql_literal(&context.scheduling_policy),
@@ -618,7 +641,51 @@ SELECT
     try_cast(json_extract(row_json, '$.attempt') AS BIGINT) AS attempt,
     try_cast(json_extract(row_json, '$.row_seq') AS BIGINT) AS row_seq,
     json_extract_string(row_json, '$.variant_id') AS variant_id,
-    json_extract_string(row_json, '$.event_type') AS event_type
+    json_extract_string(row_json, '$.task_id') AS task_id,
+    try_cast(json_extract(row_json, '$.repl_idx') AS BIGINT) AS repl_idx,
+    try_cast(json_extract(row_json, '$.seq') AS BIGINT) AS seq,
+    json_extract_string(row_json, '$.event_type') AS event_type,
+    json_extract_string(row_json, '$.ts') AS ts,
+    try_cast(
+        coalesce(
+            json_extract(row_json, '$.step_index'),
+            json_extract(row_json, '$.payload.step_index')
+        ) AS BIGINT
+    ) AS step_index,
+    try_cast(
+        coalesce(
+            json_extract(row_json, '$.turn_index'),
+            json_extract(row_json, '$.payload.turn_index')
+        ) AS BIGINT
+    ) AS turn_index,
+    coalesce(
+        json_extract_string(row_json, '$.call_id'),
+        json_extract_string(row_json, '$.payload.call_id')
+    ) AS call_id,
+    coalesce(
+        json_extract_string(row_json, '$.model.identity'),
+        json_extract_string(row_json, '$.payload.model.identity')
+    ) AS model_identity,
+    coalesce(
+        json_extract_string(row_json, '$.tool.name'),
+        json_extract_string(row_json, '$.payload.tool.name')
+    ) AS tool_name,
+    coalesce(
+        json_extract_string(row_json, '$.outcome.status'),
+        json_extract_string(row_json, '$.payload.outcome.status')
+    ) AS outcome_status,
+    try_cast(
+        coalesce(
+            json_extract(row_json, '$.usage.tokens_in'),
+            json_extract(row_json, '$.payload.usage.tokens_in')
+        ) AS DOUBLE
+    ) AS usage_tokens_in,
+    try_cast(
+        coalesce(
+            json_extract(row_json, '$.usage.tokens_out'),
+            json_extract(row_json, '$.payload.usage.tokens_out')
+        ) AS DOUBLE
+    ) AS usage_tokens_out
 FROM filtered;
 
 CREATE OR REPLACE VIEW variant_snapshots AS
@@ -678,7 +745,13 @@ SELECT
     event_type,
     count(*) AS count
 FROM events
-GROUP BY run_id, trial_id, variant_id, event_type;
+GROUP BY run_id, trial_id, variant_id, event_type
+ORDER BY
+    run_id,
+    variant_id,
+    try_cast(regexp_extract(trial_id, '([0-9]+)$', 1) AS BIGINT) NULLS LAST,
+    trial_id,
+    event_type;
 
 CREATE OR REPLACE VIEW event_counts_by_variant AS
 SELECT
@@ -687,18 +760,16 @@ SELECT
     event_type,
     count(*) AS count
 FROM events
-GROUP BY run_id, variant_id, event_type;
+GROUP BY run_id, variant_id, event_type
+ORDER BY run_id, variant_id, event_type;
 
 CREATE OR REPLACE VIEW variant_summary AS
 SELECT
-    min(baseline_id) AS baseline_id,
     variant_id,
-    count(*)::DOUBLE AS total,
-    avg(CASE WHEN outcome = 'success' THEN 1.0 ELSE 0.0 END) AS success_rate,
+    count(*)::BIGINT AS n_trials,
+    round(avg(CASE WHEN outcome = 'success' THEN 1.0 ELSE 0.0 END), 4) AS success_rate,
     first(primary_metric_name) AS primary_metric_name,
-    avg(try_cast(primary_metric_value AS DOUBLE)) AS primary_metric_mean,
-    NULL AS event_counts,
-    first(bindings) AS bindings
+    round(avg(try_cast(primary_metric_value AS DOUBLE)), 4) AS primary_metric_mean
 FROM trials
 GROUP BY variant_id;
 
@@ -733,59 +804,136 @@ ORDER BY run_id;
 }
 
 #[cfg(feature = "duckdb_engine")]
-fn materialize_run_duckdb(context: &RunAnalysisContext) -> Result<()> {
-    ensure_dir(&context.analysis_dir)?;
-    ensure_dir(&context.facts_dir)?;
-    ensure_fact_files(&context.facts_dir)?;
-    ensure_runtime_files(&context.run_dir)?;
-    fs::write(
-        context.analysis_dir.join("duckdb_view_context.json"),
-        serde_json::to_vec_pretty(&serde_json::json!({
-            "schema_version": "duckdb_view_context_v1",
-            "view_set": context.view_set.as_str(),
-            "comparison_policy": context.comparison_policy,
-            "scheduling_policy": context.scheduling_policy
-        }))?,
-    )?;
-    let db_path = context.analysis_dir.join(ANALYSIS_DB_FILE);
-    let conn = Connection::open(&db_path)
-        .with_context(|| format!("failed to open DuckDB {}", db_path.display()))?;
-    load_json_extension(&conn)?;
-    let bundle_sql = load_view_bundle_sql(context.view_set)?;
-    let relative_sql = build_load_sql_relative(context, bundle_sql.as_deref());
-    fs::write(context.analysis_dir.join(LOAD_SQL_FILE), relative_sql)?;
-    let sql = build_load_sql_absolute(context, bundle_sql.as_deref());
-    conn.execute_batch(&sql)
-        .with_context(|| format!("failed to materialize run DuckDB for {}", db_path.display()))?;
+fn write_jsonl_from_sqlite(conn: &SqliteConnection, table: &str, dest: &Path) -> Result<()> {
+    let mut stmt = conn.prepare(&format!("SELECT row_json FROM {}", table))?;
+    let mut rows = stmt.query([])?;
+    let mut out = String::new();
+    while let Some(row) = rows.next()? {
+        let raw: String = row.get(0)?;
+        out.push_str(&raw);
+        out.push('\n');
+    }
+    fs::write(dest, out).with_context(|| format!("write {}", dest.display()))?;
     Ok(())
 }
 
 #[cfg(feature = "duckdb_engine")]
-fn open_run_connection(context: &RunAnalysisContext) -> Result<Connection> {
-    let db_path = context.analysis_dir.join(ANALYSIS_DB_FILE);
-    let conn = Connection::open(&db_path)
-        .with_context(|| format!("failed to open DuckDB {}", db_path.display()))?;
-    load_json_extension(&conn)?;
-    Ok(conn)
+struct TempDirCleanup {
+    path: PathBuf,
+}
+
+#[cfg(feature = "duckdb_engine")]
+impl TempDirCleanup {
+    fn new(path: PathBuf) -> Self {
+        Self { path }
+    }
+}
+
+#[cfg(feature = "duckdb_engine")]
+impl Drop for TempDirCleanup {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.path);
+    }
+}
+
+#[cfg(feature = "duckdb_engine")]
+fn prepare_sqlite_compat_context(
+    context: &RunAnalysisContext,
+) -> Result<(RunAnalysisContext, TempDirCleanup)> {
+    let run_id = context.run_id.as_str();
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let root = std::env::temp_dir().join(format!("agentlab_sqlite_export_{}_{}", run_id, nanos));
+    let cleanup = TempDirCleanup::new(root.clone());
+    let facts_dir = root.join("facts");
+    let runtime_dir = root.join("runtime");
+    ensure_dir(&facts_dir)?;
+    ensure_dir(&runtime_dir)?;
+
+    let conn = SqliteConnection::open(&context.sqlite_path)
+        .with_context(|| format!("open {}", context.sqlite_path.display()))?;
+    write_jsonl_from_sqlite(&conn, "trial_rows", &facts_dir.join(FACTS_TRIALS_FILE))?;
+    write_jsonl_from_sqlite(
+        &conn,
+        "metric_rows",
+        &facts_dir.join(FACTS_METRICS_LONG_FILE),
+    )?;
+    write_jsonl_from_sqlite(&conn, "event_rows", &facts_dir.join(FACTS_EVENTS_FILE))?;
+    write_jsonl_from_sqlite(
+        &conn,
+        "variant_snapshot_rows",
+        &facts_dir.join(FACTS_VARIANT_SNAPSHOTS_FILE),
+    )?;
+
+    let mut commit_stmt = conn.prepare(
+        "SELECT record_json FROM slot_commit_records ORDER BY schedule_idx, attempt, record_type",
+    )?;
+    let mut commit_rows = commit_stmt.query([])?;
+    let mut commit_out = String::new();
+    while let Some(row) = commit_rows.next()? {
+        let raw: String = row.get(0)?;
+        commit_out.push_str(&raw);
+        commit_out.push('\n');
+    }
+    fs::write(runtime_dir.join(SLOT_COMMIT_JOURNAL_FILE), commit_out)?;
+
+    let schedule_progress: Option<String> = conn
+        .query_row(
+            "SELECT value_json FROM runtime_kv WHERE key=?1",
+            params!["schedule_progress_v2"],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if let Some(progress) = schedule_progress {
+        fs::write(runtime_dir.join(SCHEDULE_PROGRESS_FILE), progress)?;
+    } else {
+        fs::write(
+            runtime_dir.join(SCHEDULE_PROGRESS_FILE),
+            serde_json::to_vec(&serde_json::json!({
+                "schema_version": "schedule_progress_v2",
+                "next_schedule_index": 9223372036854775807_i64
+            }))?,
+        )?;
+    }
+
+    Ok((
+        RunAnalysisContext {
+            run_id: context.run_id.clone(),
+            run_dir: root.clone(),
+            analysis_dir: root.join("analysis"),
+            facts_dir,
+            sqlite_path: context.sqlite_path.clone(),
+            comparison_policy: context.comparison_policy.clone(),
+            scheduling_policy: context.scheduling_policy.clone(),
+            view_set: context.view_set,
+        },
+        cleanup,
+    ))
 }
 
 #[cfg(feature = "duckdb_engine")]
 fn query_run_with_materialized_db(context: &RunAnalysisContext, sql: &str) -> Result<QueryTable> {
-    materialize_run_duckdb(context)?;
-    let conn = open_run_connection(context)?;
-    execute_select_query(&conn, sql)
+    query_run_with_ephemeral_db(context, sql)
 }
 
 #[cfg(feature = "duckdb_engine")]
 fn query_run_with_ephemeral_db(context: &RunAnalysisContext, sql: &str) -> Result<QueryTable> {
-    ensure_dir(&context.facts_dir)?;
-    ensure_fact_files(&context.facts_dir)?;
-    ensure_runtime_files(&context.run_dir)?;
+    let (prepared_context, _temp_cleanup) = if context.sqlite_path.exists() {
+        let (prepared, cleanup) = prepare_sqlite_compat_context(context)?;
+        (prepared, Some(cleanup))
+    } else {
+        ensure_dir(&context.facts_dir)?;
+        ensure_fact_files(&context.facts_dir)?;
+        ensure_runtime_files(&context.run_dir)?;
+        (context.clone(), None)
+    };
     let conn = Connection::open_in_memory()
         .context("failed to open in-memory DuckDB for fallback query")?;
     load_json_extension(&conn)?;
-    let bundle_sql = load_view_bundle_sql(context.view_set)?;
-    let load_sql = build_load_sql_absolute(context, bundle_sql.as_deref());
+    let bundle_sql = load_view_bundle_sql(prepared_context.view_set)?;
+    let load_sql = build_load_sql_absolute(&prepared_context, bundle_sql.as_deref());
     conn.execute_batch(&load_sql)
         .context("failed to materialize in-memory DuckDB fallback views")?;
     execute_select_query(&conn, sql)
@@ -853,6 +1001,36 @@ fn load_json_extension(conn: &Connection) -> Result<()> {
 }
 
 #[cfg(feature = "duckdb_engine")]
+fn export_trial_rows_jsonl(sqlite_path: &Path, run_id: &str) -> Result<PathBuf> {
+    let conn = SqliteConnection::open(sqlite_path)
+        .with_context(|| format!("open {}", sqlite_path.display()))?;
+    let mut stmt = conn.prepare("SELECT row_json FROM trial_rows")?;
+    let mut rows = stmt.query([])?;
+    let temp_root = std::env::temp_dir();
+    let stable_path = temp_root.join(format!("agentlab_trials_{}.jsonl", run_id));
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let staging_path = temp_root.join(format!("agentlab_trials_{}_{}.tmp", run_id, nanos));
+    let mut out = String::new();
+    while let Some(row) = rows.next()? {
+        let raw: String = row.get(0)?;
+        out.push_str(&raw);
+        out.push('\n');
+    }
+    fs::write(&staging_path, out).with_context(|| format!("write {}", staging_path.display()))?;
+    fs::rename(&staging_path, &stable_path).with_context(|| {
+        format!(
+            "rename {} -> {}",
+            staging_path.display(),
+            stable_path.display()
+        )
+    })?;
+    Ok(stable_path)
+}
+
+#[cfg(feature = "duckdb_engine")]
 fn materialize_project_duckdb(project_root: &Path) -> Result<PathBuf> {
     let project_root = project_root
         .canonicalize()
@@ -879,6 +1057,13 @@ fn materialize_project_duckdb(project_root: &Path) -> Result<PathBuf> {
             let trials_path = run_path.join(FACTS_DIR).join(FACTS_TRIALS_FILE);
             if trials_path.exists() {
                 trial_sources.push(trials_path);
+            } else {
+                let sqlite_path = run_path.join("run.sqlite");
+                if sqlite_path.exists() {
+                    if let Ok(exported) = export_trial_rows_jsonl(&sqlite_path, &run_id) {
+                        trial_sources.push(exported);
+                    }
+                }
             }
             let resolved_path = run_path.join("resolved_experiment.json");
             if resolved_path.exists() {
@@ -975,6 +1160,17 @@ ORDER BY t.run_id, t.variant_id, t.task_id;
 #[cfg(feature = "duckdb_engine")]
 fn execute_select_query(conn: &Connection, sql: &str) -> Result<QueryTable> {
     let normalized = normalize_sql(sql)?;
+    let describe_sql = format!("DESCRIBE SELECT * FROM ({}) AS __q", normalized);
+    let mut columns: Vec<String> = Vec::new();
+    if let Ok(mut describe_stmt) = conn.prepare(&describe_sql) {
+        if let Ok(mut describe_rows) = describe_stmt.query([]) {
+            while let Ok(Some(row)) = describe_rows.next() {
+                if let Ok(name) = row.get::<_, String>(0) {
+                    columns.push(name);
+                }
+            }
+        }
+    }
 
     let row_json_sql = format!(
         "SELECT to_json(__q) AS row_json FROM ({}) AS __q",
@@ -987,8 +1183,7 @@ fn execute_select_query(conn: &Connection, sql: &str) -> Result<QueryTable> {
         .query([])
         .with_context(|| format!("failed to execute query: {}", normalized))?;
 
-    let mut columns: Vec<String> = Vec::new();
-    let mut seen_columns: BTreeSet<String> = BTreeSet::new();
+    let mut seen_columns: BTreeSet<String> = columns.iter().cloned().collect();
     let mut parsed_rows: Vec<Value> = Vec::new();
 
     while let Some(row) = rows.next()? {

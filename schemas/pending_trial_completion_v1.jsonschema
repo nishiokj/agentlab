@@ -1,0 +1,13 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agent-lab.local/schemas/pending_trial_completion_v1.json",
+  "title": "Pending Trial Completion v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "schedule_idx", "trial_result"],
+  "properties": {
+    "schema_version": { "const": "pending_trial_completion_v1" },
+    "schedule_idx": { "type": "integer", "minimum": 0 },
+    "trial_result": { "type": "object" }
+  }
+}

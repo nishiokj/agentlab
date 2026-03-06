@@ -1,16 +1,12 @@
+use crate::persistence::sqlite_store::{
+    EventRowInsert, MetricRowInsert, SqliteRunStore as BackingSqliteStore, TrialRowInsert,
+    VariantSnapshotRowInsert,
+};
+use crate::validate_schema_contract_value;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::fs::{self, File, OpenOptions};
-use std::io::{BufWriter, Write};
-use std::path::{Path, PathBuf};
-
-const FACTS_DIR: &str = "facts";
-const FACTS_TRIALS_FILE: &str = "trials.jsonl";
-const FACTS_METRICS_LONG_FILE: &str = "metrics_long.jsonl";
-const FACTS_EVENTS_FILE: &str = "events.jsonl";
-const FACTS_VARIANT_SNAPSHOTS_FILE: &str = "variant_snapshots.jsonl";
-const FACTS_RUN_MANIFEST_FILE: &str = "run_manifest.json";
+use std::path::Path;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunManifestRecord {
@@ -113,93 +109,129 @@ pub trait RunSink {
     fn flush(&mut self) -> Result<()>;
 }
 
-pub struct JsonlRunSink {
-    facts_dir: PathBuf,
-    run_manifest_path: PathBuf,
-    trials_writer: BufWriter<File>,
-    metrics_writer: BufWriter<File>,
-    events_writer: BufWriter<File>,
-    variant_snapshots_writer: BufWriter<File>,
+pub struct SqliteRunStore {
+    inner: BackingSqliteStore,
 }
 
-impl JsonlRunSink {
+impl SqliteRunStore {
     pub fn new(run_dir: &Path) -> Result<Self> {
-        let facts_dir = run_dir.join(FACTS_DIR);
-        fs::create_dir_all(&facts_dir)?;
-
         Ok(Self {
-            facts_dir: facts_dir.clone(),
-            run_manifest_path: facts_dir.join(FACTS_RUN_MANIFEST_FILE),
-            trials_writer: open_append(facts_dir.join(FACTS_TRIALS_FILE))?,
-            metrics_writer: open_append(facts_dir.join(FACTS_METRICS_LONG_FILE))?,
-            events_writer: open_append(facts_dir.join(FACTS_EVENTS_FILE))?,
-            variant_snapshots_writer: open_append(facts_dir.join(FACTS_VARIANT_SNAPSHOTS_FILE))?,
+            inner: BackingSqliteStore::open(run_dir)?,
         })
     }
 }
 
-impl RunSink for JsonlRunSink {
+impl RunSink for SqliteRunStore {
     fn write_run_manifest(&mut self, run: &RunManifestRecord) -> Result<()> {
-        fs::write(&self.run_manifest_path, serde_json::to_vec_pretty(run)?)?;
-        Ok(())
+        let payload = serde_json::to_value(run)?;
+        validate_schema_contract_value(&payload, "run manifest row")?;
+        self.inner.put_run_manifest(&run.run_id, &payload)
     }
 
     fn append_trial_record(&mut self, row: &TrialRecord) -> Result<()> {
-        append_row(&mut self.trials_writer, row)
+        self.inner.upsert_trial_row(TrialRowInsert {
+            run_id: &row.run_id,
+            trial_id: &row.trial_id,
+            schedule_idx: row.schedule_idx,
+            attempt: row.attempt,
+            row_seq: row.row_seq,
+            slot_commit_id: &row.slot_commit_id,
+            baseline_id: &row.baseline_id,
+            workload_type: &row.workload_type,
+            variant_id: &row.variant_id,
+            task_id: &row.task_id,
+            repl_idx: row.repl_idx,
+            outcome: &row.outcome,
+            primary_metric_name: &row.primary_metric_name,
+            primary_metric_value: &row.primary_metric_value,
+            metrics: &row.metrics,
+            bindings: &row.bindings,
+            hook_events_total: row.hook_events_total,
+            has_hook_events: row.has_hook_events,
+            row_json: &serde_json::to_value(row)?,
+        })
     }
 
     fn append_metric_rows(&mut self, rows: &[MetricRow]) -> Result<()> {
         for row in rows {
-            append_row(&mut self.metrics_writer, row)?;
+            self.inner.upsert_metric_row(MetricRowInsert {
+                run_id: &row.run_id,
+                trial_id: &row.trial_id,
+                schedule_idx: row.schedule_idx,
+                attempt: row.attempt,
+                row_seq: row.row_seq,
+                slot_commit_id: &row.slot_commit_id,
+                variant_id: &row.variant_id,
+                task_id: &row.task_id,
+                repl_idx: row.repl_idx,
+                outcome: &row.outcome,
+                metric_name: &row.metric_name,
+                metric_value: &row.metric_value,
+                metric_source: row.metric_source.as_deref(),
+                row_json: &serde_json::to_value(row)?,
+            })?;
         }
         Ok(())
     }
 
     fn append_event_rows(&mut self, rows: &[EventRow]) -> Result<()> {
         for row in rows {
-            append_row(&mut self.events_writer, row)?;
+            self.inner.upsert_event_row(EventRowInsert {
+                run_id: &row.run_id,
+                trial_id: &row.trial_id,
+                schedule_idx: row.schedule_idx,
+                attempt: row.attempt,
+                row_seq: row.row_seq,
+                slot_commit_id: &row.slot_commit_id,
+                variant_id: &row.variant_id,
+                task_id: &row.task_id,
+                repl_idx: row.repl_idx,
+                seq: row.seq,
+                event_type: &row.event_type,
+                ts: row.ts.as_deref(),
+                payload: &row.payload,
+                row_json: &serde_json::to_value(row)?,
+            })?;
         }
         Ok(())
     }
 
     fn append_variant_snapshot(&mut self, rows: &[VariantSnapshotRow]) -> Result<()> {
         for row in rows {
-            append_row(&mut self.variant_snapshots_writer, row)?;
+            self.inner
+                .upsert_variant_snapshot_row(VariantSnapshotRowInsert {
+                    run_id: &row.run_id,
+                    trial_id: &row.trial_id,
+                    schedule_idx: row.schedule_idx,
+                    attempt: row.attempt,
+                    row_seq: row.row_seq,
+                    slot_commit_id: &row.slot_commit_id,
+                    variant_id: &row.variant_id,
+                    baseline_id: &row.baseline_id,
+                    task_id: &row.task_id,
+                    repl_idx: row.repl_idx,
+                    binding_name: &row.binding_name,
+                    binding_value: &row.binding_value,
+                    binding_value_text: &row.binding_value_text,
+                    row_json: &serde_json::to_value(row)?,
+                })?;
         }
         Ok(())
     }
 
     fn flush(&mut self) -> Result<()> {
-        self.trials_writer.flush()?;
-        self.metrics_writer.flush()?;
-        self.events_writer.flush()?;
-        self.variant_snapshots_writer.flush()?;
-        self.trials_writer.get_ref().sync_all()?;
-        self.metrics_writer.get_ref().sync_all()?;
-        self.events_writer.get_ref().sync_all()?;
-        self.variant_snapshots_writer.get_ref().sync_all()?;
-        if let Ok(dir) = File::open(&self.facts_dir) {
-            let _ = dir.sync_all();
-        }
+        // SQLite transactions are committed by each statement in this sink path.
         Ok(())
     }
-}
-
-fn open_append(path: PathBuf) -> Result<BufWriter<File>> {
-    let file = OpenOptions::new().create(true).append(true).open(path)?;
-    Ok(BufWriter::new(file))
-}
-
-fn append_row<T: Serialize>(writer: &mut BufWriter<File>, row: &T) -> Result<()> {
-    serde_json::to_writer(&mut *writer, row)?;
-    writer.write_all(b"\n")?;
-    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::persistence::sqlite_store::{run_sqlite_path, SqliteRunStore as BackingStore};
     use serde_json::json;
+    use std::fs;
+    use std::path::PathBuf;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn temp_root(label: &str) -> PathBuf {
@@ -211,10 +243,10 @@ mod tests {
     }
 
     #[test]
-    fn jsonl_sink_appends_fact_rows() {
-        let run_dir = temp_root("append");
+    fn sqlite_sink_persists_rows() {
+        let run_dir = temp_root("sqlite_sink");
         fs::create_dir_all(&run_dir).expect("create run dir");
-        let mut sink = JsonlRunSink::new(&run_dir).expect("sink should initialize");
+        let mut sink = SqliteRunStore::new(&run_dir).expect("sink should initialize");
         sink.write_run_manifest(&RunManifestRecord {
             schema_version: "run_manifest_v1".to_string(),
             run_id: "run_123".to_string(),
@@ -252,103 +284,12 @@ mod tests {
             has_hook_events: true,
         })
         .expect("trial row should append");
-        sink.append_metric_rows(&[
-            MetricRow {
-                run_id: "run_123".to_string(),
-                trial_id: "trial_1".to_string(),
-                schedule_idx: 0,
-                slot_commit_id: "slot_test".to_string(),
-                attempt: 1,
-                row_seq: 0,
-                variant_id: "base".to_string(),
-                task_id: "task_1".to_string(),
-                repl_idx: 0,
-                outcome: "success".to_string(),
-                metric_name: "resolved".to_string(),
-                metric_value: json!(1.0),
-                metric_source: Some("primary".to_string()),
-            },
-            MetricRow {
-                run_id: "run_123".to_string(),
-                trial_id: "trial_1".to_string(),
-                schedule_idx: 0,
-                slot_commit_id: "slot_test".to_string(),
-                attempt: 1,
-                row_seq: 1,
-                variant_id: "base".to_string(),
-                task_id: "task_1".to_string(),
-                repl_idx: 0,
-                outcome: "success".to_string(),
-                metric_name: "status_code".to_string(),
-                metric_value: json!("0"),
-                metric_source: None,
-            },
-        ])
-        .expect("metric rows should append");
-        sink.append_event_rows(&[EventRow {
-            run_id: "run_123".to_string(),
-            trial_id: "trial_1".to_string(),
-            schedule_idx: 0,
-            slot_commit_id: "slot_test".to_string(),
-            attempt: 1,
-            row_seq: 0,
-            variant_id: "base".to_string(),
-            task_id: "task_1".to_string(),
-            repl_idx: 0,
-            seq: 0,
-            event_type: "tool_call".to_string(),
-            ts: Some("2026-02-22T00:00:01Z".to_string()),
-            payload: json!({"event_type":"tool_call"}),
-        }])
-        .expect("event rows should append");
-        sink.append_variant_snapshot(&[VariantSnapshotRow {
-            run_id: "run_123".to_string(),
-            trial_id: "trial_1".to_string(),
-            schedule_idx: 0,
-            slot_commit_id: "slot_test".to_string(),
-            attempt: 1,
-            row_seq: 0,
-            variant_id: "base".to_string(),
-            baseline_id: "base".to_string(),
-            task_id: "task_1".to_string(),
-            repl_idx: 0,
-            binding_name: "temp".to_string(),
-            binding_value: json!(0.2),
-            binding_value_text: "0.2".to_string(),
-        }])
-        .expect("variant snapshots should append");
         sink.flush().expect("flush should succeed");
 
-        let facts_dir = run_dir.join("facts");
-        assert!(facts_dir.join("run_manifest.json").exists());
-        assert_eq!(
-            fs::read_to_string(facts_dir.join("trials.jsonl"))
-                .expect("trials file should exist")
-                .lines()
-                .count(),
-            1
-        );
-        assert_eq!(
-            fs::read_to_string(facts_dir.join("metrics_long.jsonl"))
-                .expect("metrics file should exist")
-                .lines()
-                .count(),
-            2
-        );
-        assert_eq!(
-            fs::read_to_string(facts_dir.join("events.jsonl"))
-                .expect("events file should exist")
-                .lines()
-                .count(),
-            1
-        );
-        assert_eq!(
-            fs::read_to_string(facts_dir.join("variant_snapshots.jsonl"))
-                .expect("variant snapshots file should exist")
-                .lines()
-                .count(),
-            1
-        );
-        let _ = fs::remove_dir_all(run_dir);
+        let db_path = run_sqlite_path(&run_dir);
+        assert!(db_path.exists());
+        let db = BackingStore::open(&run_dir).expect("open sqlite");
+        assert_eq!(db.row_count("run_manifests").expect("count"), 1);
+        assert_eq!(db.row_count("trial_rows").expect("count"), 1);
     }
 }

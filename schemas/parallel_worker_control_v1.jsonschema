@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agent-lab.local/schemas/parallel_worker_control_v1.json",
+  "title": "Parallel Worker Control v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "updated_at"],
+  "properties": {
+    "schema_version": { "const": "parallel_worker_control_v1" },
+    "request": { "type": ["object", "null"] },
+    "response": { "type": ["object", "null"] },
+    "updated_at": { "type": "string", "minLength": 1 }
+  }
+}

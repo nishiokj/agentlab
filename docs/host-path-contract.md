@@ -213,7 +213,7 @@ Required decision:
 
 ### B) Replay/Fork Compatibility Under Materialization Policies
 
-`replay` / `fork` currently rely on trial-local artifacts (`trial_input.json`, workspace/dataset presence).
+`replay` / `fork` currently rely on trial-local artifacts (`trial_input.json`, workspace presence).
 
 Required decision:
 

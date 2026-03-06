@@ -1,0 +1,26 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agent-lab.local/schemas/resolved_schedule_v1.json",
+  "title": "Resolved Schedule v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "generated_at", "total_slots", "schedule"],
+  "properties": {
+    "schema_version": { "const": "resolved_schedule_v1" },
+    "generated_at": { "type": "string", "minLength": 1 },
+    "total_slots": { "type": "integer", "minimum": 0 },
+    "schedule": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["variant_idx", "task_idx", "repl_idx"],
+        "properties": {
+          "variant_idx": { "type": "integer", "minimum": 0 },
+          "task_idx": { "type": "integer", "minimum": 0 },
+          "repl_idx": { "type": "integer", "minimum": 0 }
+        }
+      }
+    }
+  }
+}

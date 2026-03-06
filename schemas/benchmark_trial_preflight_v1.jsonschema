@@ -1,0 +1,45 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agent-lab.local/schemas/benchmark_trial_preflight_v1.json",
+  "title": "Benchmark Trial Preflight v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "run_id",
+    "trial_id",
+    "schedule_idx",
+    "variant_id",
+    "task_id",
+    "grading",
+    "frozen_agent_artifacts",
+    "checked_at"
+  ],
+  "properties": {
+    "schema_version": { "const": "benchmark_trial_preflight_v1" },
+    "run_id": { "type": "string", "minLength": 1 },
+    "trial_id": { "type": "string", "minLength": 1 },
+    "schedule_idx": { "type": "integer", "minimum": 0 },
+    "variant_id": { "type": "string", "minLength": 1 },
+    "task_id": { "type": "string", "minLength": 1 },
+    "task_image": { "type": ["string", "null"] },
+    "grading": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["enabled"],
+      "properties": {
+        "enabled": { "type": "boolean" }
+      }
+    },
+    "frozen_agent_artifacts": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["trial_input_path", "trial_input_digest"],
+      "properties": {
+        "trial_input_path": { "type": "string", "minLength": 1 },
+        "trial_input_digest": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" }
+      }
+    },
+    "checked_at": { "type": "string", "minLength": 1 }
+  }
+}

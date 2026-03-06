@@ -33,16 +33,14 @@
     }
   },
   "dataset_task_row": {
-    "schema_version": "task_boundary_v1",
+    "schema_version": "task_boundary_v2",
     "task": {
       "id": "swebench__django__12345",
       "prompt": "Fix failing tests without changing expected behavior.",
-      "image": "ghcr.io/acme/swebench-task:20260222",
-      "workspace": {
-        "repo": "django/django",
-        "base_commit": "a94a8fe5ccb19ba61c4c0873d391e987982fbbd3",
-        "checkout_dir": "repo"
-      }
+      "image": "ghcr.io/acme/swebench-task:20260222"
+    },
+    "workspace_seed": {
+      "dataset_pack_ref": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
     },
     "workspace_files": [
       {

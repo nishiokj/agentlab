@@ -1,0 +1,21 @@
+name: DX Evidence Contract
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  validate-dx-evidence:
+    name: Validate DX evidence ledgers
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Validate phase ledgers (lint mode)
+        run: |
+          scripts/ci/validate-dx-evidence.sh --phase phase0 --mode lint
+          scripts/ci/validate-dx-evidence.sh --phase phase1 --mode lint
+          scripts/ci/validate-dx-evidence.sh --phase phase2 --mode lint

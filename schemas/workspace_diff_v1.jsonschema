@@ -1,0 +1,25 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agent-lab.local/schemas/workspace_diff_v1.json",
+  "title": "Workspace Diff v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "captured_at", "added", "removed", "modified", "summary"],
+  "properties": {
+    "schema_version": { "const": "workspace_diff_v1" },
+    "captured_at": { "type": "string", "minLength": 1 },
+    "added": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+    "removed": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+    "modified": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+    "summary": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["added_files", "removed_files", "modified_files"],
+      "properties": {
+        "added_files": { "type": "integer", "minimum": 0 },
+        "removed_files": { "type": "integer", "minimum": 0 },
+        "modified_files": { "type": "integer", "minimum": 0 }
+      }
+    }
+  }
+}

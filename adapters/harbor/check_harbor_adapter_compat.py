@@ -13,9 +13,16 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
+REPO_ROOT = Path(__file__).resolve().parents[2]
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
+
+from bench.taskkit.schema import validate_with_schema_file
+
 
 ERROR_CODE_RE = re.compile(r"error_code=([A-Za-z0-9._-]+)")
 DEFAULT_ADAPTER_SCRIPT = str((Path(__file__).resolve().parent / "harbor_benchmark_adapter.py"))
+SCHEMAS_DIR = REPO_ROOT / "schemas"
 
 
 def _parse_args(argv: list[str]) -> argparse.Namespace:
@@ -90,12 +97,10 @@ def _load_json(path: Path) -> dict[str, Any]:
     return payload
 
 
-def _assert_schema(payload: dict[str, Any], expected: str, label: str) -> None:
-    schema = payload.get("schema_version")
-    if schema != expected:
-        raise ValueError(
-            f"{label} schema mismatch: expected '{expected}', got '{schema}'"
-        )
+def _validate_schema(payload: dict[str, Any], schema_file: str, label: str) -> None:
+    errors = validate_with_schema_file(payload, SCHEMAS_DIR / schema_file)
+    if errors:
+        raise ValueError(f"{label} schema validation failed: {'; '.join(errors)}")
 
 
 def _assert_eval_mode(payload: dict[str, Any], expected_external: bool, label: str) -> None:
@@ -114,8 +119,12 @@ def _assert_eval_mode(payload: dict[str, Any], expected_external: bool, label: s
 def _validate_outputs(prediction_path: Path, score_path: Path, expect_external: bool) -> None:
     prediction = _load_json(prediction_path)
     score = _load_json(score_path)
-    _assert_schema(prediction, "benchmark_prediction_record_v1", "prediction")
-    _assert_schema(score, "benchmark_score_record_v1", "score")
+    _validate_schema(
+        prediction,
+        "benchmark_prediction_record_v1.jsonschema",
+        "prediction",
+    )
+    _validate_schema(score, "benchmark_score_record_v1.jsonschema", "score")
     if expect_external:
         _assert_eval_mode(prediction, True, "prediction")
         _assert_eval_mode(score, True, "score")

@@ -19,7 +19,7 @@ Use these names consistently in docs, code comments, and UX.
 
 | Primitive | Definition | Owner |
 | --- | --- | --- |
-| `Experiment` | Declarative config: dataset + design + runtime + policy. | User |
+| `Experiment` | Declarative config: DX authoring (`benchmark + agent + baseline + variants + overrides`) normalized to internal dataset/design/runtime/policy. | User |
 | `Task` | One dataset row (`task_jsonl_v1`). | Dataset provider |
 | `Variant` | Bindings/image override applied across tasks. | Experiment design |
 | `Trial` | `Task x Variant x Replication` execution unit. | Runner |
@@ -37,6 +37,40 @@ Use these names consistently in docs, code comments, and UX.
 4. Runner appends immutable facts; analysis computes aggregates and live views.
 5. Benchmark-specific logic stays in adapters, not runner core.
 
+## Phase 2 Isolation Contract (Strict)
+
+`task_boundary_v2` is now a strict boundary type. The runner owns runtime topology.
+
+1. Allowed task-boundary keys are fixed: `schema_version`, `task`, `workspace_seed`, `workspace_files`, `mount_references`, `limits`.
+2. `task.workspace` is not a boundary field and has no runtime meaning.
+3. Runner never seeds workspace by reading paths from inside a task image.
+4. Per-task image mode requires materialization via `workspace_seed` or `workspace_files` or `mount_references`; preflight fails otherwise.
+5. Agent-visible filesystem remains runner-owned workspace only (`/agentlab/workspace`) plus runner-managed deps/io mounts.
+
+### Rebuild Bench v0 Dataset For `/jesus`
+
+Run from `Experiments` root:
+
+```bash
+python3 bench/integration/agentlab/export_bench_suite_to_jsonl.py \
+  --suite v0 \
+  --output /Users/jevinnishioka/Desktop/jesus/.lab/experiments/data/bench_v0.task_boundary_v2.jsonl \
+  --default-task-image bench-v0-workspace \
+  --require-task-image \
+  --dataset-pack-root /Users/jevinnishioka/Desktop/jesus/.lab/dataset_packs/sha256
+```
+
+Then run from `/Users/jevinnishioka/Desktop/jesus`:
+
+```bash
+/Users/jevinnishioka/Desktop/Experiments/rust/target/release/lab-cli preflight \
+  .lab/experiments/bench_v0_glm5_vs_codex_spark_tarbell_latest_v0.yaml
+
+/Users/jevinnishioka/Desktop/Experiments/rust/target/release/lab-cli run \
+  .lab/experiments/bench_v0_glm5_vs_codex_spark_tarbell_latest_v0.yaml \
+  --executor local_docker
+```
+
 ### Not Public
 
 The following are intentionally not public primitives:
@@ -46,44 +80,61 @@ The following are intentionally not public primitives:
 - In-memory state machine structure.
 - Patch-spec and migration doc internals.
 
-## Minimal Experiment Shape
+## Minimal DX Experiment Shape
 
 ```yaml
-version: "0.5"
 experiment:
-  id: exp_local
-  workload_type: agent_runtime
+  id: bench_v0_qwen35b_a3b_only
+  name: "Bench v0: Qwen3.5 35B A3B (LM Studio)"
+  tags: [bench-v0, single-variant, lmstudio, qwen3.5-35b-a3b]
 
-dataset:
-  provider: local_jsonl
-  path: tasks.jsonl
-  schema_version: task_jsonl_v1
+benchmark: bench_v0
+limit: 20
 
-design:
-  comparison: paired
-  replications: 1
-  max_concurrency: 1
+agent:
+  artifact: rex-minimal-linux-dir
+  command: [rex, run, --dangerous]
+  default_config: overrides/defaults.bench-lmstudio-headless.json
+  provider_env:
+    - provider: z.ai-coder
+      env: ZAI_CODER_API_KEY
+  io: { input: --input-file, output: --output }
+  env:
+    MEMORY_DAEMON_URL: ""
+  config_files:
+    - overrides/defaults.bench-lmstudio-headless.json
+    - overrides/providers.lmstudio-docker.ts
+    - overrides/providers.lmstudio-docker.js
+  workspace_patches:
+    overrides/providers.lmstudio-docker.ts: packages/core/types/src/providers.ts
+    overrides/providers.lmstudio-docker.js: packages/core/types/dist/providers.js
+  arg_map:
+    - key: model_provider
+      flag: --provider
+    - key: model
+      flag: --model
 
 baseline:
-  variant_id: base
-  bindings: {}
+  id: qwen_35b_a3b
+  bindings:
+    model_provider: lmstudio
+    model: qwen3.5-35b-a3b
 
-variant_plan: []
-
-runtime:
-  agent:
-    command: ["python", "./examples/clean_harness/harness.py"]
-    image: python:3.11-slim
-    io:
-      input_arg: "{path}"
-      output_arg: "{path}"
-  policy:
-    timeout_ms: 600000
-    network:
-      mode: none
-    sandbox:
-      mode: container
+overrides:
+  network: full
+  root_read_only: false
 ```
+
+DX authoring notes:
+
+1. Built-in benchmark registry currently supports `benchmark: bench_v0`.
+2. `agent.artifact` resolves short names from `.lab/agents/`.
+3. `agent.default_config` stages the file (if needed) and appends `--config /agentlab/deps/<file>` when command does not already set `--config`.
+4. `agent.provider_env` appends `--provider-env provider=ENV` and auto-adds those env vars to `agent.env_from_host`.
+5. If staged config files include `.config/...` and `agent.env.HOME` is unset, HOME defaults to `/agentlab/deps` for runtime auth lookup.
+6. In DX mode, legacy fields (`dataset`, `design`, `runtime`, `variant_plan`, `baseline.variant_id`) are rejected.
+7. `arg_map` is the canonical authoring name. `bindings_to_args` with `binding:` is accepted as a compatibility alias during the transition.
+8. Persistent workspace carry-forward stores full workspace file contents. By default the runner fails fast above `AGENTLAB_MAX_WORKSPACE_BUNDLE_BYTES=268435456` bytes to avoid unbounded memory growth during bundle capture.
 
 ## Runtime Contract
 
@@ -122,24 +173,26 @@ cargo build --manifest-path rust/Cargo.toml -p lab-cli --release
 # check runner crate
 cargo check --manifest-path rust/Cargo.toml -p lab-runner
 
-# initialize local config
-rust/target/release/lab-cli init
+# create a DX experiment file using the "Minimal DX Experiment Shape" above
+mkdir -p .lab/experiments
+$EDITOR .lab/experiments/bench_v0_qwen35b_a3b_only.yaml
 
 # validate environment + resolved plan
-rust/target/release/lab-cli preflight .lab/experiment.yaml
-rust/target/release/lab-cli describe .lab/experiment.yaml --json
+rust/target/release/lab-cli preflight .lab/experiments/bench_v0_qwen35b_a3b_only.yaml
+rust/target/release/lab-cli describe .lab/experiments/bench_v0_qwen35b_a3b_only.yaml --json
 
 # run with Docker
-rust/target/release/lab-cli run .lab/experiment.yaml --executor local_docker
+rust/target/release/lab-cli run .lab/experiments/bench_v0_qwen35b_a3b_only.yaml --executor local_docker
 
 # fallback without Docker
-rust/target/release/lab-cli run .lab/experiment.yaml --executor local_process
+rust/target/release/lab-cli run .lab/experiments/bench_v0_qwen35b_a3b_only.yaml --executor local_process
 ```
 
 Notes:
 
 1. If `preflight` reports `container_ready=false`, use `local_process` or start Docker.
-2. If `local_process` fails with `No such file or directory (os error 2)` and command is `python`, switch to `python3` in your experiment.
+2. If `local_process` fails with command-not-found for `rex`, verify `agent.artifact` resolves under `.lab/agents/` and the artifact contains an executable `bin/rex`.
+3. If `preflight` reports missing config files, place them under `.lab/experiments/overrides/` or use absolute paths.
 
 ## Run Outputs (Contract-Level)
 
@@ -174,4 +227,3 @@ Key outputs:
 - `docs/AGENTLAB_ONBOARDING.md`: hands-on onboarding flow.
 - `docs/ARCHITECTURE.md`: boundary diagrams and architecture.
 - `docs/USAGE.md`: benchmark task tooling usage.
-

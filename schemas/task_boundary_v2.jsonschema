@@ -1,0 +1,24 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agent-lab.local/schemas/task_boundary_v2.json",
+  "title": "Task Boundary v2",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "task", "workspace_seed", "workspace_files", "mount_references"],
+  "properties": {
+    "schema_version": { "const": "task_boundary_v2" },
+    "task": {
+      "type": "object",
+      "required": ["id"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1 }
+      },
+      "additionalProperties": true
+    },
+    "workspace_seed": { "type": "object" },
+    "workspace_files": { "type": "array", "items": { "type": "object" } },
+    "mount_references": { "type": "array", "items": { "type": "object" } },
+    "grading": { "type": "object" },
+    "ext": { "type": "object" }
+  }
+}
