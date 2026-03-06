@@ -1,0 +1,12 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agent-lab.local/schemas/sealed_package_lock_v1.json",
+  "title": "Sealed Package Lock v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "package_digest"],
+  "properties": {
+    "schema_version": { "const": "sealed_package_lock_v1" },
+    "package_digest": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" }
+  }
+}

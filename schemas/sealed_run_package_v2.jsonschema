@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agent-lab.local/schemas/sealed_run_package_v2.json",
+  "title": "Sealed Run Package v2",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "created_at",
+    "resolved_experiment",
+    "checksums_ref",
+    "package_digest"
+  ],
+  "properties": {
+    "schema_version": { "const": "sealed_run_package_v2" },
+    "created_at": { "type": "string", "minLength": 1 },
+    "resolved_experiment": { "type": "object" },
+    "checksums_ref": { "type": "string", "minLength": 1 },
+    "package_digest": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" }
+  }
+}

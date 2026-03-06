@@ -1,0 +1,44 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agent-lab.local/schemas/fork_manifest_v1.json",
+  "title": "Fork Manifest v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "operation",
+    "fork_id",
+    "parent_trial_id",
+    "selector",
+    "fallback_mode",
+    "strict",
+    "integration_level",
+    "replay_grade",
+    "trial_id",
+    "refs",
+    "created_at"
+  ],
+  "properties": {
+    "schema_version": { "const": "fork_manifest_v1" },
+    "operation": { "const": "fork" },
+    "fork_id": { "type": "string", "minLength": 1 },
+    "parent_trial_id": { "type": "string", "minLength": 1 },
+    "selector": { "type": "string", "minLength": 1 },
+    "source_checkpoint": { "type": ["string", "null"] },
+    "fallback_mode": { "type": "string", "minLength": 1 },
+    "strict": { "type": "boolean" },
+    "integration_level": { "type": "string", "minLength": 1 },
+    "replay_grade": { "type": "string", "minLength": 1 },
+    "trial_id": { "type": "string", "minLength": 1 },
+    "refs": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["trial_input_ref", "trial_output_ref"],
+      "properties": {
+        "trial_input_ref": { "type": "string", "pattern": "^artifact://sha256/[0-9a-f]{64}$" },
+        "trial_output_ref": { "type": "string", "pattern": "^artifact://sha256/[0-9a-f]{64}$" }
+      }
+    },
+    "created_at": { "type": "string", "minLength": 1 }
+  }
+}

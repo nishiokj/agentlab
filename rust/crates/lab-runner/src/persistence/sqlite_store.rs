@@ -1,3 +1,4 @@
+use crate::validate_schema_contract_value;
 use anyhow::{anyhow, Context, Result};
 use chrono::Utc;
 use lab_core::sha256_bytes;
@@ -162,6 +163,7 @@ impl SqliteRunStore {
     }
 
     pub fn put_runtime_json(&mut self, key: &str, value: &Value) -> Result<()> {
+        validate_schema_contract_value(value, format!("runtime_kv key '{}'", key).as_str())?;
         let payload = json_text(value)?;
         self.conn.execute(
             "INSERT INTO runtime_kv (key, value_json, updated_at_ms)
@@ -187,6 +189,10 @@ impl SqliteRunStore {
     }
 
     pub fn put_run_manifest(&mut self, run_id: &str, manifest: &Value) -> Result<()> {
+        validate_schema_contract_value(
+            manifest,
+            format!("run_manifest row for run '{}'", run_id).as_str(),
+        )?;
         let payload = json_text(manifest)?;
         self.conn.execute(
             "INSERT INTO run_manifests (run_id, manifest_json, updated_at_ms)
@@ -266,6 +272,10 @@ impl SqliteRunStore {
             params![run_id],
         )?;
         for row in rows {
+            validate_schema_contract_value(
+                row,
+                format!("pending_trial_completions row for run '{}'", run_id).as_str(),
+            )?;
             let schedule_idx = extract_usize(row, "/schedule_idx")?;
             let trial_result = row
                 .get("trial_result")
@@ -373,17 +383,6 @@ impl SqliteRunStore {
             .map_err(Into::into)
     }
 
-    pub fn has_lineage_for_trial(&self, run_id: &str, trial_id: &str) -> Result<bool> {
-        let count: i64 = self.conn.query_row(
-            "SELECT count(*)
-             FROM lineage_versions
-             WHERE run_id=?1 AND trial_id=?2",
-            params![run_id, trial_id],
-            |row| row.get(0),
-        )?;
-        Ok(count > 0)
-    }
-
     pub fn latest_lineage_version_id_for_trial(
         &self,
         run_id: &str,
@@ -432,22 +431,6 @@ impl SqliteRunStore {
             params![run_id, op_kind, op_id, json_text(payload)?, now_ms()],
         )?;
         Ok(())
-    }
-
-    pub fn latest_runtime_operation(&self, run_id: &str, op_kind: &str) -> Result<Option<Value>> {
-        let raw: Option<String> = self
-            .conn
-            .query_row(
-                "SELECT payload_json
-                 FROM runtime_ops
-                 WHERE run_id=?1 AND op_kind=?2
-                 ORDER BY updated_at_ms DESC
-                 LIMIT 1",
-                params![run_id, op_kind],
-                |row| row.get(0),
-            )
-            .optional()?;
-        raw.map(parse_json_text).transpose()
     }
 
     fn upsert_lineage_from_chain_state_row(&mut self, row: &Value) -> Result<()> {
@@ -833,6 +816,36 @@ impl SqliteRunStore {
         Ok(())
     }
 
+    #[cfg(test)]
+    pub fn has_lineage_for_trial(&self, run_id: &str, trial_id: &str) -> Result<bool> {
+        let count: i64 = self.conn.query_row(
+            "SELECT count(*)
+             FROM lineage_versions
+             WHERE run_id=?1 AND trial_id=?2",
+            params![run_id, trial_id],
+            |row| row.get(0),
+        )?;
+        Ok(count > 0)
+    }
+
+    #[cfg(test)]
+    pub fn latest_runtime_operation(&self, run_id: &str, op_kind: &str) -> Result<Option<Value>> {
+        let raw: Option<String> = self
+            .conn
+            .query_row(
+                "SELECT payload_json
+                 FROM runtime_ops
+                 WHERE run_id=?1 AND op_kind=?2
+                 ORDER BY updated_at_ms DESC
+                 LIMIT 1",
+                params![run_id, op_kind],
+                |row| row.get(0),
+            )
+            .optional()?;
+        raw.map(parse_json_text).transpose()
+    }
+
+    #[cfg(test)]
     pub fn row_count(&self, table: &str) -> Result<i64> {
         let sql = format!("SELECT count(*) FROM {}", table);
         let count = self.conn.query_row(&sql, [], |row| row.get(0))?;

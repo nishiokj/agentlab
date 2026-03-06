@@ -37,6 +37,40 @@ Use these names consistently in docs, code comments, and UX.
 4. Runner appends immutable facts; analysis computes aggregates and live views.
 5. Benchmark-specific logic stays in adapters, not runner core.
 
+## Phase 2 Isolation Contract (Strict)
+
+`task_boundary_v2` is now a strict boundary type. The runner owns runtime topology.
+
+1. Allowed task-boundary keys are fixed: `schema_version`, `task`, `workspace_seed`, `workspace_files`, `mount_references`, `limits`.
+2. `task.workspace` is not a boundary field and has no runtime meaning.
+3. Runner never seeds workspace by reading paths from inside a task image.
+4. Per-task image mode requires materialization via `workspace_seed` or `workspace_files` or `mount_references`; preflight fails otherwise.
+5. Agent-visible filesystem remains runner-owned workspace only (`/agentlab/workspace`) plus runner-managed deps/io mounts.
+
+### Rebuild Bench v0 Dataset For `/jesus`
+
+Run from `Experiments` root:
+
+```bash
+python3 bench/integration/agentlab/export_bench_suite_to_jsonl.py \
+  --suite v0 \
+  --output /Users/jevinnishioka/Desktop/jesus/.lab/experiments/data/bench_v0.task_boundary_v2.jsonl \
+  --default-task-image bench-v0-workspace \
+  --require-task-image \
+  --dataset-pack-root /Users/jevinnishioka/Desktop/jesus/.lab/dataset_packs/sha256
+```
+
+Then run from `/Users/jevinnishioka/Desktop/jesus`:
+
+```bash
+/Users/jevinnishioka/Desktop/Experiments/rust/target/release/lab-cli preflight \
+  .lab/experiments/bench_v0_glm5_vs_codex_spark_tarbell_latest_v0.yaml
+
+/Users/jevinnishioka/Desktop/Experiments/rust/target/release/lab-cli run \
+  .lab/experiments/bench_v0_glm5_vs_codex_spark_tarbell_latest_v0.yaml \
+  --executor local_docker
+```
+
 ### Not Public
 
 The following are intentionally not public primitives:
@@ -74,10 +108,10 @@ agent:
   workspace_patches:
     overrides/providers.lmstudio-docker.ts: packages/core/types/src/providers.ts
     overrides/providers.lmstudio-docker.js: packages/core/types/dist/providers.js
-  bindings_to_args:
-    - binding: model_provider
+  arg_map:
+    - key: model_provider
       flag: --provider
-    - binding: model
+    - key: model
       flag: --model
 
 baseline:
@@ -99,6 +133,8 @@ DX authoring notes:
 4. `agent.provider_env` appends `--provider-env provider=ENV` and auto-adds those env vars to `agent.env_from_host`.
 5. If staged config files include `.config/...` and `agent.env.HOME` is unset, HOME defaults to `/agentlab/deps` for runtime auth lookup.
 6. In DX mode, legacy fields (`dataset`, `design`, `runtime`, `variant_plan`, `baseline.variant_id`) are rejected.
+7. `arg_map` is the canonical authoring name. `bindings_to_args` with `binding:` is accepted as a compatibility alias during the transition.
+8. Persistent workspace carry-forward stores full workspace file contents. By default the runner fails fast above `AGENTLAB_MAX_WORKSPACE_BUNDLE_BYTES=268435456` bytes to avoid unbounded memory growth during bundle capture.
 
 ## Runtime Contract
 

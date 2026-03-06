@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agent-lab.local/schemas/run_session_state_v1.json",
+  "title": "Run Session State v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "run_id", "behavior", "execution"],
+  "properties": {
+    "schema_version": { "const": "run_session_state_v1" },
+    "run_id": { "type": "string", "minLength": 1 },
+    "behavior": { "type": "object" },
+    "execution": { "type": "object" }
+  }
+}

@@ -10,6 +10,7 @@ on:
       - 'adapters/**'
       - 'scripts/**'
       - 'schemas/**'
+      - 'tests/**'
       - 'bench/benchmark/tasks/**'
       - '.github/workflows/benchmark-v0-gates.yml'
 
@@ -72,3 +73,24 @@ jobs:
           cargo test --manifest-path rust/Cargo.toml -p lab-runner inv04_artifact_unpack_succeeds_with_container_fs_constraints
           cargo test --manifest-path rust/Cargo.toml -p lab-runner inv06_recover_then_continue_succeeds_with_minimal_env
           cargo test --manifest-path rust/Cargo.toml -p lab-runner inv06_continue_handles_relative_and_absolute_dataset_paths
+
+  cli-black-box-e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      LAB_CLI_BIN: ${{ github.workspace }}/rust/target/release/lab-cli
+      AGENTLAB_MIN_FREE_BYTES: "1073741824"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install deps
+        run: pip install -r requirements.txt
+      - name: Build lab-cli release
+        run: cargo build --manifest-path rust/Cargo.toml -p lab-cli --release
+      - name: Refresh lab-cli mtime for stale-binary guard
+        run: touch rust/target/release/lab-cli
+      - name: Run CLI E2E suite
+        run: python -m pytest tests/e2e_cli/test_cli_e2e.py -q

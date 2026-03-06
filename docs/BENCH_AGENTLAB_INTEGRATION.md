@@ -44,7 +44,7 @@ Each row includes:
 4. optional `task.workspace`
 5. `task.task_dir`
 6. `task.benchmark` metadata
-7. issue text as `task.input.prompt`
+7. issue text plus task metadata (`description`, `difficulty`, `tags`) as `task.input.prompt`
 
 ## 2) Per-task experiment wiring
 

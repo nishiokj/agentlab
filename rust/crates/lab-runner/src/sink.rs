@@ -2,6 +2,7 @@ use crate::persistence::sqlite_store::{
     EventRowInsert, MetricRowInsert, SqliteRunStore as BackingSqliteStore, TrialRowInsert,
     VariantSnapshotRowInsert,
 };
+use crate::validate_schema_contract_value;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -120,12 +121,10 @@ impl SqliteRunStore {
     }
 }
 
-// Temporary compatibility alias while caller code transitions to SqliteRunStore naming.
-pub type JsonlRunSink = SqliteRunStore;
-
 impl RunSink for SqliteRunStore {
     fn write_run_manifest(&mut self, run: &RunManifestRecord) -> Result<()> {
         let payload = serde_json::to_value(run)?;
+        validate_schema_contract_value(&payload, "run manifest row")?;
         self.inner.put_run_manifest(&run.run_id, &payload)
     }
 

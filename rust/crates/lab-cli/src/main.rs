@@ -1,11 +1,13 @@
-use anyhow::Result;
-use clap::{Parser, Subcommand, ValueEnum};
+use anyhow::{anyhow, Result};
+use clap::{ArgAction, Parser, Subcommand, ValueEnum};
 use rusqlite::{params, Connection, OptionalExtension};
 use serde_json::{json, Value};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+mod tui;
 
 #[derive(Parser)]
 #[command(name = "lab", version = "0.3.0", about = "AgentLab Rust CLI")]
@@ -79,32 +81,57 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
-    Run {
+    BuildRun {
         experiment: PathBuf,
+        #[arg(long)]
+        out: Option<PathBuf>,
+        #[arg(long)]
+        overrides: Option<PathBuf>,
         #[arg(long)]
         container: bool,
         #[arg(long, value_enum)]
         executor: Option<ExecutorArg>,
         #[arg(long, value_enum)]
         materialize: Option<MaterializeArg>,
+        #[arg(long = "env", value_name = "KEY=VALUE", action = ArgAction::Append)]
+        runtime_env: Vec<String>,
+        #[arg(long = "env-file", value_name = "PATH", action = ArgAction::Append)]
+        runtime_env_file: Vec<PathBuf>,
         #[arg(long)]
-        overrides: Option<PathBuf>,
+        json: bool,
+    },
+    Run {
+        package: PathBuf,
+        #[arg(long)]
+        container: bool,
+        #[arg(long, value_enum)]
+        executor: Option<ExecutorArg>,
+        #[arg(long, value_enum)]
+        materialize: Option<MaterializeArg>,
+        #[arg(long = "env", value_name = "KEY=VALUE", action = ArgAction::Append)]
+        runtime_env: Vec<String>,
+        #[arg(long = "env-file", value_name = "PATH", action = ArgAction::Append)]
+        runtime_env_file: Vec<PathBuf>,
         #[arg(long)]
         json: bool,
     },
     RunDev {
-        experiment: PathBuf,
+        package: PathBuf,
         #[arg(long)]
         setup: Option<String>,
-        #[arg(long)]
-        overrides: Option<PathBuf>,
+        #[arg(long = "env", value_name = "KEY=VALUE", action = ArgAction::Append)]
+        runtime_env: Vec<String>,
+        #[arg(long = "env-file", value_name = "PATH", action = ArgAction::Append)]
+        runtime_env_file: Vec<PathBuf>,
         #[arg(long)]
         json: bool,
     },
     RunExperiment {
-        experiment: PathBuf,
-        #[arg(long)]
-        overrides: Option<PathBuf>,
+        package: PathBuf,
+        #[arg(long = "env", value_name = "KEY=VALUE", action = ArgAction::Append)]
+        runtime_env: Vec<String>,
+        #[arg(long = "env-file", value_name = "PATH", action = ArgAction::Append)]
+        runtime_env_file: Vec<PathBuf>,
         #[arg(long)]
         json: bool,
     },
@@ -163,6 +190,10 @@ enum Commands {
     Continue {
         #[arg(long)]
         run_dir: PathBuf,
+        #[arg(long = "env", value_name = "KEY=VALUE", action = ArgAction::Append)]
+        runtime_env: Vec<String>,
+        #[arg(long = "env-file", value_name = "PATH", action = ArgAction::Append)]
+        runtime_env_file: Vec<PathBuf>,
         #[arg(long)]
         json: bool,
     },
@@ -182,9 +213,7 @@ enum Commands {
         json: bool,
     },
     Describe {
-        experiment: PathBuf,
-        #[arg(long)]
-        overrides: Option<PathBuf>,
+        package: PathBuf,
         #[arg(long)]
         json: bool,
     },
@@ -224,18 +253,6 @@ enum Commands {
         json: bool,
         #[arg(long)]
         csv: bool,
-    },
-    #[command(about = "Live per-task scoreboard grouped by variant")]
-    Scoreboard {
-        run: String,
-        #[arg(long, default_value_t = 2)]
-        interval_seconds: u64,
-        #[arg(long, default_value_t = 8)]
-        metric_limit: usize,
-        #[arg(long)]
-        once: bool,
-        #[arg(long)]
-        no_clear: bool,
     },
     Trend {
         experiment_id: String,
@@ -303,9 +320,7 @@ enum Commands {
         profile: Option<InitProfileArg>,
     },
     Preflight {
-        experiment: PathBuf,
-        #[arg(long)]
-        overrides: Option<PathBuf>,
+        package: PathBuf,
         #[arg(long)]
         json: bool,
     },
@@ -317,10 +332,20 @@ enum Commands {
     },
 }
 
+const STALE_BINARY_WATCH_RELATIVE_PATHS: &[&str] = &[
+    "rust/Cargo.toml",
+    "rust/Cargo.lock",
+    "rust/crates/lab-cli/Cargo.toml",
+    "rust/crates/lab-cli/src",
+    "rust/crates/lab-runner/Cargo.toml",
+    "rust/crates/lab-runner/src",
+];
+
 #[derive(Clone, Copy, Debug)]
 enum ViewQueryPlan {
     Source(&'static str),
     AbComparisonSummary,
+    Scoreboard,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -335,6 +360,7 @@ struct StandardViewDef {
 enum ResolvedViewPlan {
     Source(String),
     AbComparisonSummary,
+    Scoreboard,
 }
 
 #[derive(Clone, Debug)]
@@ -371,6 +397,12 @@ const STANDARD_VIEWS_CORE_ONLY: &[StandardViewDef] = &[
         purpose: "Task-by-variant pass rates for quick gap scanning.",
         plan: ViewQueryPlan::Source("task_variant_matrix"),
         aliases: &["task_matrix", "matrix"],
+    },
+    StandardViewDef {
+        name: "scoreboard",
+        purpose: "Per-task scoreboard grouped by variant with metric aggregates.",
+        plan: ViewQueryPlan::Scoreboard,
+        aliases: &["board", "scores"],
     },
 ];
 
@@ -449,6 +481,12 @@ const STANDARD_VIEWS_AB_TEST: &[StandardViewDef] = &[
             "ab_trace_row_side_by_side",
         ],
     },
+    StandardViewDef {
+        name: "scoreboard",
+        purpose: "Per-task scoreboard grouped by variant with metric aggregates.",
+        plan: ViewQueryPlan::Scoreboard,
+        aliases: &["board", "scores"],
+    },
 ];
 
 const STANDARD_VIEWS_MULTI_VARIANT: &[StandardViewDef] = &[
@@ -481,6 +519,12 @@ const STANDARD_VIEWS_MULTI_VARIANT: &[StandardViewDef] = &[
         purpose: "Task-by-variant pass rates for quick gap scanning.",
         plan: ViewQueryPlan::Source("task_variant_matrix"),
         aliases: &["task_matrix", "matrix", "heatmap"],
+    },
+    StandardViewDef {
+        name: "scoreboard",
+        purpose: "Per-task scoreboard grouped by variant with metric aggregates.",
+        plan: ViewQueryPlan::Scoreboard,
+        aliases: &["board", "scores"],
     },
 ];
 
@@ -515,6 +559,12 @@ const STANDARD_VIEWS_PARAMETER_SWEEP: &[StandardViewDef] = &[
         plan: ViewQueryPlan::Source("sensitivity"),
         aliases: &["sensitivity"],
     },
+    StandardViewDef {
+        name: "scoreboard",
+        purpose: "Per-task scoreboard grouped by variant with metric aggregates.",
+        plan: ViewQueryPlan::Scoreboard,
+        aliases: &["board", "scores"],
+    },
 ];
 
 const STANDARD_VIEWS_REGRESSION: &[StandardViewDef] = &[
@@ -548,12 +598,147 @@ const STANDARD_VIEWS_REGRESSION: &[StandardViewDef] = &[
         plan: ViewQueryPlan::Source("failure_clusters"),
         aliases: &["clusters"],
     },
+    StandardViewDef {
+        name: "scoreboard",
+        purpose: "Per-task scoreboard grouped by variant with metric aggregates.",
+        plan: ViewQueryPlan::Scoreboard,
+        aliases: &["board", "scores"],
+    },
 ];
+
+fn repo_root_for_stale_binary_guard() -> Option<PathBuf> {
+    let candidate = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../..");
+    if candidate.exists() {
+        Some(candidate)
+    } else {
+        None
+    }
+}
+
+fn latest_mtime_in_path(path: &Path) -> Result<Option<(SystemTime, PathBuf)>> {
+    if !path.exists() {
+        return Ok(None);
+    }
+    let meta = std::fs::metadata(path)
+        .map_err(|err| anyhow!("failed to stat stale-binary watch path {}: {}", path.display(), err))?;
+    if meta.is_file() {
+        let modified = meta
+            .modified()
+            .map_err(|err| anyhow!("failed to read mtime for {}: {}", path.display(), err))?;
+        return Ok(Some((modified, path.to_path_buf())));
+    }
+    if !meta.is_dir() {
+        return Ok(None);
+    }
+
+    let mut newest: Option<(SystemTime, PathBuf)> = None;
+    let mut stack = vec![path.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let entries = std::fs::read_dir(&dir)
+            .map_err(|err| anyhow!("failed to read stale-binary watch dir {}: {}", dir.display(), err))?;
+        for entry in entries {
+            let entry = entry.map_err(|err| anyhow!("failed to read dir entry in {}: {}", dir.display(), err))?;
+            let entry_path = entry.path();
+            let entry_meta = entry
+                .metadata()
+                .map_err(|err| anyhow!("failed to stat {}: {}", entry_path.display(), err))?;
+            if entry_meta.is_dir() {
+                stack.push(entry_path);
+                continue;
+            }
+            if !entry_meta.is_file() {
+                continue;
+            }
+            let modified = entry_meta
+                .modified()
+                .map_err(|err| anyhow!("failed to read mtime for {}: {}", entry_path.display(), err))?;
+            let replace = newest
+                .as_ref()
+                .map(|(current, _)| modified > *current)
+                .unwrap_or(true);
+            if replace {
+                newest = Some((modified, entry_path));
+            }
+        }
+    }
+    Ok(newest)
+}
+
+fn newest_watch_mtime(repo_root: &Path) -> Result<Option<(SystemTime, PathBuf)>> {
+    let mut newest: Option<(SystemTime, PathBuf)> = None;
+    for rel in STALE_BINARY_WATCH_RELATIVE_PATHS {
+        let candidate = repo_root.join(rel);
+        let Some((modified, path)) = latest_mtime_in_path(&candidate)? else {
+            continue;
+        };
+        let replace = newest
+            .as_ref()
+            .map(|(current, _)| modified > *current)
+            .unwrap_or(true);
+        if replace {
+            newest = Some((modified, path));
+        }
+    }
+    Ok(newest)
+}
+
+fn stale_binary_guard_error(
+    exe_path: &Path,
+    exe_mtime: SystemTime,
+    source_path: &Path,
+    source_mtime: SystemTime,
+) -> anyhow::Error {
+    let exe_secs = exe_mtime
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or(Duration::ZERO)
+        .as_secs();
+    let source_secs = source_mtime
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or(Duration::ZERO)
+        .as_secs();
+    anyhow!(
+        "stale lab-cli binary detected: executable '{}' (mtime={}s) is older than source '{}' (mtime={}s). Rebuild with `cargo build -p lab-cli --release` and rerun.",
+        exe_path.display(),
+        exe_secs,
+        source_path.display(),
+        source_secs
+    )
+}
+
+fn enforce_cli_binary_freshness(
+    exe_path: &Path,
+    exe_mtime: SystemTime,
+    newest_source: Option<(SystemTime, PathBuf)>,
+) -> Result<()> {
+    let Some((source_mtime, source_path)) = newest_source else {
+        return Ok(());
+    };
+    if source_mtime > exe_mtime {
+        return Err(stale_binary_guard_error(
+            exe_path,
+            exe_mtime,
+            &source_path,
+            source_mtime,
+        ));
+    }
+    Ok(())
+}
+
+fn ensure_cli_binary_is_fresh() -> Result<()> {
+    let Some(repo_root) = repo_root_for_stale_binary_guard() else {
+        return Ok(());
+    };
+    let exe_path = std::env::current_exe().map_err(|err| anyhow!("failed to resolve current executable path: {}", err))?;
+    let exe_mtime = std::fs::metadata(&exe_path)
+        .and_then(|meta| meta.modified())
+        .map_err(|err| anyhow!("failed to read executable mtime for {}: {}", exe_path.display(), err))?;
+    enforce_cli_binary_freshness(&exe_path, exe_mtime, newest_watch_mtime(&repo_root)?)
+}
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let json_mode = command_json_mode(&cli.command);
-    let result = run_command(cli.command);
+    let result = ensure_cli_binary_is_fresh().and_then(|_| run_command(cli.command));
     match result {
         Ok(Some(payload)) => {
             emit_json(&payload);
@@ -562,7 +747,12 @@ fn main() -> Result<()> {
         Ok(None) => Ok(()),
         Err(err) => {
             if json_mode {
-                emit_json(&json_error("command_failed", err.to_string(), json!({})));
+                let code = if err.to_string().contains("stale lab-cli binary detected") {
+                    "stale_binary"
+                } else {
+                    "command_failed"
+                };
+                emit_json(&json_error(code, err.to_string(), json!({})));
                 std::process::exit(1);
             }
             Err(err)
@@ -599,33 +789,90 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
             println!("manifest: {}", build.manifest_path.display());
             println!("checksums: {}", build.checksums_path.display());
         }
-        Commands::Run {
+        Commands::BuildRun {
             experiment,
+            out,
+            overrides,
             container,
             executor,
             materialize,
-            overrides,
+            runtime_env,
+            runtime_env_file,
             json,
         } => {
             if !json {
-                eprintln!("resolving experiment: {}", experiment.display());
+                eprintln!("building package from: {}", experiment.display());
             }
-            let summary =
-                lab_runner::describe_experiment_with_overrides(&experiment, overrides.as_deref())?;
-            let execution = lab_runner::RunExecutionOptions {
-                executor: executor.map(Into::into),
-                materialize: materialize.map(Into::into),
-            };
+            let build = lab_runner::build_experiment_package(
+                &experiment,
+                overrides.as_deref(),
+                out.as_deref(),
+            )?;
+            let execution = build_run_execution_options(
+                executor,
+                materialize,
+                &runtime_env,
+                &runtime_env_file,
+            )?;
+            let summary = lab_runner::describe_experiment(&build.package_dir)?;
             if !json {
                 print_summary(&summary);
                 eprintln!("launching run...");
             }
-            let result = lab_runner::run_experiment_with_options_and_overrides(
-                &experiment,
+            let result = lab_runner::run_experiment_with_options(
+                &build.package_dir,
                 container,
-                overrides.as_deref(),
                 execution.clone(),
             )?;
+            if json {
+                let post_run = try_post_run_stats_json(&result.run_dir);
+                return Ok(Some(json!({
+                    "ok": true,
+                    "command": "build-run",
+                    "package_dir": build.package_dir.display().to_string(),
+                    "manifest_path": build.manifest_path.display().to_string(),
+                    "checksums_path": build.checksums_path.display().to_string(),
+                    "summary": summary_to_json(&summary),
+                    "run": run_result_to_json(&result),
+                    "artifacts": run_artifacts_to_json(&result),
+                    "container": container,
+                    "executor": execution.executor.map(|e| e.as_str()),
+                    "materialize": execution.materialize.map(|m| m.as_str()),
+                    "post_run_stats": post_run
+                })));
+            }
+            println!("package_dir: {}", build.package_dir.display());
+            println!("manifest: {}", build.manifest_path.display());
+            println!("checksums: {}", build.checksums_path.display());
+            println!("run_id: {}", result.run_id);
+            println!("run_dir: {}", result.run_dir.display());
+            try_print_post_run_stats(&result.run_dir, &result.run_id);
+        }
+        Commands::Run {
+            package,
+            container,
+            executor,
+            materialize,
+            runtime_env,
+            runtime_env_file,
+            json,
+        } => {
+            if !json {
+                eprintln!("loading package: {}", package.display());
+            }
+            let summary = lab_runner::describe_experiment(&package)?;
+            let execution = build_run_execution_options(
+                executor,
+                materialize,
+                &runtime_env,
+                &runtime_env_file,
+            )?;
+            if !json {
+                print_summary(&summary);
+                eprintln!("launching run...");
+            }
+            let result =
+                lab_runner::run_experiment_with_options(&package, container, execution.clone())?;
             if json {
                 let post_run = try_post_run_stats_json(&result.run_dir);
                 return Ok(Some(json!({
@@ -645,26 +892,25 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
             try_print_post_run_stats(&result.run_dir, &result.run_id);
         }
         Commands::RunDev {
-            experiment,
+            package,
             setup,
-            overrides,
+            runtime_env,
+            runtime_env_file,
             json,
         } => {
             if !json {
-                eprintln!("resolving experiment: {}", experiment.display());
+                eprintln!("loading package: {}", package.display());
             }
-            let summary =
-                lab_runner::describe_experiment_with_overrides(&experiment, overrides.as_deref())?;
+            let summary = lab_runner::describe_experiment(&package)?;
             let setup_for_json = setup.clone();
             if !json {
                 print_summary(&summary);
                 eprintln!("launching dev run...");
             }
-            let result = lab_runner::run_experiment_dev_with_overrides(
-                &experiment,
-                setup.clone(),
-                overrides.as_deref(),
-            )?;
+            let execution =
+                build_run_execution_options(None, None, &runtime_env, &runtime_env_file)?;
+            let result =
+                lab_runner::run_experiment_dev_with_options(&package, setup.clone(), execution)?;
             if json {
                 let post_run = try_post_run_stats_json(&result.run_dir);
                 return Ok(Some(json!({
@@ -689,23 +935,22 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
             try_print_post_run_stats(&result.run_dir, &result.run_id);
         }
         Commands::RunExperiment {
-            experiment,
-            overrides,
+            package,
+            runtime_env,
+            runtime_env_file,
             json,
         } => {
             if !json {
-                eprintln!("resolving experiment: {}", experiment.display());
+                eprintln!("loading package: {}", package.display());
             }
-            let summary =
-                lab_runner::describe_experiment_with_overrides(&experiment, overrides.as_deref())?;
+            let summary = lab_runner::describe_experiment(&package)?;
             if !json {
                 print_summary(&summary);
                 eprintln!("launching strict experiment run...");
             }
-            let result = lab_runner::run_experiment_strict_with_overrides(
-                &experiment,
-                overrides.as_deref(),
-            )?;
+            let execution =
+                build_run_execution_options(None, None, &runtime_env, &runtime_env_file)?;
+            let result = lab_runner::run_experiment_strict_with_options(&package, execution)?;
             if json {
                 let post_run = try_post_run_stats_json(&result.run_dir);
                 return Ok(Some(json!({
@@ -829,8 +1074,15 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
             println!("replay_grade: {}", result.fork.replay_grade);
             println!("harness_status: {}", result.fork.harness_status);
         }
-        Commands::Continue { run_dir, json } => {
-            let result = lab_runner::continue_run(&run_dir)?;
+        Commands::Continue {
+            run_dir,
+            runtime_env,
+            runtime_env_file,
+            json,
+        } => {
+            let execution =
+                build_run_execution_options(None, None, &runtime_env, &runtime_env_file)?;
+            let result = lab_runner::continue_run_with_options(&run_dir, execution)?;
             if json {
                 return Ok(Some(json!({
                     "ok": true,
@@ -894,13 +1146,8 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
                 println!("killed_trials: {}", result.killed_trials.join(", "));
             }
         }
-        Commands::Describe {
-            experiment,
-            overrides,
-            json,
-        } => {
-            let summary =
-                lab_runner::describe_experiment_with_overrides(&experiment, overrides.as_deref())?;
+        Commands::Describe { package, json } => {
+            let summary = lab_runner::describe_experiment(&package)?;
             if json {
                 return Ok(Some(json!({
                     "ok": true,
@@ -985,7 +1232,7 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
                 println!("view_set: {}", view_set);
                 for (resolved, table) in rendered {
                     println!("\n== {} ==", resolved.name);
-                    if !print_special_split_view(&resolved.name, &table) {
+                    if !print_special_split_view(&run_dir, &resolved.name, &table) {
                         print_query_table(&table);
                     }
                 }
@@ -1026,7 +1273,7 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
                         println!("source_view: {}", source);
                     }
                 }
-                if !print_special_split_view(&resolved.name, &table) {
+                if !print_special_split_view(&run_dir, &resolved.name, &table) {
                     print_query_table(&table);
                 }
                 return Ok(None);
@@ -1107,35 +1354,89 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
                 None => resolve_requested_view(run_view_set, &raw_view_names, "run_progress")?,
             };
             let resolved_limit = limit.max(1);
-            loop {
-                let table = query_resolved_view(&run_dir, &resolved_view, resolved_limit)?;
-                if !no_clear {
-                    print!("\x1B[2J\x1B[H");
-                    let _ = std::io::stdout().flush();
-                }
-                println!("run_dir: {}", run_dir.display());
-                println!("status: {}", read_run_status(&run_dir));
-                println!("updated_unix_s: {}", unix_now_seconds());
-                println!("view: {}", resolved_view.name);
-                if let Some(source) = resolved_view.source.as_deref() {
-                    if source != resolved_view.name {
-                        println!("source_view: {}", source);
+            let run_id = run_dir
+                .file_name()
+                .and_then(|v| v.to_str())
+                .unwrap_or("?")
+                .to_string();
+            let use_tui = !once && !no_clear && stdout_is_tty();
+
+            if use_tui {
+                let mut term = tui::Term::new()?;
+                loop {
+                    let table =
+                        query_resolved_view(&run_dir, &resolved_view, resolved_limit)?;
+                    let (display, legend, split_labels) =
+                        if resolved_view.name == "trace" && has_ab_trace_columns(&table) {
+                            let (d, l, s) = prepare_trace_split_view(&table);
+                            (d, l, Some(s))
+                        } else {
+                            let (filtered, raw_legend) = elide_constant_columns(&table);
+                            let display = shorten_display_columns(&filtered);
+                            let legend: Vec<(String, String)> = raw_legend
+                                .into_iter()
+                                .map(|(k, v)| (shorten_column_name(&k), v))
+                                .collect();
+                            (display, legend, None)
+                        };
+                    let status = read_run_status(&run_dir);
+                    let progress = read_run_progress(&run_dir);
+                    let split_refs = split_labels
+                        .as_ref()
+                        .map(|(l, r)| (l.as_str(), r.as_str()));
+                    term.draw(&tui::ViewState {
+                        run_id: &run_id,
+                        status: &status,
+                        view_name: &resolved_view.name,
+                        interval_secs: sleep_interval.as_secs(),
+                        table: &display,
+                        progress,
+                        legend: &legend,
+                        split_labels: split_refs,
+                    })?;
+                    let row_count = display.rows.len();
+                    match term.poll(sleep_interval)? {
+                        tui::Action::Quit => break,
+                        tui::Action::ScrollUp => term.scroll_up(),
+                        tui::Action::ScrollDown => term.scroll_down(row_count),
+                        tui::Action::PageUp => term.page_up(),
+                        tui::Action::PageDown => term.page_down(row_count),
+                        tui::Action::Tick => {}
                     }
                 }
-                println!("limit: {}", resolved_limit);
-                println!(
-                    "refresh_interval_seconds: {} (Ctrl-C to stop)",
-                    sleep_interval.as_secs()
-                );
-                println!();
-                if !print_special_split_view(&resolved_view.name, &table) {
-                    print_query_table(&table);
-                }
+            } else {
+                // Plain text fallback (--once, --no-clear, non-TTY)
+                loop {
+                    let table =
+                        query_resolved_view(&run_dir, &resolved_view, resolved_limit)?;
+                    if !no_clear {
+                        print!("\x1B[2J\x1B[H");
+                        let _ = std::io::stdout().flush();
+                    }
+                    println!("run_dir: {}", run_dir.display());
+                    println!("status: {}", read_run_status(&run_dir));
+                    println!("updated_unix_s: {}", unix_now_seconds());
+                    println!("view: {}", resolved_view.name);
+                    if let Some(source) = resolved_view.source.as_deref() {
+                        if source != resolved_view.name {
+                            println!("source_view: {}", source);
+                        }
+                    }
+                    println!("limit: {}", resolved_limit);
+                    println!(
+                        "refresh_interval_seconds: {} (Ctrl-C to stop)",
+                        sleep_interval.as_secs()
+                    );
+                    println!();
+                    if !print_special_split_view(&run_dir, &resolved_view.name, &table) {
+                        print_query_table(&table);
+                    }
 
-                if once {
-                    break;
+                    if once {
+                        break;
+                    }
+                    std::thread::sleep(sleep_interval);
                 }
-                std::thread::sleep(sleep_interval);
             }
         }
         Commands::Query {
@@ -1163,66 +1464,6 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
                 return Ok(None);
             }
             print_query_table(&table);
-        }
-        Commands::Scoreboard {
-            run,
-            interval_seconds,
-            metric_limit,
-            once,
-            no_clear,
-        } => {
-            let run_dir = resolve_run_dir_arg(&run)?;
-            let sleep_interval = Duration::from_secs(interval_seconds.max(1));
-            let meta = read_scoreboard_metadata(&run_dir);
-            loop {
-                let mut table = build_live_scoreboard_table(&run_dir, metric_limit)?;
-                let mut showing_in_flight = false;
-                if table.rows.is_empty() {
-                    if let Some(in_flight) = build_inflight_scoreboard_table(&run_dir) {
-                        table = in_flight;
-                        showing_in_flight = true;
-                    }
-                }
-                let variants = scoreboard_variant_ids(&table);
-                let variant_bindings = fetch_variant_bindings(&run_dir);
-                if !no_clear {
-                    print!("\x1B[2J\x1B[H");
-                    let _ = std::io::stdout().flush();
-                }
-                // Compact metadata header
-                let run_id = run_dir.file_name().and_then(|v| v.to_str()).unwrap_or("?");
-                print!("run: {}  status: {}", run_id, read_run_status(&run_dir));
-                if !meta.experiment_id.is_empty() {
-                    print!("  experiment: {}", meta.experiment_id);
-                }
-                println!();
-                if !meta.baseline_id.is_empty() {
-                    print!("reference_variant: {}", meta.baseline_id);
-                    if !meta.comparison.is_empty() {
-                        print!("  design_comparison: {}", meta.comparison);
-                    }
-                    println!();
-                }
-                if !variants.is_empty() {
-                    println!("variants: {}", variants.join(", "));
-                }
-                if !once {
-                    println!("refresh: {}s (Ctrl-C to stop)", sleep_interval.as_secs());
-                }
-                println!();
-                if showing_in_flight {
-                    println!(
-                        "note: no committed trial rows yet; showing active trials from run.sqlite runtime state"
-                    );
-                    println!();
-                }
-                print_scoreboard_grouped_by_variant(&table, &variant_bindings);
-
-                if once {
-                    break;
-                }
-                std::thread::sleep(sleep_interval);
-            }
         }
         Commands::Trend {
             experiment_id,
@@ -1415,17 +1656,14 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
                 "next: edit {} (fill in dataset path + runtime command/image)",
                 exp_show
             );
-            println!("next: lab describe {}", exp_show);
+            println!("next: lab build {} --out .lab/builds/<name>", exp_show);
+            println!("next: lab describe .lab/builds/<name>");
         }
-        Commands::Preflight {
-            experiment,
-            overrides,
-            json,
-        } => {
+        Commands::Preflight { package, json } => {
             if !json {
-                eprintln!("running preflight: {}", experiment.display());
+                eprintln!("running preflight: {}", package.display());
             }
-            let report = lab_runner::preflight_experiment(&experiment, overrides.as_deref())?;
+            let report = lab_runner::preflight_experiment(&package)?;
             if json {
                 return Ok(Some(json!({
                     "ok": report.passed,
@@ -1721,6 +1959,7 @@ fn json_error(code: &str, message: String, details: Value) -> Value {
 fn command_json_mode(command: &Commands) -> bool {
     match command {
         Commands::Build { json, .. }
+        | Commands::BuildRun { json, .. }
         | Commands::Run { json, .. }
         | Commands::RunDev { json, .. }
         | Commands::RunExperiment { json, .. }
@@ -1770,13 +2009,6 @@ fn run_artifacts_to_json(result: &lab_runner::RunResult) -> Value {
 }
 
 fn load_run_control(run_dir: &Path) -> Option<Value> {
-    let legacy_path = run_dir.join("runtime").join("run_control.json");
-    if legacy_path.exists() {
-        let raw = std::fs::read_to_string(&legacy_path).ok()?;
-        if let Ok(parsed) = serde_json::from_str::<Value>(&raw) {
-            return Some(parsed);
-        }
-    }
     let sqlite_path = run_dir.join("run.sqlite");
     if !sqlite_path.exists() {
         return None;
@@ -1865,6 +2097,35 @@ fn parse_set_bindings(values: &[String]) -> Result<BTreeMap<String, Value>> {
         out.insert(key.to_string(), parsed);
     }
     Ok(out)
+}
+
+fn parse_runtime_env_bindings(values: &[String]) -> Result<BTreeMap<String, String>> {
+    let mut out = BTreeMap::new();
+    for raw in values {
+        let (key_raw, value_raw) = raw
+            .split_once('=')
+            .ok_or_else(|| anyhow!("invalid --env '{}': expected KEY=VALUE", raw))?;
+        let key = key_raw.trim();
+        if key.is_empty() {
+            return Err(anyhow!("invalid --env '{}': key cannot be empty", raw));
+        }
+        out.insert(key.to_string(), value_raw.to_string());
+    }
+    Ok(out)
+}
+
+fn build_run_execution_options(
+    executor: Option<ExecutorArg>,
+    materialize: Option<MaterializeArg>,
+    runtime_env: &[String],
+    runtime_env_files: &[PathBuf],
+) -> Result<lab_runner::RunExecutionOptions> {
+    Ok(lab_runner::RunExecutionOptions {
+        executor: executor.map(Into::into),
+        materialize: materialize.map(Into::into),
+        runtime_env: parse_runtime_env_bindings(runtime_env)?,
+        runtime_env_files: runtime_env_files.to_vec(),
+    })
 }
 
 fn summary_to_json(summary: &lab_runner::ExperimentSummary) -> Value {
@@ -2002,6 +2263,7 @@ fn standard_view_source_label(def: &StandardViewDef) -> &'static str {
     match def.plan {
         ViewQueryPlan::Source(source) => source,
         ViewQueryPlan::AbComparisonSummary => "win_loss_tie+effect_size+mcnemar_contingency",
+        ViewQueryPlan::Scoreboard => "scoreboard (dynamic)",
     }
 }
 
@@ -2028,6 +2290,12 @@ fn resolved_view_from_def(view_set: lab_analysis::ViewSet, def: &StandardViewDef
             name: def.name.to_string(),
             source: Some(standard_view_source_label(def).to_string()),
             plan: ResolvedViewPlan::AbComparisonSummary,
+            standardize_ab_terms: false,
+        },
+        ViewQueryPlan::Scoreboard => ResolvedView {
+            name: def.name.to_string(),
+            source: None,
+            plan: ResolvedViewPlan::Scoreboard,
             standardize_ab_terms: false,
         },
     }
@@ -2093,6 +2361,7 @@ fn query_resolved_view(
     let table = match &resolved.plan {
         ResolvedViewPlan::Source(source) => query_source_view(run_dir, source, limit)?,
         ResolvedViewPlan::AbComparisonSummary => query_ab_comparison_summary(run_dir)?,
+        ResolvedViewPlan::Scoreboard => query_scoreboard(run_dir)?,
     };
 
     if resolved.standardize_ab_terms {
@@ -2375,6 +2644,17 @@ fn build_inflight_scoreboard_table(run_dir: &Path) -> Option<lab_analysis::Query
     })
 }
 
+fn query_scoreboard(run_dir: &Path) -> Result<lab_analysis::QueryTable> {
+    let table = build_live_scoreboard_table(run_dir, 8)?;
+    if !table.rows.is_empty() {
+        return Ok(table);
+    }
+    if let Some(inflight) = build_inflight_scoreboard_table(run_dir) {
+        return Ok(inflight);
+    }
+    Ok(table)
+}
+
 fn fetch_scoreboard_metric_names(run_dir: &Path, metric_limit: usize) -> Result<Vec<String>> {
     let sql = format!(
         "SELECT metric_name
@@ -2552,23 +2832,6 @@ fn print_scoreboard_grouped_by_variant(
         );
         println!();
     }
-}
-
-fn scoreboard_variant_ids(table: &lab_analysis::QueryTable) -> Vec<String> {
-    let Some(variant_col_idx) = table.columns.iter().position(|c| c == "variant_id") else {
-        return Vec::new();
-    };
-    let mut variants = BTreeSet::new();
-    for row in &table.rows {
-        let variant = row
-            .get(variant_col_idx)
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|v| !v.is_empty())
-            .unwrap_or("unknown");
-        variants.insert(variant.to_string());
-    }
-    variants.into_iter().collect()
 }
 
 /// Width-aware table printer for the scoreboard.
@@ -2788,11 +3051,188 @@ fn read_run_status(run_dir: &Path) -> String {
     )
 }
 
+fn read_run_progress(run_dir: &Path) -> Option<(usize, usize)> {
+    let sqlite_path = run_dir.join("run.sqlite");
+    let conn = Connection::open(sqlite_path).ok()?;
+    let raw: String = conn
+        .query_row(
+            "SELECT value_json FROM runtime_kv WHERE key=?1",
+            params!["schedule_progress_v2"],
+            |row| row.get(0),
+        )
+        .optional()
+        .ok()??;
+    let value: Value = serde_json::from_str(&raw).ok()?;
+    let total = value.get("total_slots")?.as_u64()? as usize;
+    let completed = value.get("completed_slots")?.as_array()?.len();
+    if total == 0 {
+        return None;
+    }
+    Some((completed, total))
+}
+
+fn stdout_is_tty() -> bool {
+    unsafe { libc::isatty(libc::STDOUT_FILENO) == 1 }
+}
+
 fn unix_now_seconds() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0)
+}
+
+/// Transform the trace side-by-side view into a compact split layout:
+/// two minimal column sets (event, turn, tool, status-dot) separated by ┃,
+/// with variant IDs as panel labels above each table half.
+fn prepare_trace_split_view(
+    table: &lab_analysis::QueryTable,
+) -> (lab_analysis::QueryTable, Vec<(String, String)>, (String, String)) {
+    let idx = |name: &str| table.columns.iter().position(|c| c == name);
+    let get = |row: &[Value], col: Option<usize>| -> Value {
+        col.and_then(|i| row.get(i)).cloned().unwrap_or(Value::Null)
+    };
+    let task_id = idx("task_id");
+    let a_id = idx("variant_a_id");
+    let b_id = idx("variant_b_id");
+    let a_event = idx("variant_a_event_type");
+    let b_event = idx("variant_b_event_type");
+    let a_turn = idx("variant_a_turn_index");
+    let b_turn = idx("variant_b_turn_index");
+    let a_tool = idx("variant_a_tool");
+    let b_tool = idx("variant_b_tool");
+    let a_status = idx("variant_a_status");
+    let b_status = idx("variant_b_status");
+
+    // Panel labels from first row
+    let (left_label, right_label) = table
+        .rows
+        .first()
+        .map(|first| {
+            let a = a_id
+                .and_then(|i| first.get(i))
+                .and_then(Value::as_str)
+                .unwrap_or("variant a")
+                .to_string();
+            let b = b_id
+                .and_then(|i| first.get(i))
+                .and_then(Value::as_str)
+                .unwrap_or("variant b")
+                .to_string();
+            (a, b)
+        })
+        .unwrap_or_else(|| ("variant a".into(), "variant b".into()));
+
+    let to_dot = |row: &[Value], col: Option<usize>| -> Value {
+        match col
+            .and_then(|i| row.get(i))
+            .and_then(Value::as_str)
+            .unwrap_or("")
+        {
+            "" => Value::Null,
+            s if s.contains("success") || s == "ok" || s.starts_with('2') || s == "pass" => {
+                Value::String("●".to_string())
+            }
+            _ => Value::String("✗".to_string()),
+        }
+    };
+
+    // Same column names on both sides — the panel labels tell you which is which
+    let columns = vec![
+        "task".into(),
+        "event".into(),
+        "turn".into(),
+        "tool".into(),
+        "st".into(),
+        "┃".into(),
+        "event".into(),
+        "turn".into(),
+        "tool".into(),
+        "st".into(),
+    ];
+
+    let rows: Vec<Vec<Value>> = table
+        .rows
+        .iter()
+        .map(|row| {
+            vec![
+                get(row, task_id),
+                get(row, a_event),
+                get(row, a_turn),
+                get(row, a_tool),
+                to_dot(row, a_status),
+                Value::String("┃".to_string()),
+                get(row, b_event),
+                get(row, b_turn),
+                get(row, b_tool),
+                to_dot(row, b_status),
+            ]
+        })
+        .collect();
+
+    let compact = lab_analysis::QueryTable { columns, rows };
+
+    // Manually elide task if constant (can't use elide_constant_columns —
+    // it would also eat the ┃ separator column since it's constant).
+    let task_col = 0;
+    let task_is_constant = compact.rows.len() > 1 && {
+        let first = compact.rows[0].get(task_col);
+        compact.rows.iter().all(|r| r.get(task_col) == first)
+    };
+
+    let (filtered, legend) = if task_is_constant {
+        let val = compact.rows[0]
+            .get(task_col)
+            .map(render_json_cell)
+            .unwrap_or_default();
+        let legend = vec![("task".to_string(), val)];
+        let columns = compact.columns[1..].to_vec();
+        let rows = compact
+            .rows
+            .into_iter()
+            .map(|mut r| {
+                r.remove(0);
+                r
+            })
+            .collect();
+        (lab_analysis::QueryTable { columns, rows }, legend)
+    } else {
+        (compact, Vec::new())
+    };
+
+    (filtered, legend, (left_label, right_label))
+}
+
+fn has_ab_trace_columns(table: &lab_analysis::QueryTable) -> bool {
+    let has = |name: &str| table.columns.iter().any(|c| c == name);
+    has("variant_a_event_type") && has("variant_b_event_type")
+}
+
+/// Shorten column names for display. Strips verbose prefixes that waste
+/// horizontal space in tables without losing meaning (`a_`/`b_` already
+/// encodes the variant side).
+fn shorten_column_name(name: &str) -> String {
+    if let Some(rest) = name.strip_prefix("variant_a_") {
+        return format!("a_{rest}");
+    }
+    if let Some(rest) = name.strip_prefix("variant_b_") {
+        return format!("b_{rest}");
+    }
+    if let Some(rest) = name.strip_prefix("delta_") {
+        return format!("d_{rest}");
+    }
+    name.to_string()
+}
+
+fn shorten_display_columns(table: &lab_analysis::QueryTable) -> lab_analysis::QueryTable {
+    lab_analysis::QueryTable {
+        columns: table
+            .columns
+            .iter()
+            .map(|c| shorten_column_name(c))
+            .collect(),
+        rows: table.rows.clone(),
+    }
 }
 
 fn normalize_view_name(input: &str) -> String {
@@ -2896,13 +3336,14 @@ fn print_query_table(table: &lab_analysis::QueryTable) {
     }
 
     let (filtered, elided) = elide_constant_columns(table);
+    let display = shorten_display_columns(&filtered);
 
     if !elided.is_empty() {
         let meta_parts: Vec<String> = elided
             .iter()
             .map(|(k, v)| {
                 let display_v = truncate_cell(v, 40);
-                format!("{}={}", k, display_v)
+                format!("{}={}", shorten_column_name(k), display_v)
             })
             .collect();
         println!("{}", meta_parts.join("  "));
@@ -2910,15 +3351,31 @@ fn print_query_table(table: &lab_analysis::QueryTable) {
     }
 
     let term_w = terminal_width();
-    if should_chunk_query_table(&filtered, term_w) {
-        print_query_table_in_column_chunks(&filtered, term_w);
+    if should_chunk_query_table(&display, term_w) {
+        print_query_table_in_column_chunks(&display, term_w);
     } else {
-        print_scoreboard_table(&filtered, term_w);
+        print_scoreboard_table(&display, term_w);
     }
 }
 
-fn print_special_split_view(view_name: &str, table: &lab_analysis::QueryTable) -> bool {
+fn print_special_split_view(run_dir: &Path, view_name: &str, table: &lab_analysis::QueryTable) -> bool {
     match view_name {
+        "scoreboard" => {
+            let meta = read_scoreboard_metadata(run_dir);
+            if !meta.experiment_id.is_empty() {
+                print!("experiment: {}", meta.experiment_id);
+                if !meta.comparison.is_empty() {
+                    print!("  comparison: {}", meta.comparison);
+                }
+                println!();
+            }
+            if !meta.baseline_id.is_empty() {
+                println!("reference_variant: {}", meta.baseline_id);
+            }
+            let variant_bindings = fetch_variant_bindings(run_dir);
+            print_scoreboard_grouped_by_variant(table, &variant_bindings);
+            true
+        }
         "task_outcomes" | "ab_task_outcomes" => {
             print_ab_task_outcomes_table(table);
             true
@@ -4098,6 +4555,35 @@ mod tests {
         ))
     }
 
+    #[test]
+    fn enforce_cli_binary_freshness_blocks_stale_executable() {
+        let exe_path = PathBuf::from("/tmp/lab-cli");
+        let exe_mtime = UNIX_EPOCH + Duration::from_secs(100);
+        let src_mtime = UNIX_EPOCH + Duration::from_secs(101);
+        let err = enforce_cli_binary_freshness(
+            &exe_path,
+            exe_mtime,
+            Some((src_mtime, PathBuf::from("/repo/rust/crates/lab-runner/src/lib.rs"))),
+        )
+        .expect_err("stale binary should be rejected");
+        let msg = err.to_string();
+        assert!(msg.contains("stale lab-cli binary detected"), "{}", msg);
+        assert!(msg.contains("cargo build -p lab-cli --release"), "{}", msg);
+    }
+
+    #[test]
+    fn enforce_cli_binary_freshness_allows_up_to_date_executable() {
+        let exe_path = PathBuf::from("/tmp/lab-cli");
+        let exe_mtime = UNIX_EPOCH + Duration::from_secs(200);
+        let src_mtime = UNIX_EPOCH + Duration::from_secs(199);
+        enforce_cli_binary_freshness(
+            &exe_path,
+            exe_mtime,
+            Some((src_mtime, PathBuf::from("/repo/rust/crates/lab-runner/src/lib.rs"))),
+        )
+        .expect("fresh binary should pass");
+    }
+
     fn count_temp_sqlite_export_dirs_for_run(run_id: &str) -> usize {
         let prefix = format!("agentlab_sqlite_export_{}_", run_id);
         std::fs::read_dir(std::env::temp_dir())
@@ -4168,6 +4654,27 @@ mod tests {
         .expect("insert slot commit record");
     }
 
+    fn seed_runtime_run_control(run_dir: &Path, control: &Value) {
+        let sqlite_path = run_dir.join("run.sqlite");
+        let conn = SqliteConnection::open(&sqlite_path).expect("open sqlite");
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS runtime_kv(
+                 key TEXT PRIMARY KEY,
+                 value_json TEXT NOT NULL
+             );",
+        )
+        .expect("create runtime_kv");
+        conn.execute(
+            "INSERT INTO runtime_kv(key, value_json) VALUES (?1, ?2)
+             ON CONFLICT(key) DO UPDATE SET value_json=excluded.value_json",
+            (
+                "run_control_v2",
+                serde_json::to_string(control).expect("serialize control"),
+            ),
+        )
+        .expect("write runtime run_control_v2");
+    }
+
     #[test]
     fn query_run_sqlite_cleans_temp_exports_and_keeps_real_run_id_in_metadata() {
         let run_dir = temp_dir("sqlite_query_cleanup");
@@ -4195,8 +4702,7 @@ mod tests {
     #[test]
     fn read_run_status_renders_multiflight_active_trials() {
         let run_dir = temp_dir("run_status");
-        let runtime_dir = run_dir.join("runtime");
-        std::fs::create_dir_all(&runtime_dir).expect("runtime dir");
+        std::fs::create_dir_all(&run_dir).expect("run dir");
         let control = json!({
             "schema_version": "run_control_v2",
             "run_id": "run_1",
@@ -4221,11 +4727,7 @@ mod tests {
             },
             "updated_at": "2026-02-22T00:00:02Z"
         });
-        std::fs::write(
-            runtime_dir.join("run_control.json"),
-            serde_json::to_vec_pretty(&control).expect("serialize control"),
-        )
-        .expect("write control");
+        seed_runtime_run_control(&run_dir, &control);
 
         let status = read_run_status(&run_dir);
         assert_eq!(
@@ -4239,8 +4741,7 @@ mod tests {
     #[test]
     fn build_inflight_scoreboard_table_reads_active_trials_when_facts_are_empty() {
         let run_dir = temp_dir("inflight_scoreboard");
-        let runtime_dir = run_dir.join("runtime");
-        std::fs::create_dir_all(&runtime_dir).expect("runtime dir");
+        std::fs::create_dir_all(&run_dir).expect("run dir");
         let control = json!({
             "schema_version": "run_control_v2",
             "run_id": "run_1",
@@ -4265,11 +4766,7 @@ mod tests {
             },
             "updated_at": "2026-02-22T00:00:02Z"
         });
-        std::fs::write(
-            runtime_dir.join("run_control.json"),
-            serde_json::to_vec_pretty(&control).expect("serialize control"),
-        )
-        .expect("write control");
+        seed_runtime_run_control(&run_dir, &control);
 
         let table =
             build_inflight_scoreboard_table(&run_dir).expect("in-flight scoreboard should exist");

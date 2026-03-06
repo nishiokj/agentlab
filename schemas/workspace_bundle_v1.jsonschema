@@ -1,0 +1,26 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agent-lab.local/schemas/workspace_bundle_v1.json",
+  "title": "Workspace Bundle v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "captured_at", "files"],
+  "properties": {
+    "schema_version": { "const": "workspace_bundle_v1" },
+    "captured_at": { "type": "string", "minLength": 1 },
+    "files": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["path", "encoding", "content", "executable"],
+        "properties": {
+          "path": { "type": "string", "minLength": 1 },
+          "encoding": { "const": "base64" },
+          "content": { "type": "string", "minLength": 1 },
+          "executable": { "type": "boolean" }
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,36 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agent-lab.local/schemas/trial_metadata_v1.json",
+  "title": "Trial Metadata v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "variant_digest", "ids", "runtime", "policy_merge", "chain"],
+  "properties": {
+    "schema_version": { "const": "trial_metadata_v1" },
+    "variant_digest": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+    "ids": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["run_id", "trial_id", "variant_id", "task_id", "repl_idx", "task_index"],
+      "properties": {
+        "run_id": { "type": "string", "minLength": 1 },
+        "trial_id": { "type": "string", "minLength": 1 },
+        "variant_id": { "type": "string", "minLength": 1 },
+        "task_id": { "type": "string", "minLength": 1 },
+        "repl_idx": { "type": "integer", "minimum": 0 },
+        "task_index": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "runtime": { "type": "object" },
+    "policy_merge": { "type": "object" },
+    "chain": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["chain_id", "step_index"],
+      "properties": {
+        "chain_id": { "type": "string", "minLength": 1 },
+        "step_index": { "type": "integer", "minimum": 0 }
+      }
+    }
+  }
+}

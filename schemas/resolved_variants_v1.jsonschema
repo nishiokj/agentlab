@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agent-lab.local/schemas/resolved_variants_v1.json",
+  "title": "Resolved Variants v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "generated_at", "baseline_id", "variants"],
+  "properties": {
+    "schema_version": { "const": "resolved_variants_v1" },
+    "generated_at": { "type": "string", "minLength": 1 },
+    "baseline_id": { "type": "string", "minLength": 1 },
+    "variants": { "type": "array", "items": { "type": "object" } }
+  }
+}

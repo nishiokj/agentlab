@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agent-lab.local/schemas/workspace_patch_v1.json",
+  "title": "Workspace Patch v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "format", "generated_at", "added", "removed", "modified"],
+  "properties": {
+    "schema_version": { "const": "workspace_patch_v1" },
+    "format": { "const": "file_digest_delta" },
+    "generated_at": { "type": "string", "minLength": 1 },
+    "added": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+    "removed": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+    "modified": { "type": "array", "items": { "type": "string", "minLength": 1 } }
+  }
+}

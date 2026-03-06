@@ -41,6 +41,7 @@ echo "building bench v0 task_boundary_v2 dataset: ${DATASET_PATH}"
   --suite "${SUITE}" \
   --output "${DATASET_PATH}" \
   --default-task-image "${DEFAULT_TASK_IMAGE}" \
+  --require-task-image \
   --default-task-workspace "${DEFAULT_TASK_WORKSPACE}" \
   --limit "${DATASET_LIMIT}"
 
