@@ -338,8 +338,9 @@ impl TrialExecutor {
             };
 
         let mut status = String::new();
-        let mut trial_output: Value =
-            json!({"schema_version": "agent_result_v1", "outcome": "error"});
+        let mut trial_output =
+            trial_output_error_payload("result_missing", "agent did not write a result payload");
+        let mut result_parse_error: Option<String> = None;
         let trial_started_at = Instant::now();
         for attempt in 0..policy_config.retry_max_attempts {
             let mut otel_receiver = None;
@@ -412,11 +413,9 @@ impl TrialExecutor {
                 }
             }
 
-            trial_output = if io_paths.output_host.exists() {
-                serde_json::from_slice(&fs::read(&io_paths.output_host)?)?
-            } else {
-                json!({"schema_version": "agent_result_v1", "outcome": "error"})
-            };
+            let (loaded_output, parse_error) = load_trial_output_resilient(&io_paths.output_host)?;
+            trial_output = loaded_output;
+            result_parse_error = parse_error;
 
             let outcome = trial_output
                 .get("outcome")
@@ -432,6 +431,7 @@ impl TrialExecutor {
         let mut deferred_benchmark_prediction_records = Vec::new();
         let mut deferred_benchmark_score_records = Vec::new();
         let mut grade_error_reason: Option<String> = None;
+        let mut missing_score_reason: Option<String> = None;
         if benchmark_grading_enabled {
             match load_optional_json_record_with_schema(
                 "benchmark_prediction_record_v1.jsonschema",
@@ -449,7 +449,7 @@ impl TrialExecutor {
             ) {
                 Ok(Some(row)) => deferred_benchmark_score_records.push(row),
                 Ok(None) => {
-                    grade_error_reason = Some(format!(
+                    missing_score_reason = Some(format!(
                         "score_record_missing: {}",
                         benchmark_score_path.display()
                     ));
@@ -463,10 +463,12 @@ impl TrialExecutor {
                     .unwrap_or_else(|_| "grade_error".to_string());
                 grade_error_reason = Some(marker_reason.trim().to_string());
             }
-            if grade_error_reason.is_none()
-                && status == BENCHMARK_GRADING_POLICY_EXIT_CODE.to_string()
-            {
-                grade_error_reason = Some("grading_policy_exit".to_string());
+            if grade_error_reason.is_none() {
+                if let Some(reason) = missing_score_reason.take() {
+                    grade_error_reason = Some(reason);
+                } else if status == BENCHMARK_GRADING_POLICY_EXIT_CODE.to_string() {
+                    grade_error_reason = Some("grading_policy_exit".to_string());
+                }
             }
         }
 
@@ -818,12 +820,15 @@ impl TrialExecutor {
         let failure_classification = if grade_error_reason.is_some() {
             trial_guard.complete("failed", Some("grade_error"))?;
             Some("grade_error".to_string())
-        } else if status == "0" && outcome != "error" {
-            trial_guard.complete("completed", None)?;
-            None
         } else if status != "0" {
             trial_guard.complete("failed", Some("agent_exit_nonzero"))?;
             Some("agent_exit_nonzero".to_string())
+        } else if result_parse_error.is_some() {
+            trial_guard.complete("failed", Some("result_parse_error"))?;
+            Some("result_parse_error".to_string())
+        } else if status == "0" && outcome != "error" {
+            trial_guard.complete("completed", None)?;
+            None
         } else {
             trial_guard.complete("failed", Some("result_error"))?;
             Some("result_error".to_string())
@@ -2766,6 +2771,7 @@ fn run_experiment_with_behavior(
             &json_value,
             &run_dir,
             &run_dir,
+            &run_dir,
             &tasks,
             &benchmark_config,
             &variants,
@@ -3021,8 +3027,10 @@ pub fn describe_experiment(path: &Path) -> Result<ExperimentSummary> {
                 &RunBehavior::default(),
                 &RunExecutionOptions::default(),
             )?,
+            baseline_variant,
             &tasks_for_preflight,
             is_clean,
+            &exp_dir,
         );
         if matches!(grader_check.severity, PreflightSeverity::Warning)
             && !grader_check.message.contains("no benchmark")
@@ -3065,5 +3073,3 @@ pub fn describe_experiment(path: &Path) -> Result<ExperimentSummary> {
         preflight_warnings,
     })
 }
-
-

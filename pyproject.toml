@@ -28,3 +28,10 @@ python_files = ["test_*.py"]
 python_classes = ["Test*"]
 python_functions = ["test_*"]
 addopts = "-q --tb=short"
+markers = [
+    "e2e_cli: black-box CLI end-to-end coverage",
+    "e2e_build_preflight: build and preflight contract boundary coverage",
+    "e2e_runtime: runtime contract boundary coverage",
+    "e2e_benchmark: benchmark adapter and grading contract coverage",
+    "e2e_cli_surface: CLI views, query, and operator surface coverage",
+]

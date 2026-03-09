@@ -2,8 +2,8 @@ mod types;
 pub use types::*;
 
 mod config;
-use config::*;
 pub use config::validate_knob_overrides;
+use config::*;
 
 mod persistence;
 mod sink;

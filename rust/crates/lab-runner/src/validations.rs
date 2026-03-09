@@ -4,7 +4,7 @@ pub fn preflight_experiment(path: &Path) -> Result<PreflightReport> {
     let LoadedExperimentInput {
         json_value,
         exp_dir,
-        project_root: _,
+        project_root,
     } = load_sealed_package_for_run(path)?;
     validate_required_fields(&json_value)?;
 
@@ -42,6 +42,7 @@ pub fn preflight_experiment(path: &Path) -> Result<PreflightReport> {
         &json_value,
         &exp_dir,
         &exp_dir,
+        &project_root,
         &tasks,
         &benchmark_config,
         &variants,
@@ -68,14 +69,6 @@ pub fn preflight_experiment(path: &Path) -> Result<PreflightReport> {
     ));
 
     Ok(PreflightReport { passed, checks })
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-struct GraderReachabilityCheckKey {
-    container_mode: bool,
-    image_source: ImageSource,
-    container_image: Option<String>,
-    resolved_binary: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
@@ -120,22 +113,6 @@ fn annotate_preflight_check_with_variants(
     check.message = format!("{}{}", prefix, check.message);
 }
 
-fn resolve_preflight_grader_binary(
-    adapter: &BenchmarkAdapterConfig,
-    runtime_profile: &VariantRuntimeProfile,
-) -> String {
-    let mut render_env = BTreeMap::new();
-    render_env.insert(
-        "WORKSPACE".to_string(),
-        AGENTLAB_CONTRACT_WORKSPACE_DIR.to_string(),
-    );
-    for (key, value) in &runtime_profile.agent_runtime_env {
-        render_env.insert(key.clone(), value.clone());
-    }
-    let rendered_cmd = apply_agentlab_template_to_command(&adapter.command, &render_env);
-    rendered_cmd.first().cloned().unwrap_or_default()
-}
-
 fn check_benchmark_grader_reachable_for_variants(
     benchmark_config: &BenchmarkConfig,
     variants: &[Variant],
@@ -143,53 +120,33 @@ fn check_benchmark_grader_reachable_for_variants(
     tasks: &[Value],
     per_task_scan: Option<&PerTaskImageScanResult>,
     is_clean: bool,
+    project_root: &Path,
 ) -> Vec<PreflightCheck> {
-    if variants.is_empty() || variant_runtime_profiles.is_empty() {
-        return Vec::new();
+    if variants.len() != variant_runtime_profiles.len() {
+        return vec![PreflightCheck {
+            name: "benchmark_grader_reachable",
+            passed: false,
+            severity: PreflightSeverity::Error,
+            message: "internal error: variant/runtime profile count mismatch".to_string(),
+        }];
     }
-    if benchmark_config.adapter.is_none() || is_clean {
-        return vec![check_benchmark_grader_reachable_with_scan(
-            benchmark_config,
-            &variant_runtime_profiles[0],
-            tasks,
-            per_task_scan,
-            is_clean,
-        )];
-    }
-
-    let adapter = benchmark_config
-        .adapter
-        .as_ref()
-        .expect("adapter checked above");
-    let mut grouped: BTreeMap<GraderReachabilityCheckKey, Vec<usize>> = BTreeMap::new();
-    for (idx, profile) in variant_runtime_profiles.iter().enumerate() {
-        let key = GraderReachabilityCheckKey {
-            container_mode: profile.container_mode,
-            image_source: profile.agent_runtime.image_source,
-            container_image: profile.agent_runtime.container_image.clone(),
-            resolved_binary: resolve_preflight_grader_binary(adapter, profile),
-        };
-        grouped.entry(key).or_default().push(idx);
-    }
-
-    let mut checks = Vec::new();
-    for indices in grouped.values() {
-        let representative = indices[0];
-        let mut check = check_benchmark_grader_reachable_with_scan(
-            benchmark_config,
-            &variant_runtime_profiles[representative],
-            tasks,
-            per_task_scan,
-            is_clean,
-        );
-        let variant_ids = indices
-            .iter()
-            .filter_map(|idx| variants.get(*idx).map(|variant| variant.id.clone()))
-            .collect::<Vec<_>>();
-        annotate_preflight_check_with_variants(&mut check, &variant_ids, variants.len());
-        checks.push(check);
-    }
-    checks
+    variants
+        .iter()
+        .zip(variant_runtime_profiles.iter())
+        .map(|(variant, runtime_profile)| {
+            let mut check = check_benchmark_grader_reachable_with_scan(
+                benchmark_config,
+                runtime_profile,
+                variant,
+                tasks,
+                per_task_scan,
+                is_clean,
+                project_root,
+            );
+            check.message = format!("variant '{}': {}", variant.id, check.message);
+            check
+        })
+        .collect()
 }
 
 fn check_container_ready_for_variants(
@@ -715,6 +672,7 @@ fn collect_preflight_checks(
     json_value: &Value,
     exp_dir: &Path,
     disk_probe_path: &Path,
+    project_root: &Path,
     tasks: &[Value],
     benchmark_config: &BenchmarkConfig,
     variants: &[Variant],
@@ -800,12 +758,39 @@ fn collect_preflight_checks(
     );
     if has_blocking_preflight_error(&checks, "container_ready") {
         checks.push(PreflightCheck {
+            name: "agent_runtime_reachable",
+            passed: true,
+            severity: PreflightSeverity::Warning,
+            message: "skipped because container_ready reported blocking failures".to_string(),
+        });
+        checks.push(PreflightCheck {
             name: "benchmark_grader_reachable",
             passed: true,
             severity: PreflightSeverity::Warning,
             message: "skipped because container_ready reported blocking failures".to_string(),
         });
     } else {
+        emit_preflight_log("running check: agent_runtime_reachable");
+        timed_check!(
+            "agent_runtime_reachable",
+            checks.extend(check_agent_runtime_reachable_for_variants(
+                variants,
+                variant_runtime_profiles,
+                tasks,
+                per_task_scan.as_ref(),
+                project_root,
+            ))
+        );
+        if has_blocking_preflight_error(&checks, "agent_runtime_reachable") {
+            checks.push(PreflightCheck {
+                name: "benchmark_grader_reachable",
+                passed: true,
+                severity: PreflightSeverity::Warning,
+                message:
+                    "skipped because agent_runtime_reachable reported blocking failures"
+                        .to_string(),
+            });
+        } else {
         emit_preflight_log("running check: benchmark_grader_reachable");
         timed_check!(
             "benchmark_grader_reachable",
@@ -816,8 +801,10 @@ fn collect_preflight_checks(
                 tasks,
                 per_task_scan.as_ref(),
                 is_clean,
+                project_root,
             ))
         );
+        }
     }
     emit_preflight_log("running check: dependency_files_exist");
     timed_check!(
@@ -974,24 +961,158 @@ fn check_dataset_task_ids(
 fn check_benchmark_grader_reachable(
     benchmark_config: &BenchmarkConfig,
     runtime_profile: &VariantRuntimeProfile,
+    variant: &Variant,
     tasks: &[Value],
     is_clean: bool,
+    project_root: &Path,
 ) -> PreflightCheck {
     check_benchmark_grader_reachable_with_scan(
         benchmark_config,
         runtime_profile,
+        variant,
         tasks,
         None,
         is_clean,
+        project_root,
     )
+}
+
+fn check_agent_runtime_reachable_for_variants(
+    variants: &[Variant],
+    variant_runtime_profiles: &[VariantRuntimeProfile],
+    tasks: &[Value],
+    per_task_scan: Option<&PerTaskImageScanResult>,
+    project_root: &Path,
+) -> Vec<PreflightCheck> {
+    if variants.len() != variant_runtime_profiles.len() {
+        return vec![PreflightCheck {
+            name: "agent_runtime_reachable",
+            passed: false,
+            severity: PreflightSeverity::Error,
+            message: "internal error: variant/runtime profile count mismatch".to_string(),
+        }];
+    }
+
+    let mut checks = Vec::with_capacity(variant_runtime_profiles.len());
+    for (variant, runtime_profile) in variants.iter().zip(variant_runtime_profiles.iter()) {
+        let mut check = check_agent_runtime_reachable_with_scan(
+            runtime_profile,
+            variant,
+            tasks,
+            per_task_scan,
+            project_root,
+        );
+        check.message = format!("variant '{}': {}", variant.id, check.message);
+        checks.push(check);
+    }
+    checks
+}
+
+fn check_agent_runtime_reachable_with_scan(
+    runtime_profile: &VariantRuntimeProfile,
+    variant: &Variant,
+    tasks: &[Value],
+    per_task_scan: Option<&PerTaskImageScanResult>,
+    project_root: &Path,
+) -> PreflightCheck {
+    let name = "agent_runtime_reachable";
+    if !runtime_profile.container_mode {
+        return PreflightCheck {
+            name,
+            passed: true,
+            severity: PreflightSeverity::Warning,
+            message: "local process mode — container agent bootstrap not applicable".to_string(),
+        };
+    }
+
+    let images = match resolve_preflight_images(
+        name,
+        runtime_profile,
+        tasks,
+        per_task_scan,
+        "no container image resolved for agent runtime",
+    ) {
+        Ok(images) => images,
+        Err(check) => return check,
+    };
+    emit_preflight_log(format!(
+        "agent_runtime_reachable: probing {} image(s) via shared runtime launch construction",
+        images.len()
+    ));
+    let failures = run_bounded_image_probes(&images, "agent_runtime_reachable", |idx, image| {
+        if should_emit_image_probe_progress(idx + 1, images.len()) {
+            emit_preflight_log(format!(
+                "agent_runtime_reachable: image {}/{} ({})",
+                idx + 1,
+                images.len(),
+                image
+            ));
+        }
+        let context =
+            match build_preflight_probe_context(runtime_profile, variant, tasks, image, project_root)
+            {
+                Ok(context) => context,
+                Err(err) => return Some(format!("{} ({})", image, err)),
+            };
+        let request = build_preflight_probe_request(&context, runtime_profile, None, false);
+        let resolved_command = match resolve_runtime_agent_command(&request) {
+            Ok(command) => command,
+            Err(err) => return Some(format!("{} ({})", image, err)),
+        };
+        match run_preflight_container_probe(&request, image, &resolved_command) {
+            Ok(report) => {
+                let blockers = detect_known_probe_output_blockers(&report);
+                if blockers.is_empty() {
+                    None
+                } else {
+                    Some(format!(
+                        "{} (probe {} emitted deterministic compatibility blockers: {})",
+                        image,
+                        shell_join(&report.probe_command),
+                        format_preview(&blockers, 3)
+                    ))
+                }
+            }
+            Err(err) => Some(format!("{} ({})", image, err)),
+        }
+    });
+
+    let failures: Vec<String> = failures.into_iter().flatten().collect();
+    if !failures.is_empty() {
+        return PreflightCheck {
+            name,
+            passed: false,
+            severity: PreflightSeverity::Error,
+            message: format!(
+                "runtime agent launch is not reachable in required images: {}",
+                format_preview(&failures, 3)
+            ),
+        };
+    }
+
+    PreflightCheck {
+        name,
+        passed: true,
+        severity: PreflightSeverity::Error,
+        message: if images.len() == 1 {
+            format!("runtime agent launch reachable in image '{}'", images[0])
+        } else {
+            format!(
+                "runtime agent launch reachable in all {} required images",
+                images.len(),
+            )
+        },
+    }
 }
 
 fn check_benchmark_grader_reachable_with_scan(
     benchmark_config: &BenchmarkConfig,
     runtime_profile: &VariantRuntimeProfile,
+    variant: &Variant,
     tasks: &[Value],
     per_task_scan: Option<&PerTaskImageScanResult>,
     is_clean: bool,
+    project_root: &Path,
 ) -> PreflightCheck {
     let name = "benchmark_grader_reachable";
 
@@ -1038,252 +1159,63 @@ fn check_benchmark_grader_reachable_with_scan(
         Ok(images) => images,
         Err(check) => return check,
     };
-
-    // Render templates in the grader binary name using placeholder env.
-    let mut render_env = BTreeMap::new();
-    render_env.insert(
-        "WORKSPACE".to_string(),
-        AGENTLAB_CONTRACT_WORKSPACE_DIR.to_string(),
-    );
-    for (k, v) in &runtime_profile.agent_runtime_env {
-        render_env.insert(k.clone(), v.clone());
-    }
-    let rendered_cmd = apply_agentlab_template_to_command(&adapter.command, &render_env);
-    let resolved_binary = rendered_cmd
-        .first()
-        .map(|value| value.as_str())
-        .unwrap_or("");
-    let resolved_script_path = rendered_cmd.get(1).and_then(|value| {
-        let trimmed = value.trim();
-        if !trimmed.is_empty() && Path::new(trimmed).is_absolute() {
-            Some(trimmed.to_string())
-        } else {
-            None
+    emit_preflight_log(format!(
+        "benchmark_grader_reachable: probing {} image(s) via shared runtime launch construction",
+        images.len()
+    ));
+    let failures = run_bounded_image_probes(&images, "benchmark_grader_reachable", |idx, image| {
+        if should_emit_image_probe_progress(idx + 1, images.len()) {
+            emit_preflight_log(format!(
+                "benchmark_grader_reachable: image {}/{} ({})",
+                idx + 1,
+                images.len(),
+                image
+            ));
+        }
+        let context =
+            match build_preflight_probe_context(runtime_profile, variant, tasks, image, project_root)
+            {
+                Ok(context) => context,
+                Err(err) => return Some(format!("{} ({})", image, err)),
+            };
+        let request =
+            build_preflight_probe_request(&context, runtime_profile, Some(adapter), true);
+        let grader_command = match resolve_benchmark_grader_command(&request) {
+            Ok(Some(command)) => command,
+            Ok(None) => return None,
+            Err(err) => return Some(format!("{} ({})", image, err)),
+        };
+        if let Err(err) = seed_preflight_probe_result(&context.io_paths.output_host) {
+            return Some(format!("{} ({})", image, err));
+        }
+        match run_preflight_container_probe(&request, image, &grader_command) {
+            Ok(_) => None,
+            Err(err) => Some(format!("{} ({})", image, err)),
         }
     });
-    let script_path_is_runner_staged = resolved_script_path
-        .as_deref()
-        .map(is_runner_staged_script_path)
-        .unwrap_or(false);
-    if let Some(script_path) = resolved_script_path.as_deref() {
-        if !script_path_is_runner_staged {
-            return PreflightCheck {
-                name,
-                passed: false,
-                severity: PreflightSeverity::Error,
-                message: format!(
-                    "forbidden grader script path '{}': benchmark grader script must be staged under {} or {}",
-                    script_path, AGENTLAB_CONTRACT_DEPS_DIR, AGENTLAB_CONTRACT_STATE_DIR
-                ),
-            };
-        }
-    }
-    if resolved_binary.trim().is_empty() {
-        return PreflightCheck {
-            name,
-            passed: false,
-            severity: PreflightSeverity::Error,
-            message: "benchmark adapter command resolved to an empty binary token".to_string(),
-        };
-    }
 
-    emit_preflight_log(format!(
-        "benchmark_grader_reachable: probing {} image(s) for binary '{}'",
-        images.len(),
-        resolved_binary
-    ));
-    #[derive(Default)]
-    struct GraderProbeOutcome {
-        shell_failure: Option<String>,
-        binary_failure: Option<String>,
-        script_failure: Option<String>,
-    }
-
-    let probe_outcomes =
-        run_bounded_image_probes(&images, "benchmark_grader_reachable", |idx, image| {
-            if should_emit_image_probe_progress(idx + 1, images.len()) {
-                emit_preflight_log(format!(
-                    "benchmark_grader_reachable: image {}/{} ({})",
-                    idx + 1,
-                    images.len(),
-                    image
-                ));
-            }
-            let mut outcome = GraderProbeOutcome::default();
-            let mut shell_probe = format!(
-                "command -v {} >/dev/null 2>&1",
-                shell_quote(resolved_binary)
-            );
-            if let Some(script_path) = resolved_script_path.as_deref() {
-                if !script_path_is_runner_staged {
-                    shell_probe.push_str(&format!(" && test -f {}", shell_quote(script_path)));
-                }
-            }
-            let shell_probe_failure = match Command::new("docker")
-                .args([
-                    "run",
-                    "--rm",
-                    "--entrypoint",
-                    "/bin/sh",
-                    image,
-                    "-lc",
-                    &shell_probe,
-                ])
-                .output()
-            {
-                Ok(out) if out.status.success() => return outcome,
-                Ok(out) => output_error_detail(&out),
-                Err(err) => err.to_string(),
-            };
-
-            let binary_ok = match Command::new("docker")
-                .args([
-                    "run",
-                    "--rm",
-                    "--entrypoint",
-                    "which",
-                    image,
-                    resolved_binary,
-                ])
-                .output()
-            {
-                Ok(out) if out.status.success() => true,
-                Ok(out) => {
-                    outcome.binary_failure =
-                        Some(format!("{} ({})", image, output_error_detail(&out)));
-                    false
-                }
-                Err(err) => {
-                    outcome.binary_failure = Some(format!("{} ({})", image, err));
-                    false
-                }
-            };
-            if !binary_ok {
-                return outcome;
-            }
-
-            if let Some(script_path) = resolved_script_path.as_deref() {
-                if script_path_is_runner_staged {
-                    return outcome;
-                }
-                let script_probe = format!("test -f {}", shell_quote(script_path));
-                match Command::new("docker")
-                    .args([
-                        "run",
-                        "--rm",
-                        "--entrypoint",
-                        "/bin/sh",
-                        image,
-                        "-lc",
-                        &script_probe,
-                    ])
-                    .output()
-                {
-                    Ok(out) if out.status.success() => {}
-                    Ok(out) => {
-                        outcome.script_failure =
-                            Some(format!("{} ({})", image, output_error_detail(&out)));
-                    }
-                    Err(err) => outcome.script_failure = Some(format!("{} ({})", image, err)),
-                }
-            } else {
-                outcome.shell_failure = Some(format!("{} ({})", image, shell_probe_failure));
-            }
-            outcome
-        });
-
-    let mut shell_failures = Vec::new();
-    let mut binary_failures = Vec::new();
-    let mut script_failures = Vec::new();
-    for outcome in probe_outcomes {
-        if let Some(failure) = outcome.shell_failure {
-            shell_failures.push(failure);
-        }
-        if let Some(failure) = outcome.binary_failure {
-            binary_failures.push(failure);
-        }
-        if let Some(failure) = outcome.script_failure {
-            script_failures.push(failure);
-        }
-    }
-
-    if !shell_failures.is_empty() {
+    let failures: Vec<String> = failures.into_iter().flatten().collect();
+    if !failures.is_empty() {
         return PreflightCheck {
             name,
             passed: false,
             severity: PreflightSeverity::Error,
             message: format!(
-                "/bin/sh not available in required images: {} — grader probe cannot execute",
-                format_preview(&shell_failures, 3)
+                "benchmark grader launch is not reachable in required images: {}",
+                format_preview(&failures, 3)
             ),
         };
     }
 
-    if !binary_failures.is_empty() {
-        return PreflightCheck {
-            name,
-            passed: false,
-            severity: PreflightSeverity::Error,
-            message: format!(
-                "grader binary '{}' not found in required images: {}",
-                resolved_binary,
-                format_preview(&binary_failures, 3)
-            ),
-        };
-    }
-    if !script_failures.is_empty() {
-        return PreflightCheck {
-            name,
-            passed: false,
-            severity: PreflightSeverity::Error,
-            message: format!(
-                "grader script path '{}' not found in required images: {}",
-                resolved_script_path.as_deref().unwrap_or("<none>"),
-                format_preview(&script_failures, 3)
-            ),
-        };
-    }
     PreflightCheck {
         name,
         passed: true,
         severity: PreflightSeverity::Error,
-        message: if let Some(script_path) = resolved_script_path.as_deref() {
-            if script_path_is_runner_staged {
-                if images.len() == 1 {
-                    format!(
-                        "grader binary '{}' found in image '{}'; script '{}' is runner-staged",
-                        resolved_binary, images[0], script_path
-                    )
-                } else {
-                    format!(
-                        "grader binary '{}' found in all {} required images; script '{}' is runner-staged",
-                        resolved_binary,
-                        images.len(),
-                        script_path
-                    )
-                }
-            } else if images.len() == 1 {
-                format!(
-                    "grader command '{}' + script '{}' reachable in image '{}'",
-                    resolved_binary, script_path, images[0]
-                )
-            } else {
-                format!(
-                    "grader command '{}' + script '{}' reachable in all {} required images",
-                    resolved_binary,
-                    script_path,
-                    images.len()
-                )
-            }
-        } else if images.len() == 1 {
-            format!(
-                "grader binary '{}' found in image '{}'",
-                resolved_binary, images[0]
-            )
+        message: if images.len() == 1 {
+            format!("benchmark grader launch reachable in image '{}'", images[0])
         } else {
             format!(
-                "grader binary '{}' found in all {} required images",
-                resolved_binary,
+                "benchmark grader launch reachable in all {} required images",
                 images.len()
             )
         },
@@ -1471,15 +1403,10 @@ fn check_container_ready(
                 ));
             }
             match Command::new("docker")
-                .args([
-                    "run",
-                    "--rm",
-                    "--entrypoint",
-                    "/bin/sh",
-                    image,
-                    "-c",
-                    "exit 0",
-                ])
+                .arg("run")
+                .arg("--rm")
+                .args(resolve_container_platform(image).map(|platform| ["--platform", platform]).into_iter().flatten())
+                .args(["--entrypoint", "/bin/sh", image, "-c", "exit 0"])
                 .output()
             {
                 Ok(out) if out.status.success() => None,
@@ -1523,6 +1450,14 @@ fn check_container_ready(
         _docker_total.elapsed().as_secs_f64()
     ));
     checks
+}
+
+fn seed_preflight_probe_result(path: &Path) -> Result<()> {
+    if let Some(parent) = path.parent() {
+        ensure_dir(parent)?;
+    }
+    fs::write(path, b"{\"output\":{\"patch\":\"\"}}\n")?;
+    Ok(())
 }
 
 fn check_dependency_files_exist(json_value: &Value, exp_dir: &Path) -> Vec<PreflightCheck> {
@@ -2041,4 +1976,3 @@ struct MountReferenceSpec {
 struct WorkspaceSeedSpec {
     dataset_pack_ref: String,
 }
-

@@ -3,6 +3,7 @@ from __future__ import annotations
 import tarfile
 import tempfile
 import unittest
+import subprocess
 from pathlib import Path
 
 import yaml
@@ -224,6 +225,129 @@ class ExportBenchSuiteToJsonlTests(unittest.TestCase):
             )
 
             self.assertEqual(row["task"]["image"], "ghcr.io/example/bench-task:latest")
+
+    def test_build_task_row_rebuilds_stale_dataset_pack(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            task_dir = root / "bench" / "benchmark" / "tasks" / "v0" / "TASK004"
+            task_dir.mkdir(parents=True)
+            _write_repo_snapshot(
+                root,
+                "repo_d/src.tar",
+                {"src/file.txt": "before\n"},
+            )
+            (task_dir / "injection.patch").write_text(
+                "\n".join(
+                    [
+                        "diff --git a/src/file.txt b/src/file.txt",
+                        "--- a/src/file.txt",
+                        "+++ b/src/file.txt",
+                        "@@ -1 +1 @@",
+                        "-before",
+                        "+after",
+                        "",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            _write_task_yaml(
+                task_dir,
+                {
+                    "task_id": "TASK004",
+                    "repo_id": "repo_d",
+                    "repo_snapshot": "repo_d/src.tar",
+                    "baseline_injection_patch": "injection.patch",
+                    "public_command": "bash .bench_public/run_public.sh",
+                    "hidden_command": "python hidden/runner.py /workspace hidden/cases.jsonl",
+                },
+            )
+
+            first = exporter._build_task_row(
+                root=root,
+                suite="v0",
+                split="test",
+                benchmark_name="bench",
+                adapter_id="bench_v0",
+                task_dir=task_dir,
+                default_task_image="bench-v0-workspace",
+                dataset_pack_root=exporter.DEFAULT_DATASET_PACK_ROOT,
+                require_task_image=True,
+            )
+
+            digest = first["workspace_seed"]["dataset_pack_ref"].split(":", 1)[1]
+            pack_dir = root / ".lab" / "dataset_packs" / "sha256" / digest
+            (pack_dir / "src" / "file.txt").write_text("corrupted\n", encoding="utf-8")
+
+            second = exporter._build_task_row(
+                root=root,
+                suite="v0",
+                split="test",
+                benchmark_name="bench",
+                adapter_id="bench_v0",
+                task_dir=task_dir,
+                default_task_image="bench-v0-workspace",
+                dataset_pack_root=exporter.DEFAULT_DATASET_PACK_ROOT,
+                require_task_image=True,
+            )
+
+            self.assertEqual(
+                second["workspace_seed"]["dataset_pack_ref"],
+                first["workspace_seed"]["dataset_pack_ref"],
+            )
+            self.assertEqual(
+                (pack_dir / "src" / "file.txt").read_text(encoding="utf-8"),
+                "after\n",
+            )
+
+    def test_materialize_workspace_seed_pack_applies_patch_inside_git_worktree(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            subprocess.run(["git", "init"], cwd=root, check=True, capture_output=True, text=True)
+            task_dir = root / "bench" / "benchmark" / "tasks" / "v0" / "TASK005"
+            task_dir.mkdir(parents=True)
+            _write_repo_snapshot(
+                root,
+                "repo_e/src.tar",
+                {"src/file.txt": "before\n"},
+            )
+            (task_dir / "injection.patch").write_text(
+                "\n".join(
+                    [
+                        "diff --git a/src/file.txt b/src/file.txt",
+                        "--- a/src/file.txt",
+                        "+++ b/src/file.txt",
+                        "@@ -1 +1 @@",
+                        "-before",
+                        "+after",
+                        "",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            _write_task_yaml(
+                task_dir,
+                {
+                    "task_id": "TASK005",
+                    "repo_id": "repo_e",
+                    "repo_snapshot": "repo_e/src.tar",
+                    "baseline_injection_patch": "injection.patch",
+                    "public_command": "bash .bench_public/run_public.sh",
+                    "hidden_command": "python hidden/runner.py /workspace hidden/cases.jsonl",
+                },
+            )
+
+            digest = exporter._materialize_workspace_seed_pack(
+                root=root,
+                task_dir=task_dir,
+                task_yaml=exporter._load_task_yaml(task_dir),
+                dataset_pack_root=exporter.DEFAULT_DATASET_PACK_ROOT,
+            )
+
+            pack_dir = root / ".lab" / "dataset_packs" / "sha256" / digest
+            self.assertEqual(
+                (pack_dir / "src" / "file.txt").read_text(encoding="utf-8"),
+                "after\n",
+            )
 
     def test_task_prompt_falls_back_to_task_yaml_metadata(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

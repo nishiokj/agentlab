@@ -30,6 +30,8 @@ BENCH_SUPPORT_PATHS = [
     "schemas",
 ]
 
+pytestmark = pytest.mark.e2e_cli
+
 
 @dataclass(frozen=True)
 class ProjectLayout:
@@ -130,7 +132,6 @@ def _only_trial_dir(run_dir: Path) -> Path:
     trials = sorted((run_dir / "trials").glob("trial_*"))
     assert len(trials) == 1, trials
     return trials[0]
-
 
 def _make_project(root: Path, artifact_bundle: Path) -> ProjectLayout:
     lab_dir = root / ".lab"
@@ -546,6 +547,19 @@ def _assert_command_failed(payload: dict[str, Any], needle: str) -> None:
     assert needle in payload["error"]["message"]
 
 
+def _failed_checks(payload: dict[str, Any], *, name: str | None = None) -> list[dict[str, Any]]:
+    checks = [check for check in payload["checks"] if not check["passed"]]
+    if name is not None:
+        checks = [check for check in checks if check["name"] == name]
+    return checks
+
+
+def _assert_failed_check_contains(payload: dict[str, Any], check_name: str, needle: str) -> None:
+    checks = _failed_checks(payload, name=check_name)
+    assert checks, payload["checks"]
+    assert any(needle in check["message"] for check in checks), checks
+
+
 @pytest.fixture(scope="session")
 def lab_cli_bin() -> Path:
     env_value = os.environ.get("LAB_CLI_BIN", "").strip()
@@ -610,6 +624,39 @@ def artifact_bundle(tmp_path_factory: pytest.TempPathFactory) -> Path:
     )
     os.chmod(helper_path, 0o755)
 
+    compat_probe_path = bin_dir / "compat-probe-agent"
+    compat_probe_path.write_text(
+        "#!/bin/sh\n"
+        "set -eu\n"
+        'case "${1:-}" in\n'
+        '  --help|--version|-h)\n'
+        "    echo \"warn: CPU lacks AVX support, strange crashes may occur.\" >&2\n"
+        "    echo \"[harness] Agent 'coding' references tool 'Skill' which is not available\"\n"
+        "    exit 0\n"
+        "    ;;\n"
+        "esac\n"
+        "out=''\n"
+        "while [ \"$#\" -gt 0 ]; do\n"
+        "  case \"$1\" in\n"
+        "    --output)\n"
+        "      out=\"$2\"\n"
+        "      shift 2\n"
+        "      ;;\n"
+        "    --input)\n"
+        "      shift 2\n"
+        "      ;;\n"
+        "    *)\n"
+        "      shift\n"
+        "      ;;\n"
+        "  esac\n"
+        "done\n"
+        "test -n \"$out\"\n"
+        "mkdir -p \"$(dirname \"$out\")\"\n"
+        "printf '%s\\n' '{\"schema_version\":\"agent_result_v1\",\"outcome\":\"success\",\"objective\":{\"name\":\"resolved\",\"value\":1.0}}' > \"$out\"\n",
+        encoding="utf-8",
+    )
+    os.chmod(compat_probe_path, 0o755)
+
     shutil.copy2(FIXTURES_DIR / "e2e_agent.py", bin_dir / "e2e_agent.py")
 
     manifest = {
@@ -629,6 +676,12 @@ def artifact_bundle(tmp_path_factory: pytest.TempPathFactory) -> Path:
     return bundle_path
 
 
+#
+# Build and preflight boundaries
+#
+
+
+@pytest.mark.e2e_build_preflight
 def test_build_preflight_describe_happy_path(
     tmp_path: Path,
     lab_cli_bin: Path,
@@ -689,6 +742,7 @@ def test_build_preflight_describe_happy_path(
     assert all(check["passed"] for check in preflight["checks"])
 
 
+@pytest.mark.e2e_build_preflight
 def test_run_plane_rejects_authoring_input(
     tmp_path: Path,
     lab_cli_bin: Path,
@@ -739,6 +793,7 @@ def test_run_plane_rejects_authoring_input(
     _assert_command_failed(run, "run_input_invalid_kind")
 
 
+@pytest.mark.e2e_build_preflight
 def test_tampered_package_fails_preflight(
     tmp_path: Path,
     lab_cli_bin: Path,
@@ -777,6 +832,7 @@ def test_tampered_package_fails_preflight(
     _assert_command_failed(preflight, "checksum mismatch")
 
 
+@pytest.mark.e2e_build_preflight
 def test_missing_per_task_image_fails_preflight(
     tmp_path: Path,
     lab_cli_bin: Path,
@@ -812,10 +868,104 @@ def test_missing_per_task_image_fails_preflight(
         cwd=project.root,
     )
     assert preflight["ok"] is False
-    messages = [check["message"] for check in preflight["checks"] if not check["passed"]]
-    assert any("tasks missing task.image in per-task mode" in message for message in messages)
+    _assert_failed_check_contains(
+        preflight,
+        "container_ready",
+        "tasks missing task.image in per-task mode",
+    )
 
 
+@pytest.mark.e2e_build_preflight
+def test_preflight_rejects_known_agent_runtime_compatibility_blockers(
+    tmp_path: Path,
+    lab_cli_bin: Path,
+    artifact_bundle: Path,
+    fixture_image: str,
+) -> None:
+    rows = [
+        _task_row(task_id="TASK_COMPAT_BLOCKER"),
+    ]
+    project, experiment_path = _create_simple_project(
+        tmp_path,
+        artifact_bundle,
+        fixture_image,
+        exp_id="preflight_rejects_known_agent_runtime_compatibility_blockers",
+        rows=rows,
+        agent_command=["compat-probe-agent"],
+    )
+
+    package_dir = _build_package(
+        lab_cli_bin,
+        project,
+        experiment_path,
+        "compatibility_blocker_pkg",
+    )
+    preflight = _run_lab(
+        lab_cli_bin,
+        "preflight",
+        package_dir,
+        "--json",
+        cwd=project.root,
+    )
+    assert preflight["ok"] is False
+    _assert_failed_check_contains(
+        preflight,
+        "agent_runtime_reachable",
+        "CPU lacks AVX support",
+    )
+    _assert_failed_check_contains(
+        preflight,
+        "agent_runtime_reachable",
+        "references tool 'Skill' which is not available",
+    )
+
+
+@pytest.mark.e2e_build_preflight
+def test_preflight_rejects_missing_agent_entrypoint_command(
+    tmp_path: Path,
+    lab_cli_bin: Path,
+    artifact_bundle: Path,
+    fixture_image: str,
+) -> None:
+    rows = [
+        _task_row(task_id="TASK_MISSING_ENTRYPOINT"),
+    ]
+    project, experiment_path = _create_simple_project(
+        tmp_path,
+        artifact_bundle,
+        fixture_image,
+        exp_id="preflight_rejects_missing_agent_entrypoint_command",
+        rows=rows,
+        agent_command=["missing-e2e-agent"],
+    )
+
+    package_dir = _build_package(
+        lab_cli_bin,
+        project,
+        experiment_path,
+        "missing_agent_entrypoint_pkg",
+    )
+    preflight = _run_lab(
+        lab_cli_bin,
+        "preflight",
+        package_dir,
+        "--json",
+        cwd=project.root,
+    )
+    assert preflight["ok"] is False
+    _assert_failed_check_contains(
+        preflight,
+        "agent_runtime_reachable",
+        "all non-destructive probes failed",
+    )
+
+
+#
+# Runtime contract boundaries
+#
+
+
+@pytest.mark.e2e_runtime
 def test_run_happy_path_writes_sqlite_and_artifacts(
     tmp_path: Path,
     lab_cli_bin: Path,
@@ -898,6 +1048,210 @@ def test_run_happy_path_writes_sqlite_and_artifacts(
     assert row["bindings"]["variant_label"] == "control"
 
 
+@pytest.mark.e2e_runtime
+def test_run_records_nonzero_agent_exit_as_failed_trial(
+    tmp_path: Path,
+    lab_cli_bin: Path,
+    artifact_bundle: Path,
+    fixture_image: str,
+) -> None:
+    rows = [
+        _task_row(task_id="TASK_EXIT_NONZERO"),
+    ]
+    project, experiment_path = _create_simple_project(
+        tmp_path,
+        artifact_bundle,
+        fixture_image,
+        exp_id="run_records_nonzero_agent_exit_as_failed_trial",
+        rows=rows,
+        baseline_bindings={"variant_label": "control", "exit_code": 17},
+    )
+
+    package_dir = _build_package(
+        lab_cli_bin,
+        project,
+        experiment_path,
+        "run_nonzero_exit_pkg",
+    )
+    run_payload = _run_package(lab_cli_bin, project, package_dir)
+    run_dir = Path(run_payload["run"]["run_dir"])
+    conn = sqlite3.connect(run_dir / "run.sqlite")
+    try:
+        raw_row = conn.execute("SELECT row_json FROM trial_rows LIMIT 1").fetchone()
+        raw_run_control = conn.execute(
+            "SELECT value_json FROM runtime_kv WHERE key = 'run_control_v2'"
+        ).fetchone()
+    finally:
+        conn.close()
+    assert raw_row is not None
+    assert raw_run_control is not None
+    row = json.loads(raw_row[0])
+    assert row["outcome"] == "error"
+    assert row["status_code"] == "17"
+    assert row["success"] is False
+    assert row["primary_metric_value"] == 0.0
+
+    run_control = json.loads(raw_run_control[0])
+    assert run_control["status"] == "completed"
+    trial_state = _read_json(_only_trial_dir(run_dir) / "trial_state.json")
+    assert trial_state["status"] == "failed"
+    assert trial_state["exit_reason"] == "agent_exit_nonzero"
+
+
+@pytest.mark.e2e_runtime
+def test_run_records_malformed_result_payload_as_failed_trial(
+    tmp_path: Path,
+    lab_cli_bin: Path,
+    artifact_bundle: Path,
+    fixture_image: str,
+) -> None:
+    rows = [
+        _task_row(task_id="TASK_BAD_RESULT"),
+    ]
+    project, experiment_path = _create_simple_project(
+        tmp_path,
+        artifact_bundle,
+        fixture_image,
+        exp_id="run_records_malformed_result_payload_as_failed_trial",
+        rows=rows,
+        baseline_bindings={"variant_label": "control", "emit_invalid_result_json": True},
+    )
+
+    package_dir = _build_package(
+        lab_cli_bin,
+        project,
+        experiment_path,
+        "run_bad_result_pkg",
+    )
+    run_payload = _run_package(lab_cli_bin, project, package_dir)
+    run_dir = Path(run_payload["run"]["run_dir"])
+    conn = sqlite3.connect(run_dir / "run.sqlite")
+    try:
+        raw_row = conn.execute("SELECT row_json FROM trial_rows LIMIT 1").fetchone()
+        raw_run_control = conn.execute(
+            "SELECT value_json FROM runtime_kv WHERE key = 'run_control_v2'"
+        ).fetchone()
+    finally:
+        conn.close()
+    assert raw_row is not None
+    assert raw_run_control is not None
+    row = json.loads(raw_row[0])
+    assert row["outcome"] == "error"
+    assert row["status_code"] == "0"
+    assert row["success"] is False
+    assert row["primary_metric_name"] == "success"
+    assert row["primary_metric_value"] == 0.0
+
+    run_control = json.loads(raw_run_control[0])
+    assert run_control["status"] == "completed"
+    trial_state = _read_json(_only_trial_dir(run_dir) / "trial_state.json")
+    assert trial_state["status"] == "failed"
+    assert trial_state["exit_reason"] == "result_parse_error"
+
+
+@pytest.mark.e2e_runtime
+def test_run_records_missing_result_payload_as_failed_trial(
+    tmp_path: Path,
+    lab_cli_bin: Path,
+    artifact_bundle: Path,
+    fixture_image: str,
+) -> None:
+    rows = [
+        _task_row(task_id="TASK_RESULT_MISSING"),
+    ]
+    project, experiment_path = _create_simple_project(
+        tmp_path,
+        artifact_bundle,
+        fixture_image,
+        exp_id="run_records_missing_result_payload_as_failed_trial",
+        rows=rows,
+        baseline_bindings={"variant_label": "control", "skip_result_write": True},
+    )
+
+    package_dir = _build_package(
+        lab_cli_bin,
+        project,
+        experiment_path,
+        "run_missing_result_pkg",
+    )
+    run_payload = _run_package(lab_cli_bin, project, package_dir)
+    run_dir = Path(run_payload["run"]["run_dir"])
+    conn = sqlite3.connect(run_dir / "run.sqlite")
+    try:
+        raw_row = conn.execute("SELECT row_json FROM trial_rows LIMIT 1").fetchone()
+        raw_run_control = conn.execute(
+            "SELECT value_json FROM runtime_kv WHERE key = 'run_control_v2'"
+        ).fetchone()
+    finally:
+        conn.close()
+    assert raw_row is not None
+    assert raw_run_control is not None
+    row = json.loads(raw_row[0])
+    assert row["outcome"] == "error"
+    assert row["status_code"] == "0"
+    assert row["success"] is False
+    assert row["primary_metric_name"] == "success"
+    assert row["primary_metric_value"] == 0.0
+
+    run_control = json.loads(raw_run_control[0])
+    assert run_control["status"] == "completed"
+    trial_state = _read_json(_only_trial_dir(run_dir) / "trial_state.json")
+    assert trial_state["status"] == "failed"
+    assert trial_state["exit_reason"] == "result_error"
+
+
+@pytest.mark.e2e_runtime
+def test_run_ignores_malformed_trajectory_lines_and_records_parse_error_event(
+    tmp_path: Path,
+    lab_cli_bin: Path,
+    artifact_bundle: Path,
+    fixture_image: str,
+) -> None:
+    rows = [
+        _task_row(task_id="TASK_BAD_TRAJECTORY"),
+    ]
+    project, experiment_path = _create_simple_project(
+        tmp_path,
+        artifact_bundle,
+        fixture_image,
+        exp_id="run_ignores_malformed_trajectory_lines_and_records_parse_error_event",
+        rows=rows,
+        baseline_bindings={"variant_label": "control", "emit_invalid_trajectory_json": True},
+    )
+
+    package_dir = _build_package(
+        lab_cli_bin,
+        project,
+        experiment_path,
+        "run_bad_trajectory_pkg",
+    )
+    run_payload = _run_package(lab_cli_bin, project, package_dir)
+    run_dir = Path(run_payload["run"]["run_dir"])
+    conn = sqlite3.connect(run_dir / "run.sqlite")
+    try:
+        raw_trial = conn.execute("SELECT row_json FROM trial_rows LIMIT 1").fetchone()
+        raw_events = conn.execute("SELECT row_json FROM event_rows ORDER BY seq").fetchall()
+    finally:
+        conn.close()
+    assert raw_trial is not None
+    row = json.loads(raw_trial[0])
+    assert row["outcome"] == "success"
+    assert row["status_code"] == "0"
+
+    event_rows = [json.loads(raw_row[0]) for raw_row in raw_events]
+    parse_error = next(row for row in event_rows if row["event_type"] == "trajectory_parse_error")
+    assert "invalid trajectory json" in parse_error["payload"]["raw_line"]
+    assert parse_error["payload"]["error"]
+    assert any(row["event_type"] == "e2e_agent.start" for row in event_rows)
+    assert any(row["event_type"] == "e2e_agent.finish" for row in event_rows)
+
+
+#
+# Materialization and query surfaces
+#
+
+
+@pytest.mark.e2e_cli_surface
 def test_materialize_full_persists_workspace_seed_files_and_mounts(
     tmp_path: Path,
     lab_cli_bin: Path,
@@ -981,6 +1335,7 @@ def test_materialize_full_persists_workspace_seed_files_and_mounts(
     assert observed["obs_mount_file_write_blocked"] == 1
 
 
+@pytest.mark.e2e_cli_surface
 def test_ab_run_exposes_views_and_query_surface(
     tmp_path: Path,
     lab_cli_bin: Path,
@@ -1079,6 +1434,12 @@ def test_ab_run_exposes_views_and_query_surface(
     assert int(_table_rows(query["result"])[0]["n"]) == 4
 
 
+#
+# Benchmark contract boundaries
+#
+
+
+@pytest.mark.e2e_benchmark
 def test_benchmark_export_build_run_writes_prediction_and_score(
     tmp_path: Path,
     lab_cli_bin: Path,
@@ -1145,6 +1506,132 @@ def test_benchmark_export_build_run_writes_prediction_and_score(
     assert score["primary_metric_value"] == 0.0
 
 
+@pytest.mark.e2e_build_preflight
+@pytest.mark.e2e_benchmark
+def test_benchmark_preflight_rejects_unreachable_grader_command(
+    tmp_path: Path,
+    lab_cli_bin: Path,
+    artifact_bundle: Path,
+    fixture_image: str,
+) -> None:
+    project, experiment_path, _ = _prepare_benchmark_experiment(
+        tmp_path,
+        artifact_bundle,
+        fixture_image,
+    )
+    experiment = yaml.safe_load(experiment_path.read_text(encoding="utf-8"))
+    experiment["benchmark"]["adapter"]["command"] = [
+        "python3",
+        "/agentlab/deps/missing_benchmark_adapter_entry.py",
+    ]
+    _write_yaml(experiment_path, experiment)
+
+    package_dir = _build_package(
+        lab_cli_bin,
+        project,
+        experiment_path,
+        "bench_v0_unreachable_grader_pkg",
+    )
+    preflight = _run_lab(
+        lab_cli_bin,
+        "preflight",
+        package_dir,
+        "--json",
+        cwd=project.root,
+    )
+    assert preflight["ok"] is False
+    _assert_failed_check_contains(
+        preflight,
+        "benchmark_grader_reachable",
+        "benchmark grader launch is not reachable in required images",
+    )
+    _assert_failed_check_contains(
+        preflight,
+        "benchmark_grader_reachable",
+        "missing_benchmark_adapter_entry.py",
+    )
+
+
+@pytest.mark.e2e_benchmark
+def test_benchmark_run_marks_missing_result_before_grader_executes(
+    tmp_path: Path,
+    lab_cli_bin: Path,
+    artifact_bundle: Path,
+    fixture_image: str,
+) -> None:
+    project = _make_project(tmp_path, artifact_bundle)
+    rows = [
+        _task_row(task_id="TASK_BENCH_RESULT_MISSING"),
+    ]
+    dataset_path = project.experiment_data_dir / "benchmark_missing_result.task_boundary_v2.jsonl"
+    _write_jsonl(dataset_path, rows)
+
+    support_root = project.root / "bench_support"
+    support_root.mkdir(parents=True, exist_ok=True)
+    grader_wrapper = support_root / "bench_benchmark_adapter_entry.py"
+    grader_wrapper.write_text(
+        "from __future__ import annotations\n"
+        "import runpy\n"
+        "runpy.run_path('/opt/agent/bench/integration/agentlab/bench_benchmark_adapter.py', run_name='__main__')\n",
+        encoding="utf-8",
+    )
+
+    experiment_path = project.experiments_dir / "benchmark_missing_result.yaml"
+    experiment = _base_experiment(
+        exp_id="benchmark_run_marks_missing_result_before_grader_executes",
+        dataset_path=_relpath(dataset_path, project.experiments_dir),
+        artifact_path=_relpath(project.agents_dir / "agent-runtime.tar.gz", project.experiments_dir),
+        image_tag=fixture_image,
+        benchmark=True,
+        baseline_bindings={"variant_label": "control", "skip_result_write": True},
+    )
+    experiment["dataset"]["limit"] = 1
+    experiment["runtime"]["dependencies"]["file_staging"] = [
+        {
+            "source_from_host": _relpath(grader_wrapper, project.experiments_dir),
+            "destination_path": "/agentlab/deps/bench_benchmark_adapter_entry.py",
+            "required": True,
+            "read_only": True,
+        },
+    ]
+    experiment["benchmark"]["adapter"]["command"] = [
+        "python3",
+        "/agentlab/deps/bench_benchmark_adapter_entry.py",
+    ]
+    _write_yaml(experiment_path, experiment)
+
+    package_dir = _build_package(
+        lab_cli_bin,
+        project,
+        experiment_path,
+        "benchmark_missing_result_pkg",
+    )
+    run_payload = _run_package(lab_cli_bin, project, package_dir)
+    run_dir = Path(run_payload["run"]["run_dir"])
+    trial_dir = _only_trial_dir(run_dir)
+
+    conn = sqlite3.connect(run_dir / "run.sqlite")
+    try:
+        raw_row = conn.execute("SELECT row_json FROM trial_rows LIMIT 1").fetchone()
+    finally:
+        conn.close()
+    assert raw_row is not None
+    row = json.loads(raw_row[0])
+    assert row["outcome"] == "error"
+    assert row["success"] is False
+    assert row["metrics"]["grade_error"] is True
+    assert row["metrics"]["grade_error_reason"] == "result_missing"
+
+    harness_stderr = (trial_dir / "harness_stderr.log").read_text(encoding="utf-8")
+    assert "No such file or directory: '/agentlab/out/result.json'" not in harness_stderr
+
+
+#
+# CLI operator surfaces
+#
+
+
+@pytest.mark.e2e_cli_surface
 def test_build_run_executes_end_to_end_in_one_command(
     tmp_path: Path,
     lab_cli_bin: Path,
@@ -1193,6 +1680,7 @@ def test_build_run_executes_end_to_end_in_one_command(
     assert int(_table_rows(trials["result"])[0]["n"]) == 1
 
 
+@pytest.mark.e2e_cli_surface
 def test_runs_command_lists_completed_run(
     tmp_path: Path,
     lab_cli_bin: Path,

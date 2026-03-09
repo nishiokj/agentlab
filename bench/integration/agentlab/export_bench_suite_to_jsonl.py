@@ -193,13 +193,14 @@ def _workspace_seed_digest(repo_snapshot: Path, injection_patch: Path | None) ->
     return hasher.hexdigest()
 
 
-def _run_checked(command: list[str], cwd: Path | None = None) -> None:
+def _run_checked(command: list[str], cwd: Path | None = None, env: dict[str, str] | None = None) -> None:
     proc = subprocess.run(
         command,
         cwd=str(cwd) if cwd is not None else None,
         text=True,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
+        env=env,
     )
     if proc.returncode == 0:
         return
@@ -228,9 +229,12 @@ def _extract_repo_snapshot(repo_snapshot: Path, destination: Path) -> None:
 def _apply_injection_patch(workspace_root: Path, injection_patch: Path | None) -> None:
     if injection_patch is None:
         return
+    env = os.environ.copy()
+    env["GIT_CEILING_DIRECTORIES"] = str(workspace_root.parent.resolve())
     _run_checked(
         ["git", "apply", "--whitespace=nowarn", str(injection_patch)],
         cwd=workspace_root,
+        env=env,
     )
 
 
@@ -250,6 +254,19 @@ def _remove_sensitive_paths(workspace_root: Path) -> None:
             shutil.rmtree(target)
         else:
             target.unlink()
+
+
+def _hash_directory_tree(root: Path) -> str:
+    hasher = hashlib.sha256()
+    for path in sorted(p for p in root.rglob("*") if p.is_file()):
+        if path.name == ".agentlab_workspace_seed_pack.json":
+            continue
+        rel = path.relative_to(root).as_posix().encode("utf-8")
+        hasher.update(rel)
+        hasher.update(b"\0")
+        hasher.update(_sha256_file(path).encode("ascii"))
+        hasher.update(b"\0")
+    return hasher.hexdigest()
 
 
 def _dataset_pack_root(root: Path, dataset_pack_root: str) -> Path:
@@ -272,8 +289,6 @@ def _materialize_workspace_seed_pack(
     pack_root = _dataset_pack_root(root, dataset_pack_root)
     pack_root.mkdir(parents=True, exist_ok=True)
     pack_dir = pack_root / digest
-    if pack_dir.exists():
-        return digest
 
     tmp_dir = Path(
         tempfile.mkdtemp(
@@ -285,10 +300,12 @@ def _materialize_workspace_seed_pack(
         _extract_repo_snapshot(repo_snapshot, tmp_dir)
         _apply_injection_patch(tmp_dir, injection_patch)
         _remove_sensitive_paths(tmp_dir)
+        tree_hash = _hash_directory_tree(tmp_dir)
         metadata = {
             "schema_version": "workspace_seed_pack_v1",
             "pack_format_version": PACK_FORMAT_VERSION,
             "digest": digest,
+            "tree_hash": tree_hash,
             "repo_snapshot": str(repo_snapshot.relative_to(root) if repo_snapshot.is_relative_to(root) else repo_snapshot),
             "injection_patch": (
                 str(injection_patch.relative_to(root))
@@ -300,6 +317,12 @@ def _materialize_workspace_seed_pack(
             json.dumps(metadata, separators=(",", ":"), sort_keys=True) + "\n",
             encoding="utf-8",
         )
+        if pack_dir.exists():
+            existing_hash = _hash_directory_tree(pack_dir)
+            if existing_hash == tree_hash:
+                shutil.rmtree(tmp_dir, ignore_errors=True)
+                return digest
+            shutil.rmtree(pack_dir, ignore_errors=True)
         os.replace(tmp_dir, pack_dir)
     except Exception:
         shutil.rmtree(tmp_dir, ignore_errors=True)

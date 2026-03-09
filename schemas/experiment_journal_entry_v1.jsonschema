@@ -1,0 +1,155 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agentlab.dev/schemas/experiment_journal_entry_v1.jsonschema",
+  "title": "Experiment Journal Entry v1",
+  "description": "One entry per terminal sealed-package attempt. Written by the agent, read by the agent, and used as persistent experiment memory across sessions.",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "experiment_id",
+    "package_digest",
+    "timestamp",
+    "hypothesis",
+    "attempt_status",
+    "verdict"
+  ],
+  "additionalProperties": false,
+  "properties": {
+    "schema_version": {
+      "const": "experiment_journal_entry_v1"
+    },
+    "run_id": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "The run_id from lab run-experiment output. Null when the package never reached run creation, for example preflight_failed."
+    },
+    "experiment_id": {
+      "type": "string",
+      "description": "The experiment.id from the authoring YAML. This should define a comparable lineage."
+    },
+    "package_digest": {
+      "type": "string",
+      "description": "The sealed package digest from package.lock / manifest.json. This is the ground-truth identity of what was evaluated."
+    },
+    "parent_run_id": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "description": "The run_id of the prior run this attempt was derived from. Null when no parent run exists.",
+      "default": null
+    },
+    "timestamp": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "hypothesis": {
+      "type": "string",
+      "description": "What the agent expected to happen and why. Stated as a testable claim before results are known."
+    },
+    "changes": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": [
+          "knob",
+          "from",
+          "to"
+        ],
+        "additionalProperties": false,
+        "properties": {
+          "knob": {
+            "type": "string",
+            "description": "The binding key or config path that was changed."
+          },
+          "from": {
+            "description": "Previous value."
+          },
+          "to": {
+            "description": "New value."
+          }
+        }
+      },
+      "description": "What changed relative to parent_run_id."
+    },
+    "attempt_status": {
+      "type": "string",
+      "enum": [
+        "preflight_failed",
+        "run_failed",
+        "run_killed",
+        "run_completed"
+      ],
+      "description": "Terminal state of the package attempt."
+    },
+    "blocking_checks": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "description": "Blocking preflight checks or terminal failure reasons worth remembering."
+    },
+    "verdict": {
+      "type": "string",
+      "enum": [
+        "confirmed",
+        "refuted",
+        "inconclusive"
+      ],
+      "description": "Whether the hypothesis was supported by valid comparable evidence. Failed or killed attempts are usually inconclusive."
+    },
+    "pass_rate": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1,
+      "description": "Overall pass rate for the treatment variant. Omit when no comparable run result exists."
+    },
+    "baseline_pass_rate": {
+      "type": "number",
+      "minimum": 0,
+      "maximum": 1,
+      "description": "Pass rate for the baseline or parent comparator when the comparison is valid."
+    },
+    "effect": {
+      "type": "string",
+      "description": "Compact result summary using metrics the views actually expose. Example: '+0.04 pass rate (0.43->0.47), McNemar chi2=4.7, Cohen's h=0.18 (small)'"
+    },
+    "regression_count": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Total number of regressed tasks when a comparable task-level delta exists."
+    },
+    "regressions": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "description": "A capped sample of task IDs that got worse relative to baseline or parent."
+    },
+    "novel_pass_count": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Total number of newly passing tasks when a comparable task-level delta exists."
+    },
+    "novel_passes": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "description": "A capped sample of task IDs that newly passed."
+    },
+    "insight": {
+      "type": "string",
+      "description": "Reusable finding stated as a causal or mechanistic conclusion, or an operational lesson for failed attempts. Not a restatement of numbers."
+    },
+    "next_steps": {
+      "type": "array",
+      "items": {
+        "type": "string"
+      },
+      "description": "Candidate hypotheses or directions suggested by this result."
+    }
+  }
+}

@@ -2291,15 +2291,7 @@ impl AgentAdapter for PrebuiltCommandAdapter {
 
 fn run_builtin_adapter_local(request: &AdapterRunRequest<'_>) -> Result<ProcessRunResult> {
     let command = resolve_runtime_agent_command(request)?;
-    let mut cmd = Command::new(&command[0]);
-    cmd.args(&command[1..]);
-    cmd.current_dir(&request.trial_paths.workspace);
-    for (key, value) in request.runtime_overrides_env {
-        cmd.env(key, value);
-    }
-    for (key, value) in request.runtime_env {
-        cmd.env(key, value);
-    }
+    let cmd = build_builtin_adapter_local_command(request, &command);
     let stdout_log_path = request.trial_paths.trial_dir.join("harness_stdout.log");
     let stderr_log_path = request.trial_paths.trial_dir.join("harness_stderr.log");
     run_adapter_process(
@@ -2309,6 +2301,22 @@ fn run_builtin_adapter_local(request: &AdapterRunRequest<'_>) -> Result<ProcessR
         &stdout_log_path,
         &stderr_log_path,
     )
+}
+
+fn build_builtin_adapter_local_command(
+    request: &AdapterRunRequest<'_>,
+    command: &[String],
+) -> Command {
+    let mut cmd = Command::new(&command[0]);
+    cmd.args(&command[1..]);
+    cmd.current_dir(&request.trial_paths.workspace);
+    for (key, value) in request.runtime_overrides_env {
+        cmd.env(key, value);
+    }
+    for (key, value) in request.runtime_env {
+        cmd.env(key, value);
+    }
+    cmd
 }
 
 fn resolve_benchmark_grader_command(
@@ -2612,6 +2620,13 @@ fn append_container_entrypoint(
              {agent}\n\
              agent_status=$?\n\
              export {agent_exit_env}=\"$agent_status\"\n\
+             if [ ! -s {result_path} ]; then\n\
+               printf '%s\\n' \"result_missing\" > {marker}\n\
+               if [ \"$agent_status\" -ne 0 ]; then\n\
+                 exit \"$agent_status\"\n\
+               fi\n\
+               exit {grade_error_code}\n\
+             fi\n\
              {grader}\n\
              grader_status=$?\n\
              if [ \"$grader_status\" -ne 0 ]; then\n\
@@ -2632,6 +2647,7 @@ fn append_container_entrypoint(
             setup = setup_block,
             agent = shell_join(command),
             agent_exit_env = AGENTLAB_ENV_AGENT_EXIT_STATUS,
+            result_path = shell_quote(&request.io_paths.result_path),
             grader = shell_join(&grader_command),
             score_env = AGENTLAB_ENV_BENCHMARK_SCORE_PATH,
             grade_error_code = BENCHMARK_GRADING_POLICY_EXIT_CODE,
@@ -2654,6 +2670,45 @@ fn append_container_entrypoint(
     }
 }
 
+fn build_baked_container_command(
+    request: &AdapterRunRequest<'_>,
+    image: &str,
+    workspace: Option<&str>,
+    command: &[String],
+    grader_command: Option<Vec<String>>,
+) -> Command {
+    let mut cmd = Command::new("docker");
+    cmd.arg("run").arg("--rm").args(["--pull", "never"]);
+    append_container_platform_arg(&mut cmd, image);
+    append_container_sandbox_args(&mut cmd, request, workspace);
+    append_container_env_args(&mut cmd, request, workspace);
+    cmd.arg(image);
+    append_container_entrypoint(&mut cmd, request, command, grader_command);
+    cmd
+}
+
+fn build_injected_container_mounted_command(
+    request: &AdapterRunRequest<'_>,
+    image: &str,
+    workspace: Option<&str>,
+    artifact_mount_dir: &Path,
+    command: &[String],
+    grader_command: Option<Vec<String>>,
+) -> Command {
+    let mut cmd = Command::new("docker");
+    cmd.arg("run").arg("--rm").args(["--pull", "never"]);
+    append_container_platform_arg(&mut cmd, image);
+    append_container_sandbox_args(&mut cmd, request, workspace);
+    cmd.args([
+        "-v",
+        &format!("{}:/opt/agent:ro", artifact_mount_dir.display()),
+    ]);
+    append_container_env_args(&mut cmd, request, workspace);
+    cmd.arg(image);
+    append_container_entrypoint(&mut cmd, request, command, grader_command);
+    cmd
+}
+
 fn run_baked_container(
     request: &AdapterRunRequest<'_>,
     image: &str,
@@ -2662,12 +2717,7 @@ fn run_baked_container(
     let command = resolve_runtime_agent_command(request)?;
     let grader_command = resolve_benchmark_grader_command(request)?;
 
-    let mut cmd = Command::new("docker");
-    cmd.arg("run").arg("--rm").args(["--pull", "never"]);
-    append_container_sandbox_args(&mut cmd, request, workspace);
-    append_container_env_args(&mut cmd, request, workspace);
-    cmd.arg(image);
-    append_container_entrypoint(&mut cmd, request, &command, grader_command);
+    let cmd = build_baked_container_command(request, image, workspace, &command, grader_command);
     let stdout_log_path = request.trial_paths.trial_dir.join("harness_stdout.log");
     let stderr_log_path = request.trial_paths.trial_dir.join("harness_stderr.log");
     run_adapter_process(
@@ -2712,12 +2762,59 @@ fn output_error_detail(out: &Output) -> String {
     }
 }
 
+fn resolve_local_image_alias(image: &str) -> Option<String> {
+    image
+        .strip_prefix("swebench/")
+        .filter(|candidate| candidate.starts_with("sweb.eval."))
+        .map(ToString::to_string)
+}
+
+pub(crate) fn resolve_container_platform(image: &str) -> Option<&'static str> {
+    let normalized = image.strip_prefix("swebench/").unwrap_or(image);
+    if normalized.starts_with("sweb.eval.x86_64.") {
+        return Some("linux/amd64");
+    }
+    if normalized.starts_with("sweb.eval.aarch64.") || normalized.starts_with("sweb.eval.arm64.") {
+        return Some("linux/arm64");
+    }
+    None
+}
+
+pub(crate) fn append_container_platform_arg(cmd: &mut Command, image: &str) {
+    if let Some(platform) = resolve_container_platform(image) {
+        cmd.arg("--platform").arg(platform);
+    }
+}
+
 fn ensure_container_image_ready(image: &str) -> Result<()> {
     let inspect_output = Command::new("docker")
         .args(["image", "inspect", image])
         .output()?;
     if inspect_output.status.success() {
         return Ok(());
+    }
+    if let Some(local_alias) = resolve_local_image_alias(image) {
+        let alias_inspect = Command::new("docker")
+            .args(["image", "inspect", &local_alias])
+            .output()?;
+        if alias_inspect.status.success() {
+            emit_preflight_log(format!(
+                "container image '{}' missing canonical tag; tagging local alias '{}'",
+                image, local_alias
+            ));
+            let tag_output = Command::new("docker")
+                .args(["image", "tag", &local_alias, image])
+                .output()?;
+            if tag_output.status.success() {
+                return Ok(());
+            }
+            return Err(anyhow!(
+                "container image alias '{}' found locally, but failed to tag as '{}': {}",
+                local_alias,
+                image,
+                output_error_detail(&tag_output),
+            ));
+        }
     }
     emit_preflight_log(format!(
         "container image '{}' not found locally; pulling",
@@ -2776,7 +2873,7 @@ fn repair_agent_artifact_layout(unpacked_dir: &Path) -> Result<()> {
     Ok(())
 }
 
-fn resolve_agent_artifact_mount_dir(artifact: &Path) -> Result<PathBuf> {
+pub(crate) fn resolve_agent_artifact_mount_dir(artifact: &Path) -> Result<PathBuf> {
     if artifact.is_dir() {
         return Ok(fs::canonicalize(artifact).unwrap_or_else(|_| artifact.to_path_buf()));
     }
@@ -2894,16 +2991,14 @@ fn run_injected_container(
     if let Ok(artifact_mount_dir) = resolve_agent_artifact_mount_dir(artifact) {
         let command = resolve_runtime_agent_command(request)?;
         let grader_command = resolve_benchmark_grader_command(request)?;
-        let mut cmd = Command::new("docker");
-        cmd.arg("run").arg("--rm").args(["--pull", "never"]);
-        append_container_sandbox_args(&mut cmd, request, workspace);
-        cmd.args([
-            "-v",
-            &format!("{}:/opt/agent:ro", artifact_mount_dir.display()),
-        ]);
-        append_container_env_args(&mut cmd, request, workspace);
-        cmd.arg(image);
-        append_container_entrypoint(&mut cmd, request, &command, grader_command);
+        let cmd = build_injected_container_mounted_command(
+            request,
+            image,
+            workspace,
+            &artifact_mount_dir,
+            &command,
+            grader_command,
+        );
         let stdout_log_path = request.trial_paths.trial_dir.join("harness_stdout.log");
         let stderr_log_path = request.trial_paths.trial_dir.join("harness_stderr.log");
         return run_adapter_process(
@@ -3024,6 +3119,273 @@ fn resolve_runtime_agent_command(request: &AdapterRunRequest<'_>) -> Result<Vec<
         )?;
     }
     Ok(command)
+}
+
+fn build_non_destructive_probe_variants(command: &[String]) -> Result<Vec<Vec<String>>> {
+    let binary = command
+        .first()
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow!("resolved probe command is empty"))?;
+    let mut base = vec![binary.to_string()];
+    if command.len() >= 3 && command[1].trim() == "-m" {
+        let module = command[2].trim();
+        if !module.is_empty() {
+            base.push("-m".to_string());
+            base.push(module.to_string());
+        }
+    } else if command.len() >= 2 {
+        let second = command[1].trim();
+        if !second.is_empty() && command_part_looks_like_path(second) {
+            base.push(second.to_string());
+        }
+    }
+    let mut probes = Vec::with_capacity(3);
+    for flag in ["--help", "--version", "-h"] {
+        let mut probe = base.clone();
+        probe.push(flag.to_string());
+        probes.push(probe);
+    }
+    Ok(probes)
+}
+
+struct PreflightProbeRoot {
+    path: PathBuf,
+}
+
+impl Drop for PreflightProbeRoot {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.path);
+    }
+}
+
+struct PreflightProbeContext {
+    _root: PreflightProbeRoot,
+    trial_paths: TrialPaths,
+    io_paths: PreparedTrialIo,
+    dynamic_mounts: Vec<ResolvedMountReference>,
+    runtime_env: BTreeMap<String, String>,
+    task_image: Option<String>,
+}
+
+fn create_preflight_probe_root(label: &str) -> Result<PreflightProbeRoot> {
+    let root = std::env::temp_dir().join(format!(
+        "agentlab_preflight_probe_{}_{}_{}",
+        sanitize_for_fs(label),
+        std::process::id(),
+        Utc::now().timestamp_micros()
+    ));
+    ensure_dir(&root)?;
+    Ok(PreflightProbeRoot { path: root })
+}
+
+fn select_preflight_probe_task(
+    tasks: &[Value],
+    image_source: ImageSource,
+    image: &str,
+) -> Result<(usize, TaskBoundaryMaterialization)> {
+    let mut parse_errors = Vec::new();
+    for (idx, task) in tasks.iter().enumerate() {
+        let boundary = match parse_task_boundary_from_dataset_task(task) {
+            Ok(boundary) => boundary,
+            Err(err) => {
+                parse_errors.push(format!("line {}: {}", idx + 1, err));
+                continue;
+            }
+        };
+        if image_source == ImageSource::Global || boundary.task_image.as_deref() == Some(image) {
+            return Ok((idx, boundary));
+        }
+    }
+    if !parse_errors.is_empty() {
+        return Err(anyhow!(
+            "failed to parse representative task boundary rows: {}",
+            format_preview(&parse_errors, 3)
+        ));
+    }
+    if image_source == ImageSource::PerTask {
+        return Err(anyhow!(
+            "no representative task boundary row found for image '{}'",
+            image
+        ));
+    }
+    Ok((
+        0,
+        TaskBoundaryMaterialization {
+            task_payload: json!({ "id": "preflight_probe" }),
+            workspace_seed: None,
+            workspace_files: Vec::new(),
+            mount_references: Vec::new(),
+            limits: TaskBoundaryLimits::default(),
+            task_image: None,
+        },
+    ))
+}
+
+fn build_preflight_probe_context(
+    runtime_profile: &VariantRuntimeProfile,
+    variant: &Variant,
+    tasks: &[Value],
+    image: &str,
+    project_root: &Path,
+) -> Result<PreflightProbeContext> {
+    let (task_idx, task_boundary) =
+        select_preflight_probe_task(tasks, runtime_profile.agent_runtime.image_source, image)?;
+    let probe_root = create_preflight_probe_root(&format!("{}_{}", variant.id, image))?;
+    let trial_dir = probe_root.path.join("trial_1");
+    ensure_dir(&trial_dir)?;
+    let trial_paths = TrialPaths::new(&trial_dir, project_root)?;
+    trial_paths.prepare(true)?;
+    stage_dependencies_for_trial(&runtime_profile.agent_runtime, &trial_paths)?;
+    materialize_workspace_seed(
+        project_root,
+        &trial_paths,
+        task_boundary.workspace_seed.as_ref(),
+    )?;
+    materialize_workspace_files(&trial_paths, &task_boundary.workspace_files)?;
+    stage_workspace_patches_for_trial(&runtime_profile.agent_runtime, &trial_paths)?;
+    let dynamic_mounts = resolve_task_mounts(project_root, &task_boundary.mount_references, true)?;
+    let mut input = build_agent_task(
+        &runtime_profile.experiment,
+        "preflight_probe",
+        "trial_preflight",
+        variant,
+        task_idx,
+        0,
+        &task_boundary,
+        &runtime_profile.agent_runtime,
+    );
+    if !is_clean_contract_experiment(&runtime_profile.experiment) {
+        set_json_pointer_value(
+            &mut input,
+            "/runtime/control_plane/path",
+            json!(DEFAULT_CONTAINER_CONTROL_PATH),
+        )?;
+        set_json_pointer_value(&mut input, "/runtime/control_plane/mode", json!("file"))?;
+    }
+    let input_bytes = serde_json::to_vec_pretty(&input)?;
+    let io_paths = prepare_io_paths(
+        &trial_paths,
+        runtime_profile.container_mode,
+        &input_bytes,
+        is_clean_contract_experiment(&runtime_profile.experiment),
+    )?;
+    let runtime_env = build_runtime_contract_env(
+        "preflight_probe",
+        &input,
+        &io_paths,
+        resolve_trial_timeout_ms(&input, runtime_profile.invocation_default_timeout_ms),
+        is_clean_contract_experiment(&runtime_profile.experiment),
+    );
+    Ok(PreflightProbeContext {
+        _root: probe_root,
+        trial_paths,
+        io_paths,
+        dynamic_mounts,
+        runtime_env,
+        task_image: task_boundary.task_image,
+    })
+}
+
+fn build_preflight_probe_request<'a>(
+    context: &'a PreflightProbeContext,
+    runtime_profile: &'a VariantRuntimeProfile,
+    benchmark_adapter: Option<&'a BenchmarkAdapterConfig>,
+    benchmark_grading_enabled: bool,
+) -> AdapterRunRequest<'a> {
+    AdapterRunRequest {
+        runtime_experiment: &runtime_profile.experiment,
+        runtime: &runtime_profile.agent_runtime,
+        variant_args: &runtime_profile.variant_args,
+        runtime_env: &context.runtime_env,
+        runtime_overrides_env: &runtime_profile.agent_runtime_env,
+        container_mode: runtime_profile.container_mode,
+        trial_paths: &context.trial_paths,
+        dynamic_mounts: &context.dynamic_mounts,
+        io_paths: &context.io_paths,
+        network_mode: runtime_profile.effective_network_mode.as_str(),
+        setup_command: None,
+        benchmark_adapter,
+        benchmark_grading_enabled,
+        run_id: "preflight_probe",
+        task_image: context.task_image.as_deref(),
+        agent_artifact: runtime_profile.agent_runtime.agent_artifact.as_deref(),
+    }
+}
+
+fn run_preflight_container_probe(
+    request: &AdapterRunRequest<'_>,
+    image: &str,
+    resolved_command: &[String],
+) -> Result<PreflightProbeExecution> {
+    let probe_variants = build_non_destructive_probe_variants(resolved_command)?;
+    let workspace = resolve_container_workspace(request);
+    let mut failures = Vec::new();
+    for probe_command in probe_variants {
+        let output = if let Some(artifact) = request.agent_artifact {
+            let artifact_mount_dir = resolve_agent_artifact_mount_dir(artifact)?;
+            build_injected_container_mounted_command(
+                request,
+                image,
+                workspace,
+                &artifact_mount_dir,
+                &probe_command,
+                None,
+            )
+            .output()
+        } else {
+            build_baked_container_command(request, image, workspace, &probe_command, None).output()
+        };
+        match output {
+            Ok(out) if out.status.success() => {
+                return Ok(PreflightProbeExecution {
+                    probe_command,
+                    stdout: String::from_utf8_lossy(&out.stdout).to_string(),
+                    stderr: String::from_utf8_lossy(&out.stderr).to_string(),
+                })
+            }
+            Ok(out) => failures.push(format!(
+                "{} ({})",
+                shell_join(&probe_command),
+                output_error_detail(&out)
+            )),
+            Err(err) => failures.push(format!("{} ({})", shell_join(&probe_command), err)),
+        }
+    }
+    Err(anyhow!(
+        "all non-destructive probes failed for '{}': {}",
+        shell_join(resolved_command),
+        format_preview(&failures, 3)
+    ))
+}
+
+struct PreflightProbeExecution {
+    probe_command: Vec<String>,
+    stdout: String,
+    stderr: String,
+}
+
+fn detect_known_probe_output_blockers(report: &PreflightProbeExecution) -> Vec<String> {
+    let mut blockers = Vec::new();
+    for line in report.stdout.lines().chain(report.stderr.lines()) {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let lower = trimmed.to_ascii_lowercase();
+        if lower.contains("cpu lacks avx support") {
+            blockers.push(trimmed.to_string());
+            continue;
+        }
+        if lower.contains("references tool")
+            && lower.contains("which is not available")
+        {
+            blockers.push(trimmed.to_string());
+        }
+    }
+    blockers.sort();
+    blockers.dedup();
+    blockers
 }
 
 fn resolve_agent_runtime_command(
@@ -3288,6 +3650,41 @@ fn shell_quote(s: &str) -> String {
         s.to_string()
     } else {
         format!("'{}'", s.replace('\'', "'\"'\"'"))
+    }
+}
+
+fn trial_output_error_payload(code: &str, message: &str) -> Value {
+    json!({
+        "schema_version": "agent_result_v1",
+        "outcome": "error",
+        "error": {
+            "code": code,
+            "message": message,
+        },
+    })
+}
+
+fn load_trial_output_resilient(path: &Path) -> Result<(Value, Option<String>)> {
+    if !path.exists() {
+        return Ok((
+            trial_output_error_payload(
+                "result_missing",
+                "agent did not write a result payload",
+            ),
+            None,
+        ));
+    }
+
+    let bytes = fs::read(path)?;
+    match serde_json::from_slice(&bytes) {
+        Ok(value) => Ok((value, None)),
+        Err(err) => {
+            let detail = format!("failed to parse agent result JSON at {}: {}", path.display(), err);
+            Ok((
+                trial_output_error_payload("result_parse_error", &detail),
+                Some(detail),
+            ))
+        }
     }
 }
 
@@ -3730,18 +4127,31 @@ fn load_event_rows(
         if trimmed.is_empty() {
             continue;
         }
-        let payload: Value = serde_json::from_str(trimmed)?;
-        let event_type = payload
-            .get("event_type")
-            .and_then(Value::as_str)
-            .or_else(|| payload.get("type").and_then(Value::as_str))
-            .unwrap_or("unknown")
-            .to_string();
-        let ts = payload
-            .get("ts")
-            .and_then(Value::as_str)
-            .or_else(|| payload.get("timestamp").and_then(Value::as_str))
-            .map(str::to_string);
+        let (event_type, ts, payload) = match serde_json::from_str::<Value>(trimmed) {
+            Ok(payload) => {
+                let event_type = payload
+                    .get("event_type")
+                    .and_then(Value::as_str)
+                    .or_else(|| payload.get("type").and_then(Value::as_str))
+                    .unwrap_or("unknown")
+                    .to_string();
+                let ts = payload
+                    .get("ts")
+                    .and_then(Value::as_str)
+                    .or_else(|| payload.get("timestamp").and_then(Value::as_str))
+                    .map(str::to_string);
+                (event_type, ts, payload)
+            }
+            Err(err) => (
+                "trajectory_parse_error".to_string(),
+                None,
+                json!({
+                    "event_type": "trajectory_parse_error",
+                    "error": err.to_string(),
+                    "raw_line": trimmed,
+                }),
+            ),
+        };
         rows.push(EventRow {
             run_id: run_id.to_string(),
             trial_id: trial_id.to_string(),

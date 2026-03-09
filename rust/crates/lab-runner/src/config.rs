@@ -39,10 +39,7 @@ pub(crate) fn atomic_write_bytes(path: &Path, bytes: &[u8]) -> Result<()> {
 }
 
 pub(crate) fn atomic_write_json_pretty(path: &Path, value: &Value) -> Result<()> {
-    validate_schema_contract_value(
-        value,
-        format!("json write {}", path.display()).as_str(),
-    )?;
+    validate_schema_contract_value(value, format!("json write {}", path.display()).as_str())?;
     let bytes = serde_json::to_vec_pretty(value)?;
     atomic_write_bytes(path, &bytes)
 }
@@ -370,7 +367,10 @@ pub(crate) fn parse_string_array_field(value: Option<&Value>, field: &str) -> Re
     }
 }
 
-pub(crate) fn parse_string_map_field(value: Option<&Value>, field: &str) -> Result<BTreeMap<String, String>> {
+pub(crate) fn parse_string_map_field(
+    value: Option<&Value>,
+    field: &str,
+) -> Result<BTreeMap<String, String>> {
     match value {
         None => Ok(BTreeMap::new()),
         Some(Value::Object(map)) => {
@@ -390,7 +390,10 @@ pub(crate) fn parse_string_map_field(value: Option<&Value>, field: &str) -> Resu
     }
 }
 
-pub(crate) fn parse_optional_nonempty_string(value: Option<&Value>, field: &str) -> Result<Option<String>> {
+pub(crate) fn parse_optional_nonempty_string(
+    value: Option<&Value>,
+    field: &str,
+) -> Result<Option<String>> {
     match value {
         None | Some(Value::Null) => Ok(None),
         Some(Value::String(raw)) => {
@@ -409,7 +412,11 @@ pub(crate) fn parse_optional_nonempty_string(value: Option<&Value>, field: &str)
 // Package path resolution & integrity
 // ---------------------------------------------------------------------------
 
-pub(crate) fn require_exact_object_keys(value: &Value, allowed: &[&str], context: &str) -> Result<()> {
+pub(crate) fn require_exact_object_keys(
+    value: &Value,
+    allowed: &[&str],
+    context: &str,
+) -> Result<()> {
     let obj = value
         .as_object()
         .ok_or_else(|| anyhow!("{} must be an object", context))?;
@@ -452,7 +459,10 @@ pub(crate) fn resolve_package_path_under_root(
     Ok(resolved)
 }
 
-pub(crate) fn verify_sealed_package_integrity(package_dir: &Path, manifest: &Value) -> Result<Value> {
+pub(crate) fn verify_sealed_package_integrity(
+    package_dir: &Path,
+    manifest: &Value,
+) -> Result<Value> {
     require_exact_object_keys(
         manifest,
         &[
@@ -800,7 +810,10 @@ pub(crate) fn resolve_effective_task_policy(
     }
 }
 
-pub(crate) fn validate_required_evidence_classes(record: &Value, required: &[String]) -> Result<()> {
+pub(crate) fn validate_required_evidence_classes(
+    record: &Value,
+    required: &[String],
+) -> Result<()> {
     if required.is_empty() {
         return Ok(());
     }
@@ -971,7 +984,11 @@ pub(crate) fn resolved_schedule_path(run_dir: &Path) -> PathBuf {
     run_dir.join("resolved_schedule.json")
 }
 
-pub(crate) fn write_resolved_variants(run_dir: &Path, baseline_id: &str, variants: &[Variant]) -> Result<()> {
+pub(crate) fn write_resolved_variants(
+    run_dir: &Path,
+    baseline_id: &str,
+    variants: &[Variant],
+) -> Result<()> {
     let manifest = ResolvedVariantsManifest {
         schema_version: "resolved_variants_v1".to_string(),
         generated_at: Utc::now().to_rfc3339(),
@@ -997,7 +1014,10 @@ pub(crate) fn write_resolved_schedule(run_dir: &Path, schedule: &[TrialSlot]) ->
 // Run variants loading
 // ---------------------------------------------------------------------------
 
-pub(crate) fn load_run_variants(run_dir: &Path, experiment: &Value) -> Result<(Vec<Variant>, String)> {
+pub(crate) fn load_run_variants(
+    run_dir: &Path,
+    experiment: &Value,
+) -> Result<(Vec<Variant>, String)> {
     let manifest_path = resolved_variants_path(run_dir);
     if !manifest_path.exists() {
         return resolve_variant_plan(experiment);
@@ -1293,7 +1313,11 @@ fn decode_pointer_token(token: &str) -> String {
     token.replace("~1", "/").replace("~0", "~")
 }
 
-pub(crate) fn set_json_pointer_value(root: &mut Value, pointer: &str, new_value: Value) -> Result<()> {
+pub(crate) fn set_json_pointer_value(
+    root: &mut Value,
+    pointer: &str,
+    new_value: Value,
+) -> Result<()> {
     if pointer.is_empty() || pointer == "/" {
         *root = new_value;
         return Ok(());
@@ -1408,7 +1432,10 @@ pub(crate) fn resolve_runtime_for_variant(experiment: &Value, variant: &Variant)
     Ok(resolved)
 }
 
-pub(crate) fn find_variant_by_id<'a>(variants: &'a [Variant], variant_id: &str) -> Result<&'a Variant> {
+pub(crate) fn find_variant_by_id<'a>(
+    variants: &'a [Variant],
+    variant_id: &str,
+) -> Result<&'a Variant> {
     let trimmed = variant_id.trim();
     if trimmed.is_empty() {
         return variants
@@ -1576,7 +1603,10 @@ pub fn validate_knob_overrides(manifest_path: &Path, overrides_path: &Path) -> R
 // Dataset & tasks
 // ---------------------------------------------------------------------------
 
-pub(crate) fn resolve_dataset_path_in_package(json_value: &Value, package_dir: &Path) -> Result<PathBuf> {
+pub(crate) fn resolve_dataset_path_in_package(
+    json_value: &Value,
+    package_dir: &Path,
+) -> Result<PathBuf> {
     let rel = json_value
         .pointer("/dataset/path")
         .and_then(Value::as_str)
