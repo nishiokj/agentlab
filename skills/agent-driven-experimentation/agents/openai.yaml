@@ -1,0 +1,4 @@
+interface:
+  display_name: "Experiment Driver"
+  short_description: "Iterative benchmark experiment loop"
+  default_prompt: "Use $agent-driven-experimentation to build, run, analyze, and journal an experiment loop for this benchmark."

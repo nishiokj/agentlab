@@ -563,11 +563,7 @@ pub fn replay_trial(run_dir: &Path, trial_id: &str, strict: bool) -> Result<Repl
     let proc_result = adapter.run_trial(&run_request)?;
     let status = proc_result.status;
 
-    let trial_output: Value = if io_paths.output_host.exists() {
-        serde_json::from_slice(&fs::read(&io_paths.output_host)?)?
-    } else {
-        json!({"schema_version":"agent_result_v1","outcome":"error"})
-    };
+    let (trial_output, result_parse_error) = load_trial_output_resilient(&io_paths.output_host)?;
 
     let outcome = trial_output
         .get("outcome")
@@ -577,6 +573,8 @@ pub fn replay_trial(run_dir: &Path, trial_id: &str, strict: bool) -> Result<Repl
         trial_guard.complete("completed", None)?;
     } else if status != "0" {
         trial_guard.complete("failed", Some("harness_exit_nonzero"))?;
+    } else if result_parse_error.is_some() {
+        trial_guard.complete("failed", Some("trial_output_parse_error"))?;
     } else {
         trial_guard.complete("failed", Some("trial_output_error"))?;
     }
@@ -850,11 +848,7 @@ fn fork_trial_inner(
     let proc_result = adapter.run_trial(&run_request)?;
     let status = proc_result.status;
 
-    let trial_output: Value = if io_paths.output_host.exists() {
-        serde_json::from_slice(&fs::read(&io_paths.output_host)?)?
-    } else {
-        json!({"schema_version":"agent_result_v1","outcome":"error"})
-    };
+    let (trial_output, result_parse_error) = load_trial_output_resilient(&io_paths.output_host)?;
     let outcome = trial_output
         .get("outcome")
         .and_then(|v| v.as_str())
@@ -863,6 +857,8 @@ fn fork_trial_inner(
         trial_guard.complete("completed", None)?;
     } else if status != "0" {
         trial_guard.complete("failed", Some("harness_exit_nonzero"))?;
+    } else if result_parse_error.is_some() {
+        trial_guard.complete("failed", Some("trial_output_parse_error"))?;
     } else {
         trial_guard.complete("failed", Some("trial_output_error"))?;
     }
@@ -3126,12 +3122,18 @@ fn normalize_experiment_authoring(
         .map(str::trim)
         .filter(|v| !v.is_empty())
         .ok_or_else(|| anyhow!("benchmark is required and must be a non-empty string"))?;
-    if benchmark_name != "bench_v0" {
-        return Err(anyhow!(
-            "unknown benchmark '{}': only built-in benchmark 'bench_v0' is currently supported",
-            benchmark_name
-        ));
-    }
+    let builtin_benchmark = match benchmark_name {
+        "bench_v0" => "bench_v0",
+        "swebench_lite" | "swebench-lite" | "swebench_lite_curated" | "swebench-lite-curated" => {
+            "swebench_lite_curated"
+        }
+        other => {
+            return Err(anyhow!(
+                "unknown benchmark '{}': supported built-ins are 'bench_v0' and 'swebench_lite_curated' (alias: 'swebench_lite')",
+                other
+            ));
+        }
+    };
 
     let baseline_id = json_value
         .pointer("/baseline/id")
@@ -3279,32 +3281,120 @@ fn normalize_experiment_authoring(
             "read_only": true
         }));
     }
-    let benchmark_adapter_source_candidates = [
-        project_root
-            .join("benchmark")
-            .join("grader")
-            .join("bench_benchmark_adapter.py"),
-        project_root
-            .join(".lab")
-            .join("experiments")
-            .join("bench_benchmark_adapter_standalone.py"),
-    ];
-    let benchmark_adapter_source = benchmark_adapter_source_candidates
-        .iter()
-        .find(|candidate| candidate.exists())
-        .ok_or_else(|| {
-            anyhow!(
-                "benchmark grader adapter source not found; expected one of: {}, {}",
-                benchmark_adapter_source_candidates[0].display(),
-                benchmark_adapter_source_candidates[1].display()
+    let (
+        dataset_path,
+        dataset_schema_version,
+        dataset_suite_id,
+        dataset_split_id,
+        metrics,
+        benchmark_policy,
+        benchmark_adapter_command,
+    ) = match builtin_benchmark {
+        "bench_v0" => {
+            let benchmark_adapter_source_candidates = [
+                project_root
+                    .join("benchmark")
+                    .join("grader")
+                    .join("bench_benchmark_adapter.py"),
+                project_root
+                    .join(".lab")
+                    .join("experiments")
+                    .join("bench_benchmark_adapter_standalone.py"),
+            ];
+            let benchmark_adapter_source = benchmark_adapter_source_candidates
+                .iter()
+                .find(|candidate| candidate.exists())
+                .ok_or_else(|| {
+                    anyhow!(
+                        "benchmark grader adapter source not found; expected one of: {}, {}",
+                        benchmark_adapter_source_candidates[0].display(),
+                        benchmark_adapter_source_candidates[1].display()
+                    )
+                })?;
+            file_staging.push(json!({
+                "source_from_host": benchmark_adapter_source.to_string_lossy().to_string(),
+                "destination_path": "/agentlab/deps/bench_benchmark_adapter.py",
+                "required": true,
+                "read_only": true
+            }));
+            (
+                project_root
+                    .join(".lab")
+                    .join("experiments")
+                    .join("data")
+                    .join("bench_v0.task_boundary_v2.jsonl"),
+                "task_boundary_v2",
+                "bench_v0",
+                "test",
+                json!([
+                    { "id": "duration_ms", "source": "runner", "weight": 0, "primary": false },
+                    { "id": "turn_count", "source": "runner", "weight": 0, "primary": false },
+                    { "id": "resolved", "source": "output", "json_pointer": "/metrics/resolved", "weight": 1, "direction": "maximize", "primary": true },
+                    { "id": "hidden_cases_passed", "source": "output", "json_pointer": "/metrics/hidden_cases_passed", "weight": 0, "primary": false },
+                    { "id": "hidden_cases_total", "source": "output", "json_pointer": "/metrics/hidden_cases_total", "weight": 0, "primary": false }
+                ]),
+                json!({
+                    "task_model": "independent",
+                    "evaluator_mode": "custom",
+                    "scoring_lifecycle": "predict_then_score",
+                    "chain_failure_policy": "continue_with_flag"
+                }),
+                json!(["python3", "/agentlab/deps/bench_benchmark_adapter.py"]),
             )
-        })?;
-    file_staging.push(json!({
-        "source_from_host": benchmark_adapter_source.to_string_lossy().to_string(),
-        "destination_path": "/agentlab/deps/bench_benchmark_adapter.py",
-        "required": true,
-        "read_only": true
-    }));
+        }
+        "swebench_lite_curated" => {
+            let grader_source = project_root
+                .join("adapters")
+                .join("swebench")
+                .join("swebench_task_container_grader.py");
+            let meta_source = project_root
+                .join("adapters")
+                .join("swebench")
+                .join("_swebench_meta.py");
+            if !grader_source.exists() || !meta_source.exists() {
+                return Err(anyhow!(
+                    "swebench adapter sources not found; expected {}, {}",
+                    grader_source.display(),
+                    meta_source.display()
+                ));
+            }
+            file_staging.push(json!({
+                "source_from_host": grader_source.to_string_lossy().to_string(),
+                "destination_path": "/agentlab/deps/swebench_task_container_grader.py",
+                "required": true,
+                "read_only": true
+            }));
+            file_staging.push(json!({
+                "source_from_host": meta_source.to_string_lossy().to_string(),
+                "destination_path": "/agentlab/deps/_swebench_meta.py",
+                "required": true,
+                "read_only": true
+            }));
+            (
+                project_root
+                    .join(".lab")
+                    .join("experiments")
+                    .join("data")
+                    .join("swebench_lite_curated.task_boundary_v2.jsonl"),
+                "task_boundary_v2",
+                "swebench_lite_curated",
+                "test",
+                json!([
+                    { "id": "duration_ms", "source": "runner", "weight": 0, "primary": false },
+                    { "id": "turn_count", "source": "runner", "weight": 0, "primary": false },
+                    { "id": "success", "source": "output", "json_pointer": "/metrics/success", "weight": 1, "direction": "maximize", "primary": true }
+                ]),
+                json!({
+                    "task_model": "independent",
+                    "evaluator_mode": "custom",
+                    "scoring_lifecycle": "integrated_score",
+                    "chain_failure_policy": "continue_with_flag"
+                }),
+                json!(["python3", "/agentlab/deps/swebench_task_container_grader.py"]),
+            )
+        }
+        _ => unreachable!(),
+    };
     let workspace_patches = parse_dx_workspace_patches(&json_value, exp_dir, project_root)?;
 
     let timeout_ms = json_value
@@ -3346,12 +3436,6 @@ fn normalize_experiment_authoring(
         .unwrap_or(1)
         .max(1);
 
-    let dataset_path = project_root
-        .join(".lab")
-        .join("experiments")
-        .join("data")
-        .join("bench_v0.task_boundary_v2.jsonl");
-
     let mut resolved = json!({
         "version": "0.5",
         "experiment": {
@@ -3364,9 +3448,9 @@ fn normalize_experiment_authoring(
         "dataset": {
             "provider": "local_jsonl",
             "path": dataset_path.to_string_lossy().to_string(),
-            "schema_version": "task_boundary_v2",
-            "suite_id": "bench_v0",
-            "split_id": "test"
+            "schema_version": dataset_schema_version,
+            "suite_id": dataset_suite_id,
+            "split_id": dataset_split_id
         },
         "design": {
             "sanitization_profile": "hermetic_functional",
@@ -3382,29 +3466,15 @@ fn normalize_experiment_authoring(
                 }
             }
         },
-        "metrics": [
-            { "id": "duration_ms", "source": "runner", "weight": 0, "primary": false },
-            { "id": "turn_count", "source": "runner", "weight": 0, "primary": false },
-            { "id": "resolved", "source": "output", "json_pointer": "/metrics/resolved", "weight": 1, "direction": "maximize", "primary": true },
-            { "id": "hidden_cases_passed", "source": "output", "json_pointer": "/metrics/hidden_cases_passed", "weight": 0, "primary": false },
-            { "id": "hidden_cases_total", "source": "output", "json_pointer": "/metrics/hidden_cases_total", "weight": 0, "primary": false }
-        ],
+        "metrics": metrics,
         "baseline": {
             "variant_id": baseline_id,
             "bindings": baseline_bindings
         },
         "benchmark": {
-            "policy": {
-                "task_model": "independent",
-                "evaluator_mode": "custom",
-                "scoring_lifecycle": "predict_then_score",
-                "chain_failure_policy": "continue_with_flag"
-            },
+            "policy": benchmark_policy,
             "adapter": {
-                "command": [
-                    "python3",
-                    "/agentlab/deps/bench_benchmark_adapter.py"
-                ]
+                "command": benchmark_adapter_command
             }
         },
         "runtime": {

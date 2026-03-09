@@ -83,6 +83,20 @@ def _coerce_int(value: Any, default: int) -> int:
     return default
 
 
+def _coerce_bool(value: Any, default: bool) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes", "on"}:
+            return True
+        if normalized in {"0", "false", "no", "off"}:
+            return False
+    return default
+
+
 def _observe_path(workspace: Path, spec: dict[str, Any]) -> dict[str, Any]:
     raw_path = spec.get("path")
     if not isinstance(raw_path, str) or not raw_path.strip():
@@ -128,6 +142,16 @@ def _write_trajectory(event_type: str, payload: dict[str, Any]) -> None:
     event = {"event_type": event_type, **payload}
     with path.open("a", encoding="utf-8") as handle:
         handle.write(json.dumps(event, sort_keys=True) + "\n")
+
+
+def _write_raw_trajectory_line(line: str) -> None:
+    raw = os.environ.get("AGENTLAB_TRAJECTORY_PATH", "").strip()
+    if not raw:
+        return
+    path = Path(raw)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(line.rstrip("\n") + "\n")
 
 
 def main() -> int:
@@ -218,6 +242,8 @@ def main() -> int:
         },
     )
 
+    if _coerce_bool(bindings.get("emit_invalid_trajectory_json"), False):
+        _write_raw_trajectory_line("{invalid trajectory json")
     _write_trajectory(
         "e2e_agent.start",
         {
@@ -276,7 +302,14 @@ def main() -> int:
             "message": "forced error outcome",
         }
 
-    _write_json(args.output, result)
+    exit_code = _coerce_int(bindings.get("exit_code"), 0)
+    if _coerce_bool(bindings.get("emit_invalid_result_json"), False):
+        target = Path(args.output)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("{invalid result json\n", encoding="utf-8")
+    elif exit_code == 0 and not _coerce_bool(bindings.get("skip_result_write"), False):
+        _write_json(args.output, result)
+
     _write_trajectory(
         "e2e_agent.finish",
         {
@@ -286,7 +319,7 @@ def main() -> int:
             "objective_value": objective_value,
         },
     )
-    return 0
+    return exit_code
 
 
 if __name__ == "__main__":

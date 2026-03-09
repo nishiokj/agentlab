@@ -5573,6 +5573,17 @@ mod tests {
         }
     }
 
+    fn preflight_test_variant() -> Variant {
+        Variant {
+            id: "test_variant".to_string(),
+            bindings: json!({}),
+            args: Vec::new(),
+            env: BTreeMap::new(),
+            image: None,
+            runtime_overrides: None,
+        }
+    }
+
     #[test]
     fn preflight_resolve_images_reports_missing_global_image() {
         let profile = preflight_test_runtime_profile(ImageSource::Global, None);
@@ -5604,6 +5615,29 @@ mod tests {
         assert!(check
             .message
             .contains("failed to parse task image boundary rows"));
+    }
+
+    #[test]
+    fn preflight_probe_output_blockers_detect_avx_incompatibility_warning() {
+        let blockers = detect_known_probe_output_blockers(&PreflightProbeExecution {
+            probe_command: vec!["bun".to_string(), "--help".to_string()],
+            stdout: String::new(),
+            stderr: "warn: CPU lacks AVX support, strange crashes may occur.".to_string(),
+        });
+        assert_eq!(blockers.len(), 1);
+        assert!(blockers[0].contains("CPU lacks AVX support"));
+    }
+
+    #[test]
+    fn preflight_probe_output_blockers_detect_missing_tool_registry_warning() {
+        let blockers = detect_known_probe_output_blockers(&PreflightProbeExecution {
+            probe_command: vec!["agent".to_string(), "--help".to_string()],
+            stdout: "[harness] Agent 'coding' references tool 'Skill' which is not available"
+                .to_string(),
+            stderr: String::new(),
+        });
+        assert_eq!(blockers.len(), 1);
+        assert!(blockers[0].contains("references tool 'Skill'"));
     }
 
     #[test]
@@ -6232,6 +6266,33 @@ mod tests {
         run_checked_command(verify, "docker verify").expect("verify unpacked artifact");
     }
 
+    #[test]
+    fn resolve_local_image_alias_maps_swebench_legacy_local_tag() {
+        assert_eq!(
+            resolve_local_image_alias("swebench/sweb.eval.x86_64.astropy__astropy-12907:latest")
+                .as_deref(),
+            Some("sweb.eval.x86_64.astropy__astropy-12907:latest")
+        );
+        assert_eq!(resolve_local_image_alias("python:3.11-slim"), None);
+        assert_eq!(
+            resolve_local_image_alias("ghcr.io/acme/swebench-task:latest"),
+            None
+        );
+    }
+
+    #[test]
+    fn resolve_container_platform_maps_swebench_architecture_tags() {
+        assert_eq!(
+            resolve_container_platform("swebench/sweb.eval.x86_64.astropy__astropy-12907:latest"),
+            Some("linux/amd64")
+        );
+        assert_eq!(
+            resolve_container_platform("sweb.eval.arm64.astropy__astropy-12907:latest"),
+            Some("linux/arm64")
+        );
+        assert_eq!(resolve_container_platform("python:3.11-slim"), None);
+    }
+
     fn create_dx_authoring_fixture(prefix: &str) -> TempDirGuard {
         let root = TempDirGuard::new(prefix);
         let dataset_dir = root.path.join(".lab").join("experiments").join("data");
@@ -6253,6 +6314,11 @@ mod tests {
             ),
         )
         .expect("dataset row");
+        fs::write(
+            dataset_dir.join("swebench_lite_curated.task_boundary_v2.jsonl"),
+            r#"{"schema_version":"task_boundary_v2","task":{"id":"swebench_astropy_astropy_12907","image":"swebench/sweb.eval.x86_64.astropy__astropy-12907:latest","benchmark":{"adapter_id":"swebench_task_container_grader","name":"swebench_lite_curated","split":"test"},"swebench":{"input":{"repo":"astropy/astropy","instance_id":"astropy__astropy-12907","base_commit":"deadbeef"}}},"workspace_files":[],"mount_references":[]}"#,
+        )
+        .expect("swebench dataset row");
 
         let artifact_bin = root
             .path
@@ -6300,6 +6366,18 @@ mod tests {
             "#!/usr/bin/env python3\nprint('ok')\n",
         )
         .expect("benchmark adapter");
+        let swebench_adapter_dir = root.path.join("adapters").join("swebench");
+        ensure_dir(&swebench_adapter_dir).expect("swebench adapter dir");
+        fs::write(
+            swebench_adapter_dir.join("swebench_task_container_grader.py"),
+            "#!/usr/bin/env python3\nprint('ok')\n",
+        )
+        .expect("swebench benchmark adapter");
+        fs::write(
+            swebench_adapter_dir.join("_swebench_meta.py"),
+            "def extract_swebench_meta(payload):\n    return {\"repo\": None, \"instance_id\": None, \"base_commit\": None}\n",
+        )
+        .expect("swebench meta helper");
         root
     }
 
@@ -6396,6 +6474,41 @@ mod tests {
                     "config": { "model_provider": "anthropic", "model": "claude-sonnet-4" }
                 }
             ],
+            "overrides": {
+                "network": "full",
+                "root_read_only": false
+            }
+        })
+    }
+
+    fn minimal_swebench_dx_spec() -> Value {
+        json!({
+            "experiment": {
+                "id": "swebench_lite_qwen35b_a3b_only",
+                "name": "SWE-bench Lite: Qwen3.5 35B A3B",
+                "tags": ["swebench-lite", "single-variant"]
+            },
+            "benchmark": "swebench_lite",
+            "limit": 20,
+            "agent": {
+                "artifact": "rex-minimal-linux-dir",
+                "command": ["rex", "run", "--dangerous"],
+                "io": { "input": "--input-file", "output": "--output" },
+                "env": { "MEMORY_DAEMON_URL": "" },
+                "config_files": ["providers.a.ts", "providers.b.ts"],
+                "workspace_patches": {
+                    "providers.a.ts": "packages/core/types/src/providers.ts",
+                    "providers.b.ts": "packages/core/types/src/providers.ts"
+                },
+                "arg_map": [
+                    { "key": "model_provider", "flag": "--provider" },
+                    { "key": "model", "flag": "--model" }
+                ]
+            },
+            "baseline": {
+                "id": "qwen_35b_a3b",
+                "bindings": { "model_provider": "lmstudio", "model": "qwen3.5-35b-a3b" }
+            },
             "overrides": {
                 "network": "full",
                 "root_read_only": false
@@ -6543,6 +6656,73 @@ mod tests {
                 .iter()
                 .any(|v| *v == "/agentlab/deps/.config/nova/codex-auth.json"),
             "missing codex auth staging: {:?}",
+            destinations
+        );
+    }
+
+    #[test]
+    fn normalize_authoring_supports_swebench_lite_builtin_registry() {
+        let root = create_dx_authoring_fixture("agentlab_dx_swebench_builtin");
+        let resolved =
+            normalize_experiment_authoring(minimal_swebench_dx_spec(), &root.path, &root.path)
+                .expect("normalize");
+
+        assert_eq!(
+            resolved
+                .pointer("/dataset/suite_id")
+                .and_then(Value::as_str)
+                .unwrap_or(""),
+            "swebench_lite_curated"
+        );
+        assert!(
+            resolved
+                .pointer("/dataset/path")
+                .and_then(Value::as_str)
+                .unwrap_or("")
+                .ends_with(".lab/experiments/data/swebench_lite_curated.task_boundary_v2.jsonl"),
+            "unexpected swebench dataset path: {:?}",
+            resolved.pointer("/dataset/path")
+        );
+        assert_eq!(
+            resolved
+                .pointer("/benchmark/adapter/command/1")
+                .and_then(Value::as_str)
+                .unwrap_or(""),
+            "/agentlab/deps/swebench_task_container_grader.py"
+        );
+        assert_eq!(
+            resolved
+                .pointer("/benchmark/policy/scoring_lifecycle")
+                .and_then(Value::as_str)
+                .unwrap_or(""),
+            "integrated_score"
+        );
+        assert_eq!(
+            resolved
+                .pointer("/runtime/agent/image_source")
+                .and_then(Value::as_str)
+                .unwrap_or(""),
+            "per_task"
+        );
+        let destinations = resolved
+            .pointer("/runtime/dependencies/file_staging")
+            .and_then(Value::as_array)
+            .expect("file staging")
+            .iter()
+            .filter_map(|row| row.get("destination_path").and_then(Value::as_str))
+            .collect::<Vec<_>>();
+        assert!(
+            destinations
+                .iter()
+                .any(|v| *v == "/agentlab/deps/swebench_task_container_grader.py"),
+            "missing swebench grader staging: {:?}",
+            destinations
+        );
+        assert!(
+            destinations
+                .iter()
+                .any(|v| *v == "/agentlab/deps/_swebench_meta.py"),
+            "missing swebench meta staging: {:?}",
             destinations
         );
     }
@@ -6922,14 +7102,24 @@ mod tests {
             "mount_references": []
         })];
 
-        let check =
-            check_benchmark_grader_reachable(&benchmark_config, &runtime_profile, &tasks, false);
+        let variant = preflight_test_variant();
+        let root = TempDirGuard::new("agentlab_p0_grader_reachability_forbidden");
+        let check = check_benchmark_grader_reachable(
+            &benchmark_config,
+            &runtime_profile,
+            &variant,
+            &tasks,
+            false,
+            &root.path,
+        );
         assert!(
             !check.passed,
             "preflight must fail when grader script path is under forbidden /opt/bench"
         );
         assert!(
-            check.message.contains("forbidden grader script path"),
+            check
+                .message
+                .contains("forbidden benchmark adapter script path"),
             "unexpected message: {}",
             check.message
         );
@@ -6960,13 +7150,119 @@ mod tests {
                 manifest: None,
             }),
         };
-        let runtime_profile =
+        let mut runtime_profile =
             preflight_test_runtime_profile(ImageSource::Global, Some("python:3.11-slim"));
-        let check =
-            check_benchmark_grader_reachable(&benchmark_config, &runtime_profile, &[], false);
+        let variant = preflight_test_variant();
+        let root = TempDirGuard::new("agentlab_p0_grader_reachability_staged");
+        let staged_grader = root.path.join("bench_benchmark_adapter.py");
+        write_executable_script(&staged_grader, "#!/usr/bin/env python3\nprint('ok')\n");
+        runtime_profile.agent_runtime.dependency_file_staging = vec![DependencyFileStagingSpec {
+            source_from_host: staged_grader,
+            destination_path: format!(
+                "{}/bench_benchmark_adapter.py",
+                AGENTLAB_CONTRACT_DEPS_DIR
+            ),
+            required: true,
+            read_only: true,
+        }];
+        let check = check_benchmark_grader_reachable(
+            &benchmark_config,
+            &runtime_profile,
+            &variant,
+            &[],
+            false,
+            &root.path,
+        );
         assert!(
             check.passed,
             "runner-staged script path should not be required in task image: {}",
+            check.message
+        );
+    }
+
+    #[test]
+    fn p0_i06_preflight_grader_reachability_supports_swebench_grader_probe_contract() {
+        let docker_ok = Command::new("docker")
+            .arg("info")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false);
+        if !docker_ok {
+            eprintln!("skipping p0_i06 swebench grader probe test: docker daemon unavailable");
+            return;
+        }
+        ensure_container_image_ready("python:3.11-slim").expect("python image");
+
+        let benchmark_config = BenchmarkConfig {
+            policy: BenchmarkPolicyConfig::default(),
+            adapter: Some(BenchmarkAdapterConfig {
+                command: vec![
+                    "python3".to_string(),
+                    "/agentlab/deps/swebench_task_container_grader.py".to_string(),
+                ],
+                manifest: None,
+            }),
+        };
+        let mut runtime_profile =
+            preflight_test_runtime_profile(ImageSource::Global, Some("python:3.11-slim"));
+        let variant = preflight_test_variant();
+        let root = TempDirGuard::new("agentlab_p0_swebench_grader_reachability");
+        runtime_profile.agent_runtime.dependency_file_staging = vec![
+            DependencyFileStagingSpec {
+                source_from_host: PathBuf::from(
+                    env!("CARGO_MANIFEST_DIR")
+                        .replace("/rust/crates/lab-runner", "/adapters/swebench/swebench_task_container_grader.py"),
+                ),
+                destination_path: format!(
+                    "{}/swebench_task_container_grader.py",
+                    AGENTLAB_CONTRACT_DEPS_DIR
+                ),
+                required: true,
+                read_only: true,
+            },
+            DependencyFileStagingSpec {
+                source_from_host: PathBuf::from(
+                    env!("CARGO_MANIFEST_DIR")
+                        .replace("/rust/crates/lab-runner", "/adapters/swebench/_swebench_meta.py"),
+                ),
+                destination_path: format!("{}/_swebench_meta.py", AGENTLAB_CONTRACT_DEPS_DIR),
+                required: true,
+                read_only: true,
+            },
+        ];
+        let tasks = vec![json!({
+            "schema_version": "task_boundary_v2",
+            "task": {
+                "id": "swebench_astropy_astropy_12907",
+                "benchmark": {
+                    "adapter_id": "swebench_task_container_grader",
+                    "name": "swebench_lite_curated",
+                    "split": "test"
+                },
+                "swebench": {
+                    "input": {
+                        "repo": "astropy/astropy",
+                        "instance_id": "astropy__astropy-12907",
+                        "base_commit": "deadbeef"
+                    }
+                }
+            },
+            "workspace_files": [],
+            "mount_references": []
+        })];
+        let check = check_benchmark_grader_reachable(
+            &benchmark_config,
+            &runtime_profile,
+            &variant,
+            &tasks,
+            false,
+            &root.path,
+        );
+        assert!(
+            check.passed,
+            "swebench grader probe should pass with seeded probe result: {}",
             check.message
         );
     }
@@ -7245,6 +7541,198 @@ mod tests {
             "grader wrapper missing PATH export for artifact command lookup: {:?}",
             wrapper
         );
+        assert!(
+            wrapper.contains("if [ ! -s /agentlab/out/result.json ]; then"),
+            "grader wrapper missing missing-result guard before invoking grader: {:?}",
+            wrapper
+        );
+        assert!(
+            wrapper.contains("printf '%s\\n' \"result_missing\" >"),
+            "grader wrapper missing explicit result_missing marker: {:?}",
+            wrapper
+        );
+        assert!(
+            wrapper.contains("if [ \"$agent_status\" -ne 0 ]; then"),
+            "grader wrapper missing agent status passthrough inside result-missing guard: {:?}",
+            wrapper
+        );
+    }
+
+    #[test]
+    fn p0_i03_swebench_container_commands_request_explicit_platform() {
+        let (_root, paths) = create_trial_paths_fixture("agentlab_p0_swebench_platform");
+        let runtime = AgentRuntimeConfig {
+            adapter_ref: AgentAdapterRef::default(),
+            command_raw: vec!["rex".to_string(), "run".to_string()],
+            container_image: Some(
+                "swebench/sweb.eval.x86_64.astropy__astropy-12907:latest".to_string(),
+            ),
+            image_source: ImageSource::Global,
+            agent_artifact: Some(PathBuf::from("/tmp/agent-artifact")),
+            agent_artifact_digest: None,
+            agent_artifact_resolved_path: None,
+            io: AgentRuntimeIoConfig {
+                input_arg: "--input".to_string(),
+                output_arg: "--output".to_string(),
+            },
+            clean_contract_v1: false,
+            integration_level: "cli_basic".to_string(),
+            launch_mode: AgentLaunchMode::File,
+            env: BTreeMap::new(),
+            env_from_host: Vec::new(),
+            bindings_to_args: Vec::new(),
+            workspace_patches: Vec::new(),
+            trajectory_path: None,
+            causal_extraction: None,
+            default_timeout_ms: None,
+            tracing_mode: None,
+            force_container: true,
+            dependency_file_staging: Vec::new(),
+            dependency_services: Vec::new(),
+        };
+        let runtime_env = BTreeMap::new();
+        let overrides = BTreeMap::new();
+        let io_paths = PreparedTrialIo {
+            input_host: PathBuf::from("/tmp/trial_input.json"),
+            output_host: paths.out.join("result.json"),
+            events_host: paths.state.join("events.jsonl"),
+            task_path: AGENTLAB_TASK_PATH.to_string(),
+            bindings_path: AGENTLAB_BINDINGS_PATH.to_string(),
+            dependencies_path: AGENTLAB_DEPENDENCIES_PATH.to_string(),
+            policy_path: AGENTLAB_POLICY_PATH.to_string(),
+            result_path: AGENTLAB_RESULT_PATH.to_string(),
+            trajectory_path: AGENTLAB_TRAJECTORY_PATH.to_string(),
+        };
+        let empty_json = json!({});
+        let request = AdapterRunRequest {
+            runtime_experiment: &empty_json,
+            runtime: &runtime,
+            variant_args: &[],
+            runtime_env: &runtime_env,
+            runtime_overrides_env: &overrides,
+            container_mode: true,
+            trial_paths: &paths,
+            dynamic_mounts: &[],
+            io_paths: &io_paths,
+            network_mode: "none",
+            setup_command: None,
+            benchmark_adapter: None,
+            benchmark_grading_enabled: false,
+            run_id: "run_1",
+            task_image: None,
+            agent_artifact: runtime.agent_artifact.as_deref(),
+        };
+        let baked_args = build_baked_container_command(
+            &request,
+            "swebench/sweb.eval.x86_64.astropy__astropy-12907:latest",
+            None,
+            &["rex".to_string(), "run".to_string()],
+            None,
+        )
+        .get_args()
+        .map(|value| value.to_string_lossy().to_string())
+        .collect::<Vec<_>>();
+        assert!(
+            baked_args.windows(2).any(|pair| pair == ["--platform", "linux/amd64"]),
+            "baked task container command missing explicit platform: {:?}",
+            baked_args
+        );
+
+        let mounted_args = build_injected_container_mounted_command(
+            &request,
+            "swebench/sweb.eval.x86_64.astropy__astropy-12907:latest",
+            None,
+            Path::new("/tmp/agent-artifact"),
+            &["rex".to_string(), "run".to_string()],
+            None,
+        )
+        .get_args()
+        .map(|value| value.to_string_lossy().to_string())
+        .collect::<Vec<_>>();
+        assert!(
+            mounted_args
+                .windows(2)
+                .any(|pair| pair == ["--platform", "linux/amd64"]),
+            "mounted task container command missing explicit platform: {:?}",
+            mounted_args
+        );
+    }
+
+    #[test]
+    fn build_non_destructive_probe_variants_supports_binary_path_script_and_module() {
+        assert_eq!(
+            build_non_destructive_probe_variants(&["rex".to_string()]).expect("bare binary probe"),
+            vec![
+                vec!["rex".to_string(), "--help".to_string()],
+                vec!["rex".to_string(), "--version".to_string()],
+                vec!["rex".to_string(), "-h".to_string()],
+            ]
+        );
+        assert_eq!(
+            build_non_destructive_probe_variants(&["/opt/agent/bin/rex".to_string()])
+                .expect("absolute path probe"),
+            vec![
+                vec!["/opt/agent/bin/rex".to_string(), "--help".to_string()],
+                vec!["/opt/agent/bin/rex".to_string(), "--version".to_string()],
+                vec!["/opt/agent/bin/rex".to_string(), "-h".to_string()],
+            ]
+        );
+        assert_eq!(
+            build_non_destructive_probe_variants(&[
+                "python3".to_string(),
+                "/agentlab/deps/grader.py".to_string(),
+                "--input".to_string(),
+                "/agentlab/task.json".to_string(),
+            ])
+            .expect("script probe"),
+            vec![
+                vec![
+                    "python3".to_string(),
+                    "/agentlab/deps/grader.py".to_string(),
+                    "--help".to_string(),
+                ],
+                vec![
+                    "python3".to_string(),
+                    "/agentlab/deps/grader.py".to_string(),
+                    "--version".to_string(),
+                ],
+                vec![
+                    "python3".to_string(),
+                    "/agentlab/deps/grader.py".to_string(),
+                    "-h".to_string(),
+                ],
+            ]
+        );
+        assert_eq!(
+            build_non_destructive_probe_variants(&[
+                "python3".to_string(),
+                "-m".to_string(),
+                "agentlab.grader".to_string(),
+                "--input".to_string(),
+            ])
+            .expect("module probe"),
+            vec![
+                vec![
+                    "python3".to_string(),
+                    "-m".to_string(),
+                    "agentlab.grader".to_string(),
+                    "--help".to_string(),
+                ],
+                vec![
+                    "python3".to_string(),
+                    "-m".to_string(),
+                    "agentlab.grader".to_string(),
+                    "--version".to_string(),
+                ],
+                vec![
+                    "python3".to_string(),
+                    "-m".to_string(),
+                    "agentlab.grader".to_string(),
+                    "-h".to_string(),
+                ],
+            ]
+        );
+        assert!(build_non_destructive_probe_variants(&["   ".to_string()]).is_err());
     }
 
     #[test]
