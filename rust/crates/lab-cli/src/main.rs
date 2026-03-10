@@ -233,9 +233,9 @@ enum Commands {
         #[arg(long)]
         html: bool,
     },
-    #[command(about = "Live refresh for a view (defaults to run_progress)")]
+    #[command(about = "Live refresh for a view; omit run/view in a TTY to browse active runs and views")]
     ViewsLive {
-        run: String,
+        run: Option<String>,
         view: Option<String>,
         #[arg(long, default_value_t = 2)]
         interval_seconds: u64,
@@ -377,6 +377,38 @@ enum TableRenderFormat {
     Csv,
     Markdown,
     Html,
+}
+
+#[derive(Clone, Debug, Default)]
+struct RunControlSummary {
+    status: String,
+    status_display: String,
+    live_summary: String,
+    active_trials: usize,
+    is_active: bool,
+}
+
+#[derive(Clone, Debug)]
+struct RunInventoryEntry {
+    run_id: String,
+    run_dir: PathBuf,
+    experiment: String,
+    started_at: String,
+    started_at_display: String,
+    control: RunControlSummary,
+}
+
+#[derive(Clone, Debug)]
+struct RunMetrics {
+    variants: usize,
+    pass_rate: Option<f64>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ViewsBrowserScreen {
+    RunPicker,
+    ViewPicker,
+    Viewer,
 }
 
 const STANDARD_VIEWS_CORE_ONLY: &[StandardViewDef] = &[
@@ -619,8 +651,16 @@ fn latest_mtime_in_path(path: &Path) -> Result<Option<(SystemTime, PathBuf)>> {
     if !path.exists() {
         return Ok(None);
     }
-    let meta = std::fs::metadata(path)
-        .map_err(|err| anyhow!("failed to stat stale-binary watch path {}: {}", path.display(), err))?;
+    if path.file_name().and_then(|name| name.to_str()) == Some("tests.rs") {
+        return Ok(None);
+    }
+    let meta = std::fs::metadata(path).map_err(|err| {
+        anyhow!(
+            "failed to stat stale-binary watch path {}: {}",
+            path.display(),
+            err
+        )
+    })?;
     if meta.is_file() {
         let modified = meta
             .modified()
@@ -634,10 +674,16 @@ fn latest_mtime_in_path(path: &Path) -> Result<Option<(SystemTime, PathBuf)>> {
     let mut newest: Option<(SystemTime, PathBuf)> = None;
     let mut stack = vec![path.to_path_buf()];
     while let Some(dir) = stack.pop() {
-        let entries = std::fs::read_dir(&dir)
-            .map_err(|err| anyhow!("failed to read stale-binary watch dir {}: {}", dir.display(), err))?;
+        let entries = std::fs::read_dir(&dir).map_err(|err| {
+            anyhow!(
+                "failed to read stale-binary watch dir {}: {}",
+                dir.display(),
+                err
+            )
+        })?;
         for entry in entries {
-            let entry = entry.map_err(|err| anyhow!("failed to read dir entry in {}: {}", dir.display(), err))?;
+            let entry = entry
+                .map_err(|err| anyhow!("failed to read dir entry in {}: {}", dir.display(), err))?;
             let entry_path = entry.path();
             let entry_meta = entry
                 .metadata()
@@ -649,9 +695,12 @@ fn latest_mtime_in_path(path: &Path) -> Result<Option<(SystemTime, PathBuf)>> {
             if !entry_meta.is_file() {
                 continue;
             }
-            let modified = entry_meta
-                .modified()
-                .map_err(|err| anyhow!("failed to read mtime for {}: {}", entry_path.display(), err))?;
+            if entry_path.file_name().and_then(|name| name.to_str()) == Some("tests.rs") {
+                continue;
+            }
+            let modified = entry_meta.modified().map_err(|err| {
+                anyhow!("failed to read mtime for {}: {}", entry_path.display(), err)
+            })?;
             let replace = newest
                 .as_ref()
                 .map(|(current, _)| modified > *current)
@@ -728,10 +777,17 @@ fn ensure_cli_binary_is_fresh() -> Result<()> {
     let Some(repo_root) = repo_root_for_stale_binary_guard() else {
         return Ok(());
     };
-    let exe_path = std::env::current_exe().map_err(|err| anyhow!("failed to resolve current executable path: {}", err))?;
+    let exe_path = std::env::current_exe()
+        .map_err(|err| anyhow!("failed to resolve current executable path: {}", err))?;
     let exe_mtime = std::fs::metadata(&exe_path)
         .and_then(|meta| meta.modified())
-        .map_err(|err| anyhow!("failed to read executable mtime for {}: {}", exe_path.display(), err))?;
+        .map_err(|err| {
+            anyhow!(
+                "failed to read executable mtime for {}: {}",
+                exe_path.display(),
+                err
+            )
+        })?;
     enforce_cli_binary_freshness(&exe_path, exe_mtime, newest_watch_mtime(&repo_root)?)
 }
 
@@ -1343,72 +1399,42 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
             once,
             no_clear,
         } => {
-            let run_dir = resolve_run_dir_arg(&run)?;
             let sleep_interval = Duration::from_secs(interval_seconds.max(1));
-            let run_view_set = lab_analysis::run_view_set(&run_dir)?;
-            let raw_view_names = lab_analysis::list_views(&run_dir)?;
-            let resolved_view = match view.as_deref() {
-                Some(requested) => {
-                    resolve_requested_view(run_view_set, &raw_view_names, requested)?
-                }
-                None => resolve_requested_view(run_view_set, &raw_view_names, "run_progress")?,
-            };
             let resolved_limit = limit.max(1);
-            let run_id = run_dir
-                .file_name()
-                .and_then(|v| v.to_str())
-                .unwrap_or("?")
-                .to_string();
             let use_tui = !once && !no_clear && stdout_is_tty();
+            let run_dir = match run.as_deref() {
+                Some(run_arg) => Some(resolve_run_dir_arg(run_arg)?),
+                None => None,
+            };
 
             if use_tui {
-                let mut term = tui::Term::new()?;
-                loop {
-                    let table =
-                        query_resolved_view(&run_dir, &resolved_view, resolved_limit)?;
-                    let (display, legend, split_labels) =
-                        if resolved_view.name == "trace" && has_ab_trace_columns(&table) {
-                            let (d, l, s) = prepare_trace_split_view(&table);
-                            (d, l, Some(s))
-                        } else {
-                            let (filtered, raw_legend) = elide_constant_columns(&table);
-                            let display = shorten_display_columns(&filtered);
-                            let legend: Vec<(String, String)> = raw_legend
-                                .into_iter()
-                                .map(|(k, v)| (shorten_column_name(&k), v))
-                                .collect();
-                            (display, legend, None)
-                        };
-                    let status = read_run_status(&run_dir);
-                    let progress = read_run_progress(&run_dir);
-                    let split_refs = split_labels
-                        .as_ref()
-                        .map(|(l, r)| (l.as_str(), r.as_str()));
-                    term.draw(&tui::ViewState {
-                        run_id: &run_id,
-                        status: &status,
-                        view_name: &resolved_view.name,
-                        interval_secs: sleep_interval.as_secs(),
-                        table: &display,
-                        progress,
-                        legend: &legend,
-                        split_labels: split_refs,
-                    })?;
-                    let row_count = display.rows.len();
-                    match term.poll(sleep_interval)? {
-                        tui::Action::Quit => break,
-                        tui::Action::ScrollUp => term.scroll_up(),
-                        tui::Action::ScrollDown => term.scroll_down(row_count),
-                        tui::Action::PageUp => term.page_up(),
-                        tui::Action::PageDown => term.page_down(row_count),
-                        tui::Action::Tick => {}
-                    }
-                }
+                let project_root = resolve_project_root(std::env::current_dir()?.as_path());
+                run_interactive_views_browser(
+                    &project_root,
+                    run_dir,
+                    view.as_deref(),
+                    sleep_interval,
+                    resolved_limit,
+                )?;
             } else {
+                let run_dir = run_dir.ok_or_else(|| {
+                    anyhow::anyhow!(
+                        "run is required when interactive TUI selection is unavailable; pass a run id/path or use a TTY without --once/--no-clear"
+                    )
+                })?;
+                let run_view_set = lab_analysis::run_view_set(&run_dir)?;
+                let raw_view_names = lab_analysis::list_views(&run_dir)?;
+                let resolved_view = match view.as_deref() {
+                    Some(requested) => {
+                        resolve_requested_view(run_view_set, &raw_view_names, requested)?
+                    }
+                    None => {
+                        resolve_requested_view(run_view_set, &raw_view_names, "run_progress")?
+                    }
+                };
                 // Plain text fallback (--once, --no-clear, non-TTY)
                 loop {
-                    let table =
-                        query_resolved_view(&run_dir, &resolved_view, resolved_limit)?;
+                    let table = query_resolved_view(&run_dir, &resolved_view, resolved_limit)?;
                     if !no_clear {
                         print!("\x1B[2J\x1B[H");
                         let _ = std::io::stdout().flush();
@@ -1622,7 +1648,7 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
                 println!(
                     "  - ab-test     : paired two-variant comparison (variant_a vs variant_b)"
                 );
-                println!("  - sweep       : independent parameter sweep over variant_plan");
+                println!("  - sweep       : independent parameter sweep over variants");
                 println!("  - regression  : fixed-suite pass-rate tracking over time");
                 println!("  - local-dev   : fast local iteration (single worker)");
                 println!("usage: lab init --profile <name>");
@@ -1714,8 +1740,7 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
 fn init_profile_template(profile: InitProfileArg) -> &'static str {
     match profile {
         InitProfileArg::AgentEval => {
-            "version: \"0.5\"
-experiment:
+            "experiment:
   id: my_eval
   name: My Agent Evaluation
   workload_type: agent_runtime
@@ -1723,7 +1748,7 @@ dataset:
   suite_id: local_suite
   provider: local_jsonl
   path: tasks.jsonl
-  schema_version: task_jsonl_v1
+  schema_version: task_boundary_v3
   split_id: dev
   limit: 50
 design:
@@ -1740,25 +1765,29 @@ variant_plan: []
 runtime:
   agent:
     command: [python, harness.py]
-    image: my-harness:latest
+    bundle: ./agents/my-agent-runtime.tar.gz
+    io:
+      input_arg: --input
+      output_arg: --output
+  sandbox:
+    executor: docker
+    image_source: global
+    image: ghcr.io/acme/task-sandbox:latest
+    profile: default
+    network: none
+  dependencies:
+    file_staging: []
+    services: []
   policy:
     timeout_ms: 300000
-    network:
-      mode: none
-      allowed_hosts: []
-    sandbox:
-      mode: container
-      resources:
-        cpu_count: 2
-        memory_mb: 2048
+    root_read_only: true
 validity:
   fail_on_state_leak: true
   fail_on_profile_invariant_violation: true
 "
         }
         InitProfileArg::AbTest => {
-            "version: \"0.5\"
-experiment:
+            "experiment:
   id: my_ab_test
   name: Paired Variant Comparison
   workload_type: agent_runtime
@@ -1766,7 +1795,7 @@ dataset:
   suite_id: local_suite
   provider: local_jsonl
   path: tasks.jsonl
-  schema_version: task_jsonl_v1
+  schema_version: task_boundary_v3
   split_id: dev
   limit: 100
 design:
@@ -1786,25 +1815,29 @@ variant_plan:
 runtime:
   agent:
     command: [python, harness.py]
-    image: my-harness:latest
+    bundle: ./agents/my-agent-runtime.tar.gz
+    io:
+      input_arg: --input
+      output_arg: --output
+  sandbox:
+    executor: docker
+    image_source: global
+    image: ghcr.io/acme/task-sandbox:latest
+    profile: default
+    network: none
+  dependencies:
+    file_staging: []
+    services: []
   policy:
     timeout_ms: 300000
-    network:
-      mode: none
-      allowed_hosts: []
-    sandbox:
-      mode: container
-      resources:
-        cpu_count: 2
-        memory_mb: 2048
+    root_read_only: true
 validity:
   fail_on_state_leak: true
   fail_on_profile_invariant_violation: true
 "
         }
         InitProfileArg::Sweep => {
-            "version: \"0.5\"
-experiment:
+            "experiment:
   id: my_sweep
   name: Parameter Sweep
   workload_type: agent_runtime
@@ -1812,7 +1845,7 @@ dataset:
   suite_id: local_suite
   provider: local_jsonl
   path: tasks.jsonl
-  schema_version: task_jsonl_v1
+  schema_version: task_boundary_v3
   split_id: dev
   limit: 100
 design:
@@ -1835,25 +1868,29 @@ variant_plan:
 runtime:
   agent:
     command: [python, harness.py]
-    image: my-harness:latest
+    bundle: ./agents/my-agent-runtime.tar.gz
+    io:
+      input_arg: --input
+      output_arg: --output
+  sandbox:
+    executor: docker
+    image_source: global
+    image: ghcr.io/acme/task-sandbox:latest
+    profile: default
+    network: none
+  dependencies:
+    file_staging: []
+    services: []
   policy:
     timeout_ms: 300000
-    network:
-      mode: none
-      allowed_hosts: []
-    sandbox:
-      mode: container
-      resources:
-        cpu_count: 2
-        memory_mb: 2048
+    root_read_only: true
 validity:
   fail_on_state_leak: true
   fail_on_profile_invariant_violation: true
 "
         }
         InitProfileArg::Regression => {
-            "version: \"0.5\"
-experiment:
+            "experiment:
   id: my_regression
   name: Regression Tracking
   workload_type: agent_runtime
@@ -1861,7 +1898,7 @@ dataset:
   suite_id: local_suite
   provider: local_jsonl
   path: tasks.jsonl
-  schema_version: task_jsonl_v1
+  schema_version: task_boundary_v3
   split_id: dev
   limit: 50
 design:
@@ -1878,25 +1915,29 @@ variant_plan: []
 runtime:
   agent:
     command: [python, harness.py]
-    image: my-harness:latest
+    bundle: ./agents/my-agent-runtime.tar.gz
+    io:
+      input_arg: --input
+      output_arg: --output
+  sandbox:
+    executor: docker
+    image_source: global
+    image: ghcr.io/acme/task-sandbox:latest
+    profile: default
+    network: none
+  dependencies:
+    file_staging: []
+    services: []
   policy:
     timeout_ms: 300000
-    network:
-      mode: none
-      allowed_hosts: []
-    sandbox:
-      mode: container
-      resources:
-        cpu_count: 2
-        memory_mb: 2048
+    root_read_only: true
 validity:
   fail_on_state_leak: true
   fail_on_profile_invariant_violation: true
 "
         }
         InitProfileArg::LocalDev => {
-            "version: \"0.5\"
-experiment:
+            "experiment:
   id: my_local_dev
   name: Local Development
   workload_type: agent_runtime
@@ -1904,7 +1945,7 @@ dataset:
   suite_id: local_suite
   provider: local_jsonl
   path: tasks.jsonl
-  schema_version: task_jsonl_v1
+  schema_version: task_boundary_v3
   split_id: dev
   limit: 10
 design:
@@ -1921,13 +1962,22 @@ variant_plan: []
 runtime:
   agent:
     command: [python, harness.py]
+    bundle: ./agents/my-agent-runtime.tar.gz
+    io:
+      input_arg: --input
+      output_arg: --output
+  sandbox:
+    executor: docker
+    image_source: global
+    image: ghcr.io/acme/task-sandbox:latest
+    profile: default
+    network: full
+  dependencies:
+    file_staging: []
+    services: []
   policy:
     timeout_ms: 120000
-    network:
-      mode: full
-      allowed_hosts: []
-    sandbox:
-      mode: local
+    root_read_only: false
 validity:
   fail_on_state_leak: true
   fail_on_profile_invariant_violation: true
@@ -2368,6 +2418,291 @@ fn query_resolved_view(
         return Ok(standardize_ab_table_columns(&table));
     }
     Ok(table)
+}
+
+fn run_interactive_views_browser(
+    project_root: &Path,
+    initial_run_dir: Option<PathBuf>,
+    initial_view: Option<&str>,
+    sleep_interval: Duration,
+    limit: usize,
+) -> Result<()> {
+    let mut term = tui::Term::new()?;
+    let can_return_to_run_picker = initial_run_dir.is_none();
+    let mut run_entries = collect_run_inventory(project_root)?;
+    let mut current_run_dir = initial_run_dir;
+    let mut current_view = None;
+    let mut selected_run_idx = 0usize;
+    let mut selected_view_idx = 0usize;
+
+    if let Some(run_dir) = current_run_dir.as_ref() {
+        if let Some(idx) = run_entries.iter().position(|entry| entry.run_dir == *run_dir) {
+            selected_run_idx = idx;
+        }
+        if let Some(requested_view) = initial_view {
+            let run_view_set = lab_analysis::run_view_set(run_dir)?;
+            let raw_view_names = lab_analysis::list_views(run_dir)?;
+            let resolved = resolve_requested_view(run_view_set, &raw_view_names, requested_view)?;
+            selected_view_idx = standard_views_for_set(run_view_set)
+                .iter()
+                .position(|def| def.name == resolved.name)
+                .unwrap_or(0);
+            current_view = Some(resolved);
+        }
+    }
+
+    let mut screen = match (&current_run_dir, &current_view) {
+        (Some(_), Some(_)) => ViewsBrowserScreen::Viewer,
+        (Some(_), None) => ViewsBrowserScreen::ViewPicker,
+        (None, _) => ViewsBrowserScreen::RunPicker,
+    };
+    term.set_selected(match screen {
+        ViewsBrowserScreen::RunPicker => selection_for_len(
+            selected_run_idx,
+            run_entries.iter().filter(|entry| entry.control.is_active).count(),
+        ),
+        ViewsBrowserScreen::ViewPicker => Some(selected_view_idx),
+        ViewsBrowserScreen::Viewer => Some(0),
+    });
+
+    loop {
+        match screen {
+            ViewsBrowserScreen::RunPicker => {
+                run_entries = collect_run_inventory(project_root)?;
+                let active_run_entries = run_entries
+                    .iter()
+                    .filter(|entry| entry.control.is_active)
+                    .cloned()
+                    .collect::<Vec<_>>();
+                selected_run_idx = clamp_index(
+                    if let Some(run_dir) = current_run_dir.as_ref() {
+                        active_run_entries
+                            .iter()
+                            .position(|entry| entry.run_dir == *run_dir)
+                            .unwrap_or(selected_run_idx)
+                    } else {
+                        selected_run_idx
+                    },
+                    active_run_entries.len(),
+                );
+                let run_items = build_run_browser_items(&active_run_entries);
+                term.set_selected(selection_for_len(selected_run_idx, active_run_entries.len()));
+                term.draw(&tui::Screen::RunBrowser(tui::RunBrowserState {
+                    items: &run_items,
+                    refresh_secs: sleep_interval.as_secs(),
+                }))?;
+
+                match term.poll(sleep_interval)? {
+                    tui::Action::Quit => break,
+                    tui::Action::Back => break,
+                    tui::Action::Select => {
+                        if let Some(entry) = active_run_entries.get(selected_run_idx) {
+                            current_run_dir = Some(entry.run_dir.clone());
+                            selected_view_idx = 0;
+                            screen = ViewsBrowserScreen::ViewPicker;
+                            term.set_selected(Some(0));
+                        }
+                    }
+                    tui::Action::ScrollUp => {
+                        term.scroll_up();
+                        selected_run_idx = term.selected().unwrap_or(0);
+                    }
+                    tui::Action::ScrollDown => {
+                        term.scroll_down(active_run_entries.len());
+                        selected_run_idx = term.selected().unwrap_or(0);
+                    }
+                    tui::Action::PageUp => {
+                        term.page_up();
+                        selected_run_idx = term.selected().unwrap_or(0);
+                    }
+                    tui::Action::PageDown => {
+                        term.page_down(active_run_entries.len());
+                        selected_run_idx = term.selected().unwrap_or(0);
+                    }
+                    tui::Action::Refresh | tui::Action::Tick => {}
+                }
+            }
+            ViewsBrowserScreen::ViewPicker => {
+                let run_dir = current_run_dir
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("interactive view picker requires a selected run"))?;
+                let run_entry = lookup_run_inventory(&run_entries, run_dir)
+                    .unwrap_or_else(|| inspect_run_inventory_entry(run_dir));
+                let run_view_set = lab_analysis::run_view_set(run_dir)?;
+                let standard_views = standard_views_for_set(run_view_set);
+                selected_view_idx = clamp_index(selected_view_idx, standard_views.len());
+                let view_items = build_view_browser_items(run_view_set);
+                term.set_selected(selection_for_len(selected_view_idx, standard_views.len()));
+                term.draw(&tui::Screen::ViewBrowser(tui::ViewBrowserState {
+                    run_id: &run_entry.run_id,
+                    experiment: &run_entry.experiment,
+                    started_at: &run_entry.started_at_display,
+                    status: &run_entry.control.status_display,
+                    items: &view_items,
+                    refresh_secs: sleep_interval.as_secs(),
+                }))?;
+
+                match term.poll(sleep_interval)? {
+                    tui::Action::Quit => break,
+                    tui::Action::Back => {
+                        if can_return_to_run_picker {
+                            screen = ViewsBrowserScreen::RunPicker;
+                            let active_len =
+                                run_entries.iter().filter(|entry| entry.control.is_active).count();
+                            term.set_selected(selection_for_len(selected_run_idx, active_len));
+                        } else {
+                            break;
+                        }
+                    }
+                    tui::Action::Select => {
+                        if let Some(def) = standard_views.get(selected_view_idx) {
+                            current_view = Some(resolved_view_from_def(run_view_set, def));
+                            screen = ViewsBrowserScreen::Viewer;
+                            term.set_selected(Some(0));
+                        }
+                    }
+                    tui::Action::ScrollUp => {
+                        term.scroll_up();
+                        selected_view_idx = term.selected().unwrap_or(0);
+                    }
+                    tui::Action::ScrollDown => {
+                        term.scroll_down(standard_views.len());
+                        selected_view_idx = term.selected().unwrap_or(0);
+                    }
+                    tui::Action::PageUp => {
+                        term.page_up();
+                        selected_view_idx = term.selected().unwrap_or(0);
+                    }
+                    tui::Action::PageDown => {
+                        term.page_down(standard_views.len());
+                        selected_view_idx = term.selected().unwrap_or(0);
+                    }
+                    tui::Action::Refresh | tui::Action::Tick => {}
+                }
+            }
+            ViewsBrowserScreen::Viewer => {
+                let run_dir = current_run_dir
+                    .as_ref()
+                    .ok_or_else(|| anyhow!("interactive viewer requires a selected run"))?;
+                let run_entry = lookup_run_inventory(&run_entries, run_dir)
+                    .unwrap_or_else(|| inspect_run_inventory_entry(run_dir));
+                let run_view_set = lab_analysis::run_view_set(run_dir)?;
+                let raw_view_names = lab_analysis::list_views(run_dir)?;
+                let resolved_view = match current_view.clone() {
+                    Some(view) => view,
+                    None => resolve_requested_view(run_view_set, &raw_view_names, "run_progress")?,
+                };
+                current_view = Some(resolved_view.clone());
+
+                let table = query_resolved_view(run_dir, &resolved_view, limit)?;
+                let (display, legend, split_labels) =
+                    if resolved_view.name == "trace" && has_ab_trace_columns(&table) {
+                        let (d, l, s) = prepare_trace_split_view(&table);
+                        (d, l, Some(s))
+                    } else {
+                        let (filtered, raw_legend) = elide_constant_columns(&table);
+                        let display = shorten_display_columns(&filtered);
+                        let legend: Vec<(String, String)> = raw_legend
+                            .into_iter()
+                            .map(|(k, v)| (shorten_column_name(&k), v))
+                            .collect();
+                        (display, legend, None)
+                    };
+
+                let hints = [
+                    tui::KeyHint {
+                        key: "Esc",
+                        label: "views",
+                    },
+                    tui::KeyHint {
+                        key: "q",
+                        label: "quit",
+                    },
+                    tui::KeyHint {
+                        key: "r",
+                        label: "refresh",
+                    },
+                ];
+                let split_refs = split_labels.as_ref().map(|(l, r)| (l.as_str(), r.as_str()));
+                term.draw(&tui::Screen::LiveView(tui::ViewState {
+                    run_id: &run_entry.run_id,
+                    status: &run_entry.control.status_display,
+                    started_at: &run_entry.started_at_display,
+                    view_name: &resolved_view.name,
+                    interval_secs: sleep_interval.as_secs(),
+                    table: &display,
+                    progress: read_run_progress(run_dir),
+                    legend: &legend,
+                    split_labels: split_refs,
+                    hints: &hints,
+                }))?;
+
+                match term.poll(sleep_interval)? {
+                    tui::Action::Quit => break,
+                    tui::Action::Back => {
+                        selected_view_idx = standard_views_for_set(run_view_set)
+                            .iter()
+                            .position(|def| def.name == resolved_view.name)
+                            .unwrap_or(0);
+                        screen = ViewsBrowserScreen::ViewPicker;
+                        term.set_selected(Some(selected_view_idx));
+                    }
+                    tui::Action::ScrollUp => term.scroll_up(),
+                    tui::Action::ScrollDown => term.scroll_down(display.rows.len()),
+                    tui::Action::PageUp => term.page_up(),
+                    tui::Action::PageDown => term.page_down(display.rows.len()),
+                    tui::Action::Select | tui::Action::Refresh | tui::Action::Tick => {}
+                }
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn selection_for_len(index: usize, len: usize) -> Option<usize> {
+    if len == 0 {
+        None
+    } else {
+        Some(clamp_index(index, len))
+    }
+}
+
+fn clamp_index(index: usize, len: usize) -> usize {
+    if len == 0 {
+        0
+    } else {
+        index.min(len.saturating_sub(1))
+    }
+}
+
+fn build_run_browser_items(entries: &[RunInventoryEntry]) -> Vec<tui::RunBrowserItem> {
+    entries
+        .iter()
+        .map(|entry| tui::RunBrowserItem {
+            run_id: entry.run_id.clone(),
+            experiment: display_or_dash(&entry.experiment),
+            started_at: entry.started_at_display.clone(),
+            status: entry.control.status.clone(),
+            status_detail: entry.control.status_display.clone(),
+            active_trials: entry.control.active_trials,
+        })
+        .collect()
+}
+
+fn build_view_browser_items(view_set: lab_analysis::ViewSet) -> Vec<tui::ViewBrowserItem> {
+    standard_views_for_set(view_set)
+        .iter()
+        .map(|def| tui::ViewBrowserItem {
+            name: def.name.to_string(),
+            source_view: standard_view_source_label(def).to_string(),
+            purpose: def.purpose.to_string(),
+        })
+        .collect()
+}
+
+fn lookup_run_inventory(entries: &[RunInventoryEntry], run_dir: &Path) -> Option<RunInventoryEntry> {
+    entries.iter().find(|entry| entry.run_dir == run_dir).cloned()
 }
 
 fn query_source_view(
@@ -3010,45 +3345,7 @@ fn cap_widths(natural: &[usize], budget: usize) -> Vec<usize> {
 }
 
 fn read_run_status(run_dir: &Path) -> String {
-    let Some(parsed) = load_run_control(run_dir) else {
-        return "unknown".to_string();
-    };
-    let status = parsed
-        .get("status")
-        .and_then(Value::as_str)
-        .unwrap_or("unknown")
-        .to_string();
-    let active_trials = match parsed.get("active_trials").and_then(Value::as_object) {
-        Some(active_trials) => active_trials,
-        None => return status,
-    };
-    if active_trials.is_empty() {
-        return status;
-    }
-    let mut workers = BTreeSet::new();
-    for entry in active_trials.values() {
-        if let Some(worker_id) = entry.get("worker_id").and_then(Value::as_str) {
-            workers.insert(worker_id.to_string());
-        }
-    }
-    if workers.is_empty() {
-        return format!("{} (active_trials={})", status, active_trials.len());
-    }
-    if workers.len() <= 3 {
-        let worker_list = workers.into_iter().collect::<Vec<_>>().join(",");
-        return format!(
-            "{} (active_trials={}, workers={})",
-            status,
-            active_trials.len(),
-            worker_list
-        );
-    }
-    format!(
-        "{} (active_trials={}, workers={} total)",
-        status,
-        active_trials.len(),
-        workers.len()
-    )
+    summarize_run_control(load_run_control(run_dir).as_ref()).status_display
 }
 
 fn read_run_progress(run_dir: &Path) -> Option<(usize, usize)> {
@@ -3087,7 +3384,11 @@ fn unix_now_seconds() -> u64 {
 /// with variant IDs as panel labels above each table half.
 fn prepare_trace_split_view(
     table: &lab_analysis::QueryTable,
-) -> (lab_analysis::QueryTable, Vec<(String, String)>, (String, String)) {
+) -> (
+    lab_analysis::QueryTable,
+    Vec<(String, String)>,
+    (String, String),
+) {
     let idx = |name: &str| table.columns.iter().position(|c| c == name);
     let get = |row: &[Value], col: Option<usize>| -> Value {
         col.and_then(|i| row.get(i)).cloned().unwrap_or(Value::Null)
@@ -3358,7 +3659,11 @@ fn print_query_table(table: &lab_analysis::QueryTable) {
     }
 }
 
-fn print_special_split_view(run_dir: &Path, view_name: &str, table: &lab_analysis::QueryTable) -> bool {
+fn print_special_split_view(
+    run_dir: &Path,
+    view_name: &str,
+    table: &lab_analysis::QueryTable,
+) -> bool {
     match view_name {
         "scoreboard" => {
             let meta = read_scoreboard_metadata(run_dir);
@@ -4266,166 +4571,19 @@ fn try_load_headline(run_dir: &Path) -> Option<(lab_analysis::ViewSet, lab_analy
 }
 
 fn build_runs_table(project_root: &Path) -> Result<lab_analysis::QueryTable> {
-    let runs_dir = project_root.join(".lab").join("runs");
-    if !runs_dir.exists() {
-        return Ok(lab_analysis::QueryTable {
-            columns: vec![
-                "run_id".into(),
-                "experiment".into(),
-                "created_at".into(),
-                "variants".into(),
-                "pass_rate".into(),
-            ],
-            rows: vec![],
-        });
-    }
-
-    struct RunRow {
-        run_id: String,
-        experiment: String,
-        created_at: String,
-        variants: usize,
-        pass_rate: Option<f64>,
-    }
-
-    let mut entries: Vec<RunRow> = Vec::new();
-    for entry in std::fs::read_dir(&runs_dir)? {
-        let entry = entry?;
-        if !entry.file_type()?.is_dir() {
-            continue;
-        }
-        let run_path = entry.path();
-
-        // manifest.json → run_id, created_at
-        let manifest_path = run_path.join("manifest.json");
-        let (run_id, created_at) = if manifest_path.exists() {
-            let raw = std::fs::read_to_string(&manifest_path).unwrap_or_default();
-            let val: Value = serde_json::from_str(&raw).unwrap_or(json!({}));
-            (
-                val.get("run_id")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_string(),
-                val.get("created_at")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_string(),
-            )
-        } else {
-            let dirname = entry.file_name().to_string_lossy().to_string();
-            (dirname, String::new())
-        };
-
-        // resolved_experiment.json → experiment id
-        let resolved_path = run_path.join("resolved_experiment.json");
-        let experiment = if resolved_path.exists() {
-            let raw = std::fs::read_to_string(&resolved_path).unwrap_or_default();
-            let val: Value = serde_json::from_str(&raw).unwrap_or(json!({}));
-            val.pointer("/experiment/id")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_string()
-        } else {
-            String::new()
-        };
-
-        let sqlite_path = run_path.join("run.sqlite");
-        let (variants, pass_rate) = if sqlite_path.exists() {
-            match Connection::open(&sqlite_path) {
-                Ok(conn) => {
-                    let variants = conn
-                        .query_row(
-                            "SELECT count(DISTINCT variant_id) FROM trial_rows",
-                            [],
-                            |row| row.get::<_, i64>(0),
-                        )
-                        .unwrap_or(0_i64) as usize;
-                    let baseline_id: Option<String> = conn
-                        .query_row("SELECT baseline_id FROM trial_rows LIMIT 1", [], |row| {
-                            row.get(0)
-                        })
-                        .optional()
-                        .unwrap_or(None);
-                    let pass_rate = match baseline_id {
-                        Some(baseline) => conn
-                            .query_row(
-                                "SELECT avg(CASE WHEN outcome = 'success' THEN 1.0 ELSE 0.0 END)
-                                 FROM trial_rows
-                                 WHERE variant_id = ?1",
-                                params![baseline],
-                                |row| row.get::<_, Option<f64>>(0),
-                            )
-                            .unwrap_or(None),
-                        None => None,
-                    };
-                    (variants, pass_rate)
-                }
-                Err(_) => (0, None),
-            }
-        } else {
-            let trials_facts_path = run_path.join("facts").join("trials.jsonl");
-            if trials_facts_path.exists() {
-                let raw = std::fs::read_to_string(&trials_facts_path).unwrap_or_default();
-                let mut baseline_id = String::new();
-                let mut variant_ids: BTreeSet<String> = BTreeSet::new();
-                let mut baseline_total = 0usize;
-                let mut baseline_successes = 0usize;
-                for line in raw.lines().filter(|line| !line.trim().is_empty()) {
-                    let row: Value = serde_json::from_str(line).unwrap_or(json!({}));
-                    let variant_id = row
-                        .get("variant_id")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default()
-                        .to_string();
-                    if variant_id.is_empty() {
-                        continue;
-                    }
-                    variant_ids.insert(variant_id.clone());
-                    if baseline_id.is_empty() {
-                        baseline_id = row
-                            .get("baseline_id")
-                            .and_then(Value::as_str)
-                            .unwrap_or_default()
-                            .to_string();
-                    }
-                    if !baseline_id.is_empty() && variant_id == baseline_id {
-                        baseline_total += 1;
-                        if row.get("outcome").and_then(Value::as_str) == Some("success") {
-                            baseline_successes += 1;
-                        }
-                    }
-                }
-                let pr = if baseline_total > 0 {
-                    Some(baseline_successes as f64 / baseline_total as f64)
-                } else {
-                    None
-                };
-                (variant_ids.len(), pr)
-            } else {
-                (0, None)
-            }
-        };
-
-        entries.push(RunRow {
-            run_id,
-            experiment,
-            created_at,
-            variants,
-            pass_rate,
-        });
-    }
-
-    entries.sort_by(|a, b| b.created_at.cmp(&a.created_at));
-
-    let rows: Vec<Vec<Value>> = entries
+    let entries = collect_run_inventory(project_root)?;
+    let rows = entries
         .into_iter()
-        .map(|e| {
+        .map(|entry| {
+            let metrics = read_run_metrics(&entry.run_dir);
             vec![
-                Value::String(e.run_id),
-                Value::String(e.experiment),
-                Value::String(e.created_at),
-                json!(e.variants),
-                match e.pass_rate {
+                Value::String(entry.control.status_display),
+                Value::String(entry.started_at_display),
+                Value::String(entry.run_id),
+                Value::String(display_or_dash(&entry.experiment)),
+                Value::String(entry.control.live_summary),
+                json!(metrics.variants),
+                match metrics.pass_rate {
                     Some(pr) => json!((pr * 10000.0).round() / 10000.0),
                     None => Value::Null,
                 },
@@ -4435,14 +4593,283 @@ fn build_runs_table(project_root: &Path) -> Result<lab_analysis::QueryTable> {
 
     Ok(lab_analysis::QueryTable {
         columns: vec![
+            "status".into(),
+            "started_at".into(),
             "run_id".into(),
             "experiment".into(),
-            "created_at".into(),
+            "live".into(),
             "variants".into(),
             "pass_rate".into(),
         ],
         rows,
     })
+}
+
+fn collect_run_inventory(project_root: &Path) -> Result<Vec<RunInventoryEntry>> {
+    let runs_dir = project_root.join(".lab").join("runs");
+    if !runs_dir.exists() {
+        return Ok(Vec::new());
+    }
+
+    let mut entries = Vec::new();
+    for entry in std::fs::read_dir(&runs_dir)? {
+        let entry = entry?;
+        if !entry.file_type()?.is_dir() {
+            continue;
+        }
+        entries.push(inspect_run_inventory_entry(&entry.path()));
+    }
+
+    entries.sort_by(|a, b| {
+        b.control
+            .is_active
+            .cmp(&a.control.is_active)
+            .then_with(|| b.started_at.cmp(&a.started_at))
+            .then_with(|| a.run_id.cmp(&b.run_id))
+    });
+    Ok(entries)
+}
+
+fn inspect_run_inventory_entry(run_dir: &Path) -> RunInventoryEntry {
+    let dir_name = run_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("unknown_run")
+        .to_string();
+    let manifest = read_json_file(&run_dir.join("manifest.json")).unwrap_or_else(|| json!({}));
+    let resolved = read_json_file(&run_dir.join("resolved_experiment.json"))
+        .unwrap_or_else(|| json!({}));
+
+    let run_id = manifest
+        .get("run_id")
+        .and_then(Value::as_str)
+        .unwrap_or(&dir_name)
+        .to_string();
+    let started_at = manifest
+        .get("created_at")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_string)
+        .or_else(|| timestamp_from_run_id(&run_id))
+        .unwrap_or_default();
+    let experiment = resolved
+        .pointer("/experiment/id")
+        .or_else(|| resolved.pointer("/id"))
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string();
+    let control = summarize_run_control(load_run_control(run_dir).as_ref());
+
+    RunInventoryEntry {
+        run_id,
+        run_dir: run_dir.to_path_buf(),
+        experiment,
+        started_at_display: format_timestamp_for_display(&started_at),
+        started_at,
+        control,
+    }
+}
+
+fn read_json_file(path: &Path) -> Option<Value> {
+    let raw = std::fs::read_to_string(path).ok()?;
+    serde_json::from_str(&raw).ok()
+}
+
+fn summarize_run_control(parsed: Option<&Value>) -> RunControlSummary {
+    let Some(parsed) = parsed else {
+        return RunControlSummary {
+            status: "unknown".to_string(),
+            status_display: "unknown".to_string(),
+            live_summary: "idle".to_string(),
+            active_trials: 0,
+            is_active: false,
+        };
+    };
+
+    let status = parsed
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown")
+        .to_string();
+    let active_trials_map = parsed
+        .get("active_trials")
+        .and_then(Value::as_object)
+        .cloned()
+        .unwrap_or_default();
+    let active_trials = active_trials_map.len();
+    let workers = active_trials_map
+        .values()
+        .filter_map(|entry| entry.get("worker_id").and_then(Value::as_str))
+        .map(str::to_string)
+        .collect::<BTreeSet<_>>();
+    let worker_list = workers.iter().cloned().collect::<Vec<_>>();
+    let worker_suffix = if worker_list.is_empty() {
+        None
+    } else if worker_list.len() <= 3 {
+        Some(worker_list.join(","))
+    } else {
+        Some(format!("{} total", worker_list.len()))
+    };
+
+    let status_display = if active_trials == 0 {
+        status.clone()
+    } else if let Some(worker_text) = worker_suffix.as_deref() {
+        format!(
+            "{} (active_trials={}, workers={})",
+            status, active_trials, worker_text
+        )
+    } else {
+        format!("{} (active_trials={})", status, active_trials)
+    };
+    let live_summary = if active_trials == 0 {
+        "idle".to_string()
+    } else if worker_list.is_empty() {
+        format!("{} active", active_trials)
+    } else if worker_list.len() <= 3 {
+        format!("{} active / {}", active_trials, worker_list.join(","))
+    } else {
+        format!("{} active / {} workers", active_trials, worker_list.len())
+    };
+    let is_active = matches!(status.as_str(), "running" | "paused") || active_trials > 0;
+
+    RunControlSummary {
+        status,
+        status_display,
+        live_summary,
+        active_trials,
+        is_active,
+    }
+}
+
+fn read_run_metrics(run_dir: &Path) -> RunMetrics {
+    let sqlite_path = run_dir.join("run.sqlite");
+    if sqlite_path.exists() {
+        if let Ok(conn) = Connection::open(&sqlite_path) {
+            let variants = conn
+                .query_row(
+                    "SELECT count(DISTINCT variant_id) FROM trial_rows",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap_or(0_i64) as usize;
+            let baseline_id: Option<String> = conn
+                .query_row("SELECT baseline_id FROM trial_rows LIMIT 1", [], |row| row.get(0))
+                .optional()
+                .unwrap_or(None);
+            let pass_rate = match baseline_id {
+                Some(baseline) => conn
+                    .query_row(
+                        "SELECT avg(CASE WHEN outcome = 'success' THEN 1.0 ELSE 0.0 END)
+                         FROM trial_rows
+                         WHERE variant_id = ?1",
+                        params![baseline],
+                        |row| row.get::<_, Option<f64>>(0),
+                    )
+                    .unwrap_or(None),
+                None => None,
+            };
+            return RunMetrics {
+                variants,
+                pass_rate,
+            };
+        }
+    }
+
+    let trials_facts_path = run_dir.join("facts").join("trials.jsonl");
+    if !trials_facts_path.exists() {
+        return RunMetrics {
+            variants: 0,
+            pass_rate: None,
+        };
+    }
+
+    let raw = std::fs::read_to_string(&trials_facts_path).unwrap_or_default();
+    let mut baseline_id = String::new();
+    let mut variant_ids: BTreeSet<String> = BTreeSet::new();
+    let mut baseline_total = 0usize;
+    let mut baseline_successes = 0usize;
+    for line in raw.lines().filter(|line| !line.trim().is_empty()) {
+        let row: Value = serde_json::from_str(line).unwrap_or(json!({}));
+        let variant_id = row
+            .get("variant_id")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        if variant_id.is_empty() {
+            continue;
+        }
+        variant_ids.insert(variant_id.clone());
+        if baseline_id.is_empty() {
+            baseline_id = row
+                .get("baseline_id")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string();
+        }
+        if !baseline_id.is_empty() && variant_id == baseline_id {
+            baseline_total += 1;
+            if row.get("outcome").and_then(Value::as_str) == Some("success") {
+                baseline_successes += 1;
+            }
+        }
+    }
+
+    RunMetrics {
+        variants: variant_ids.len(),
+        pass_rate: if baseline_total > 0 {
+            Some(baseline_successes as f64 / baseline_total as f64)
+        } else {
+            None
+        },
+    }
+}
+
+fn format_timestamp_for_display(value: &str) -> String {
+    if value.trim().is_empty() {
+        return "unknown".to_string();
+    }
+    let display = value.replacen('T', " ", 1).trim().to_string();
+    if let Some(prefix) = display.strip_suffix("+00:00") {
+        format!("{}Z", prefix)
+    } else {
+        display
+    }
+}
+
+fn timestamp_from_run_id(run_id: &str) -> Option<String> {
+    let rest = run_id.strip_prefix("run_")?;
+    let mut parts = rest.split('_');
+    let date = parts.next()?;
+    let time = parts.next()?;
+    let micros = parts.next()?;
+    if date.len() != 8
+        || time.len() != 6
+        || micros.len() != 6
+        || !date.chars().all(|ch| ch.is_ascii_digit())
+        || !time.chars().all(|ch| ch.is_ascii_digit())
+        || !micros.chars().all(|ch| ch.is_ascii_digit())
+    {
+        return None;
+    }
+
+    Some(format!(
+        "{}-{}-{} {}:{}:{}.{}",
+        &date[0..4],
+        &date[4..6],
+        &date[6..8],
+        &time[0..2],
+        &time[2..4],
+        &time[4..6],
+        micros
+    ))
+}
+
+fn display_or_dash(value: &str) -> String {
+    if value.trim().is_empty() {
+        "-".to_string()
+    } else {
+        value.to_string()
+    }
 }
 
 fn write_knob_files(
@@ -4482,9 +4909,9 @@ fn write_knob_files(
       "scientific_role": "control"
     },
     {
-      "id": "runtime.policy.network.mode",
+      "id": "runtime.sandbox.network",
       "label": "Network Mode",
-      "json_pointer": "/runtime/policy/network/mode",
+      "json_pointer": "/runtime/sandbox/network",
       "type": "string",
       "options": ["none", "full", "allowlist_enforced"],
       "role": "infra",
@@ -4499,9 +4926,18 @@ fn write_knob_files(
       "scientific_role": "treatment"
     },
     {
-      "id": "runtime.agent.image",
-      "label": "Agent Image",
-      "json_pointer": "/runtime/agent/image",
+      "id": "runtime.agent.bundle",
+      "label": "Agent Bundle",
+      "json_pointer": "/runtime/agent/bundle",
+      "type": "string",
+      "role": "infra",
+      "scientific_role": "treatment",
+      "autotune": { "enabled": false, "requires_human_approval": true }
+    },
+    {
+      "id": "runtime.sandbox.image",
+      "label": "Sandbox Image",
+      "json_pointer": "/runtime/sandbox/image",
       "type": "string",
       "role": "infra",
       "scientific_role": "treatment",
@@ -4563,7 +4999,10 @@ mod tests {
         let err = enforce_cli_binary_freshness(
             &exe_path,
             exe_mtime,
-            Some((src_mtime, PathBuf::from("/repo/rust/crates/lab-runner/src/lib.rs"))),
+            Some((
+                src_mtime,
+                PathBuf::from("/repo/rust/crates/lab-runner/src/lib.rs"),
+            )),
         )
         .expect_err("stale binary should be rejected");
         let msg = err.to_string();
@@ -4579,7 +5018,10 @@ mod tests {
         enforce_cli_binary_freshness(
             &exe_path,
             exe_mtime,
-            Some((src_mtime, PathBuf::from("/repo/rust/crates/lab-runner/src/lib.rs"))),
+            Some((
+                src_mtime,
+                PathBuf::from("/repo/rust/crates/lab-runner/src/lib.rs"),
+            )),
         )
         .expect("fresh binary should pass");
     }
@@ -4734,6 +5176,66 @@ mod tests {
             status,
             "running (active_trials=2, workers=worker_1,worker_2)"
         );
+
+        let _ = std::fs::remove_dir_all(&run_dir);
+    }
+
+    #[test]
+    fn summarize_run_control_exposes_live_summary_and_activity_flag() {
+        let control = json!({
+            "schema_version": "run_control_v2",
+            "run_id": "run_1",
+            "status": "running",
+            "active_trials": {
+                "trial_1": {
+                    "trial_id": "trial_1",
+                    "worker_id": "worker_a",
+                    "schedule_idx": 0,
+                    "variant_id": "base",
+                    "started_at": "2026-03-09T17:00:00Z",
+                    "control": null
+                }
+            },
+            "updated_at": "2026-03-09T17:00:02Z"
+        });
+
+        let summary = summarize_run_control(Some(&control));
+        assert_eq!(summary.status, "running");
+        assert_eq!(summary.active_trials, 1);
+        assert_eq!(summary.status_display, "running (active_trials=1, workers=worker_a)");
+        assert_eq!(summary.live_summary, "1 active / worker_a");
+        assert!(summary.is_active);
+    }
+
+    #[test]
+    fn inspect_run_inventory_entry_reads_manifest_timestamp_and_experiment() {
+        let run_dir = temp_dir("inventory_entry");
+        std::fs::create_dir_all(&run_dir).expect("run dir");
+        std::fs::write(
+            run_dir.join("manifest.json"),
+            r#"{
+  "schema_version": "manifest_v1",
+  "run_id": "run_123",
+  "created_at": "2026-03-09T17:33:12Z"
+}"#,
+        )
+        .expect("manifest");
+        std::fs::write(
+            run_dir.join("resolved_experiment.json"),
+            r#"{
+  "experiment": {
+    "id": "exp_browser"
+  }
+}"#,
+        )
+        .expect("resolved");
+
+        let entry = inspect_run_inventory_entry(&run_dir);
+        assert_eq!(entry.run_id, "run_123");
+        assert_eq!(entry.experiment, "exp_browser");
+        assert_eq!(entry.started_at, "2026-03-09T17:33:12Z");
+        assert_eq!(entry.started_at_display, "2026-03-09 17:33:12Z");
+        assert_eq!(entry.control.status, "unknown");
 
         let _ = std::fs::remove_dir_all(&run_dir);
     }

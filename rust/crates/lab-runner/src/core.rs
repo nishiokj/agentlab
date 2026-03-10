@@ -11,8 +11,7 @@ use lab_core::{
     AGENTLAB_ENV_REPL_IDX, AGENTLAB_ENV_RESULT_PATH, AGENTLAB_ENV_RUN_ID, AGENTLAB_ENV_TASK_ID,
     AGENTLAB_ENV_TASK_PATH, AGENTLAB_ENV_TIMEOUT_MS, AGENTLAB_ENV_TRAJECTORY_PATH,
     AGENTLAB_ENV_TRIAL_ID, AGENTLAB_ENV_VARIANT_ID, AGENTLAB_POLICY_PATH, AGENTLAB_RESULT_PATH,
-    AGENTLAB_TASK_PATH, AGENTLAB_TRAJECTORY_PATH, HARNESS_IN_DIR,
-    HARNESS_OUT_DIR, HARNESS_RESULT_PATH, HARNESS_TASK_PATH,
+    AGENTLAB_TASK_PATH, AGENTLAB_TRAJECTORY_PATH,
 };
 use lab_hooks::{load_manifest, validate_hooks};
 use lab_provenance::{default_attestation, write_attestation};
@@ -574,12 +573,12 @@ impl WorkerBackend for LocalThreadWorkerBackend {
                     worker_id
                 )
             })?;
-        Ok(WorkerPauseAck {
-            worker_id: worker_id.to_string(),
-            trial_id: ticket.trial_id.clone(),
-            label: label.to_string(),
-            accepted: true,
-        })
+        Err(anyhow!(
+            "local worker backend does not support pause for active worker {} (trial {} label {})",
+            worker_id,
+            ticket.trial_id,
+            label
+        ))
     }
 
     fn request_stop(&self, worker_id: &str, reason: &str) -> Result<()> {
@@ -599,7 +598,11 @@ impl WorkerBackend for LocalThreadWorkerBackend {
                     reason
                 )
             })?;
-        Ok(())
+        Err(anyhow!(
+            "local worker backend does not support stop for active worker {} (reason: {})",
+            worker_id,
+            reason
+        ))
     }
 }
 

@@ -22,23 +22,21 @@ impl TaskBoundaryLimits {
 #[derive(Debug, Clone)]
 struct TaskBoundaryMaterialization {
     task_payload: Value,
-    workspace_seed: Option<WorkspaceSeedSpec>,
-    workspace_files: Vec<WorkspaceFileSpec>,
-    mount_references: Vec<MountReferenceSpec>,
+    environment: TaskEnvironmentSpec,
+    workspace: WorkspaceSpec,
     limits: TaskBoundaryLimits,
-    task_image: Option<String>,
+    task_image: String,
 }
-
 
 fn parse_task_boundary_from_dataset_task(task: &Value) -> Result<TaskBoundaryMaterialization> {
     let obj = task
         .as_object()
         .ok_or_else(|| anyhow!("task boundary must be an object"))?;
     let schema_version = obj.get("schema_version").and_then(|v| v.as_str());
-    if schema_version != Some(TASK_BOUNDARY_V2_SCHEMA_VERSION) {
+    if schema_version != Some(TASK_BOUNDARY_V3_SCHEMA_VERSION) {
         return Err(anyhow!(
             "task boundary schema_version must be '{}' (got {:?})",
-            TASK_BOUNDARY_V2_SCHEMA_VERSION,
+            TASK_BOUNDARY_V3_SCHEMA_VERSION,
             schema_version
         ));
     }
@@ -46,15 +44,14 @@ fn parse_task_boundary_from_dataset_task(task: &Value) -> Result<TaskBoundaryMat
     let allowed = [
         "schema_version",
         "task",
-        "workspace_seed",
-        "workspace_files",
-        "mount_references",
+        "environment",
+        "workspace",
         "limits",
     ];
     for key in obj.keys() {
         if !allowed.contains(&key.as_str()) {
             return Err(anyhow!(
-                "task boundary contains unsupported key '{}'; expected task + workspace_seed + workspace_files + mount_references + limits",
+                "task boundary contains unsupported key '{}'; expected schema_version + task + environment + workspace + limits",
                 key
             ));
         }
@@ -67,25 +64,24 @@ fn parse_task_boundary_from_dataset_task(task: &Value) -> Result<TaskBoundaryMat
     if !task_payload.is_object() {
         return Err(anyhow!("task boundary field 'task' must be an object"));
     }
-    let task_image = task_payload
-        .pointer("/image")
-        .and_then(|v| v.as_str())
-        .map(str::trim)
-        .filter(|v| !v.is_empty())
-        .map(ToString::to_string);
-    if task_payload.get("image").is_some() && task_image.is_none() {
+    if task_payload.get("image").is_some() {
         return Err(anyhow!(
-            "task boundary field 'task.image' must be a non-empty string when provided"
+            "task boundary field 'task.image' was removed; use environment.image"
+        ));
+    }
+    if task_payload.get("workspace").is_some() {
+        return Err(anyhow!(
+            "task boundary field 'task.workspace' was removed; sandbox topology is runner-owned"
         ));
     }
 
+    let environment = parse_task_environment(obj.get("environment"))?;
     Ok(TaskBoundaryMaterialization {
         task_payload,
-        workspace_seed: parse_workspace_seed(obj.get("workspace_seed"))?,
-        workspace_files: parse_workspace_files(obj.get("workspace_files"))?,
-        mount_references: parse_mount_references(obj.get("mount_references"))?,
+        task_image: environment.image.clone(),
+        environment,
+        workspace: parse_workspace_spec(obj.get("workspace"))?,
         limits: parse_task_limits(obj.get("limits"))?,
-        task_image,
     })
 }
 
@@ -95,18 +91,18 @@ fn parse_task_boundary_from_trial_input(input: &Value) -> Result<TaskBoundaryMat
             return Err(anyhow!("trial_input /task must be an object"));
         }
         let ext = input
-            .pointer("/ext/task_boundary_v2")
-            .ok_or_else(|| anyhow!("trial_input /ext/task_boundary_v2 is required"))?;
+            .pointer("/ext/task_boundary_v3")
+            .ok_or_else(|| anyhow!("trial_input /ext/task_boundary_v3 is required"))?;
         parse_task_boundary_ext(ext, task_payload)
     } else if input.is_object() {
         if input.get("schema_version").and_then(|v| v.as_str())
-            == Some(TASK_BOUNDARY_V2_SCHEMA_VERSION)
+            == Some(TASK_BOUNDARY_V3_SCHEMA_VERSION)
         {
             parse_task_boundary_from_dataset_task(input)
         } else {
             Err(anyhow!(
-                "trial_input must provide '/task' + '/ext/task_boundary_v2' or be a '{}' object",
-                TASK_BOUNDARY_V2_SCHEMA_VERSION
+                "trial_input must provide '/task' + '/ext/task_boundary_v3' or be a '{}' object",
+                TASK_BOUNDARY_V3_SCHEMA_VERSION
             ))
         }
     } else {
@@ -120,65 +116,51 @@ fn parse_task_boundary_ext(
 ) -> Result<TaskBoundaryMaterialization> {
     let obj = ext
         .as_object()
-        .ok_or_else(|| anyhow!("trial_input /ext/task_boundary_v2 must be an object"))?;
+        .ok_or_else(|| anyhow!("trial_input /ext/task_boundary_v3 must be an object"))?;
     let schema_version = obj.get("schema_version").and_then(|v| v.as_str());
-    if schema_version != Some(TASK_BOUNDARY_V2_SCHEMA_VERSION) {
+    if schema_version != Some(TASK_BOUNDARY_V3_SCHEMA_VERSION) {
         return Err(anyhow!(
-            "trial_input /ext/task_boundary_v2 schema_version must be '{}'",
-            TASK_BOUNDARY_V2_SCHEMA_VERSION
+            "trial_input /ext/task_boundary_v3 schema_version must be '{}'",
+            TASK_BOUNDARY_V3_SCHEMA_VERSION
         ));
     }
-    let allowed = [
-        "schema_version",
-        "workspace_seed",
-        "workspace_files",
-        "mount_references",
-        "limits",
-    ];
+    let allowed = ["schema_version", "environment", "workspace", "limits"];
     for key in obj.keys() {
         if !allowed.contains(&key.as_str()) {
             return Err(anyhow!(
-                "trial_input /ext/task_boundary_v2 contains unsupported key '{}'",
+                "trial_input /ext/task_boundary_v3 contains unsupported key '{}'",
                 key
             ));
         }
     }
-    let task_image = task_payload
-        .pointer("/image")
-        .and_then(|v| v.as_str())
-        .map(str::trim)
-        .filter(|v| !v.is_empty())
-        .map(ToString::to_string);
-    if task_payload.get("image").is_some() && task_image.is_none() {
+    if task_payload.get("image").is_some() {
         return Err(anyhow!(
-            "trial_input /task.image must be a non-empty string when provided"
+            "trial_input /task.image was removed; use /ext/task_boundary_v3/environment.image"
+        ));
+    }
+    if task_payload.get("workspace").is_some() {
+        return Err(anyhow!(
+            "trial_input /task.workspace was removed; sandbox topology is runner-owned"
         ));
     }
 
+    let environment = parse_task_environment(obj.get("environment"))?;
     Ok(TaskBoundaryMaterialization {
         task_payload,
-        workspace_seed: parse_workspace_seed(obj.get("workspace_seed"))?,
-        workspace_files: parse_workspace_files(obj.get("workspace_files"))?,
-        mount_references: parse_mount_references(obj.get("mount_references"))?,
+        task_image: environment.image.clone(),
+        environment,
+        workspace: parse_workspace_spec(obj.get("workspace"))?,
         limits: parse_task_limits(obj.get("limits"))?,
-        task_image,
     })
 }
 
 fn validate_task_boundary_workspace_materialization(
     task_boundary: &TaskBoundaryMaterialization,
-    task_boundary_policy: &TaskBoundaryPolicy,
-    image_source: ImageSource,
 ) -> Result<()> {
-    let require_materialization = task_boundary_policy.require_workspace_materialization
-        || image_source == ImageSource::PerTask;
-    if !require_materialization {
+    if task_boundary.workspace.mode != WorkspaceMode::Patch {
         return Ok(());
     }
-    if task_boundary.workspace_seed.is_some()
-        || !task_boundary.workspace_files.is_empty()
-        || !task_boundary.mount_references.is_empty()
-    {
+    if task_boundary.workspace.base.kind != WorkspaceBaseKind::Empty {
         return Ok(());
     }
     let task_id = task_boundary
@@ -187,62 +169,105 @@ fn validate_task_boundary_workspace_materialization(
         .and_then(|v| v.as_str())
         .unwrap_or("<unknown_task>");
     Err(anyhow!(
-        "task '{}' is missing required workspace materialization: provide task boundary workspace_seed, workspace_files, or mount_references",
+        "task '{}' uses workspace.mode='patch' but workspace.base.kind='empty'; patch tasks require a real base (dataset_pack or git_checkout)",
         task_id
     ))
 }
 
-fn parse_workspace_files(value: Option<&Value>) -> Result<Vec<WorkspaceFileSpec>> {
-    let Some(raw) = value else {
-        return Ok(Vec::new());
-    };
-    let arr = raw
-        .as_array()
-        .ok_or_else(|| anyhow!("task boundary workspace_files must be an array"))?;
+fn parse_task_environment(value: Option<&Value>) -> Result<TaskEnvironmentSpec> {
+    let raw = value.ok_or_else(|| anyhow!("task boundary missing field: environment"))?;
+    let environment: TaskEnvironmentSpec =
+        serde_json::from_value(raw.clone()).map_err(|e| anyhow!("invalid environment: {}", e))?;
+    if environment.image.trim().is_empty() {
+        return Err(anyhow!("environment.image must be a non-empty string"));
+    }
+    Ok(environment)
+}
 
-    let mut files = Vec::with_capacity(arr.len());
-    for (idx, item) in arr.iter().enumerate() {
-        let file: WorkspaceFileSpec = serde_json::from_value(item.clone())
-            .map_err(|e| anyhow!("invalid workspace_files[{}]: {}", idx, e))?;
-        let _ = validate_workspace_relative_path(&file.path).map_err(|e| {
+fn validate_workspace_base(base: &WorkspaceBaseSpec) -> Result<()> {
+    match base.kind {
+        WorkspaceBaseKind::Empty => {
+            if base.dataset_pack_ref.is_some() || base.repo.is_some() || base.commit.is_some() {
+                return Err(anyhow!(
+                    "workspace.base.kind='empty' does not allow dataset_pack_ref, repo, or commit"
+                ));
+            }
+        }
+        WorkspaceBaseKind::DatasetPack => {
+            let dataset_pack_ref = base.dataset_pack_ref.as_deref().ok_or_else(|| {
+                anyhow!("workspace.base.dataset_pack_ref is required for dataset_pack")
+            })?;
+            let _ = parse_dataset_pack_ref_digest(dataset_pack_ref).map_err(|e| {
+                anyhow!(
+                    "invalid workspace.base.dataset_pack_ref '{}': {}",
+                    dataset_pack_ref,
+                    e
+                )
+            })?;
+            if base.repo.is_some() || base.commit.is_some() {
+                return Err(anyhow!(
+                    "workspace.base.kind='dataset_pack' does not allow repo or commit"
+                ));
+            }
+        }
+        WorkspaceBaseKind::GitCheckout => {
+            let repo = base
+                .repo
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| anyhow!("workspace.base.repo is required for git_checkout"))?;
+            let commit = base
+                .commit
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| anyhow!("workspace.base.commit is required for git_checkout"))?;
+            if repo.starts_with('/') {
+                return Err(anyhow!(
+                    "workspace.base.repo must be a repo identifier, not a path"
+                ));
+            }
+            if commit.contains(char::is_whitespace) {
+                return Err(anyhow!("workspace.base.commit must not contain whitespace"));
+            }
+            if base.dataset_pack_ref.is_some() {
+                return Err(anyhow!(
+                    "workspace.base.kind='git_checkout' does not allow dataset_pack_ref"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn parse_workspace_spec(value: Option<&Value>) -> Result<WorkspaceSpec> {
+    let raw = value.ok_or_else(|| anyhow!("task boundary missing field: workspace"))?;
+    let workspace: WorkspaceSpec =
+        serde_json::from_value(raw.clone()).map_err(|e| anyhow!("invalid workspace: {}", e))?;
+    validate_workspace_base(&workspace.base)?;
+    for (idx, overlay) in workspace.overlays.iter().enumerate() {
+        let _ = validate_workspace_relative_path(&overlay.path).map_err(|e| {
             anyhow!(
-                "invalid workspace_files[{}].path '{}': {}",
+                "invalid workspace.overlays[{}].path '{}': {}",
                 idx,
-                file.path,
+                overlay.path,
                 e
             )
         })?;
-        if let Some(encoding) = file.encoding.as_deref() {
+        if let Some(encoding) = overlay.encoding.as_deref() {
             if encoding != "utf8" && encoding != "base64" {
                 return Err(anyhow!(
-                    "workspace_files[{}].encoding must be 'utf8' or 'base64'",
+                    "workspace.overlays[{}].encoding must be 'utf8' or 'base64'",
                     idx
                 ));
             }
         }
-        files.push(file);
     }
-    Ok(files)
-}
-
-fn parse_mount_references(value: Option<&Value>) -> Result<Vec<MountReferenceSpec>> {
-    let Some(raw) = value else {
-        return Ok(Vec::new());
-    };
-    let arr = raw
-        .as_array()
-        .ok_or_else(|| anyhow!("task boundary mount_references must be an array"))?;
-
-    let mut mounts = Vec::with_capacity(arr.len());
-    for (idx, item) in arr.iter().enumerate() {
-        let mount: MountReferenceSpec = serde_json::from_value(item.clone())
-            .map_err(|e| anyhow!("invalid mount_references[{}]: {}", idx, e))?;
-        if !mount.read_only {
-            return Err(anyhow!("mount_references[{}].read_only must be true", idx));
-        }
+    for (idx, mount) in workspace.aux_mounts.iter().enumerate() {
         validate_container_workspace_path(&mount.mount_path).map_err(|e| {
             anyhow!(
-                "invalid mount_references[{}].mount_path '{}': {}",
+                "invalid workspace.aux_mounts[{}].mount_path '{}': {}",
                 idx,
                 mount.mount_path,
                 e
@@ -250,31 +275,14 @@ fn parse_mount_references(value: Option<&Value>) -> Result<Vec<MountReferenceSpe
         })?;
         let _ = parse_dataset_pack_ref_digest(&mount.dataset_pack_ref).map_err(|e| {
             anyhow!(
-                "invalid mount_references[{}].dataset_pack_ref '{}': {}",
+                "invalid workspace.aux_mounts[{}].dataset_pack_ref '{}': {}",
                 idx,
                 mount.dataset_pack_ref,
                 e
             )
         })?;
-        mounts.push(mount);
     }
-    Ok(mounts)
-}
-
-fn parse_workspace_seed(value: Option<&Value>) -> Result<Option<WorkspaceSeedSpec>> {
-    let Some(raw) = value else {
-        return Ok(None);
-    };
-    let seed: WorkspaceSeedSpec = serde_json::from_value(raw.clone())
-        .map_err(|e| anyhow!("invalid workspace_seed: {}", e))?;
-    let _ = parse_dataset_pack_ref_digest(&seed.dataset_pack_ref).map_err(|e| {
-        anyhow!(
-            "invalid workspace_seed.dataset_pack_ref '{}': {}",
-            seed.dataset_pack_ref,
-            e
-        )
-    })?;
-    Ok(Some(seed))
+    Ok(workspace)
 }
 
 fn parse_task_limits(value: Option<&Value>) -> Result<TaskBoundaryLimits> {
@@ -371,19 +379,19 @@ fn resolve_dataset_pack_host_path(project_root: &Path, dataset_pack_ref: &str) -
     Ok(path)
 }
 
-fn resolve_task_mounts(
+fn resolve_workspace_aux_mounts(
     project_root: &Path,
-    mount_references: &[MountReferenceSpec],
+    aux_mounts: &[WorkspaceAuxMountSpec],
     container_mode: bool,
 ) -> Result<Vec<ResolvedMountReference>> {
-    if mount_references.is_empty() {
+    if aux_mounts.is_empty() {
         return Ok(Vec::new());
     }
     if !container_mode {
-        return Err(anyhow!("task mount_references require container executor"));
+        return Err(anyhow!("workspace.aux_mounts require container executor"));
     }
-    let mut mounts = Vec::with_capacity(mount_references.len());
-    for mount in mount_references {
+    let mut mounts = Vec::with_capacity(aux_mounts.len());
+    for mount in aux_mounts {
         let host_path = resolve_dataset_pack_host_path(project_root, &mount.dataset_pack_ref)?;
         mounts.push(ResolvedMountReference {
             host_path,
@@ -393,34 +401,189 @@ fn resolve_task_mounts(
     Ok(mounts)
 }
 
-fn materialize_workspace_seed(
+fn git_repo_cache_dir(project_root: &Path, repo: &str) -> PathBuf {
+    project_root
+        .join(".lab")
+        .join("git_checkouts")
+        .join(sanitize_for_fs(repo))
+}
+
+fn git_checkout_clone_url(repo: &str) -> String {
+    if repo.contains("://") || repo.starts_with("git@") {
+        repo.to_string()
+    } else {
+        format!("https://github.com/{}.git", repo.trim_end_matches(".git"))
+    }
+}
+
+fn git_commit_available(repo_dir: &Path, commit: &str) -> Result<bool> {
+    let output = Command::new("git")
+        .args([
+            "-C",
+            repo_dir.to_string_lossy().as_ref(),
+            "rev-parse",
+            "--verify",
+            &format!("{}^{{commit}}", commit),
+        ])
+        .output()?;
+    Ok(output.status.success())
+}
+
+fn ensure_git_checkout_cache(project_root: &Path, repo: &str, commit: &str) -> Result<PathBuf> {
+    let cache_dir = git_repo_cache_dir(project_root, repo);
+    if !cache_dir.exists() {
+        if let Some(parent) = cache_dir.parent() {
+            ensure_dir(parent)?;
+        }
+        let clone_url = git_checkout_clone_url(repo);
+        let mut clone = Command::new("git");
+        clone.args([
+            "clone",
+            "--filter=blob:none",
+            "--no-checkout",
+            clone_url.as_str(),
+            cache_dir.to_string_lossy().as_ref(),
+        ]);
+        run_checked_command(
+            clone,
+            &format!("failed to clone workspace.base git repo '{}'", repo),
+        )?;
+    }
+    if !git_commit_available(&cache_dir, commit)? {
+        let mut fetch = Command::new("git");
+        fetch.args([
+            "-C",
+            cache_dir.to_string_lossy().as_ref(),
+            "fetch",
+            "--depth",
+            "1",
+            "origin",
+            commit,
+        ]);
+        run_checked_command(
+            fetch,
+            &format!(
+                "failed to fetch commit '{}' for workspace.base repo '{}'",
+                commit, repo
+            ),
+        )?;
+    }
+    Ok(cache_dir)
+}
+
+fn materialize_workspace_git_checkout(
     project_root: &Path,
     paths: &TrialPaths,
-    workspace_seed: Option<&WorkspaceSeedSpec>,
+    repo: &str,
+    commit: &str,
 ) -> Result<()> {
-    let Some(seed) = workspace_seed else {
-        return Ok(());
-    };
-    let source = resolve_dataset_pack_host_path(project_root, &seed.dataset_pack_ref)?;
-    if !source.is_dir() {
-        return Err(anyhow!(
-            "workspace_seed dataset pack must resolve to a directory: {}",
-            source.display()
+    let cache_dir = ensure_git_checkout_cache(project_root, repo, commit)?;
+    let staging_dir = project_root
+        .join(".lab")
+        .join("git_checkout_staging")
+        .join(format!(
+            "{}_{}_{}",
+            sanitize_for_fs(repo),
+            sanitize_for_fs(commit),
+            Utc::now().timestamp_micros()
         ));
+    if staging_dir.exists() {
+        let _ = fs::remove_dir_all(&staging_dir);
     }
+    if let Some(parent) = staging_dir.parent() {
+        ensure_dir(parent)?;
+    }
+
+    let mut clone = Command::new("git");
+    clone.args([
+        "clone",
+        "--shared",
+        "--no-checkout",
+        cache_dir.to_string_lossy().as_ref(),
+        staging_dir.to_string_lossy().as_ref(),
+    ]);
+    run_checked_command(
+        clone,
+        &format!(
+            "failed to stage workspace.base git checkout '{}' at '{}'",
+            repo, commit
+        ),
+    )?;
+
+    let mut checkout = Command::new("git");
+    checkout.args([
+        "-C",
+        staging_dir.to_string_lossy().as_ref(),
+        "checkout",
+        "--force",
+        commit,
+    ]);
+    if let Err(err) = run_checked_command(
+        checkout,
+        &format!(
+            "failed to checkout workspace.base commit '{}' for repo '{}'",
+            commit, repo
+        ),
+    ) {
+        let _ = fs::remove_dir_all(&staging_dir);
+        return Err(err);
+    }
+
     if paths.workspace.exists() {
         fs::remove_dir_all(&paths.workspace)?;
     }
     ensure_dir(&paths.workspace)?;
-    copy_dir_filtered(&source, &paths.workspace, &[])?;
+    let result = copy_dir_filtered(&staging_dir, &paths.workspace, &[".git"]);
+    let _ = fs::remove_dir_all(&staging_dir);
+    result?;
     Ok(())
 }
 
-fn materialize_workspace_files(
+fn materialize_workspace_base(
+    project_root: &Path,
     paths: &TrialPaths,
-    workspace_files: &[WorkspaceFileSpec],
+    base: &WorkspaceBaseSpec,
 ) -> Result<()> {
-    for file in workspace_files {
+    if paths.workspace.exists() {
+        fs::remove_dir_all(&paths.workspace)?;
+    }
+    ensure_dir(&paths.workspace)?;
+    match base.kind {
+        WorkspaceBaseKind::Empty => Ok(()),
+        WorkspaceBaseKind::DatasetPack => {
+            let dataset_pack_ref = base
+                .dataset_pack_ref
+                .as_deref()
+                .ok_or_else(|| anyhow!("workspace.base.dataset_pack_ref missing"))?;
+            let source = resolve_dataset_pack_host_path(project_root, dataset_pack_ref)?;
+            if !source.is_dir() {
+                return Err(anyhow!(
+                    "workspace.base dataset pack must resolve to a directory: {}",
+                    source.display()
+                ));
+            }
+            copy_dir_filtered(&source, &paths.workspace, &[])?;
+            Ok(())
+        }
+        WorkspaceBaseKind::GitCheckout => {
+            let repo = base
+                .repo
+                .as_deref()
+                .ok_or_else(|| anyhow!("workspace.base.repo missing"))?;
+            let commit = base
+                .commit
+                .as_deref()
+                .ok_or_else(|| anyhow!("workspace.base.commit missing"))?;
+            materialize_workspace_git_checkout(project_root, paths, repo, commit)
+        }
+    }
+}
+
+fn materialize_workspace_overlays(
+    paths: &TrialPaths,
+    workspace_overlays: &[WorkspaceOverlaySpec],
+) -> Result<()> {
+    for file in workspace_overlays {
         let rel = validate_workspace_relative_path(&file.path)?;
         let host_path = paths.workspace.join(rel);
         let bytes = match file.encoding.as_deref() {
@@ -429,14 +592,14 @@ fn materialize_workspace_files(
                 .decode(file.content.as_bytes())
                 .map_err(|e| {
                     anyhow!(
-                        "failed to decode base64 workspace file '{}': {}",
+                        "failed to decode base64 workspace overlay '{}': {}",
                         file.path,
                         e
                     )
                 })?,
             Some(other) => {
                 return Err(anyhow!(
-                    "unsupported workspace file encoding '{}' for '{}'",
+                    "unsupported workspace overlay encoding '{}' for '{}'",
                     other,
                     file.path
                 ));
@@ -559,16 +722,12 @@ fn stage_workspace_patches_for_trial(
 }
 
 fn task_boundary_ext_value(task_boundary: &TaskBoundaryMaterialization) -> Value {
-    let mut ext = json!({
-        "schema_version": TASK_BOUNDARY_V2_SCHEMA_VERSION,
-        "workspace_files": task_boundary.workspace_files,
-        "mount_references": task_boundary.mount_references,
+    json!({
+        "schema_version": TASK_BOUNDARY_V3_SCHEMA_VERSION,
+        "environment": task_boundary.environment,
+        "workspace": task_boundary.workspace,
         "limits": task_boundary.limits,
-    });
-    if let Some(seed) = task_boundary.workspace_seed.clone() {
-        set_json_pointer_value(&mut ext, "/workspace_seed", json!(seed)).ok();
-    }
-    ext
+    })
 }
 
 #[derive(Clone)]
@@ -607,7 +766,6 @@ struct AgentRuntimeConfig {
     agent_artifact_digest: Option<String>,
     agent_artifact_resolved_path: Option<PathBuf>,
     io: AgentRuntimeIoConfig,
-    clean_contract_v1: bool,
     integration_level: String,
     launch_mode: AgentLaunchMode,
     env: BTreeMap<String, String>,
@@ -622,7 +780,6 @@ struct AgentRuntimeConfig {
     dependency_file_staging: Vec<DependencyFileStagingSpec>,
     dependency_services: Vec<Value>,
 }
-
 
 fn resolve_host_path_from_spec(raw: &str, exp_dir: &Path) -> Result<PathBuf> {
     let trimmed = raw.trim();
@@ -830,14 +987,12 @@ fn parse_bindings_to_args(value: Option<&Value>) -> Result<Vec<BindingArgProject
             .ok_or_else(|| anyhow!("runtime.agent.arg_map[{}] must be an object", idx))?;
         let binding = obj
             .get("key")
-            .or_else(|| obj.get("binding"))
             .and_then(Value::as_str)
             .map(str::trim)
             .filter(|v| !v.is_empty())
             .ok_or_else(|| {
                 anyhow!(
-                    "runtime.agent.arg_map[{}].key or runtime.agent.arg_map[{}].binding must be a non-empty string",
-                    idx,
+                    "runtime.agent.arg_map[{}].key must be a non-empty string",
                     idx
                 )
             })?;
@@ -953,53 +1108,7 @@ fn project_bindings_to_args(
 }
 
 fn resolve_agent_runtime(json_value: &Value, exp_dir: &Path) -> Result<AgentRuntimeConfig> {
-    if is_clean_contract_experiment(json_value) {
-        let runtime_root = json_value
-            .pointer("/runtime")
-            .ok_or_else(|| anyhow!("runtime is required"))?;
-        let container_image = runtime_root
-            .pointer("/image")
-            .and_then(|v| v.as_str())
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-            .map(|s| s.to_string())
-            .ok_or_else(|| anyhow!("runtime.image is required"))?;
-        let command = parse_command_field(runtime_root.pointer("/command"), "runtime.command")?
-            .ok_or_else(|| anyhow!("runtime.command is required"))?;
-        let default_timeout_ms = runtime_root
-            .pointer("/timeout_ms")
-            .and_then(|v| v.as_u64())
-            .filter(|v| *v > 0);
-
-        let launch_mode = AgentLaunchMode::parse(None)?;
-        return Ok(AgentRuntimeConfig {
-            adapter_ref: AgentAdapterRef::default(),
-            command_raw: command,
-            container_image: Some(container_image),
-            image_source: ImageSource::Global,
-            agent_artifact: None,
-            agent_artifact_digest: None,
-            agent_artifact_resolved_path: None,
-            io: AgentRuntimeIoConfig {
-                input_arg: DEFAULT_CLEAN_TASK_PATH.to_string(),
-                output_arg: DEFAULT_CLEAN_RESULT_PATH.to_string(),
-            },
-            clean_contract_v1: true,
-            integration_level: "cli_basic".to_string(),
-            launch_mode,
-            env: BTreeMap::new(),
-            env_from_host: Vec::new(),
-            bindings_to_args: Vec::new(),
-            workspace_patches: Vec::new(),
-            trajectory_path: None,
-            causal_extraction: None,
-            default_timeout_ms,
-            tracing_mode: None,
-            force_container: true,
-            dependency_file_staging: Vec::new(),
-            dependency_services: Vec::new(),
-        });
-    }
+    reject_legacy_experiment_version(json_value)?;
 
     if json_value.pointer("/runtime/harness").is_some() {
         return Err(anyhow!(
@@ -1009,6 +1118,9 @@ fn resolve_agent_runtime(json_value: &Value, exp_dir: &Path) -> Result<AgentRunt
     let agent = json_value
         .pointer("/runtime/agent")
         .ok_or_else(|| anyhow!("runtime.agent is required"))?;
+    let sandbox = json_value
+        .pointer("/runtime/sandbox")
+        .ok_or_else(|| anyhow!("runtime.sandbox is required"))?;
     if agent.pointer("/mode").is_some()
         || agent.pointer("/known_agent_ref").is_some()
         || agent.pointer("/custom_image").is_some()
@@ -1017,7 +1129,7 @@ fn resolve_agent_runtime(json_value: &Value, exp_dir: &Path) -> Result<AgentRunt
         || agent.pointer("/overrides").is_some()
     {
         return Err(anyhow!(
-            "runtime.agent hard cut: use runtime.agent.command + runtime.agent.image (+ optional runtime.agent.io)"
+            "runtime.agent hard cut: use runtime.agent.command + runtime.agent.bundle (+ optional runtime.agent.io) and move sandbox settings under runtime.sandbox"
         ));
     }
 
@@ -1032,24 +1144,22 @@ fn resolve_agent_runtime(json_value: &Value, exp_dir: &Path) -> Result<AgentRunt
         .map(|s| s.to_string());
     let tracing_mode = None;
 
-    let force_container = json_value
-        .pointer("/runtime/policy/sandbox/mode")
-        .and_then(|v| v.as_str())
-        == Some("container");
+    let force_container = sandbox.pointer("/executor").and_then(|v| v.as_str()) == Some("docker");
     let mut dependency_file_staging = parse_dependency_file_staging(json_value, exp_dir)?;
     let dependency_services = json_value
         .pointer("/runtime/dependencies/services")
         .and_then(|v| v.as_array())
         .cloned()
         .unwrap_or_default();
-    let runtime_agent_image = agent
+    let runtime_agent_image = sandbox
         .pointer("/image")
         .and_then(|v| v.as_str())
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty());
-    let image_source = ImageSource::parse(agent.pointer("/image_source").and_then(|v| v.as_str()))?;
+    let image_source =
+        ImageSource::parse(sandbox.pointer("/image_source").and_then(|v| v.as_str()))?;
     let agent_artifact =
-        parse_optional_nonempty_string(agent.pointer("/artifact"), "runtime.agent.artifact")?.map(
+        parse_optional_nonempty_string(agent.pointer("/bundle"), "runtime.agent.bundle")?.map(
             |p| {
                 let raw = p.trim();
                 if raw.starts_with("./") || raw.starts_with("../") || raw.contains('/') {
@@ -1060,12 +1170,12 @@ fn resolve_agent_runtime(json_value: &Value, exp_dir: &Path) -> Result<AgentRunt
             },
         );
     let agent_artifact_digest = parse_optional_nonempty_string(
-        agent.pointer("/artifact_digest"),
-        "runtime.agent.artifact_digest",
+        agent.pointer("/bundle_digest"),
+        "runtime.agent.bundle_digest",
     )?;
     let agent_artifact_resolved_path = parse_optional_nonempty_string(
-        agent.pointer("/artifact_resolved_path"),
-        "runtime.agent.artifact_resolved_path",
+        agent.pointer("/bundle_resolved_path"),
+        "runtime.agent.bundle_resolved_path",
     )?
     .map(|raw| {
         let path = PathBuf::from(raw);
@@ -1077,7 +1187,7 @@ fn resolve_agent_runtime(json_value: &Value, exp_dir: &Path) -> Result<AgentRunt
     });
     if image_source == ImageSource::PerTask && agent_artifact.is_none() {
         return Err(anyhow!(
-            "runtime.agent.artifact is required when runtime.agent.image_source='per_task'"
+            "runtime.agent.bundle is required when runtime.sandbox.image_source='per_task'"
         ));
     }
 
@@ -1219,7 +1329,6 @@ fn resolve_agent_runtime(json_value: &Value, exp_dir: &Path) -> Result<AgentRunt
             input_arg,
             output_arg,
         },
-        clean_contract_v1: false,
         integration_level,
         launch_mode,
         env,
@@ -1274,7 +1383,8 @@ fn parse_runtime_env_file(path: &Path) -> Result<BTreeMap<String, String>> {
 
 fn resolve_runtime_env_inputs(execution: &RunExecutionOptions) -> Result<BTreeMap<String, String>> {
     let mut resolved = BTreeMap::new();
-    let cwd = std::env::current_dir().map_err(|err| anyhow!("failed to resolve current dir: {}", err))?;
+    let cwd =
+        std::env::current_dir().map_err(|err| anyhow!("failed to resolve current dir: {}", err))?;
     for raw_path in &execution.runtime_env_files {
         let path = if raw_path.is_absolute() {
             raw_path.clone()
@@ -1327,7 +1437,7 @@ fn validate_agent_artifact_pin(runtime_agent: &AgentRuntimeConfig) -> Result<()>
         let expected = normalize_path(expected_path);
         if normalized != expected {
             return Err(anyhow!(
-                "runtime.agent.artifact path mismatch: expected {}, got {}",
+                "runtime.agent.bundle path mismatch: expected {}, got {}",
                 expected.display(),
                 normalized.display()
             ));
@@ -1345,7 +1455,7 @@ fn validate_agent_artifact_pin(runtime_agent: &AgentRuntimeConfig) -> Result<()>
             .unwrap_or(actual_full.as_str());
         if !expected.eq_ignore_ascii_case(actual) {
             return Err(anyhow!(
-                "runtime.agent.artifact digest mismatch: expected sha256:{}, got sha256:{}",
+                "runtime.agent.bundle digest mismatch: expected sha256:{}, got sha256:{}",
                 expected,
                 actual
             ));
@@ -1406,7 +1516,7 @@ fn resolve_variant_runtime_profile(
         && !matches!(executor_kind, ExecutorKind::LocalDocker)
     {
         return Err(anyhow!(
-            "runtime.agent.image_source='per_task' requires container execution"
+            "runtime.sandbox.image_source='per_task' requires container execution"
         ));
     }
     let container_mode = matches!(executor_kind, ExecutorKind::LocalDocker);
@@ -1526,6 +1636,12 @@ impl TrialPaths {
     }
 }
 
+impl Drop for TrialPaths {
+    fn drop(&mut self) {
+        let _ = remove_path_if_exists(&self.scratch_dir);
+    }
+}
+
 fn build_agent_task(
     json_value: &Value,
     run_id: &str,
@@ -1537,10 +1653,6 @@ fn build_agent_task(
     runtime_agent: &AgentRuntimeConfig,
 ) -> Value {
     let normalized_task_payload = normalize_task_prompt_aliases(&task_boundary.task_payload);
-    if is_clean_contract_experiment(json_value) {
-        return normalized_task_payload;
-    }
-
     let mut policy = json_value
         .pointer("/runtime/policy")
         .cloned()
@@ -1572,7 +1684,7 @@ fn build_agent_task(
     if let Some(obj) = input.as_object_mut() {
         obj.insert(
             "ext".to_string(),
-            json!({ "task_boundary_v2": task_boundary_ext }),
+            json!({ "task_boundary_v3": task_boundary_ext }),
         );
     }
     input
@@ -1692,7 +1804,10 @@ fn row_has_sqlite_identity_fields(row: &Value) -> bool {
     row.pointer("/run_id")
         .and_then(Value::as_str)
         .is_some_and(|value| !value.trim().is_empty())
-        && row.pointer("/schedule_idx").and_then(Value::as_u64).is_some()
+        && row
+            .pointer("/schedule_idx")
+            .and_then(Value::as_u64)
+            .is_some()
         && row.pointer("/attempt").and_then(Value::as_u64).is_some()
         && row.pointer("/row_seq").and_then(Value::as_u64).is_some()
         && row
@@ -2055,7 +2170,6 @@ fn rel_to_run_dir(path: &Path, run_dir: &Path) -> String {
         .to_string()
 }
 
-
 fn resolve_trial_timeout_ms(
     input: &Value,
     invocation_default_timeout_ms: Option<u64>,
@@ -2079,11 +2193,7 @@ fn build_runtime_contract_env(
     input: &Value,
     io: &PreparedTrialIo,
     timeout_ms: Option<u64>,
-    clean_contract_v1: bool,
 ) -> BTreeMap<String, String> {
-    if clean_contract_v1 {
-        return BTreeMap::new();
-    }
     let trial_id = input
         .pointer("/ids/trial_id")
         .and_then(|v| v.as_str())
@@ -2097,7 +2207,8 @@ fn build_runtime_contract_env(
         .and_then(|v| v.as_str())
         .unwrap_or("");
     let task_image = input
-        .pointer("/task/image")
+        .pointer("/ext/task_boundary_v3/environment/image")
+        .or_else(|| input.pointer("/environment/image"))
         .and_then(|v| v.as_str())
         .map(str::trim)
         .filter(|v| !v.is_empty())
@@ -2185,11 +2296,7 @@ fn run_command_contract_trial(request: &AdapterRunRequest<'_>) -> Result<Process
             "setup command is only supported for container runs"
         ));
     }
-    if request.container_mode {
-        run_builtin_adapter_container(request)
-    } else {
-        run_builtin_adapter_local(request)
-    }
+    run_external_agent_runtime_trial(request)
 }
 
 fn pause_command_contract_trial(request: &AdapterPauseRequest<'_>) -> Result<AdapterPauseAck> {
@@ -2291,7 +2398,7 @@ impl AgentAdapter for PrebuiltCommandAdapter {
 
 fn run_builtin_adapter_local(request: &AdapterRunRequest<'_>) -> Result<ProcessRunResult> {
     let command = resolve_runtime_agent_command(request)?;
-    let cmd = build_builtin_adapter_local_command(request, &command);
+    let cmd = build_builtin_adapter_local_command(request, &command)?;
     let stdout_log_path = request.trial_paths.trial_dir.join("harness_stdout.log");
     let stderr_log_path = request.trial_paths.trial_dir.join("harness_stderr.log");
     run_adapter_process(
@@ -2303,26 +2410,232 @@ fn run_builtin_adapter_local(request: &AdapterRunRequest<'_>) -> Result<ProcessR
     )
 }
 
+fn run_container_sidecar_command(
+    request: &AdapterRunRequest<'_>,
+    image: &str,
+    workspace: Option<&str>,
+    command: &[String],
+    runtime_overrides_env: &BTreeMap<String, String>,
+    label: &str,
+) -> Result<Output> {
+    let sidecar_request = AdapterRunRequest {
+        runtime_experiment: request.runtime_experiment,
+        runtime: request.runtime,
+        variant_args: &[],
+        runtime_env: request.runtime_env,
+        runtime_overrides_env,
+        container_mode: request.container_mode,
+        trial_paths: request.trial_paths,
+        dynamic_mounts: request.dynamic_mounts,
+        io_paths: request.io_paths,
+        network_mode: request.network_mode,
+        setup_command: None,
+        benchmark_adapter: None,
+        benchmark_grading_enabled: false,
+        run_id: request.run_id,
+        task_image: request.task_image,
+        agent_artifact: None,
+    };
+    let mut cmd = build_baked_container_command(&sidecar_request, image, workspace, command, None);
+    let output = cmd.output()?;
+    if output.status.success() {
+        return Ok(output);
+    }
+    Err(anyhow!(
+        "{} failed: {}",
+        label,
+        output_error_detail(&output)
+    ))
+}
+
+fn run_external_agent_runtime_trial(request: &AdapterRunRequest<'_>) -> Result<ProcessRunResult> {
+    let command = resolve_runtime_agent_command(request)?;
+    if let Some(bundle) = request.agent_artifact {
+        validate_agent_artifact_pin(request.runtime)?;
+        if !bundle.exists() {
+            return Err(anyhow!(
+                "runtime.agent.bundle not found: {}",
+                bundle.display()
+            ));
+        }
+        let bundle_context = format!("runtime.agent.bundle {}", bundle.display());
+        validate_agent_artifact_path(bundle, &command, bundle_context.as_str())?;
+    }
+
+    let container_image = if request.container_mode {
+        let image = resolve_container_image(request)?;
+        ensure_container_image_ready(&image)?;
+        Some(image)
+    } else {
+        None
+    };
+    let workspace = if request.container_mode {
+        resolve_container_workspace(request)
+    } else {
+        None
+    };
+
+    if let (Some(image), Some(setup)) = (container_image.as_deref(), request.setup_command) {
+        let setup_command = vec!["/bin/sh".to_string(), "-lc".to_string(), setup.to_string()];
+        run_container_sidecar_command(
+            request,
+            image,
+            workspace,
+            &setup_command,
+            request.runtime_overrides_env,
+            "task sandbox setup",
+        )?;
+    }
+
+    let agent_result = run_builtin_adapter_local(request)?;
+
+    if let (Some(image), Some(grader_command)) = (
+        container_image.as_deref(),
+        resolve_benchmark_grader_command(request)?,
+    ) {
+        let grade_error_marker_path = request.trial_paths.out.join(BENCHMARK_GRADE_ERROR_FILENAME);
+        let result_path = &request.io_paths.output_host;
+        if !result_path.exists() || result_path.metadata().map(|meta| meta.len()).unwrap_or(0) == 0
+        {
+            fs::write(&grade_error_marker_path, b"result_missing\n")?;
+            if agent_result.status == "0" {
+                return Ok(ProcessRunResult {
+                    status: BENCHMARK_GRADING_POLICY_EXIT_CODE.to_string(),
+                });
+            }
+            return Ok(agent_result);
+        }
+
+        let mut overrides = request.runtime_overrides_env.clone();
+        overrides.insert(
+            AGENTLAB_ENV_AGENT_EXIT_STATUS.to_string(),
+            agent_result.status.clone(),
+        );
+        if let Err(err) = run_container_sidecar_command(
+            request,
+            image,
+            workspace,
+            &grader_command,
+            &overrides,
+            "benchmark grader",
+        ) {
+            fs::write(
+                &grade_error_marker_path,
+                format!("grader_command_failed:{}\n", err).into_bytes(),
+            )?;
+            return Ok(ProcessRunResult {
+                status: BENCHMARK_GRADING_POLICY_EXIT_CODE.to_string(),
+            });
+        }
+        if !request
+            .trial_paths
+            .out
+            .join(BENCHMARK_SCORE_FILENAME)
+            .exists()
+        {
+            fs::write(&grade_error_marker_path, b"score_record_missing\n")?;
+            return Ok(ProcessRunResult {
+                status: BENCHMARK_GRADING_POLICY_EXIT_CODE.to_string(),
+            });
+        }
+    }
+
+    Ok(agent_result)
+}
+
+fn rewrite_local_bundle_command(command: &[String], bundle_root: &Path) -> Vec<String> {
+    command
+        .iter()
+        .enumerate()
+        .map(|(idx, token)| {
+            if let Some(relative) = token.trim().strip_prefix("/opt/agent/") {
+                bundle_root.join(relative).to_string_lossy().to_string()
+            } else if idx == 0 && !token.contains('/') {
+                let candidate = bundle_root.join("bin").join(token);
+                if candidate.exists() {
+                    candidate.to_string_lossy().to_string()
+                } else {
+                    token.clone()
+                }
+            } else {
+                token.clone()
+            }
+        })
+        .collect()
+}
+
 fn build_builtin_adapter_local_command(
     request: &AdapterRunRequest<'_>,
     command: &[String],
-) -> Command {
-    let mut cmd = Command::new(&command[0]);
-    cmd.args(&command[1..]);
-    cmd.current_dir(&request.trial_paths.workspace);
-    for (key, value) in request.runtime_overrides_env {
-        cmd.env(key, value);
-    }
+) -> Result<Command> {
+    let mut resolved_command = command.to_vec();
+    let mut env_vars = request.runtime_overrides_env.clone();
     for (key, value) in request.runtime_env {
+        env_vars.insert(key.clone(), value.clone());
+    }
+    if let Some(bundle) = request.agent_artifact {
+        let bundle_root = resolve_agent_artifact_mount_dir(bundle)?;
+        resolved_command = rewrite_local_bundle_command(command, &bundle_root);
+        let bundle_bin = bundle_root.join("bin");
+        let existing_path = env_vars
+            .get("PATH")
+            .cloned()
+            .or_else(|| std::env::var("PATH").ok())
+            .unwrap_or_default();
+        let bundle_bin_text = bundle_bin.to_string_lossy().to_string();
+        let merged_path = if existing_path.is_empty() {
+            bundle_bin_text
+        } else {
+            format!("{}:{}", bundle_bin_text, existing_path)
+        };
+        env_vars.insert("PATH".to_string(), merged_path);
+    }
+    resolved_command = resolved_command
+        .into_iter()
+        .map(|token| {
+            if token.starts_with("/agentlab/") {
+                map_contract_path_to_host(
+                    &token,
+                    &ContractPathHostRoots::from_trial_paths(request.trial_paths),
+                    ContractPathMode::ContainerMount,
+                )
+                .map(|path| path.to_string_lossy().to_string())
+                .unwrap_or(token)
+            } else {
+                token
+            }
+        })
+        .collect();
+
+    let env_keys = env_vars.keys().cloned().collect::<Vec<_>>();
+    for env_key in env_keys {
+        let Some(raw) = env_vars.get(&env_key).cloned() else {
+            continue;
+        };
+        if raw.starts_with("/agentlab/") || raw.starts_with("/harness/") {
+            let host_path =
+                resolve_trial_io_host_path(&raw, request.trial_paths, request.container_mode)?;
+            env_vars.insert(env_key, host_path.to_string_lossy().to_string());
+        }
+    }
+    env_vars.insert(
+        "WORKSPACE".to_string(),
+        request.trial_paths.workspace.to_string_lossy().to_string(),
+    );
+
+    let mut cmd = Command::new(&resolved_command[0]);
+    cmd.args(&resolved_command[1..]);
+    cmd.current_dir(&request.trial_paths.workspace);
+    for (key, value) in &env_vars {
         cmd.env(key, value);
     }
-    cmd
+    Ok(cmd)
 }
 
 fn resolve_benchmark_grader_command(
     request: &AdapterRunRequest<'_>,
 ) -> Result<Option<Vec<String>>> {
-    if request.runtime.clean_contract_v1 || !request.benchmark_grading_enabled {
+    if !request.benchmark_grading_enabled {
         return Ok(None);
     }
     let Some(adapter) = request.benchmark_adapter else {
@@ -2357,26 +2670,6 @@ fn resolve_benchmark_grader_command(
     Ok(Some(rendered))
 }
 
-fn run_builtin_adapter_container(request: &AdapterRunRequest<'_>) -> Result<ProcessRunResult> {
-    if request.network_mode == "allowlist_enforced" {
-        return Err(anyhow!("allowlist_enforced not implemented in Rust runner"));
-    }
-    let image = resolve_container_image(request)?;
-    ensure_container_image_ready(&image)?;
-    let workspace = resolve_container_workspace(request);
-    if request.runtime.image_source == ImageSource::PerTask && request.agent_artifact.is_none() {
-        return Err(anyhow!(
-            "runtime.agent.artifact is required when runtime.agent.image_source='per_task'"
-        ));
-    }
-
-    if let Some(artifact) = request.agent_artifact {
-        run_injected_container(request, &image, artifact, workspace)
-    } else {
-        run_baked_container(request, &image, workspace)
-    }
-}
-
 fn resolve_container_image(request: &AdapterRunRequest<'_>) -> Result<String> {
     let task_image = request
         .task_image
@@ -2384,7 +2677,7 @@ fn resolve_container_image(request: &AdapterRunRequest<'_>) -> Result<String> {
         .filter(|value| !value.is_empty());
     match request.runtime.image_source {
         ImageSource::PerTask => task_image.map(ToString::to_string).ok_or_else(|| {
-            anyhow!("task.image is required when runtime.agent.image_source='per_task'")
+            anyhow!("environment.image is required when runtime.sandbox.image_source='per_task'")
         }),
         ImageSource::Global => request
             .runtime
@@ -2395,11 +2688,8 @@ fn resolve_container_image(request: &AdapterRunRequest<'_>) -> Result<String> {
 }
 
 fn resolve_container_workspace<'a>(request: &'a AdapterRunRequest<'_>) -> Option<&'a str> {
-    if request.runtime.clean_contract_v1 {
-        None
-    } else {
-        Some(AGENTLAB_CONTRACT_WORKSPACE_DIR)
-    }
+    let _ = request;
+    Some(AGENTLAB_CONTRACT_WORKSPACE_DIR)
 }
 
 fn append_container_sandbox_args(
@@ -2407,156 +2697,124 @@ fn append_container_sandbox_args(
     request: &AdapterRunRequest<'_>,
     workspace: Option<&str>,
 ) {
-    let root_read_only = if request.runtime.clean_contract_v1 {
-        true
-    } else {
-        request
-            .runtime_experiment
-            .pointer("/runtime/policy/sandbox/root_read_only")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(true)
-    };
+    let root_read_only = request
+        .runtime_experiment
+        .pointer("/runtime/policy/sandbox/root_read_only")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
     if root_read_only {
         cmd.arg("--read-only");
     }
 
-    if !request.runtime.clean_contract_v1 {
-        let run_as_user = request
-            .runtime_experiment
-            .pointer("/runtime/policy/sandbox/run_as_user")
-            .and_then(|v| v.as_str());
-        if let Some(user) = run_as_user {
-            cmd.args(["-u", user]);
-        }
+    let run_as_user = request
+        .runtime_experiment
+        .pointer("/runtime/policy/sandbox/run_as_user")
+        .and_then(|v| v.as_str());
+    if let Some(user) = run_as_user {
+        cmd.args(["-u", user]);
     }
 
     if request.network_mode == "none" {
         cmd.arg("--network=none");
     }
 
-    let no_new_privileges = if request.runtime.clean_contract_v1 {
-        true
-    } else {
-        request
-            .runtime_experiment
-            .pointer("/runtime/policy/sandbox/hardening/no_new_privileges")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(true)
-    };
+    let no_new_privileges = request
+        .runtime_experiment
+        .pointer("/runtime/policy/sandbox/hardening/no_new_privileges")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
     if no_new_privileges {
         cmd.args(["--security-opt", "no-new-privileges"]);
     }
 
-    let drop_all_caps = if request.runtime.clean_contract_v1 {
-        true
-    } else {
-        request
-            .runtime_experiment
-            .pointer("/runtime/policy/sandbox/hardening/drop_all_caps")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(true)
-    };
+    let drop_all_caps = request
+        .runtime_experiment
+        .pointer("/runtime/policy/sandbox/hardening/drop_all_caps")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
     if drop_all_caps {
         cmd.args(["--cap-drop", "ALL"]);
     }
 
-    let cpu_limit = if request.runtime.clean_contract_v1 {
-        request
-            .runtime_experiment
-            .pointer("/runtime/resources/cpus")
-            .and_then(|v| v.as_u64())
-    } else {
-        request
-            .runtime_experiment
-            .pointer("/runtime/policy/sandbox/resources/cpu_count")
-            .and_then(|v| v.as_u64())
-    };
+    let cpu_limit = request
+        .runtime_experiment
+        .pointer("/runtime/policy/sandbox/resources/cpu_count")
+        .and_then(|v| v.as_u64());
     if let Some(cpu) = cpu_limit {
         cmd.arg("--cpus").arg(cpu.to_string());
     }
-    let memory_limit_mb = if request.runtime.clean_contract_v1 {
-        request
-            .runtime_experiment
-            .pointer("/runtime/resources/memory_mb")
-            .and_then(|v| v.as_u64())
-    } else {
-        request
-            .runtime_experiment
-            .pointer("/runtime/policy/sandbox/resources/memory_mb")
-            .and_then(|v| v.as_u64())
-    };
+    let memory_limit_mb = request
+        .runtime_experiment
+        .pointer("/runtime/policy/sandbox/resources/memory_mb")
+        .and_then(|v| v.as_u64());
     if let Some(mem) = memory_limit_mb {
         cmd.arg("--memory").arg(format!("{}m", mem));
     }
 
-    if request.runtime.clean_contract_v1 {
+    cmd.args([
+        "-v",
+        &format!(
+            "{}:{}:ro",
+            request.trial_paths.in_dir.display(),
+            AGENTLAB_CONTRACT_IN_DIR
+        ),
+    ]);
+    cmd.args([
+        "-v",
+        &format!(
+            "{}:{}",
+            request.trial_paths.out.display(),
+            AGENTLAB_CONTRACT_OUT_DIR
+        ),
+    ]);
+    cmd.args([
+        "-v",
+        &format!(
+            "{}:{}",
+            request.trial_paths.state.display(),
+            AGENTLAB_CONTRACT_STATE_DIR
+        ),
+    ]);
+    cmd.args([
+        "-v",
+        &format!(
+            "{}:{}",
+            request.trial_paths.deps.display(),
+            AGENTLAB_CONTRACT_DEPS_DIR
+        ),
+    ]);
+    cmd.args([
+        "-v",
+        &format!(
+            "{}:{}",
+            request.trial_paths.workspace.display(),
+            AGENTLAB_CONTRACT_WORKSPACE_DIR
+        ),
+    ]);
+    let sandbox_profile = request
+        .runtime_experiment
+        .pointer("/runtime/sandbox/profile")
+        .and_then(|v| v.as_str())
+        .unwrap_or("default");
+    if sandbox_profile == "swebench_testbed" {
         cmd.args([
             "-v",
-            &format!(
-                "{}:{}:ro",
-                request.trial_paths.runtime.task.display(),
-                HARNESS_TASK_PATH
-            ),
+            &format!("{}:/testbed", request.trial_paths.workspace.display()),
         ]);
+    }
+    for mount in request.dynamic_mounts {
         cmd.args([
             "-v",
-            &format!("{}:{}", request.trial_paths.out.display(), HARNESS_OUT_DIR),
+            &format!("{}:{}:ro", mount.host_path.display(), mount.mount_path),
         ]);
-    } else {
-        cmd.args([
-            "-v",
-            &format!(
-                "{}:{}:ro",
-                request.trial_paths.in_dir.display(),
-                AGENTLAB_CONTRACT_IN_DIR
-            ),
-        ]);
-        cmd.args([
-            "-v",
-            &format!(
-                "{}:{}",
-                request.trial_paths.out.display(),
-                AGENTLAB_CONTRACT_OUT_DIR
-            ),
-        ]);
-        cmd.args([
-            "-v",
-            &format!(
-                "{}:{}",
-                request.trial_paths.state.display(),
-                AGENTLAB_CONTRACT_STATE_DIR
-            ),
-        ]);
-        cmd.args([
-            "-v",
-            &format!(
-                "{}:{}",
-                request.trial_paths.deps.display(),
-                AGENTLAB_CONTRACT_DEPS_DIR
-            ),
-        ]);
-        cmd.args([
-            "-v",
-            &format!(
-                "{}:{}",
-                request.trial_paths.workspace.display(),
-                AGENTLAB_CONTRACT_WORKSPACE_DIR
-            ),
-        ]);
-        for mount in request.dynamic_mounts {
-            cmd.args([
-                "-v",
-                &format!("{}:{}:ro", mount.host_path.display(), mount.mount_path),
-            ]);
-        }
-        cmd.args(["--tmpfs", "/tmp:rw"]);
-        // Mask legacy image-level /workspace so agent cannot read image internals.
-        cmd.args(["--tmpfs", "/workspace:rw"]);
-        // Mask benchmark internals bundled in task images from agent runtime view.
-        cmd.args(["--tmpfs", "/opt/bench:rw"]);
-        if let Some(workspace) = workspace {
-            cmd.args(["-w", workspace]);
-        }
+    }
+    cmd.args(["--tmpfs", "/tmp:rw"]);
+    // Mask legacy image-level /workspace so agent cannot read image internals.
+    cmd.args(["--tmpfs", "/workspace:rw"]);
+    // Mask benchmark internals bundled in task images from agent runtime view.
+    cmd.args(["--tmpfs", "/opt/bench:rw"]);
+    if let Some(workspace) = workspace {
+        cmd.args(["-w", workspace]);
     }
 }
 
@@ -2572,13 +2830,11 @@ fn append_container_env_args(
         }
         cmd.arg("-e").arg(format!("{}={}", key, value));
     }
-    if !request.runtime.clean_contract_v1 {
-        for (key, value) in request.runtime_env {
-            if key == "PATH" {
-                path_overridden = true;
-            }
-            cmd.arg("-e").arg(format!("{}={}", key, value));
+    for (key, value) in request.runtime_env {
+        if key == "PATH" {
+            path_overridden = true;
         }
+        cmd.arg("-e").arg(format!("{}={}", key, value));
     }
     if request.agent_artifact.is_some() && !path_overridden {
         cmd.arg("-e").arg(AGENT_ARTIFACT_PATH_ENV_VALUE);
@@ -2685,48 +2941,6 @@ fn build_baked_container_command(
     cmd.arg(image);
     append_container_entrypoint(&mut cmd, request, command, grader_command);
     cmd
-}
-
-fn build_injected_container_mounted_command(
-    request: &AdapterRunRequest<'_>,
-    image: &str,
-    workspace: Option<&str>,
-    artifact_mount_dir: &Path,
-    command: &[String],
-    grader_command: Option<Vec<String>>,
-) -> Command {
-    let mut cmd = Command::new("docker");
-    cmd.arg("run").arg("--rm").args(["--pull", "never"]);
-    append_container_platform_arg(&mut cmd, image);
-    append_container_sandbox_args(&mut cmd, request, workspace);
-    cmd.args([
-        "-v",
-        &format!("{}:/opt/agent:ro", artifact_mount_dir.display()),
-    ]);
-    append_container_env_args(&mut cmd, request, workspace);
-    cmd.arg(image);
-    append_container_entrypoint(&mut cmd, request, command, grader_command);
-    cmd
-}
-
-fn run_baked_container(
-    request: &AdapterRunRequest<'_>,
-    image: &str,
-    workspace: Option<&str>,
-) -> Result<ProcessRunResult> {
-    let command = resolve_runtime_agent_command(request)?;
-    let grader_command = resolve_benchmark_grader_command(request)?;
-
-    let cmd = build_baked_container_command(request, image, workspace, &command, grader_command);
-    let stdout_log_path = request.trial_paths.trial_dir.join("harness_stdout.log");
-    let stderr_log_path = request.trial_paths.trial_dir.join("harness_stderr.log");
-    run_adapter_process(
-        cmd,
-        &request.io_paths.output_host,
-        None,
-        &stdout_log_path,
-        &stderr_log_path,
-    )
 }
 
 struct ContainerCleanupGuard {
@@ -2879,13 +3093,13 @@ pub(crate) fn resolve_agent_artifact_mount_dir(artifact: &Path) -> Result<PathBu
     }
     if !artifact.exists() {
         return Err(anyhow!(
-            "runtime.agent.artifact not found: {}",
+            "runtime.agent.bundle not found: {}",
             artifact.display()
         ));
     }
     if !artifact.is_file() {
         return Err(anyhow!(
-            "runtime.agent.artifact must be a file or directory: {}",
+            "runtime.agent.bundle must be a file or directory: {}",
             artifact.display()
         ));
     }
@@ -2900,7 +3114,7 @@ pub(crate) fn resolve_agent_artifact_mount_dir(artifact: &Path) -> Result<PathBu
         "-xf"
     } else {
         return Err(anyhow!(
-            "runtime.agent.artifact '{}' must be a directory or .tar/.tar.gz archive",
+            "runtime.agent.bundle '{}' must be a directory or .tar/.tar.gz archive",
             artifact_path.display()
         ));
     };
@@ -2953,7 +3167,7 @@ pub(crate) fn resolve_agent_artifact_mount_dir(artifact: &Path) -> Result<PathBu
     if !unpack_out.status.success() {
         let _ = fs::remove_dir_all(&staging_dir);
         return Err(anyhow!(
-            "failed to unpack runtime.agent.artifact {}: {}",
+            "failed to unpack runtime.agent.bundle {}: {}",
             artifact_path.display(),
             output_error_detail(&unpack_out),
         ));
@@ -2961,7 +3175,7 @@ pub(crate) fn resolve_agent_artifact_mount_dir(artifact: &Path) -> Result<PathBu
     if let Err(err) = fs::rename(&staging_dir, &unpacked_dir) {
         let _ = fs::remove_dir_all(&staging_dir);
         return Err(anyhow!(
-            "failed to finalize unpacked runtime.agent.artifact {} into {}: {}",
+            "failed to finalize unpacked runtime.agent.bundle {} into {}: {}",
             artifact_path.display(),
             unpacked_dir.display(),
             err
@@ -2970,105 +3184,6 @@ pub(crate) fn resolve_agent_artifact_mount_dir(artifact: &Path) -> Result<PathBu
     repair_agent_artifact_layout(&unpacked_dir)?;
     fs::write(&ready_marker, digest.as_bytes())?;
     Ok(unpacked_dir)
-}
-
-fn run_injected_container(
-    request: &AdapterRunRequest<'_>,
-    image: &str,
-    artifact: &Path,
-    workspace: Option<&str>,
-) -> Result<ProcessRunResult> {
-    validate_agent_artifact_pin(request.runtime)?;
-    if !artifact.exists() {
-        return Err(anyhow!(
-            "runtime.agent.artifact not found: {}",
-            artifact.display()
-        ));
-    }
-    let artifact_context = format!("runtime.agent.artifact {}", artifact.display());
-    validate_agent_artifact_path(artifact, artifact_context.as_str())?;
-
-    if let Ok(artifact_mount_dir) = resolve_agent_artifact_mount_dir(artifact) {
-        let command = resolve_runtime_agent_command(request)?;
-        let grader_command = resolve_benchmark_grader_command(request)?;
-        let cmd = build_injected_container_mounted_command(
-            request,
-            image,
-            workspace,
-            &artifact_mount_dir,
-            &command,
-            grader_command,
-        );
-        let stdout_log_path = request.trial_paths.trial_dir.join("harness_stdout.log");
-        let stderr_log_path = request.trial_paths.trial_dir.join("harness_stderr.log");
-        return run_adapter_process(
-            cmd,
-            &request.io_paths.output_host,
-            None,
-            &stdout_log_path,
-            &stderr_log_path,
-        );
-    }
-
-    let command = resolve_runtime_agent_command(request)?;
-    let grader_command = resolve_benchmark_grader_command(request)?;
-
-    let mut create = Command::new("docker");
-    create.arg("create");
-    append_container_sandbox_args(&mut create, request, workspace);
-    append_container_env_args(&mut create, request, workspace);
-    create.arg(image);
-    create.args(["tail", "-f", "/dev/null"]);
-    let create_out = run_checked_command(create, "docker create failed")?;
-    let container_id = String::from_utf8_lossy(&create_out.stdout)
-        .trim()
-        .to_string();
-    if container_id.is_empty() {
-        return Err(anyhow!("docker create failed: missing container id"));
-    }
-    let _cleanup = ContainerCleanupGuard {
-        container_id: container_id.clone(),
-    };
-
-    let mut start = Command::new("docker");
-    start.args(["start", &container_id]);
-    run_checked_command(start, "docker start failed")?;
-
-    let mut prepare_agent_dir = Command::new("docker");
-    prepare_agent_dir.args(["exec", &container_id, "/bin/sh", "-lc"]);
-    prepare_agent_dir.arg("mkdir -p /opt/agent");
-    run_checked_command(prepare_agent_dir, "docker exec prepare agent dir failed")?;
-
-    // `/tmp` is mounted as tmpfs in sandbox mode; docker cp to tmpfs paths can
-    // report success while the file is absent at exec time.
-    let mut copy = Command::new("docker");
-    copy.arg("cp");
-    copy.arg(artifact);
-    copy.arg(format!("{}:/opt/agent.tar.gz", container_id));
-    run_checked_command(copy, "docker cp failed")?;
-
-    let mut unpack = Command::new("docker");
-    unpack.args(["exec", &container_id, "/bin/sh", "-lc"]);
-    unpack.arg(AGENT_ARTIFACT_UNPACK_COMMAND);
-    run_checked_command(unpack, "docker exec artifact unpack failed")?;
-
-    let mut exec = Command::new("docker");
-    exec.args(["exec"]);
-    if let Some(workspace) = workspace {
-        exec.args(["-w", workspace]);
-    }
-    append_container_env_args(&mut exec, request, workspace);
-    exec.arg(&container_id);
-    append_container_entrypoint(&mut exec, request, &command, grader_command);
-    let stdout_log_path = request.trial_paths.trial_dir.join("harness_stdout.log");
-    let stderr_log_path = request.trial_paths.trial_dir.join("harness_stderr.log");
-    run_adapter_process(
-        exec,
-        &request.io_paths.output_host,
-        None,
-        &stdout_log_path,
-        &stderr_log_path,
-    )
 }
 
 fn append_runtime_io_arg(command: &mut Vec<String>, arg_spec: &str, path: &str) -> Result<()> {
@@ -3103,50 +3218,17 @@ fn resolve_runtime_agent_command(request: &AdapterRunRequest<'_>) -> Result<Vec<
     }
     let mut command = rendered;
     command.extend(request.variant_args.iter().cloned());
-    if request.runtime.clean_contract_v1 {
-        command.push(request.io_paths.task_path.clone());
-        command.push(request.io_paths.result_path.clone());
-    } else {
-        append_runtime_io_arg(
-            &mut command,
-            &request.runtime.io.input_arg,
-            &request.io_paths.task_path,
-        )?;
-        append_runtime_io_arg(
-            &mut command,
-            &request.runtime.io.output_arg,
-            &request.io_paths.result_path,
-        )?;
-    }
+    append_runtime_io_arg(
+        &mut command,
+        &request.runtime.io.input_arg,
+        &request.io_paths.task_path,
+    )?;
+    append_runtime_io_arg(
+        &mut command,
+        &request.runtime.io.output_arg,
+        &request.io_paths.result_path,
+    )?;
     Ok(command)
-}
-
-fn build_non_destructive_probe_variants(command: &[String]) -> Result<Vec<Vec<String>>> {
-    let binary = command
-        .first()
-        .map(|value| value.trim())
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| anyhow!("resolved probe command is empty"))?;
-    let mut base = vec![binary.to_string()];
-    if command.len() >= 3 && command[1].trim() == "-m" {
-        let module = command[2].trim();
-        if !module.is_empty() {
-            base.push("-m".to_string());
-            base.push(module.to_string());
-        }
-    } else if command.len() >= 2 {
-        let second = command[1].trim();
-        if !second.is_empty() && command_part_looks_like_path(second) {
-            base.push(second.to_string());
-        }
-    }
-    let mut probes = Vec::with_capacity(3);
-    for flag in ["--help", "--version", "-h"] {
-        let mut probe = base.clone();
-        probe.push(flag.to_string());
-        probes.push(probe);
-    }
-    Ok(probes)
 }
 
 struct PreflightProbeRoot {
@@ -3193,7 +3275,7 @@ fn select_preflight_probe_task(
                 continue;
             }
         };
-        if image_source == ImageSource::Global || boundary.task_image.as_deref() == Some(image) {
+        if image_source == ImageSource::Global || boundary.task_image.as_str() == image {
             return Ok((idx, boundary));
         }
     }
@@ -3213,11 +3295,22 @@ fn select_preflight_probe_task(
         0,
         TaskBoundaryMaterialization {
             task_payload: json!({ "id": "preflight_probe" }),
-            workspace_seed: None,
-            workspace_files: Vec::new(),
-            mount_references: Vec::new(),
+            environment: TaskEnvironmentSpec {
+                image: image.to_string(),
+            },
+            workspace: WorkspaceSpec {
+                mode: WorkspaceMode::Scratch,
+                base: WorkspaceBaseSpec {
+                    kind: WorkspaceBaseKind::Empty,
+                    dataset_pack_ref: None,
+                    repo: None,
+                    commit: None,
+                },
+                overlays: Vec::new(),
+                aux_mounts: Vec::new(),
+            },
             limits: TaskBoundaryLimits::default(),
-            task_image: None,
+            task_image: image.to_string(),
         },
     ))
 }
@@ -3235,16 +3328,13 @@ fn build_preflight_probe_context(
     let trial_dir = probe_root.path.join("trial_1");
     ensure_dir(&trial_dir)?;
     let trial_paths = TrialPaths::new(&trial_dir, project_root)?;
-    trial_paths.prepare(true)?;
+    trial_paths.prepare(false)?;
     stage_dependencies_for_trial(&runtime_profile.agent_runtime, &trial_paths)?;
-    materialize_workspace_seed(
-        project_root,
-        &trial_paths,
-        task_boundary.workspace_seed.as_ref(),
-    )?;
-    materialize_workspace_files(&trial_paths, &task_boundary.workspace_files)?;
+    materialize_workspace_base(project_root, &trial_paths, &task_boundary.workspace.base)?;
+    materialize_workspace_overlays(&trial_paths, &task_boundary.workspace.overlays)?;
     stage_workspace_patches_for_trial(&runtime_profile.agent_runtime, &trial_paths)?;
-    let dynamic_mounts = resolve_task_mounts(project_root, &task_boundary.mount_references, true)?;
+    let dynamic_mounts =
+        resolve_workspace_aux_mounts(project_root, &task_boundary.workspace.aux_mounts, true)?;
     let mut input = build_agent_task(
         &runtime_profile.experiment,
         "preflight_probe",
@@ -3255,35 +3345,27 @@ fn build_preflight_probe_context(
         &task_boundary,
         &runtime_profile.agent_runtime,
     );
-    if !is_clean_contract_experiment(&runtime_profile.experiment) {
-        set_json_pointer_value(
-            &mut input,
-            "/runtime/control_plane/path",
-            json!(DEFAULT_CONTAINER_CONTROL_PATH),
-        )?;
-        set_json_pointer_value(&mut input, "/runtime/control_plane/mode", json!("file"))?;
-    }
-    let input_bytes = serde_json::to_vec_pretty(&input)?;
-    let io_paths = prepare_io_paths(
-        &trial_paths,
-        runtime_profile.container_mode,
-        &input_bytes,
-        is_clean_contract_experiment(&runtime_profile.experiment),
+    set_json_pointer_value(
+        &mut input,
+        "/runtime/control_plane/path",
+        json!(DEFAULT_CONTAINER_CONTROL_PATH),
     )?;
-    let runtime_env = build_runtime_contract_env(
-        "preflight_probe",
-        &input,
-        &io_paths,
-        resolve_trial_timeout_ms(&input, runtime_profile.invocation_default_timeout_ms),
-        is_clean_contract_experiment(&runtime_profile.experiment),
-    );
+    set_json_pointer_value(&mut input, "/runtime/control_plane/mode", json!("file"))?;
+    let input_bytes = serde_json::to_vec_pretty(&input)?;
+    let io_paths = prepare_io_paths(&trial_paths, runtime_profile.container_mode, &input_bytes)?;
+    let smoke_timeout_ms =
+        resolve_trial_timeout_ms(&input, runtime_profile.invocation_default_timeout_ms)
+            .map(|value| value.min(DEFAULT_PREFLIGHT_CONTRACT_SMOKE_TIMEOUT_MS));
+    let mut runtime_env =
+        build_runtime_contract_env("preflight_probe", &input, &io_paths, smoke_timeout_ms);
+    runtime_env.insert(AGENTLAB_ENV_PREFLIGHT_SMOKE.to_string(), "1".to_string());
     Ok(PreflightProbeContext {
         _root: probe_root,
         trial_paths,
         io_paths,
         dynamic_mounts,
         runtime_env,
-        task_image: task_boundary.task_image,
+        task_image: Some(task_boundary.task_image),
     })
 }
 
@@ -3313,61 +3395,38 @@ fn build_preflight_probe_request<'a>(
     }
 }
 
-fn run_preflight_container_probe(
-    request: &AdapterRunRequest<'_>,
-    image: &str,
-    resolved_command: &[String],
-) -> Result<PreflightProbeExecution> {
-    let probe_variants = build_non_destructive_probe_variants(resolved_command)?;
-    let workspace = resolve_container_workspace(request);
-    let mut failures = Vec::new();
-    for probe_command in probe_variants {
-        let output = if let Some(artifact) = request.agent_artifact {
-            let artifact_mount_dir = resolve_agent_artifact_mount_dir(artifact)?;
-            build_injected_container_mounted_command(
-                request,
-                image,
-                workspace,
-                &artifact_mount_dir,
-                &probe_command,
-                None,
-            )
-            .output()
-        } else {
-            build_baked_container_command(request, image, workspace, &probe_command, None).output()
-        };
-        match output {
-            Ok(out) if out.status.success() => {
-                return Ok(PreflightProbeExecution {
-                    probe_command,
-                    stdout: String::from_utf8_lossy(&out.stdout).to_string(),
-                    stderr: String::from_utf8_lossy(&out.stderr).to_string(),
-                })
-            }
-            Ok(out) => failures.push(format!(
-                "{} ({})",
-                shell_join(&probe_command),
-                output_error_detail(&out)
-            )),
-            Err(err) => failures.push(format!("{} ({})", shell_join(&probe_command), err)),
-        }
-    }
-    Err(anyhow!(
-        "all non-destructive probes failed for '{}': {}",
-        shell_join(resolved_command),
-        format_preview(&failures, 3)
-    ))
-}
-
-struct PreflightProbeExecution {
-    probe_command: Vec<String>,
+struct PreflightContractSmokeExecution {
+    status: String,
     stdout: String,
     stderr: String,
 }
 
-fn detect_known_probe_output_blockers(report: &PreflightProbeExecution) -> Vec<String> {
+fn read_optional_text_file(path: &Path) -> Result<String> {
+    if !path.exists() {
+        return Ok(String::new());
+    }
+    Ok(fs::read_to_string(path)?)
+}
+
+fn run_preflight_contract_smoke(
+    request: &AdapterRunRequest<'_>,
+) -> Result<PreflightContractSmokeExecution> {
+    let adapter = adapter_registry_entry(&request.runtime.adapter_ref)?;
+    let proc_result = adapter.run_trial(request)?;
+    let stdout =
+        read_optional_text_file(&request.trial_paths.trial_dir.join("harness_stdout.log"))?;
+    let stderr =
+        read_optional_text_file(&request.trial_paths.trial_dir.join("harness_stderr.log"))?;
+    Ok(PreflightContractSmokeExecution {
+        status: proc_result.status,
+        stdout,
+        stderr,
+    })
+}
+
+fn detect_known_probe_output_blockers(stdout: &str, stderr: &str) -> Vec<String> {
     let mut blockers = Vec::new();
-    for line in report.stdout.lines().chain(report.stderr.lines()) {
+    for line in stdout.lines().chain(stderr.lines()) {
         let trimmed = line.trim();
         if trimmed.is_empty() {
             continue;
@@ -3377,15 +3436,187 @@ fn detect_known_probe_output_blockers(report: &PreflightProbeExecution) -> Vec<S
             blockers.push(trimmed.to_string());
             continue;
         }
-        if lower.contains("references tool")
-            && lower.contains("which is not available")
-        {
+        if lower.contains("references tool") && lower.contains("which is not available") {
             blockers.push(trimmed.to_string());
         }
     }
     blockers.sort();
     blockers.dedup();
     blockers
+}
+
+fn summarize_preflight_failure_logs(stdout: &str, stderr: &str) -> Vec<String> {
+    let mut lines = Vec::new();
+    for line in stderr.lines().chain(stdout.lines()) {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        lines.push(trimmed.to_string());
+        if lines.len() >= 3 {
+            break;
+        }
+    }
+    lines
+}
+
+fn validate_preflight_result_payload(path: &Path) -> Vec<String> {
+    let mut failures = Vec::new();
+    if !path.exists() {
+        failures.push(format!(
+            "contract smoke did not write result payload: {}",
+            path.display()
+        ));
+        return failures;
+    }
+    if !path.is_file() {
+        failures.push(format!(
+            "contract smoke result payload path is not a file: {}",
+            path.display()
+        ));
+        return failures;
+    }
+    let raw = match fs::read_to_string(path) {
+        Ok(value) => value,
+        Err(err) => {
+            failures.push(format!(
+                "failed to read contract smoke result payload at {}: {}",
+                path.display(),
+                err
+            ));
+            return failures;
+        }
+    };
+    if raw.trim().is_empty() {
+        failures.push(format!(
+            "contract smoke wrote an empty result payload: {}",
+            path.display()
+        ));
+        return failures;
+    }
+    let value = match serde_json::from_str::<Value>(&raw) {
+        Ok(value) => value,
+        Err(err) => {
+            failures.push(format!(
+                "failed to parse agent result JSON at {}: {}",
+                path.display(),
+                err
+            ));
+            return failures;
+        }
+    };
+    match value.pointer("/schema_version").and_then(Value::as_str) {
+        Some("agent_result_v1") => {}
+        Some(other) => failures.push(format!(
+            "result payload schema_version was '{}', expected 'agent_result_v1' at {}",
+            other,
+            path.display()
+        )),
+        None => failures.push(format!(
+            "result payload missing schema_version 'agent_result_v1' at {}",
+            path.display()
+        )),
+    }
+    if value
+        .pointer("/outcome")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .is_none()
+    {
+        failures.push(format!(
+            "result payload missing non-empty outcome at {}",
+            path.display()
+        ));
+    }
+    failures
+}
+
+fn validate_preflight_benchmark_smoke_outputs(
+    request: &AdapterRunRequest<'_>,
+    status: &str,
+) -> Vec<String> {
+    let mut failures = Vec::new();
+    let prediction_path = request.trial_paths.out.join(BENCHMARK_PREDICTION_FILENAME);
+    let score_path = request.trial_paths.out.join(BENCHMARK_SCORE_FILENAME);
+    let grade_error_path = request.trial_paths.out.join(BENCHMARK_GRADE_ERROR_FILENAME);
+
+    match load_optional_json_record_with_schema(
+        "benchmark_prediction_record_v1.jsonschema",
+        &prediction_path,
+    ) {
+        Ok(Some(_)) => {}
+        Ok(None) => failures.push(format!(
+            "contract smoke did not write benchmark prediction record: {}",
+            prediction_path.display()
+        )),
+        Err(err) => failures.push(format!("benchmark prediction record invalid: {}", err)),
+    }
+    match load_optional_json_record_with_schema("benchmark_score_record_v1.jsonschema", &score_path)
+    {
+        Ok(Some(_)) => {}
+        Ok(None) => failures.push(format!(
+            "contract smoke did not write benchmark score record: {}",
+            score_path.display()
+        )),
+        Err(err) => failures.push(format!("benchmark score record invalid: {}", err)),
+    }
+    if grade_error_path.exists() {
+        let marker_reason =
+            fs::read_to_string(&grade_error_path).unwrap_or_else(|_| "grade_error".to_string());
+        let reason = marker_reason.trim();
+        failures.push(format!(
+            "benchmark smoke recorded grade error: {}",
+            if reason.is_empty() {
+                "grade_error"
+            } else {
+                reason
+            }
+        ));
+    } else if status == BENCHMARK_GRADING_POLICY_EXIT_CODE.to_string() {
+        failures.push(format!(
+            "benchmark smoke exited with grading policy code {} without a grade error marker",
+            BENCHMARK_GRADING_POLICY_EXIT_CODE
+        ));
+    }
+    failures
+}
+
+fn collect_preflight_contract_smoke_failures(
+    request: &AdapterRunRequest<'_>,
+    execution: &PreflightContractSmokeExecution,
+) -> Vec<String> {
+    let mut failures = detect_known_probe_output_blockers(&execution.stdout, &execution.stderr);
+    let log_summaries = summarize_preflight_failure_logs(&execution.stdout, &execution.stderr);
+    let mut contract_failed = false;
+    if execution.status != "0" {
+        failures.push(format!(
+            "contract smoke exited with status {}",
+            execution.status
+        ));
+        contract_failed = true;
+    }
+    let result_failures = validate_preflight_result_payload(&request.io_paths.output_host);
+    if !result_failures.is_empty() {
+        contract_failed = true;
+    }
+    failures.extend(result_failures);
+    if contract_failed {
+        failures.extend(log_summaries.clone());
+    }
+    if request.benchmark_grading_enabled {
+        let benchmark_failures =
+            validate_preflight_benchmark_smoke_outputs(request, &execution.status);
+        if !benchmark_failures.is_empty() {
+            contract_failed = true;
+        }
+        failures.extend(benchmark_failures);
+    }
+    let mut seen = HashSet::new();
+    failures
+        .into_iter()
+        .filter(|failure| seen.insert(failure.clone()))
+        .collect()
 }
 
 fn resolve_agent_runtime_command(
@@ -3667,10 +3898,7 @@ fn trial_output_error_payload(code: &str, message: &str) -> Value {
 fn load_trial_output_resilient(path: &Path) -> Result<(Value, Option<String>)> {
     if !path.exists() {
         return Ok((
-            trial_output_error_payload(
-                "result_missing",
-                "agent did not write a result payload",
-            ),
+            trial_output_error_payload("result_missing", "agent did not write a result payload"),
             None,
         ));
     }
@@ -3679,7 +3907,11 @@ fn load_trial_output_resilient(path: &Path) -> Result<(Value, Option<String>)> {
     match serde_json::from_slice(&bytes) {
         Ok(value) => Ok((value, None)),
         Err(err) => {
-            let detail = format!("failed to parse agent result JSON at {}: {}", path.display(), err);
+            let detail = format!(
+                "failed to parse agent result JSON at {}: {}",
+                path.display(),
+                err
+            );
             Ok((
                 trial_output_error_payload("result_parse_error", &detail),
                 Some(detail),
@@ -3707,68 +3939,7 @@ fn prepare_io_paths(
     paths: &TrialPaths,
     container_mode: bool,
     input_bytes: &[u8],
-    clean_contract_v1: bool,
 ) -> Result<PreparedTrialIo> {
-    if clean_contract_v1 {
-        let task_host = paths.runtime.task.clone();
-        let result_host = paths.runtime.result.clone();
-        let trajectory_host = paths.runtime.trajectory.clone();
-        let output_host = result_host.clone();
-        let events_host = trajectory_host.clone();
-
-        if let Some(parent) = task_host.parent() {
-            ensure_dir(parent)?;
-        }
-        if let Some(parent) = result_host.parent() {
-            ensure_dir(parent)?;
-        }
-        if let Some(parent) = trajectory_host.parent() {
-            ensure_dir(parent)?;
-        }
-
-        let input_value: Value = serde_json::from_slice(input_bytes)?;
-        let task_value = input_value
-            .pointer("/task")
-            .cloned()
-            .unwrap_or_else(|| input_value.clone());
-        atomic_write_json_pretty(&task_host, &task_value)?;
-
-        if result_host.exists() {
-            let _ = fs::remove_file(&result_host);
-        }
-        if trajectory_host.exists() {
-            let _ = fs::remove_file(&trajectory_host);
-        }
-
-        let task_path = if container_mode {
-            DEFAULT_CLEAN_TASK_PATH.to_string()
-        } else {
-            task_host.to_string_lossy().to_string()
-        };
-        let result_path = if container_mode {
-            DEFAULT_CLEAN_RESULT_PATH.to_string()
-        } else {
-            result_host.to_string_lossy().to_string()
-        };
-        let trajectory_path = if container_mode {
-            DEFAULT_CONTAINER_TRAJECTORY_PATH.to_string()
-        } else {
-            trajectory_host.to_string_lossy().to_string()
-        };
-
-        return Ok(PreparedTrialIo {
-            input_host: task_host,
-            output_host,
-            events_host,
-            task_path,
-            bindings_path: String::new(),
-            dependencies_path: String::new(),
-            policy_path: String::new(),
-            result_path,
-            trajectory_path,
-        });
-    }
-
     let (
         task_path,
         bindings_path,
@@ -3972,23 +4143,15 @@ fn write_state_inventory(
     effective_network_mode: &str,
     invocation_source: &str,
 ) -> Result<()> {
-    let clean_contract_v1 = is_clean_contract_experiment(json_value);
     let sanitization_profile = json_value
         .pointer("/design/sanitization_profile")
         .and_then(|v| v.as_str())
         .unwrap_or("hermetic_functional");
     let integration_level = agent_runtime.integration_level.as_str();
-    let mode_requested = if clean_contract_v1 {
-        json_value
-            .pointer("/runtime/network")
-            .and_then(|v| v.as_str())
-            .unwrap_or("none")
-    } else {
-        json_value
-            .pointer("/runtime/policy/network/mode")
-            .and_then(|v| v.as_str())
-            .unwrap_or("none")
-    };
+    let mode_requested = json_value
+        .pointer("/runtime/sandbox/network")
+        .and_then(|v| v.as_str())
+        .unwrap_or("none");
     let mode_effective = if container_mode {
         effective_network_mode
     } else {
@@ -4000,12 +4163,7 @@ fn write_state_inventory(
         "unknown"
     };
 
-    let mounts = if container_mode && clean_contract_v1 {
-        vec![
-            json!({"name": "in", "path": HARNESS_IN_DIR, "writable": false}),
-            json!({"name": "out", "path": HARNESS_OUT_DIR, "writable": true}),
-        ]
-    } else if container_mode {
+    let mounts = if container_mode {
         vec![
             json!({"name": "in", "path": AGENTLAB_CONTRACT_IN_DIR, "writable": false}),
             json!({"name": "workspace", "path": AGENTLAB_CONTRACT_WORKSPACE_DIR, "writable": true}),
@@ -4033,11 +4191,10 @@ fn write_state_inventory(
         "network": {
             "mode_requested": mode_requested,
             "mode_effective": mode_effective,
-            "allowed_hosts": if clean_contract_v1 {
-                json!([])
-            } else {
-                json_value.pointer("/runtime/policy/network/allowed_hosts").cloned().unwrap_or(json!([]))
-            },
+            "allowed_hosts": json_value
+                .pointer("/runtime/policy/network/allowed_hosts")
+                .cloned()
+                .unwrap_or(json!([])),
             "enforcement_effective": enforcement_effective,
             "egress_self_test": {
                 "performed": false,

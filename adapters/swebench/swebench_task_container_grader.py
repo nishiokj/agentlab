@@ -35,6 +35,23 @@ def _env_int(name: str, fallback: int = 0) -> int:
         return fallback
 
 
+def _env_int_min(name: str, fallback: int, minimum: int) -> int:
+    parsed = _env_int(name, fallback)
+    if parsed < minimum:
+        return fallback
+    return parsed
+
+
+def _identity_fields() -> dict[str, Any]:
+    slot_commit_id = os.environ.get("AGENTLAB_SLOT_COMMIT_ID", "").strip() or "slot_pending"
+    return {
+        "schedule_idx": _env_int_min("AGENTLAB_SCHEDULE_IDX", 0, 0),
+        "slot_commit_id": slot_commit_id,
+        "attempt": _env_int_min("AGENTLAB_ATTEMPT", 1, 1),
+        "row_seq": _env_int_min("AGENTLAB_ROW_SEQ", 0, 0),
+    }
+
+
 def _task_id(task_payload: Any) -> str:
     if isinstance(task_payload, dict):
         if isinstance(task_payload.get("id"), str) and task_payload["id"].strip():
@@ -92,6 +109,7 @@ def build_prediction_record(task_payload: Any, agent_result: Any) -> dict[str, A
     benchmark = _extract_benchmark_spec(task_payload)
     return {
         "schema_version": "benchmark_prediction_record_v1",
+        **_identity_fields(),
         "ids": {
             "run_id": os.environ.get("AGENTLAB_RUN_ID", "run_unknown"),
             "trial_id": os.environ.get("AGENTLAB_TRIAL_ID", "trial_unknown"),
@@ -113,6 +131,7 @@ def build_score_record(task_payload: Any, agent_result: Any) -> dict[str, Any]:
     verdict = "pass" if resolved == 1.0 else "fail"
     return {
         "schema_version": "benchmark_score_record_v1",
+        **_identity_fields(),
         "ids": {
             "run_id": os.environ.get("AGENTLAB_RUN_ID", "run_unknown"),
             "trial_id": os.environ.get("AGENTLAB_TRIAL_ID", "trial_unknown"),

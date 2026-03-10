@@ -28,18 +28,15 @@ function loadAgentRuntimeCommand() {
   }
 
   const defaultCandidates = [
-    ['python', './harness.py', 'run'],
-    ['python', './examples/clean_harness/harness.py', 'run'],
+    ['python', '/opt/agent/harness.py', 'run'],
+    ['python', '/opt/agent/examples/clean_harness/harness.py', 'run'],
   ];
   for (const candidate of defaultCandidates) {
-    const entry = candidate[1];
-    if (existsSync(resolve(process.cwd(), entry))) {
-      return candidate;
-    }
+    return candidate;
   }
 
   throw new Error(
-    'No harness entrypoint found. Set AGENTLAB_AGENT_RUNTIME_CMD_JSON, or add ./harness.py or ./examples/clean_harness/harness.py',
+    'No harness entrypoint configured. Set AGENTLAB_AGENT_RUNTIME_CMD_JSON to a command rooted under /opt/agent/...',
   );
 }
 
@@ -143,10 +140,16 @@ async function main() {
   }
 
   const agentRuntimeCommand = loadAgentRuntimeCommand();
+  const bundle = process.env.AGENTLAB_AGENT_BUNDLE || '.lab/agents/agent-runtime.tar.gz';
   const image = values['container-image'];
+  const bundleAbs = resolve(cwd, bundle);
+  if (!existsSync(bundleAbs)) {
+    throw new Error(`Agent bundle not found at ${bundle}. Set AGENTLAB_AGENT_BUNDLE or build the runtime bundle first.`);
+  }
 
   const expDirAbs = dirname(expAbs);
   const datasetRelFromExp = relative(expDirAbs, datasetAbs);
+  const bundleRelFromExp = relative(expDirAbs, bundleAbs);
 
   const baselineBindings = loadJsonEnv('AGENTLAB_BASELINE_BINDINGS_JSON', {
     prompt_profile: 'baseline',
@@ -169,6 +172,7 @@ async function main() {
       splitId: 'test',
       limit: safeLimit,
     })
+    .agentBundle(bundleRelFromExp)
     .agentLoop(agentRuntimeCommand)
     .sanitizationProfile('hermetic_functional')
     .replications(replications)

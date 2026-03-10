@@ -60,7 +60,9 @@ class ExportBenchSuiteToJsonlTests(unittest.TestCase):
                 },
             )
 
-            with self.assertRaisesRegex(ValueError, "task.image missing"):
+            with self.assertRaisesRegex(
+                ValueError, "environment.image could not be resolved"
+            ):
                 exporter._build_task_row(
                     root=root,
                     suite="v0",
@@ -73,7 +75,7 @@ class ExportBenchSuiteToJsonlTests(unittest.TestCase):
                     require_task_image=True,
                 )
 
-    def test_build_task_row_emits_workspace_seed_and_materializes_dataset_pack(self) -> None:
+    def test_build_task_row_emits_workspace_base_and_materializes_dataset_pack(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             task_dir = root / "bench" / "benchmark" / "tasks" / "v0" / "TASK001"
@@ -135,10 +137,10 @@ class ExportBenchSuiteToJsonlTests(unittest.TestCase):
             )
 
             self.assertEqual(row["schema_version"], exporter.TASK_BOUNDARY_SCHEMA_VERSION)
-            self.assertEqual(row["mount_references"], [])
             self.assertEqual(row["task"]["id"], "TASK001")
-            self.assertEqual(row["task"]["image"], "bench-v0-workspace-task001:latest")
-            self.assertNotIn("workspace", row["task"])
+            self.assertEqual(
+                row["environment"]["image"], "bench-v0-workspace-task001:latest"
+            )
             self.assertEqual(
                 row["task"]["input"]["prompt"],
                 "\n\n".join(
@@ -156,7 +158,7 @@ class ExportBenchSuiteToJsonlTests(unittest.TestCase):
                 ),
             )
             self.assertEqual(
-                row["workspace_files"],
+                row["workspace"]["overlays"],
                 [
                     {
                         "path": "ISSUE.md",
@@ -178,10 +180,14 @@ class ExportBenchSuiteToJsonlTests(unittest.TestCase):
                     },
                 ],
             )
+            self.assertEqual(row["workspace"]["mode"], "patch")
+            self.assertEqual(row["workspace"]["base"]["kind"], "dataset_pack")
+            self.assertEqual(row["workspace"]["aux_mounts"], [])
+            self.assertEqual(row["limits"], {})
 
-            seed_ref = row["workspace_seed"]["dataset_pack_ref"]
-            self.assertTrue(seed_ref.startswith("sha256:"))
-            digest = seed_ref.split(":", 1)[1]
+            base_ref = row["workspace"]["base"]["dataset_pack_ref"]
+            self.assertTrue(base_ref.startswith("sha256:"))
+            digest = base_ref.split(":", 1)[1]
             pack_dir = root / ".lab" / "dataset_packs" / "sha256" / digest
             self.assertTrue(pack_dir.exists())
             self.assertEqual(
@@ -224,7 +230,9 @@ class ExportBenchSuiteToJsonlTests(unittest.TestCase):
                 require_task_image=True,
             )
 
-            self.assertEqual(row["task"]["image"], "ghcr.io/example/bench-task:latest")
+            self.assertEqual(
+                row["environment"]["image"], "ghcr.io/example/bench-task:latest"
+            )
 
     def test_build_task_row_rebuilds_stale_dataset_pack(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -274,7 +282,7 @@ class ExportBenchSuiteToJsonlTests(unittest.TestCase):
                 require_task_image=True,
             )
 
-            digest = first["workspace_seed"]["dataset_pack_ref"].split(":", 1)[1]
+            digest = first["workspace"]["base"]["dataset_pack_ref"].split(":", 1)[1]
             pack_dir = root / ".lab" / "dataset_packs" / "sha256" / digest
             (pack_dir / "src" / "file.txt").write_text("corrupted\n", encoding="utf-8")
 
@@ -291,15 +299,15 @@ class ExportBenchSuiteToJsonlTests(unittest.TestCase):
             )
 
             self.assertEqual(
-                second["workspace_seed"]["dataset_pack_ref"],
-                first["workspace_seed"]["dataset_pack_ref"],
+                second["workspace"]["base"]["dataset_pack_ref"],
+                first["workspace"]["base"]["dataset_pack_ref"],
             )
             self.assertEqual(
                 (pack_dir / "src" / "file.txt").read_text(encoding="utf-8"),
                 "after\n",
             )
 
-    def test_materialize_workspace_seed_pack_applies_patch_inside_git_worktree(self) -> None:
+    def test_materialize_workspace_base_pack_applies_patch_inside_git_worktree(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             subprocess.run(["git", "init"], cwd=root, check=True, capture_output=True, text=True)
@@ -336,7 +344,7 @@ class ExportBenchSuiteToJsonlTests(unittest.TestCase):
                 },
             )
 
-            digest = exporter._materialize_workspace_seed_pack(
+            digest = exporter._materialize_workspace_base_pack(
                 root=root,
                 task_dir=task_dir,
                 task_yaml=exporter._load_task_yaml(task_dir),
@@ -394,7 +402,7 @@ class ExportBenchSuiteToJsonlTests(unittest.TestCase):
                     ]
                 ),
             )
-            self.assertEqual(row["workspace_files"], [])
+            self.assertEqual(row["workspace"]["overlays"], [])
 
 
 if __name__ == "__main__":

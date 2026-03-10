@@ -63,7 +63,6 @@ mod tests {
                 input_arg: "--input".to_string(),
                 output_arg: "--output".to_string(),
             },
-            clean_contract_v1: false,
             integration_level: "cli_basic".to_string(),
             launch_mode: AgentLaunchMode::File,
             env: BTreeMap::new(),
@@ -77,6 +76,86 @@ mod tests {
             force_container: true,
             dependency_file_staging: Vec::new(),
             dependency_services: Vec::new(),
+        }
+    }
+
+    fn workspace_base_empty() -> WorkspaceBaseSpec {
+        WorkspaceBaseSpec {
+            kind: WorkspaceBaseKind::Empty,
+            dataset_pack_ref: None,
+            repo: None,
+            commit: None,
+        }
+    }
+
+    fn workspace_base_dataset_pack(dataset_pack_ref: &str) -> WorkspaceBaseSpec {
+        WorkspaceBaseSpec {
+            kind: WorkspaceBaseKind::DatasetPack,
+            dataset_pack_ref: Some(dataset_pack_ref.to_string()),
+            repo: None,
+            commit: None,
+        }
+    }
+
+    fn workspace_overlay(
+        path: &str,
+        content: &str,
+        encoding: Option<&str>,
+    ) -> WorkspaceOverlaySpec {
+        WorkspaceOverlaySpec {
+            path: path.to_string(),
+            content: content.to_string(),
+            encoding: encoding.map(str::to_string),
+            executable: false,
+        }
+    }
+
+    fn workspace_aux_mount(dataset_pack_ref: &str, mount_path: &str) -> WorkspaceAuxMountSpec {
+        WorkspaceAuxMountSpec {
+            dataset_pack_ref: dataset_pack_ref.to_string(),
+            mount_path: mount_path.to_string(),
+        }
+    }
+
+    fn scratch_workspace() -> WorkspaceSpec {
+        WorkspaceSpec {
+            mode: WorkspaceMode::Scratch,
+            base: workspace_base_empty(),
+            overlays: Vec::new(),
+            aux_mounts: Vec::new(),
+        }
+    }
+
+    fn runtime_sandbox(image_source: &str, image: Option<&str>) -> Value {
+        let mut sandbox = json!({
+            "executor": "docker",
+            "image_source": image_source,
+            "profile": "workspace_write",
+            "network": "none",
+        });
+        if let Some(image) = image {
+            sandbox
+                .as_object_mut()
+                .expect("sandbox object")
+                .insert("image".to_string(), json!(image));
+        }
+        sandbox
+    }
+
+    fn ensure_test_agent_bundle(project_root: &Path, bundle_name: &str) -> PathBuf {
+        let bundle_root = project_root.join(".lab").join("agents").join(bundle_name);
+        let bin_dir = bundle_root.join("bin");
+        ensure_dir(&bin_dir).expect("test bundle bin dir");
+        for name in ["sh", "python", "python3", "node", "rex"] {
+            fs::copy("/bin/sh", bin_dir.join(name)).expect("copy test bundle executable");
+        }
+        bundle_root
+    }
+
+    fn local_process_execution() -> RunExecutionOptions {
+        RunExecutionOptions {
+            executor: Some(ExecutorKind::LocalProcess),
+            ..RunExecutionOptions::default()
         }
     }
 
@@ -139,6 +218,8 @@ mod tests {
         include_events_path: bool,
     ) {
         let _ = include_events_path;
+        let project_root = find_project_root(run_dir);
+        let bundle_root = ensure_test_agent_bundle(&project_root, "rex-current");
 
         let resolved = json!({
             "version": "0.3",
@@ -149,14 +230,13 @@ mod tests {
             "runtime": {
                 "agent": {
                     "command": harness_success_command(),
-                    "image": "img",
+                    "bundle": bundle_root.to_string_lossy().to_string(),
                     "integration_level": integration_level,
                     "io": { "input_arg": "--input", "output_arg": "--output" }
                 },
+                "sandbox": runtime_sandbox("global", Some("img")),
                 "policy": {
-                    "timeout_ms": 600000,
-                    "sandbox": { "mode": "local" },
-                    "network": { "mode": "none", "allowed_hosts": [] }
+                    "timeout_ms": 600000
                 }
             }
         });
@@ -179,6 +259,8 @@ mod tests {
         integration_level: &str,
         command: Vec<String>,
     ) {
+        let project_root = find_project_root(run_dir);
+        let bundle_root = ensure_test_agent_bundle(&project_root, "rex-current");
         let resolved = json!({
             "version": "0.3",
             "experiment": { "id": "e", "name": "n", "workload_type": "agent_harness" },
@@ -188,13 +270,13 @@ mod tests {
             "runtime": {
                 "agent": {
                     "command": command,
+                    "bundle": bundle_root.to_string_lossy().to_string(),
                     "integration_level": integration_level,
                     "io": { "input_arg": "--input", "output_arg": "--output" }
                 },
+                "sandbox": runtime_sandbox("global", Some("img")),
                 "policy": {
-                    "timeout_ms": 600000,
-                    "sandbox": { "mode": "local" },
-                    "network": { "mode": "none", "allowed_hosts": [] }
+                    "timeout_ms": 600000
                 }
             }
         });
@@ -208,7 +290,13 @@ mod tests {
         fs::write(
             path,
             format!(
-                "{{\"schema_version\":\"task_boundary_v2\",\"task\":{{\"id\":\"{}\"}},\"workspace_files\":[],\"mount_references\":[],\"limits\":{{}}}}\n",
+                concat!(
+                    "{{\"schema_version\":\"task_boundary_v3\",",
+                    "\"task\":{{\"id\":\"{}\"}},",
+                    "\"environment\":{{\"image\":\"python:3.11-slim\"}},",
+                    "\"workspace\":{{\"mode\":\"scratch\",\"base\":{{\"kind\":\"empty\"}},\"overlays\":[],\"aux_mounts\":[]}},",
+                    "\"limits\":{{}}}}\n"
+                ),
                 task_id
             ),
         )
@@ -239,10 +327,17 @@ mod tests {
                 "id": "task_1"
             },
             "ext": {
-                "task_boundary_v2": {
-                    "schema_version": "task_boundary_v2",
-                    "workspace_files": [],
-                    "mount_references": [],
+                "task_boundary_v3": {
+                    "schema_version": "task_boundary_v3",
+                    "environment": {
+                        "image": "python:3.11-slim"
+                    },
+                    "workspace": {
+                        "mode": "scratch",
+                        "base": { "kind": "empty" },
+                        "overlays": [],
+                        "aux_mounts": []
+                    },
                     "limits": {}
                 }
             },
@@ -267,11 +362,8 @@ mod tests {
             "outcome": "success",
             "checkpoints": checkpoints
         });
-        atomic_write_json_pretty(
-            &trial_dir.join("result.json"),
-            &trial_output,
-        )
-        .expect("trial output");
+        atomic_write_json_pretty(&trial_dir.join("result.json"), &trial_output)
+            .expect("trial output");
 
         write_trial_state(
             &trial_dir,
@@ -438,7 +530,7 @@ mod tests {
             &run_dir,
             "run_1",
             &RunBehavior::default(),
-            &RunExecutionOptions::default(),
+            &local_process_execution(),
         )
         .expect("run session");
 
@@ -527,6 +619,33 @@ mod tests {
         let paths = TrialPaths::new(&trial_dir, &exp_dir).expect("trial paths");
         paths.prepare(true).expect("prepare");
         (root, paths)
+    }
+
+    #[test]
+    fn trial_paths_drop_cleans_scratch_without_explicit_cleanup() {
+        let root = TempDirGuard::new("agentlab_trial_paths_drop_cleanup");
+        let exp_dir = root.path.join("exp");
+        ensure_dir(&exp_dir).expect("exp dir");
+        fs::write(exp_dir.join("README.md"), "fixture").expect("exp fixture");
+        let trial_dir = root.path.join("trial_1");
+        ensure_dir(&trial_dir).expect("trial dir");
+
+        let scratch_dir = {
+            let paths = TrialPaths::new(&trial_dir, &exp_dir).expect("trial paths");
+            paths.prepare(true).expect("prepare");
+            fs::write(paths.out.join("result.json"), "{}").expect("write result");
+            assert!(
+                paths.scratch_dir.exists(),
+                "scratch dir should exist while trial paths live"
+            );
+            paths.scratch_dir.clone()
+        };
+
+        assert!(
+            !scratch_dir.exists(),
+            "trial path drop should cleanup scratch dir: {}",
+            scratch_dir.display()
+        );
     }
 
     #[test]
@@ -783,15 +902,18 @@ mod tests {
             "runtime": {
                 "agent": {
                     "command": harness_success_command(),
-                    "image": "img",
+                    "bundle": ".lab/agents/rex-current.tar.gz",
                     "integration_level": "cli_basic",
                     "io": { "input_arg": "--input", "output_arg": "--output" }
                 },
-                "policy": {
-                    "timeout_ms": 600000,
-                    "sandbox": { "mode": "local" },
-                    "network": { "mode": "full", "allowed_hosts": [] }
-                }
+                "sandbox": {
+                    "executor": "docker",
+                    "image_source": "global",
+                    "image": "img",
+                    "profile": "workspace_write",
+                    "network": "full"
+                },
+                "policy": { "timeout_ms": 600000 }
             }
         });
         atomic_write_json_pretty(&run_dir.join("resolved_experiment.json"), &resolved)
@@ -817,13 +939,8 @@ mod tests {
             network_mode_override: None,
             require_network_none: true,
         };
-        write_run_session_state(
-            &run_dir,
-            "run_1",
-            &behavior,
-            &RunExecutionOptions::default(),
-        )
-        .expect("run session");
+        write_run_session_state(&run_dir, "run_1", &behavior, &local_process_execution())
+            .expect("run session");
 
         let err = continue_run(&run_dir).expect_err("continue should honor persisted behavior");
         assert!(
@@ -842,27 +959,45 @@ mod tests {
         assert_eq!(result.run_id, "run_1");
 
         let control = load_json_file(&run_control_path(&run_dir)).expect("run control");
-        assert_eq!(
-            control.pointer("/status").and_then(Value::as_str),
-            Some("completed")
-        );
+        let trial_state = load_json_file(
+            &run_dir
+                .join("trials")
+                .join("trial_1")
+                .join("trial_state.json"),
+        )
+        .expect("trial state");
+        if control.pointer("/status").and_then(Value::as_str) != Some("completed") {
+            panic!("control={:?} trial_state={:?}", control, trial_state);
+        }
 
         let schedule_progress = load_schedule_progress(&run_dir).expect("schedule progress");
+        let trial_output =
+            load_json_file(&run_dir.join("trials").join("trial_1").join("result.json"))
+                .expect("trial output");
         assert_eq!(schedule_progress.next_schedule_index, 1);
         assert_eq!(schedule_progress.completed_slots.len(), 1);
         assert_eq!(schedule_progress.completed_slots[0].schedule_index, 0);
         assert_eq!(schedule_progress.completed_slots[0].trial_id, "trial_1");
-        assert_eq!(schedule_progress.completed_slots[0].status, "completed");
+        if schedule_progress.completed_slots[0].status != "completed" {
+            panic!(
+                "slot={:?} trial_state={:?} trial_output={:?}",
+                schedule_progress.completed_slots[0], trial_state, trial_output
+            );
+        }
         assert_eq!(schedule_progress.completed_slots[0].attempt, 1);
         assert!(
-            !schedule_progress.completed_slots[0].slot_commit_id.is_empty(),
+            !schedule_progress.completed_slots[0]
+                .slot_commit_id
+                .is_empty(),
             "slot commit id should be persisted"
         );
 
         let store = BackingSqliteStore::open(&run_dir).expect("store");
         assert_eq!(store.row_count("evidence_rows").expect("evidence count"), 1);
         assert_eq!(
-            store.row_count("chain_state_rows").expect("chain state count"),
+            store
+                .row_count("chain_state_rows")
+                .expect("chain state count"),
             1
         );
         assert!(
@@ -902,10 +1037,22 @@ mod tests {
         continue_run(&run_dir).expect("continue run");
 
         let evidence = load_sqlite_json_row(&run_dir, "evidence_rows", "run_1");
-        assert_eq!(evidence.pointer("/run_id").and_then(Value::as_str), Some("run_1"));
-        assert_eq!(evidence.pointer("/schedule_idx").and_then(Value::as_u64), Some(0));
-        assert_eq!(evidence.pointer("/attempt").and_then(Value::as_u64), Some(1));
-        assert_eq!(evidence.pointer("/row_seq").and_then(Value::as_u64), Some(0));
+        assert_eq!(
+            evidence.pointer("/run_id").and_then(Value::as_str),
+            Some("run_1")
+        );
+        assert_eq!(
+            evidence.pointer("/schedule_idx").and_then(Value::as_u64),
+            Some(0)
+        );
+        assert_eq!(
+            evidence.pointer("/attempt").and_then(Value::as_u64),
+            Some(1)
+        );
+        assert_eq!(
+            evidence.pointer("/row_seq").and_then(Value::as_u64),
+            Some(0)
+        );
         assert_eq!(
             evidence.pointer("/ids/trial_id").and_then(Value::as_str),
             Some("trial_1")
@@ -927,8 +1074,14 @@ mod tests {
             chain_state.pointer("/schedule_idx").and_then(Value::as_u64),
             Some(0)
         );
-        assert_eq!(chain_state.pointer("/attempt").and_then(Value::as_u64), Some(1));
-        assert_eq!(chain_state.pointer("/row_seq").and_then(Value::as_u64), Some(0));
+        assert_eq!(
+            chain_state.pointer("/attempt").and_then(Value::as_u64),
+            Some(1)
+        );
+        assert_eq!(
+            chain_state.pointer("/row_seq").and_then(Value::as_u64),
+            Some(0)
+        );
         assert!(
             chain_state
                 .pointer("/slot_commit_id")
@@ -992,15 +1145,12 @@ mod tests {
             "runtime": {
                 "agent": {
                     "command": ["sh", "-lc", "echo ok"],
-                    "image": "img",
+                    "bundle": ".lab/agents/rex-current.tar.gz",
                     "integration_level": "cli_basic",
                     "launch": { "mode": "stdio" }
                 },
-                "policy": {
-                    "timeout_ms": 600000,
-                    "sandbox": { "mode": "container", "image": "img" },
-                    "network": { "mode": "none", "allowed_hosts": [] }
-                }
+                "sandbox": runtime_sandbox("global", Some("img")),
+                "policy": { "timeout_ms": 600000 }
             }
         });
 
@@ -1017,13 +1167,10 @@ mod tests {
             "runtime": {
                 "agent": {
                     "command": "rex",
-                    "image": "img"
+                    "bundle": ".lab/agents/rex-current.tar.gz"
                 },
-                "policy": {
-                    "timeout_ms": 600000,
-                    "sandbox": { "mode": "container", "image": "img" },
-                    "network": { "mode": "none", "allowed_hosts": [] }
-                }
+                "sandbox": runtime_sandbox("global", Some("img")),
+                "policy": { "timeout_ms": 600000 }
             }
         });
 
@@ -1039,14 +1186,10 @@ mod tests {
         let spec = json!({
             "runtime": {
                 "agent": {
-                    "command": ["rex", "run"],
-                    "image_source": "per_task"
+                    "command": ["rex", "run"]
                 },
-                "policy": {
-                    "timeout_ms": 600000,
-                    "sandbox": { "mode": "container" },
-                    "network": { "mode": "none", "allowed_hosts": [] }
-                }
+                "sandbox": runtime_sandbox("per_task", None),
+                "policy": { "timeout_ms": 600000 }
             }
         });
 
@@ -1055,8 +1198,7 @@ mod tests {
             Err(err) => err,
         };
         assert!(
-            err.to_string()
-                .contains("runtime.agent.artifact is required"),
+            err.to_string().contains("runtime.agent.bundle is required"),
             "unexpected error: {}",
             err
         );
@@ -1076,14 +1218,10 @@ mod tests {
             "runtime": {
                 "agent": {
                     "command": ["rex", "run"],
-                    "image_source": "per_task",
-                    "artifact": ".lab/agents/rex-current.tar.gz"
+                    "bundle": ".lab/agents/rex-current.tar.gz"
                 },
-                "policy": {
-                    "timeout_ms": 600000,
-                    "sandbox": { "mode": "local" },
-                    "network": { "mode": "none", "allowed_hosts": [] }
-                }
+                "sandbox": runtime_sandbox("per_task", None),
+                "policy": { "timeout_ms": 600000 }
             }
         });
         let variant = Variant {
@@ -1100,14 +1238,17 @@ mod tests {
             &exp_dir,
             false,
             &RunBehavior::default(),
-            &RunExecutionOptions::default(),
+            &RunExecutionOptions {
+                executor: Some(ExecutorKind::LocalProcess),
+                ..RunExecutionOptions::default()
+            },
         ) {
             Ok(_) => panic!("per-task local runtime should be rejected"),
             Err(err) => err,
         };
         assert!(
             err.to_string()
-                .contains("requires /runtime/policy/sandbox/mode='container'"),
+                .contains("runtime.sandbox.image_source='per_task' requires container execution"),
             "unexpected error: {}",
             err
         );
@@ -1125,13 +1266,10 @@ mod tests {
                     "aliases": {
                         "rex": ["bun", "./scripts/rex.js"]
                     },
-                    "image": "img"
+                    "bundle": ".lab/agents/rex-current.tar.gz"
                 },
-                "policy": {
-                    "timeout_ms": 600000,
-                    "sandbox": { "mode": "container", "image": "img" },
-                    "network": { "mode": "none", "allowed_hosts": [] }
-                }
+                "sandbox": runtime_sandbox("global", Some("img")),
+                "policy": { "timeout_ms": 600000 }
             }
         });
 
@@ -1167,7 +1305,7 @@ mod tests {
                 "repl_idx": 0
             }
         });
-        let env = build_runtime_contract_env("run_1", &input, &io, Some(12345), false);
+        let env = build_runtime_contract_env("run_1", &input, &io, Some(12345));
         assert_eq!(
             env.get(AGENTLAB_ENV_TASK_PATH).map(String::as_str),
             Some(AGENTLAB_TASK_PATH)
@@ -1183,23 +1321,23 @@ mod tests {
     }
 
     #[test]
-    fn build_runtime_contract_env_is_empty_for_clean_contract() {
+    fn build_runtime_contract_env_includes_paths_for_minimal_input() {
         let io = PreparedTrialIo {
             input_host: PathBuf::from("/tmp/trial_input.json"),
             output_host: PathBuf::from("/tmp/out.json"),
             events_host: PathBuf::from("/tmp/events.jsonl"),
-            task_path: HARNESS_TASK_PATH.to_string(),
-            bindings_path: String::new(),
-            dependencies_path: String::new(),
-            policy_path: String::new(),
-            result_path: HARNESS_RESULT_PATH.to_string(),
-            trajectory_path: String::new(),
+            task_path: AGENTLAB_TASK_PATH.to_string(),
+            bindings_path: AGENTLAB_BINDINGS_PATH.to_string(),
+            dependencies_path: AGENTLAB_DEPENDENCIES_PATH.to_string(),
+            policy_path: AGENTLAB_POLICY_PATH.to_string(),
+            result_path: AGENTLAB_RESULT_PATH.to_string(),
+            trajectory_path: AGENTLAB_TRAJECTORY_PATH.to_string(),
         };
-        let input = json!({ "id": "task_1" });
-        let env = build_runtime_contract_env("run_1", &input, &io, Some(12345), true);
+        let input = json!({ "ids": { "trial_id": "trial_1" } });
+        let env = build_runtime_contract_env("run_1", &input, &io, Some(12345));
         assert!(
-            env.is_empty(),
-            "clean contract should not project AGENTLAB_* env vars"
+            env.contains_key(AGENTLAB_ENV_TASK_PATH),
+            "runtime env should always include AGENTLAB_* paths after the hard cutover"
         );
     }
 
@@ -1212,7 +1350,7 @@ mod tests {
             "runtime": {
                 "agent": {
                     "command": ["sh", "-lc", "echo ok"],
-                    "image": "img",
+                    "bundle": ".lab/agents/rex-current.tar.gz",
                     "env": {"A":"B"}
                 },
                 "dependencies": {
@@ -1224,11 +1362,8 @@ mod tests {
                         }
                     ]
                 },
-                "policy": {
-                    "timeout_ms": 600000,
-                    "network": {"mode":"none","allowed_hosts":[]},
-                    "sandbox": { "mode": "container", "image": "img" }
-                }
+                "sandbox": runtime_sandbox("global", Some("img")),
+                "policy": { "timeout_ms": 600000 }
             }
         });
 
@@ -1261,7 +1396,7 @@ mod tests {
             "runtime": {
                 "agent": {
                     "command": ["sh", "-lc", "echo ok"],
-                    "image": "img"
+                    "bundle": ".lab/agents/rex-current.tar.gz"
                 },
                 "dependencies": {
                     "file_staging": [
@@ -1271,11 +1406,8 @@ mod tests {
                         }
                     ]
                 },
-                "policy": {
-                    "timeout_ms": 600000,
-                    "network": {"mode":"none","allowed_hosts":[]},
-                    "sandbox": { "mode": "container", "image": "img" }
-                }
+                "sandbox": runtime_sandbox("global", Some("img")),
+                "policy": { "timeout_ms": 600000 }
             }
         });
 
@@ -1300,7 +1432,7 @@ mod tests {
             "runtime": {
                 "agent": {
                     "command": ["sh", "-lc", "echo ok"],
-                    "image": "img"
+                    "bundle": ".lab/agents/rex-current.tar.gz"
                 },
                 "dependencies": {
                     "file_staging": [
@@ -1310,11 +1442,8 @@ mod tests {
                         }
                     ]
                 },
-                "policy": {
-                    "timeout_ms": 600000,
-                    "network": {"mode":"none","allowed_hosts":[]},
-                    "sandbox": { "mode": "container", "image": "img" }
-                }
+                "sandbox": runtime_sandbox("global", Some("img")),
+                "policy": { "timeout_ms": 600000 }
             }
         });
 
@@ -1339,7 +1468,7 @@ mod tests {
             "runtime": {
                 "agent": {
                     "command": ["sh", "-lc", "echo ok"],
-                    "image": "img"
+                    "bundle": ".lab/agents/rex-current.tar.gz"
                 },
                 "dependencies": {
                     "secret_files": [
@@ -1349,11 +1478,8 @@ mod tests {
                         }
                     ]
                 },
-                "policy": {
-                    "timeout_ms": 600000,
-                    "network": {"mode":"none","allowed_hosts":[]},
-                    "sandbox": { "mode": "container", "image": "img" }
-                }
+                "sandbox": runtime_sandbox("global", Some("img")),
+                "policy": { "timeout_ms": 600000 }
             }
         });
 
@@ -1377,18 +1503,15 @@ mod tests {
             "runtime": {
                 "agent": {
                     "command": ["sh", "-lc", "echo ok"],
-                    "image": "img",
+                    "bundle": ".lab/agents/rex-current.tar.gz",
                     "env_from_host": ["OPENAI_API_KEY"],
                     "secret_env": ["ANTHROPIC_API_KEY"]
                 },
                 "dependencies": {
                     "secret_env": ["OPENAI_API_KEY", "GEMINI_API_KEY"]
                 },
-                "policy": {
-                    "timeout_ms": 600000,
-                    "network": {"mode":"none","allowed_hosts":[]},
-                    "sandbox": { "mode": "container", "image": "img" }
-                }
+                "sandbox": runtime_sandbox("global", Some("img")),
+                "policy": { "timeout_ms": 600000 }
             }
         });
 
@@ -1397,7 +1520,8 @@ mod tests {
             Err(err) => err,
         };
         assert!(
-            err.to_string().contains("runtime.agent.secret_env is not supported"),
+            err.to_string()
+                .contains("runtime.agent.secret_env is not supported"),
             "unexpected error: {}",
             err
         );
@@ -1421,18 +1545,15 @@ mod tests {
             "runtime": {
                 "agent": {
                     "command": ["rex", "run"],
-                    "image": "img",
+                    "bundle": ".lab/agents/rex-current.tar.gz",
                     "config_files": [
                         "overrides/defaults.json",
                         ".config/agent/auth.json"
                     ],
                     "default_config": "overrides/defaults.json"
                 },
-                "policy": {
-                    "timeout_ms": 600000,
-                    "network": {"mode":"none","allowed_hosts":[]},
-                    "sandbox": { "mode": "container", "image": "img" }
-                }
+                "sandbox": runtime_sandbox("global", Some("img")),
+                "policy": { "timeout_ms": 600000 }
             }
         });
 
@@ -1495,7 +1616,6 @@ mod tests {
                 input_arg: "--input".to_string(),
                 output_arg: "--output".to_string(),
             },
-            clean_contract_v1: false,
             integration_level: "cli_basic".to_string(),
             launch_mode: AgentLaunchMode::File,
             env: BTreeMap::new(),
@@ -2111,12 +2231,9 @@ mod tests {
             "design": { "sanitization_profile": "hermetic_functional", "comparison": "paired", "replications": 1, "random_seed": 1337, "shuffle_tasks": true, "max_concurrency": 1 },
             "baseline": { "variant_id": "base", "bindings": {} },
             "runtime": {
-                "agent": { "command": ["node", "h.js"] },
-                "policy": {
-                    "timeout_ms": 600000,
-                    "sandbox": { "mode": "local" },
-                    "network": { "mode": "none", "allowed_hosts": [] }
-                }
+                "agent": { "command": ["node", "h.js"], "bundle": ".lab/agents/rex-current.tar.gz" },
+                "sandbox": runtime_sandbox("global", Some("img")),
+                "policy": { "timeout_ms": 600000 }
             }
         });
         validate_required_fields(&spec).expect("valid spec should pass");
@@ -2132,7 +2249,8 @@ mod tests {
             "baseline": {},
             "runtime": {
                 "agent": {},
-                "policy": { "sandbox": { "mode": "local" }, "network": {} }
+                "policy": {},
+                "sandbox": {}
             }
         });
         let err = validate_required_fields(&spec).expect_err("should fail");
@@ -2153,13 +2271,28 @@ mod tests {
             msg
         );
         assert!(
-            msg.contains("/runtime/agent"),
-            "missing runtime.agent: {}",
+            msg.contains("/runtime/agent/command"),
+            "missing runtime.agent.command: {}",
             msg
         );
         assert!(
-            msg.contains("/runtime/policy/network/mode"),
-            "missing network mode: {}",
+            msg.contains("/runtime/sandbox/network"),
+            "missing sandbox network: {}",
+            msg
+        );
+        assert!(
+            msg.contains("/runtime/agent/bundle"),
+            "missing bundle: {}",
+            msg
+        );
+        assert!(
+            msg.contains("/runtime/sandbox/executor"),
+            "missing sandbox executor: {}",
+            msg
+        );
+        assert!(
+            msg.contains("/runtime/sandbox/profile"),
+            "missing sandbox profile: {}",
             msg
         );
         assert!(
@@ -2178,12 +2311,9 @@ mod tests {
             "design": { "sanitization_profile": "hermetic_functional", "comparison": "paired", "replications": 1, "random_seed": 1337, "shuffle_tasks": true, "max_concurrency": 1 },
             "baseline": { "variant_id": "base", "bindings": {} },
             "runtime": {
-                "agent": { "command": ["node", "h.js"] },
-                "policy": {
-                    "timeout_ms": 600000,
-                    "sandbox": { "mode": "local" },
-                    "network": { "mode": "none", "allowed_hosts": [] }
-                }
+                "agent": { "command": ["node", "h.js"], "bundle": ".lab/agents/rex-current.tar.gz" },
+                "sandbox": runtime_sandbox("global", Some("img")),
+                "policy": { "timeout_ms": 600000 }
             }
         });
         validate_required_fields(&spec).expect("missing integration_level should default");
@@ -2199,18 +2329,16 @@ mod tests {
             "baseline": { "variant_id": "base", "bindings": {} },
             "runtime": {
                 "agent": {
-                    "command": ["node", "/app/h.js"]
+                    "command": ["node", "/app/h.js"],
+                    "bundle": ".lab/agents/rex-current.tar.gz"
                 },
-                "policy": {
-                    "timeout_ms": 600000,
-                    "sandbox": { "mode": "container" },
-                    "network": { "mode": "none", "allowed_hosts": [] }
-                }
+                "sandbox": runtime_sandbox("global", None),
+                "policy": { "timeout_ms": 600000 }
             }
         });
         let err = validate_required_fields(&spec).expect_err("should fail");
         assert!(
-            err.to_string().contains("/runtime/agent/image"),
+            err.to_string().contains("/runtime/sandbox/image"),
             "missing sandbox image: {}",
             err
         );
@@ -2227,18 +2355,14 @@ mod tests {
             "runtime": {
                 "agent": {
                     "command": ["node", "/app/h.js"],
-                    "image_source": "per_task",
-                    "artifact": ".lab/agents/rex-current.tar.gz"
+                    "bundle": ".lab/agents/rex-current.tar.gz"
                 },
-                "policy": {
-                    "timeout_ms": 600000,
-                    "sandbox": { "mode": "container" },
-                    "network": { "mode": "none", "allowed_hosts": [] }
-                }
+                "sandbox": runtime_sandbox("per_task", None),
+                "policy": { "timeout_ms": 600000 }
             }
         });
         validate_required_fields(&spec)
-            .expect("per-task image mode should not require runtime.agent.image");
+            .expect("per-task image mode should not require runtime.sandbox.image");
     }
 
     #[test]
@@ -2251,21 +2375,17 @@ mod tests {
             "baseline": { "variant_id": "base", "bindings": {} },
             "runtime": {
                 "agent": {
-                    "command": ["node", "/app/h.js"],
-                    "image_source": "per_task"
+                    "command": ["node", "/app/h.js"]
                 },
-                "policy": {
-                    "timeout_ms": 600000,
-                    "sandbox": { "mode": "container" },
-                    "network": { "mode": "none", "allowed_hosts": [] }
-                }
+                "sandbox": runtime_sandbox("per_task", None),
+                "policy": { "timeout_ms": 600000 }
             }
         });
         let err =
             validate_required_fields(&spec).expect_err("missing per-task artifact should fail");
         assert!(
-            err.to_string().contains("/runtime/agent/artifact"),
-            "expected missing artifact error: {}",
+            err.to_string().contains("/runtime/agent/bundle"),
+            "expected missing bundle error: {}",
             err
         );
     }
@@ -2281,28 +2401,29 @@ mod tests {
             "runtime": {
                 "agent": {
                     "command": ["node", "/app/h.js"],
-                    "image_source": "per_task",
-                    "artifact": ".lab/agents/rex-current.tar.gz"
+                    "bundle": ".lab/agents/rex-current.tar.gz"
                 },
-                "policy": {
-                    "timeout_ms": 600000,
-                    "sandbox": { "mode": "local" },
-                    "network": { "mode": "none", "allowed_hosts": [] }
-                }
+                "sandbox": json!({
+                    "executor": "local",
+                    "image_source": "per_task",
+                    "profile": "workspace_write",
+                    "network": "none"
+                }),
+                "policy": { "timeout_ms": 600000 }
             }
         });
         let err = validate_required_fields(&spec)
             .expect_err("per-task image source in local mode should fail");
         assert!(
             err.to_string()
-                .contains("requires /runtime/policy/sandbox/mode='container'"),
+                .contains("/runtime/sandbox/executor (must be 'docker')"),
             "unexpected error: {}",
             err
         );
     }
 
     #[test]
-    fn validate_required_fields_v1_accepts_flat_shape() {
+    fn validate_required_fields_rejects_legacy_experiment_version() {
         let spec = json!({
             "version": "1.0",
             "experiment": { "id": "e", "name": "n" },
@@ -2316,30 +2437,28 @@ mod tests {
                 "network": "none"
             }
         });
-        validate_required_fields(&spec).expect("valid v1 spec should pass");
+        let err = validate_required_fields(&spec).expect_err("legacy v1 spec must fail");
+        assert!(
+            err.to_string().contains("legacy experiment version '1.0'"),
+            "unexpected error: {}",
+            err
+        );
     }
 
     #[test]
-    fn validate_required_fields_v1_reports_flat_runtime_requirements() {
+    fn resolve_variant_plan_rejects_legacy_experiment_version() {
         let spec = json!({
             "version": "1.0",
-            "experiment": { "id": "e", "name": "n" },
-            "dataset": { "path": "tasks.jsonl" },
-            "design": { "replications": 1 },
-            "baseline": { "variant_id": "base" },
-            "runtime": {}
+            "baseline": { "variant_id": "base", "args": ["--temperature", "0.7"] },
+            "variant_plan": [
+                { "variant_id": "hot", "args": ["--temperature", "0.9"] }
+            ]
         });
-        let err = validate_required_fields(&spec).expect_err("should fail");
-        let msg = err.to_string();
+        let err = resolve_variant_plan(&spec).expect_err("legacy v1 variants must fail");
         assert!(
-            msg.contains("/runtime/image"),
-            "missing runtime.image: {}",
-            msg
-        );
-        assert!(
-            msg.contains("/runtime/command"),
-            "missing runtime.command: {}",
-            msg
+            err.to_string().contains("legacy experiment version '1.0'"),
+            "unexpected error: {}",
+            err
         );
     }
 
@@ -2440,7 +2559,7 @@ mod tests {
     }
 
     #[test]
-    fn resolve_variant_plan_parses_clean_contract_args_env_image() {
+    fn resolve_variant_plan_rejects_clean_contract_args_env_image_shape() {
         let spec = json!({
             "version": "1.0",
             "baseline": {
@@ -2458,12 +2577,13 @@ mod tests {
             ]
         });
 
-        let (variants, baseline_id) = resolve_variant_plan(&spec).expect("variant plan");
-        assert_eq!(baseline_id, "control");
-        assert_eq!(variants.len(), 2);
-        assert_eq!(variants[0].args, vec!["--temperature", "0.7"]);
-        assert_eq!(variants[1].env.get("DEBUG").map(String::as_str), Some("1"));
-        assert_eq!(variants[1].image.as_deref(), Some("my-harness-v2:latest"));
+        let err =
+            resolve_variant_plan(&spec).expect_err("legacy clean contract variants must fail");
+        assert!(
+            err.to_string().contains("legacy experiment version '1.0'"),
+            "unexpected error: {}",
+            err
+        );
     }
 
     #[test]
@@ -2646,6 +2766,90 @@ mod tests {
     }
 
     #[test]
+    fn resolve_runtime_for_variant_appends_dependency_file_staging_entries() {
+        let base = json!({
+            "runtime": {
+                "dependencies": {
+                    "file_staging": [
+                        {
+                            "source_from_host": "files/benchmark.py",
+                            "destination_path": "/agentlab/deps/benchmark.py",
+                            "required": true,
+                            "read_only": true
+                        },
+                        {
+                            "source_from_host": "files/defaults.json",
+                            "destination_path": "/agentlab/deps/defaults.json",
+                            "required": true,
+                            "read_only": true
+                        }
+                    ],
+                    "services": [
+                        { "id": "grader" }
+                    ]
+                }
+            }
+        });
+        let variant = Variant {
+            id: "treatment".to_string(),
+            bindings: json!({}),
+            args: Vec::new(),
+            env: BTreeMap::new(),
+            image: None,
+            runtime_overrides: Some(json!({
+                "dependencies": {
+                    "file_staging": [
+                        {
+                            "source_from_host": "files/alt-defaults.json",
+                            "destination_path": "/agentlab/deps/defaults.json",
+                            "required": true,
+                            "read_only": true
+                        },
+                        {
+                            "source_from_host": "files/codex-auth.json",
+                            "destination_path": "/agentlab/deps/.config/rex/codex-auth.json",
+                            "required": true,
+                            "read_only": true
+                        }
+                    ]
+                }
+            })),
+        };
+
+        let merged = resolve_runtime_for_variant(&base, &variant).expect("merge");
+        let file_staging = merged
+            .pointer("/runtime/dependencies/file_staging")
+            .and_then(|value| value.as_array())
+            .expect("merged file staging");
+        assert_eq!(file_staging.len(), 3);
+        assert!(file_staging.iter().any(|entry| {
+            entry.get("destination_path").and_then(Value::as_str)
+                == Some("/agentlab/deps/benchmark.py")
+        }));
+        assert!(file_staging.iter().any(|entry| {
+            entry.get("destination_path").and_then(Value::as_str)
+                == Some("/agentlab/deps/.config/rex/codex-auth.json")
+        }));
+        let defaults_entry = file_staging
+            .iter()
+            .find(|entry| {
+                entry.get("destination_path").and_then(Value::as_str)
+                    == Some("/agentlab/deps/defaults.json")
+            })
+            .expect("defaults entry");
+        assert_eq!(
+            defaults_entry
+                .get("source_from_host")
+                .and_then(Value::as_str),
+            Some("files/alt-defaults.json")
+        );
+        assert_eq!(
+            merged.pointer("/runtime/dependencies/services"),
+            Some(&json!([{ "id": "grader" }]))
+        );
+    }
+
+    #[test]
     fn validate_required_fields_requires_benchmark_adapter_command() {
         let spec = json!({
             "version": "0.3",
@@ -2657,12 +2861,9 @@ mod tests {
                 "policy": { "task_model": "independent" }
             },
             "runtime": {
-                "agent": { "mode": "custom_image", "custom_image": { "entrypoint": ["node", "h.js"] } },
-                "policy": {
-                    "timeout_ms": 600000,
-                    "sandbox": { "mode": "local" },
-                    "network": { "mode": "none", "allowed_hosts": [] }
-                }
+                "agent": { "command": ["node", "h.js"], "bundle": ".lab/agents/rex-current.tar.gz" },
+                "sandbox": runtime_sandbox("global", Some("img")),
+                "policy": { "timeout_ms": 600000 }
             }
         });
         let err = validate_required_fields(&spec).expect_err("should fail");
@@ -2833,23 +3034,20 @@ mod tests {
             "swebench__django__12345"
         );
         assert_eq!(
-            boundary
-                .task_payload
-                .pointer("/image")
-                .and_then(|v| v.as_str())
-                .unwrap_or(""),
+            boundary.environment.image.as_str(),
             "ghcr.io/acme/swebench-task:20260222"
         );
         assert_eq!(
             boundary
-                .workspace_seed
-                .as_ref()
-                .map(|seed| seed.dataset_pack_ref.as_str())
+                .workspace
+                .base
+                .dataset_pack_ref
+                .as_deref()
                 .unwrap_or(""),
             "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
         );
-        assert_eq!(boundary.workspace_files.len(), 1);
-        assert_eq!(boundary.mount_references.len(), 1);
+        assert_eq!(boundary.workspace.overlays.len(), 1);
+        assert_eq!(boundary.workspace.aux_mounts.len(), 1);
         assert_eq!(boundary.limits.max_steps, Some(12));
         assert_eq!(boundary.limits.max_total_tokens, Some(16000));
         assert_eq!(boundary.limits.max_tool_calls, Some(32));
@@ -2957,7 +3155,7 @@ mod tests {
             variant_id: "baseline".to_string(),
             task_id: format!("task_{}", schedule_idx),
             repl_idx: 0,
-            runtime_profile: json!({ "runtime": { "agent": { "image": "img" } } }),
+            runtime_profile: json!({ "runtime": { "sandbox": { "image": "img" } } }),
             task_payload: json!({ "id": format!("task_{}", schedule_idx) }),
             effective_policy: json!({ "timeout_ms": 1000 }),
         }
@@ -3301,7 +3499,7 @@ mod tests {
     }
 
     #[test]
-    fn p2c_local_thread_worker_backend_ticket_map_drives_pause_and_stop() {
+    fn p2c_local_thread_worker_backend_rejects_fake_pause_and_stop() {
         let executor: Arc<LocalTrialExecutor> = Arc::new(|dispatch| {
             thread::sleep(Duration::from_millis(120));
             Ok(TrialCompletion {
@@ -3323,17 +3521,24 @@ mod tests {
         let dispatch = worker_dispatch_fixture(2, "trial_pause");
         let ticket = backend.submit(dispatch.clone()).expect("submit");
 
-        let ack = backend
+        let pause_err = backend
             .request_pause(&ticket.worker_id, "checkpoint_now")
-            .expect("pause ack");
-        assert_eq!(ack.worker_id, ticket.worker_id);
-        assert_eq!(ack.trial_id, ticket.trial_id);
-        assert_eq!(ack.label, "checkpoint_now");
-        assert!(ack.accepted);
+            .expect_err("pause should fail honestly");
+        assert!(
+            pause_err.to_string().contains("does not support pause"),
+            "unexpected pause error: {}",
+            pause_err
+        );
 
-        backend
+        let stop_err = backend
             .request_stop(&ticket.worker_id, "unit test stop")
-            .expect("stop should accept known worker");
+            .expect_err("stop should fail honestly");
+        assert!(
+            stop_err.to_string().contains("does not support stop"),
+            "unexpected stop error: {}",
+            stop_err
+        );
+
         let err = backend
             .request_pause("unknown.worker", "x")
             .expect_err("unknown worker should fail");
@@ -3630,9 +3835,9 @@ mod tests {
             "candidate",
             &json!({
                 "id": "task_9",
-                "image": "ghcr.io/acme/task:20260222",
                 "grading": { "enabled": false }
             }),
+            Some("ghcr.io/acme/task:20260222"),
             &trial_input_path,
         )
         .expect("preflight");
@@ -3641,7 +3846,7 @@ mod tests {
             load_json_file(&trial_dir.join("benchmark_preflight.json")).expect("preflight json");
         assert_eq!(
             preflight
-                .pointer("/task_image")
+                .pointer("/environment_image")
                 .and_then(|v| v.as_str())
                 .unwrap_or(""),
             "ghcr.io/acme/task:20260222"
@@ -4640,21 +4845,30 @@ mod tests {
     #[test]
     fn parse_task_boundary_extracts_runtime_fields() {
         let task = json!({
-            "schema_version": "task_boundary_v2",
+            "schema_version": "task_boundary_v3",
             "task": {
                 "id": "task_1",
                 "prompt": "solve this"
             },
-            "workspace_files": [
-                { "path": "notes/input.txt", "content": "hello" }
-            ],
-            "mount_references": [
-                {
-                    "dataset_pack_ref": format!("sha256:{}", "a".repeat(64)),
-                    "mount_path": format!("{}/dataset_pack", AGENTLAB_CONTRACT_WORKSPACE_DIR),
-                    "read_only": true
-                }
-            ],
+            "environment": {
+                "image": "python:3.11-slim"
+            },
+            "workspace": {
+                "mode": "patch",
+                "base": {
+                    "kind": "dataset_pack",
+                    "dataset_pack_ref": format!("sha256:{}", "d".repeat(64))
+                },
+                "overlays": [
+                    { "path": "notes/input.txt", "content": "hello" }
+                ],
+                "aux_mounts": [
+                    {
+                        "dataset_pack_ref": format!("sha256:{}", "a".repeat(64)),
+                        "mount_path": format!("{}/dataset_pack", AGENTLAB_CONTRACT_WORKSPACE_DIR)
+                    }
+                ]
+            },
             "limits": {
                 "max_steps": 8,
                 "max_total_tokens": 2048,
@@ -4672,8 +4886,9 @@ mod tests {
                 .unwrap_or(""),
             "task_1"
         );
-        assert_eq!(parsed.workspace_files.len(), 1);
-        assert_eq!(parsed.mount_references.len(), 1);
+        assert_eq!(parsed.environment.image, "python:3.11-slim");
+        assert_eq!(parsed.workspace.overlays.len(), 1);
+        assert_eq!(parsed.workspace.aux_mounts.len(), 1);
         assert_eq!(parsed.limits.max_steps, Some(8));
         assert_eq!(parsed.limits.max_total_tokens, Some(2048));
         assert_eq!(parsed.limits.max_tool_calls, Some(4));
@@ -4681,34 +4896,48 @@ mod tests {
     }
 
     #[test]
-    fn parse_task_boundary_v2_parses_workspace_seed() {
+    fn parse_task_boundary_v3_parses_workspace_base_dataset_pack() {
+        let dataset_pack_ref = format!("sha256:{}", "d".repeat(64));
         let task = json!({
-            "schema_version": "task_boundary_v2",
+            "schema_version": "task_boundary_v3",
             "task": {
                 "id": "task_1",
-                "image": "swebench/sweb.eval.x86_64.astropy__astropy-12907:latest",
                 "prompt": "solve this"
             },
-            "workspace_seed": {
-                "dataset_pack_ref": format!("sha256:{}", "d".repeat(64))
+            "environment": {
+                "image": "swebench/sweb.eval.x86_64.astropy__astropy-12907:latest"
             },
-            "workspace_files": [],
-            "mount_references": [],
+            "workspace": {
+                "mode": "patch",
+                "base": {
+                    "kind": "dataset_pack",
+                    "dataset_pack_ref": dataset_pack_ref
+                },
+                "overlays": [],
+                "aux_mounts": []
+            },
             "limits": {}
         });
 
-        let parsed = parse_task_boundary_from_dataset_task(&task).expect("workspace seed");
-        let seed = parsed.workspace_seed.expect("workspace seed present");
-        assert_eq!(seed.dataset_pack_ref, format!("sha256:{}", "d".repeat(64)));
+        let parsed = parse_task_boundary_from_dataset_task(&task).expect("workspace base");
+        assert_eq!(
+            parsed.workspace.base.dataset_pack_ref.as_deref(),
+            Some(dataset_pack_ref.as_str())
+        );
     }
 
     #[test]
     fn parse_task_boundary_rejects_unsupported_keys() {
         let task = json!({
-            "schema_version": "task_boundary_v2",
+            "schema_version": "task_boundary_v3",
             "task": { "id": "task_1" },
-            "workspace_files": [],
-            "mount_references": [],
+            "environment": { "image": "python:3.11-slim" },
+            "workspace": {
+                "mode": "scratch",
+                "base": { "kind": "empty" },
+                "overlays": [],
+                "aux_mounts": []
+            },
             "limits": {},
             "benchmark_kind": "custom_magic"
         });
@@ -4736,56 +4965,61 @@ mod tests {
     }
 
     #[test]
-    fn task_boundary_workspace_materialization_uses_policy_not_benchmark_identity() {
-        let boundary = TaskBoundaryMaterialization {
+    fn task_boundary_workspace_materialization_requires_patch_base() {
+        let scratch_boundary = TaskBoundaryMaterialization {
             task_payload: json!({
                 "id": "swebench_like_id",
                 "swebench": { "repo": "x/y" }
             }),
-            workspace_seed: None,
-            workspace_files: Vec::new(),
-            mount_references: Vec::new(),
+            environment: TaskEnvironmentSpec {
+                image: "python:3.11-slim".to_string(),
+            },
+            workspace: scratch_workspace(),
             limits: TaskBoundaryLimits::default(),
-            task_image: None,
+            task_image: "python:3.11-slim".to_string(),
         };
-        let not_required = TaskBoundaryPolicy {
-            require_workspace_materialization: false,
-        };
-        validate_task_boundary_workspace_materialization(
-            &boundary,
-            &not_required,
-            ImageSource::Global,
-        )
-        .expect("should not require materialization when policy flag is false");
+        validate_task_boundary_workspace_materialization(&scratch_boundary)
+            .expect("scratch mode can use an empty base");
 
-        let required = TaskBoundaryPolicy {
-            require_workspace_materialization: true,
-        };
-        let err = validate_task_boundary_workspace_materialization(
-            &boundary,
-            &required,
-            ImageSource::Global,
-        )
-        .expect_err("policy-required materialization should fail when task boundary is empty");
+        let err = validate_task_boundary_workspace_materialization(&TaskBoundaryMaterialization {
+            task_payload: json!({
+                "id": "swebench_like_id",
+                "swebench": { "repo": "x/y" }
+            }),
+            environment: TaskEnvironmentSpec {
+                image: "python:3.11-slim".to_string(),
+            },
+            workspace: WorkspaceSpec {
+                mode: WorkspaceMode::Patch,
+                base: workspace_base_empty(),
+                overlays: Vec::new(),
+                aux_mounts: Vec::new(),
+            },
+            limits: TaskBoundaryLimits::default(),
+            task_image: "python:3.11-slim".to_string(),
+        })
+        .expect_err("patch tasks with an empty base should fail");
         assert!(
-            err.to_string()
-                .contains("missing required workspace materialization"),
+            err.to_string().contains("patch tasks require a real base"),
             "unexpected error: {}",
             err
         );
 
-        let err = validate_task_boundary_workspace_materialization(
-            &boundary,
-            &not_required,
-            ImageSource::PerTask,
-        )
-        .expect_err("per-task image source must require materialization");
-        assert!(
-            err.to_string()
-                .contains("missing required workspace materialization"),
-            "unexpected error: {}",
-            err
-        );
+        validate_task_boundary_workspace_materialization(&TaskBoundaryMaterialization {
+            task_payload: json!({ "id": "patch_with_base" }),
+            environment: TaskEnvironmentSpec {
+                image: "python:3.11-slim".to_string(),
+            },
+            workspace: WorkspaceSpec {
+                mode: WorkspaceMode::Patch,
+                base: workspace_base_dataset_pack(&format!("sha256:{}", "c".repeat(64))),
+                overlays: Vec::new(),
+                aux_mounts: Vec::new(),
+            },
+            limits: TaskBoundaryLimits::default(),
+            task_image: "python:3.11-slim".to_string(),
+        })
+        .expect("patch mode with a real base should pass");
     }
 
     #[test]
@@ -4804,7 +5038,7 @@ mod tests {
             parse_task_boundary_from_trial_input(&input).expect_err("should require task field");
         assert!(
             err.to_string()
-                .contains("must provide '/task' + '/ext/task_boundary_v2'"),
+                .contains("must provide '/task' + '/ext/task_boundary_v3'"),
             "unexpected error: {}",
             err
         );
@@ -4819,7 +5053,7 @@ mod tests {
         let err = parse_task_boundary_from_trial_input(&input).expect_err("untyped payload");
         assert!(
             err.to_string()
-                .contains("must provide '/task' + '/ext/task_boundary_v2'"),
+                .contains("must provide '/task' + '/ext/task_boundary_v3'"),
             "unexpected error: {}",
             err
         );
@@ -4831,22 +5065,21 @@ mod tests {
             "schema_version": "agent_task_v1",
             "task": {
                 "id": "task_1",
-                "image": "swebench/sweb.eval.x86_64.astropy__astropy-12907:latest",
                 "input": { "prompt": "hello" }
             }
         });
         let err = parse_task_boundary_from_trial_input(&input).expect_err("missing boundary ext");
         assert!(
             err.to_string()
-                .contains("/ext/task_boundary_v2 is required"),
+                .contains("/ext/task_boundary_v3 is required"),
             "unexpected error: {}",
             err
         );
     }
 
     #[test]
-    fn materialize_workspace_files_writes_utf8_and_base64() {
-        let root = TempDirGuard::new("agentlab_task_boundary_workspace_files");
+    fn materialize_workspace_overlays_writes_utf8_and_base64() {
+        let root = TempDirGuard::new("agentlab_task_boundary_workspace_overlays");
         let exp_dir = root.path.join("exp");
         ensure_dir(&exp_dir).expect("exp dir");
         fs::write(exp_dir.join("README.md"), "fixture").expect("exp fixture");
@@ -4856,21 +5089,11 @@ mod tests {
         paths.prepare(true).expect("prepare");
 
         let files = vec![
-            WorkspaceFileSpec {
-                path: "notes/plain.txt".to_string(),
-                content: "hello world".to_string(),
-                encoding: Some("utf8".to_string()),
-                executable: false,
-            },
-            WorkspaceFileSpec {
-                path: "notes/decoded.txt".to_string(),
-                content: "aGVsbG8gYmFzZTY0".to_string(),
-                encoding: Some("base64".to_string()),
-                executable: false,
-            },
+            workspace_overlay("notes/plain.txt", "hello world", Some("utf8")),
+            workspace_overlay("notes/decoded.txt", "aGVsbG8gYmFzZTY0", Some("base64")),
         ];
 
-        materialize_workspace_files(&paths, &files).expect("materialize");
+        materialize_workspace_overlays(&paths, &files).expect("materialize");
         assert_eq!(
             fs::read_to_string(paths.workspace.join("notes/plain.txt")).expect("plain"),
             "hello world"
@@ -4882,19 +5105,19 @@ mod tests {
     }
 
     #[test]
-    fn resolve_task_mounts_requires_container_and_existing_pack() {
+    fn resolve_workspace_aux_mounts_requires_container_and_existing_pack() {
         let root = TempDirGuard::new("agentlab_task_boundary_mounts");
         let digest = "b".repeat(64);
         let pack_dir = root.path.join(".lab").join("dataset_packs").join("sha256");
         ensure_dir(&pack_dir).expect("pack dir");
         fs::write(pack_dir.join(&digest), "pack bytes").expect("pack file");
 
-        let refs = vec![MountReferenceSpec {
-            dataset_pack_ref: format!("sha256:{}", digest),
-            mount_path: format!("{}/dataset_pack", AGENTLAB_CONTRACT_WORKSPACE_DIR),
-            read_only: true,
-        }];
-        let resolved = resolve_task_mounts(&root.path, &refs, true).expect("resolve mounts");
+        let refs = vec![workspace_aux_mount(
+            &format!("sha256:{}", digest),
+            &format!("{}/dataset_pack", AGENTLAB_CONTRACT_WORKSPACE_DIR),
+        )];
+        let resolved =
+            resolve_workspace_aux_mounts(&root.path, &refs, true).expect("resolve mounts");
         assert_eq!(resolved.len(), 1);
         assert!(
             resolved[0].host_path.ends_with(Path::new(&digest)),
@@ -4902,8 +5125,8 @@ mod tests {
             resolved[0].host_path.display()
         );
 
-        let err =
-            resolve_task_mounts(&root.path, &refs, false).expect_err("local mode should fail");
+        let err = resolve_workspace_aux_mounts(&root.path, &refs, false)
+            .expect_err("local mode should fail");
         assert!(
             err.to_string().contains("require container"),
             "unexpected error: {}",
@@ -4912,8 +5135,8 @@ mod tests {
     }
 
     #[test]
-    fn materialize_workspace_seed_copies_dataset_pack_into_workspace() {
-        let root = TempDirGuard::new("agentlab_workspace_seed_materialize");
+    fn materialize_workspace_base_copies_dataset_pack_into_workspace() {
+        let root = TempDirGuard::new("agentlab_workspace_base_materialize");
         let digest = "e".repeat(64);
         let pack_root = root
             .path
@@ -4934,14 +5157,12 @@ mod tests {
         paths.prepare(true).expect("prepare");
         fs::write(paths.workspace.join("stale.txt"), "stale").expect("stale workspace file");
 
-        let seed = WorkspaceSeedSpec {
-            dataset_pack_ref: format!("sha256:{}", digest),
-        };
-        materialize_workspace_seed(&root.path, &paths, Some(&seed)).expect("materialize seed");
+        let base = workspace_base_dataset_pack(&format!("sha256:{}", digest));
+        materialize_workspace_base(&root.path, &paths, &base).expect("materialize base");
 
         assert!(
             !paths.workspace.join("stale.txt").exists(),
-            "workspace seed should replace existing workspace content"
+            "workspace base should replace existing workspace content"
         );
         assert_eq!(
             fs::read_to_string(paths.workspace.join("src/main.ts")).expect("seeded file"),
@@ -4965,13 +5186,18 @@ mod tests {
             "runtime": {
                 "agent": {
                     "command": ["sh", "-lc", "echo ok"],
-                    "image": "img"
+                    "bundle": ".lab/agents/rex-current.tar.gz"
+                },
+                "sandbox": {
+                    "executor": "docker",
+                    "image_source": "global",
+                    "image": "img",
+                    "profile": "workspace_write",
+                    "network": "none"
                 },
                 "dependencies": { "services": [] },
                 "policy": {
-                    "timeout_ms": 600000,
-                    "network": { "mode": "none", "allowed_hosts": [] },
-                    "sandbox": { "mode": "container", "image": "img" }
+                    "timeout_ms": 600000
                 }
             }
         });
@@ -4987,25 +5213,25 @@ mod tests {
         };
         let task_boundary = TaskBoundaryMaterialization {
             task_payload: json!({ "id": "task_1", "prompt": "x" }),
-            workspace_seed: None,
-            workspace_files: vec![WorkspaceFileSpec {
-                path: "input.txt".to_string(),
-                content: "hello".to_string(),
-                encoding: Some("utf8".to_string()),
-                executable: false,
-            }],
-            mount_references: vec![MountReferenceSpec {
-                dataset_pack_ref: format!("sha256:{}", "c".repeat(64)),
-                mount_path: format!("{}/dataset_pack", AGENTLAB_CONTRACT_WORKSPACE_DIR),
-                read_only: true,
-            }],
+            environment: TaskEnvironmentSpec {
+                image: "python:3.11-slim".to_string(),
+            },
+            workspace: WorkspaceSpec {
+                mode: WorkspaceMode::Patch,
+                base: workspace_base_dataset_pack(&format!("sha256:{}", "d".repeat(64))),
+                overlays: vec![workspace_overlay("input.txt", "hello", Some("utf8"))],
+                aux_mounts: vec![workspace_aux_mount(
+                    &format!("sha256:{}", "c".repeat(64)),
+                    &format!("{}/dataset_pack", AGENTLAB_CONTRACT_WORKSPACE_DIR),
+                )],
+            },
             limits: TaskBoundaryLimits {
                 max_steps: Some(12),
                 max_total_tokens: Some(4096),
                 max_tool_calls: Some(9),
                 trial_seconds: Some(90),
             },
-            task_image: None,
+            task_image: "python:3.11-slim".to_string(),
         };
 
         let input = build_agent_task(
@@ -5035,7 +5261,7 @@ mod tests {
         );
         assert_eq!(
             input
-                .pointer("/ext/task_boundary_v2/workspace_files/0/path")
+                .pointer("/ext/task_boundary_v3/workspace/overlays/0/path")
                 .and_then(|v| v.as_str())
                 .unwrap_or(""),
             "input.txt"
@@ -5437,7 +5663,7 @@ mod tests {
             }
         });
         let timeout_ms = resolve_trial_timeout_ms(&input, Some(111000));
-        let env = build_runtime_contract_env("run_1", &input, &io, timeout_ms, false);
+        let env = build_runtime_contract_env("run_1", &input, &io, timeout_ms);
         assert_eq!(
             env.get(AGENTLAB_ENV_TIMEOUT_MS).map(String::as_str),
             Some("456000")
@@ -5548,7 +5774,6 @@ mod tests {
                     input_arg: "--input".to_string(),
                     output_arg: "--output".to_string(),
                 },
-                clean_contract_v1: false,
                 integration_level: "cli_basic".to_string(),
                 launch_mode: AgentLaunchMode::File,
                 env: BTreeMap::new(),
@@ -5619,25 +5844,35 @@ mod tests {
 
     #[test]
     fn preflight_probe_output_blockers_detect_avx_incompatibility_warning() {
-        let blockers = detect_known_probe_output_blockers(&PreflightProbeExecution {
-            probe_command: vec!["bun".to_string(), "--help".to_string()],
-            stdout: String::new(),
-            stderr: "warn: CPU lacks AVX support, strange crashes may occur.".to_string(),
-        });
+        let blockers = detect_known_probe_output_blockers(
+            "",
+            "warn: CPU lacks AVX support, strange crashes may occur.",
+        );
         assert_eq!(blockers.len(), 1);
         assert!(blockers[0].contains("CPU lacks AVX support"));
     }
 
     #[test]
     fn preflight_probe_output_blockers_detect_missing_tool_registry_warning() {
-        let blockers = detect_known_probe_output_blockers(&PreflightProbeExecution {
-            probe_command: vec!["agent".to_string(), "--help".to_string()],
-            stdout: "[harness] Agent 'coding' references tool 'Skill' which is not available"
-                .to_string(),
-            stderr: String::new(),
-        });
+        let blockers = detect_known_probe_output_blockers(
+            "[harness] Agent 'coding' references tool 'Skill' which is not available",
+            "",
+        );
         assert_eq!(blockers.len(), 1);
         assert!(blockers[0].contains("references tool 'Skill'"));
+    }
+
+    #[test]
+    fn preflight_contract_smoke_result_validation_rejects_missing_payload() {
+        let (_root, paths) = create_trial_paths_fixture("agentlab_preflight_missing_result");
+        let failures = validate_preflight_result_payload(&paths.out.join("result.json"));
+        assert!(
+            failures
+                .iter()
+                .any(|failure| failure.contains("contract smoke did not write result payload")),
+            "unexpected failures: {:?}",
+            failures
+        );
     }
 
     #[test]
@@ -5653,10 +5888,16 @@ mod tests {
             }),
         };
         let tasks = vec![json!({
-            "schema_version": "task_boundary_v2",
-            "task": { "id": "TASK001", "image": "img:latest" },
-            "workspace_files": [],
-            "mount_references": []
+            "schema_version": "task_boundary_v3",
+            "task": { "id": "TASK001" },
+            "environment": { "image": "img:latest" },
+            "workspace": {
+                "mode": "patch",
+                "base": { "kind": "empty" },
+                "overlays": [],
+                "aux_mounts": []
+            },
+            "limits": {}
         })];
         let profiles = vec![preflight_test_runtime_profile(ImageSource::PerTask, None)];
 
@@ -5665,7 +5906,9 @@ mod tests {
             checks.iter().any(|check| {
                 !check.passed
                     && check.name == "dataset_task_ids"
-                    && check.message.contains("missing workspace materialization")
+                    && check
+                        .message
+                        .contains("patch tasks missing a real workspace base")
             }),
             "expected missing-materialization failure in dataset_task_ids preflight checks"
         );
@@ -5717,12 +5960,12 @@ mod tests {
             "runtime": {
                 "agent": {
                     "command": ["sh", "-lc", "echo ok"],
+                    "bundle": ".lab/agents/rex-current.tar.gz",
                     "env": runtime_env
                 },
+                "sandbox": runtime_sandbox("global", Some("img")),
                 "policy": {
                     "timeout_ms": 600000,
-                    "sandbox": { "mode": "local" },
-                    "network": { "mode": "none", "allowed_hosts": [] },
                     "provider_env": provider_env
                 }
             }
@@ -5804,6 +6047,8 @@ mod tests {
         run_id: &str,
         run_status: &str,
     ) -> Value {
+        let project_root = find_project_root(run_dir);
+        let bundle_root = ensure_test_agent_bundle(&project_root, "rex-current");
         let resolved = json!({
             "version": "0.3",
             "experiment": { "id": "e", "name": "n", "workload_type": "agent_harness" },
@@ -5813,17 +6058,15 @@ mod tests {
             "runtime": {
                 "agent": {
                     "command": [
-                        "/bin/sh",
+                        "sh",
                         "-lc",
                         "printf '%s' '{\"schema_version\":\"agent_result_v1\",\"outcome\":\"success\",\"checkpoints\":[]}'"
                     ],
+                    "bundle": bundle_root.to_string_lossy().to_string(),
                     "io": { "input_arg": "--input", "output_arg": "--output" }
                 },
-                "policy": {
-                    "timeout_ms": 600000,
-                    "sandbox": { "mode": "local" },
-                    "network": { "mode": "none", "allowed_hosts": [] }
-                }
+                "sandbox": runtime_sandbox("global", Some("img")),
+                "policy": { "timeout_ms": 600000 }
             }
         });
         atomic_write_json_pretty(&run_dir.join("resolved_experiment.json"), &resolved)
@@ -5835,7 +6078,7 @@ mod tests {
             run_dir,
             run_id,
             &RunBehavior::default(),
-            &RunExecutionOptions::default(),
+            &local_process_execution(),
         )
         .expect("run session");
         let schedule = build_trial_schedule(1, 1, 1, parse_policies(&resolved).scheduling, 1);
@@ -6297,26 +6540,36 @@ mod tests {
         let root = TempDirGuard::new(prefix);
         let dataset_dir = root.path.join(".lab").join("experiments").join("data");
         ensure_dir(&dataset_dir).expect("dataset dir");
-        let workspace_seed_digest = "f".repeat(64);
-        let workspace_seed_pack = root
+        let workspace_base_digest = "f".repeat(64);
+        let workspace_base_pack = root
             .path
             .join(".lab")
             .join("dataset_packs")
             .join("sha256")
-            .join(&workspace_seed_digest);
-        ensure_dir(&workspace_seed_pack).expect("workspace seed pack dir");
-        fs::write(workspace_seed_pack.join("README.md"), "seed").expect("workspace seed content");
+            .join(&workspace_base_digest);
+        ensure_dir(&workspace_base_pack).expect("workspace base pack dir");
+        fs::write(workspace_base_pack.join("README.md"), "seed").expect("workspace base content");
         fs::write(
-            dataset_dir.join("bench_v0.task_boundary_v2.jsonl"),
+            dataset_dir.join("bench_v0.task_boundary_v3.jsonl"),
             format!(
-                r#"{{"schema_version":"task_boundary_v2","task":{{"id":"TASK001","image":"python:3.11-slim"}},"workspace_seed":{{"dataset_pack_ref":"sha256:{digest}"}},"workspace_files":[],"mount_references":[]}}"#,
-                digest = workspace_seed_digest
+                concat!(
+                    r#"{{"schema_version":"task_boundary_v3","task":{{"id":"TASK001"}},"#,
+                    r#""environment":{{"image":"python:3.11-slim"}},"#,
+                    r#""workspace":{{"mode":"patch","base":{{"kind":"dataset_pack","dataset_pack_ref":"sha256:{digest}"}},"overlays":[],"aux_mounts":[]}},"#,
+                    r#""limits":{{}}}}"#
+                ),
+                digest = workspace_base_digest
             ),
         )
         .expect("dataset row");
         fs::write(
-            dataset_dir.join("swebench_lite_curated.task_boundary_v2.jsonl"),
-            r#"{"schema_version":"task_boundary_v2","task":{"id":"swebench_astropy_astropy_12907","image":"swebench/sweb.eval.x86_64.astropy__astropy-12907:latest","benchmark":{"adapter_id":"swebench_task_container_grader","name":"swebench_lite_curated","split":"test"},"swebench":{"input":{"repo":"astropy/astropy","instance_id":"astropy__astropy-12907","base_commit":"deadbeef"}}},"workspace_files":[],"mount_references":[]}"#,
+            dataset_dir.join("swebench_lite_curated.task_boundary_v3.jsonl"),
+            concat!(
+                r#"{"schema_version":"task_boundary_v3","task":{"id":"swebench_astropy_astropy_12907","benchmark":{"adapter_id":"swebench_task_container_grader","name":"swebench_lite_curated","split":"test"},"swebench":{"input":{"repo":"astropy/astropy","instance_id":"astropy__astropy-12907","base_commit":"deadbeef"}}},"#,
+                r#""environment":{"image":"swebench/sweb.eval.x86_64.astropy__astropy-12907:latest"},"#,
+                r#""workspace":{"mode":"scratch","base":{"kind":"empty"},"overlays":[],"aux_mounts":[]},"#,
+                r#""limits":{}}"#
+            ),
         )
         .expect("swebench dataset row");
 
@@ -6359,7 +6612,7 @@ mod tests {
         ensure_dir(&codex_auth_dir).expect("codex auth dir");
         fs::write(codex_auth_dir.join("codex-auth.json"), "{}\n").expect("codex auth");
 
-        let benchmark_grader_dir = root.path.join("benchmark").join("grader");
+        let benchmark_grader_dir = root.path.join("bench").join("integration").join("agentlab");
         ensure_dir(&benchmark_grader_dir).expect("benchmark grader dir");
         fs::write(
             benchmark_grader_dir.join("bench_benchmark_adapter.py"),
@@ -6526,6 +6779,92 @@ mod tests {
         }
     }
 
+    fn write_preflight_result_agent(path: &Path) {
+        write_executable_script(
+            path,
+            concat!(
+                "#!/usr/bin/env python3\n",
+                "from __future__ import annotations\n",
+                "import pathlib\n",
+                "import sys\n",
+                "\n",
+                "def main() -> int:\n",
+                "    out = None\n",
+                "    args = sys.argv[1:]\n",
+                "    idx = 0\n",
+                "    while idx < len(args):\n",
+                "        if args[idx] == '--output' and idx + 1 < len(args):\n",
+                "            out = args[idx + 1]\n",
+                "            idx += 2\n",
+                "            continue\n",
+                "        idx += 1\n",
+                "    if not out:\n",
+                "        raise SystemExit('missing --output')\n",
+                "    target = pathlib.Path(out)\n",
+                "    target.parent.mkdir(parents=True, exist_ok=True)\n",
+                "    target.write_text('{\"schema_version\":\"agent_result_v1\",\"outcome\":\"success\"}\\n', encoding='utf-8')\n",
+                "    return 0\n",
+                "\n",
+                "raise SystemExit(main())\n",
+            ),
+        );
+    }
+
+    fn write_preflight_benchmark_grader(path: &Path) {
+        write_executable_script(
+            path,
+            concat!(
+                "#!/usr/bin/env python3\n",
+                "from __future__ import annotations\n",
+                "import json\n",
+                "import os\n",
+                "import pathlib\n",
+                "\n",
+                "def _write(path: str, payload: dict) -> None:\n",
+                "    target = pathlib.Path(path)\n",
+                "    target.parent.mkdir(parents=True, exist_ok=True)\n",
+                "    target.write_text(json.dumps(payload, separators=(',', ':')) + '\\n', encoding='utf-8')\n",
+                "\n",
+                "ids = {\n",
+                "    'run_id': 'run_preflight',\n",
+                "    'trial_id': 'trial_preflight',\n",
+                "    'variant_id': 'variant_preflight',\n",
+                "    'task_id': os.environ.get('AGENTLAB_TASK_ID', 'task_preflight'),\n",
+                "    'repl_idx': 0,\n",
+                "}\n",
+                "identity = {\n",
+                "    'schedule_idx': 0,\n",
+                "    'slot_commit_id': 'slot_preflight',\n",
+                "    'attempt': 1,\n",
+                "    'row_seq': 0,\n",
+                "}\n",
+                "benchmark = {\n",
+                "    'adapter_id': 'test_adapter',\n",
+                "    'name': 'test_bench',\n",
+                "    'split': 'test',\n",
+                "}\n",
+                "_write(os.environ['AGENTLAB_BENCHMARK_PREDICTION_PATH'], {\n",
+                "    'schema_version': 'benchmark_prediction_record_v1',\n",
+                "    **identity,\n",
+                "    'ids': ids,\n",
+                "    'benchmark': benchmark,\n",
+                "    'prediction': {'kind': 'text', 'value': ''},\n",
+                "})\n",
+                "_write(os.environ['AGENTLAB_BENCHMARK_SCORE_PATH'], {\n",
+                "    'schema_version': 'benchmark_score_record_v1',\n",
+                "    **identity,\n",
+                "    'ids': ids,\n",
+                "    'benchmark': benchmark,\n",
+                "    'verdict': 'pass',\n",
+                "    'primary_metric_name': 'resolved',\n",
+                "    'primary_metric_value': 1.0,\n",
+                "    'metrics': {'resolved': 1.0},\n",
+                "    'evaluator': {'name': 'test_grader', 'mode': 'custom'},\n",
+                "})\n",
+            ),
+        );
+    }
+
     #[test]
     fn p0_i01_and_p0_i05_dx_registry_resolution_is_complete_and_deterministic() {
         let root = create_dx_authoring_fixture("agentlab_p0_registry_resolution");
@@ -6568,7 +6907,7 @@ mod tests {
             "variant_sequential"
         );
         let artifact_digest = resolved_a
-            .pointer("/runtime/agent/artifact_digest")
+            .pointer("/runtime/agent/bundle_digest")
             .and_then(Value::as_str)
             .unwrap_or("");
         assert!(
@@ -6679,7 +7018,7 @@ mod tests {
                 .pointer("/dataset/path")
                 .and_then(Value::as_str)
                 .unwrap_or("")
-                .ends_with(".lab/experiments/data/swebench_lite_curated.task_boundary_v2.jsonl"),
+                .ends_with(".lab/experiments/data/swebench_lite_curated.task_boundary_v3.jsonl"),
             "unexpected swebench dataset path: {:?}",
             resolved.pointer("/dataset/path")
         );
@@ -6699,7 +7038,7 @@ mod tests {
         );
         assert_eq!(
             resolved
-                .pointer("/runtime/agent/image_source")
+                .pointer("/runtime/sandbox/image_source")
                 .and_then(Value::as_str)
                 .unwrap_or(""),
             "per_task"
@@ -6750,7 +7089,7 @@ mod tests {
         );
         assert_eq!(
             resolved
-                .pointer("/runtime/agent/arg_map/0/binding")
+                .pointer("/runtime/agent/arg_map/0/key")
                 .and_then(Value::as_str)
                 .unwrap_or(""),
             "model_provider"
@@ -6837,7 +7176,7 @@ mod tests {
     }
 
     #[test]
-    fn normalize_authoring_accepts_bindings_to_args_alias() {
+    fn normalize_authoring_rejects_bindings_to_args_alias() {
         let root = create_dx_authoring_fixture("agentlab_dx_bindings_to_args_alias");
         let mut spec = minimal_dx_spec();
         let agent = spec
@@ -6853,14 +7192,12 @@ mod tests {
             ]),
         );
 
-        let resolved =
-            normalize_experiment_authoring(spec, &root.path, &root.path).expect("normalize");
-        assert_eq!(
-            resolved.pointer("/runtime/agent/arg_map").cloned().unwrap_or(json!([])),
-            json!([
-                { "key": "model_provider", "binding": "model_provider", "flag": "--provider" },
-                { "key": "model", "binding": "model", "flag": "--model" }
-            ])
+        let err = normalize_experiment_authoring(spec, &root.path, &root.path)
+            .expect_err("bindings_to_args alias should be rejected");
+        assert!(
+            err.to_string().contains("/agent/bindings_to_args"),
+            "unexpected error: {}",
+            err
         );
     }
 
@@ -6903,7 +7240,7 @@ mod tests {
             "tasks/tasks.jsonl"
         );
         let artifact = manifest
-            .pointer("/resolved_experiment/runtime/agent/artifact")
+            .pointer("/resolved_experiment/runtime/agent/bundle")
             .and_then(Value::as_str)
             .unwrap_or("");
         assert!(
@@ -6996,7 +7333,56 @@ mod tests {
     }
 
     #[test]
-    fn build_experiment_package_rejects_artifact_without_executable() {
+    fn build_experiment_package_accepts_explicit_artifact_command_without_entrypoint_shim() {
+        let root = create_dx_authoring_fixture("agentlab_build_explicit_artifact_command");
+        let artifact_root = root
+            .path
+            .join(".lab")
+            .join("agents")
+            .join("rex-explicit-command");
+        let artifact_bin = artifact_root.join("bin");
+        let script_dir = artifact_root
+            .join("packages")
+            .join("apps")
+            .join("launcher")
+            .join("dist");
+        ensure_dir(&artifact_bin).expect("artifact bin dir");
+        ensure_dir(&script_dir).expect("script dir");
+        write_executable_script(&artifact_bin.join("bun"), "#!/bin/sh\nexit 0\n");
+        write_executable_script(
+            &artifact_bin.join("rex"),
+            "#!/usr/bin/env sh\nexec /usr/local/bin/bun /workspace/packages/apps/launcher/index.ts \"$@\"\n",
+        );
+        fs::write(script_dir.join("index.js"), "console.log('ok');\n").expect("launcher");
+
+        let mut spec = minimal_new_dx_spec();
+        if let Some(builds) = spec
+            .pointer_mut("/agent_builds")
+            .and_then(Value::as_array_mut)
+        {
+            for build in builds {
+                if let Some(obj) = build.as_object_mut() {
+                    obj.insert("artifact".to_string(), json!("rex-explicit-command"));
+                    obj.insert(
+                        "command".to_string(),
+                        json!([
+                            "/opt/agent/bin/bun",
+                            "/opt/agent/packages/apps/launcher/dist/index.js"
+                        ]),
+                    );
+                    obj.remove("provider_env");
+                }
+            }
+        }
+        let spec_path = root.path.join("experiment.yaml");
+        fs::write(&spec_path, serde_yaml::to_string(&spec).expect("yaml")).expect("write spec");
+
+        build_experiment_package(&spec_path, None, Some(&root.path.join("package")))
+            .expect("explicit artifact command should pass");
+    }
+
+    #[test]
+    fn build_experiment_package_rejects_artifact_not_referenced_by_command() {
         let root = create_dx_authoring_fixture("agentlab_build_reject_no_executable");
         let artifact_root = root
             .path
@@ -7024,7 +7410,8 @@ mod tests {
         let err = build_experiment_package(&spec_path, None, Some(&root.path.join("package")))
             .expect_err("non-executable artifact should fail");
         assert!(
-            err.to_string().contains("at least one executable"),
+            err.to_string()
+                .contains("did not resolve to artifact executable"),
             "unexpected error: {}",
             err
         );
@@ -7070,7 +7457,6 @@ mod tests {
                     input_arg: "--input-file".to_string(),
                     output_arg: "--output".to_string(),
                 },
-                clean_contract_v1: false,
                 integration_level: "cli_basic".to_string(),
                 launch_mode: AgentLaunchMode::File,
                 env: BTreeMap::new(),
@@ -7094,12 +7480,18 @@ mod tests {
             effective_network_mode: "none".to_string(),
         };
         let tasks = vec![json!({
-            "schema_version": "task_boundary_v2",
+            "schema_version": "task_boundary_v3",
             "task": {
                 "id": "TASK001"
             },
-            "workspace_files": [],
-            "mount_references": []
+            "environment": { "image": "python:3.11-slim" },
+            "workspace": {
+                "mode": "scratch",
+                "base": { "kind": "empty" },
+                "overlays": [],
+                "aux_mounts": []
+            },
+            "limits": {}
         })];
 
         let variant = preflight_test_variant();
@@ -7109,7 +7501,6 @@ mod tests {
             &runtime_profile,
             &variant,
             &tasks,
-            false,
             &root.path,
         );
         assert!(
@@ -7154,23 +7545,36 @@ mod tests {
             preflight_test_runtime_profile(ImageSource::Global, Some("python:3.11-slim"));
         let variant = preflight_test_variant();
         let root = TempDirGuard::new("agentlab_p0_grader_reachability_staged");
+        let staged_agent = root.path.join("preflight_agent.py");
         let staged_grader = root.path.join("bench_benchmark_adapter.py");
-        write_executable_script(&staged_grader, "#!/usr/bin/env python3\nprint('ok')\n");
-        runtime_profile.agent_runtime.dependency_file_staging = vec![DependencyFileStagingSpec {
-            source_from_host: staged_grader,
-            destination_path: format!(
-                "{}/bench_benchmark_adapter.py",
-                AGENTLAB_CONTRACT_DEPS_DIR
-            ),
-            required: true,
-            read_only: true,
-        }];
+        write_preflight_result_agent(&staged_agent);
+        write_preflight_benchmark_grader(&staged_grader);
+        runtime_profile.agent_runtime.command_raw = vec![
+            "python3".to_string(),
+            format!("{}/preflight_agent.py", AGENTLAB_CONTRACT_DEPS_DIR),
+        ];
+        runtime_profile.agent_runtime.dependency_file_staging = vec![
+            DependencyFileStagingSpec {
+                source_from_host: staged_agent,
+                destination_path: format!("{}/preflight_agent.py", AGENTLAB_CONTRACT_DEPS_DIR),
+                required: true,
+                read_only: true,
+            },
+            DependencyFileStagingSpec {
+                source_from_host: staged_grader,
+                destination_path: format!(
+                    "{}/bench_benchmark_adapter.py",
+                    AGENTLAB_CONTRACT_DEPS_DIR
+                ),
+                required: true,
+                read_only: true,
+            },
+        ];
         let check = check_benchmark_grader_reachable(
             &benchmark_config,
             &runtime_profile,
             &variant,
             &[],
-            false,
             &root.path,
         );
         assert!(
@@ -7209,12 +7613,24 @@ mod tests {
             preflight_test_runtime_profile(ImageSource::Global, Some("python:3.11-slim"));
         let variant = preflight_test_variant();
         let root = TempDirGuard::new("agentlab_p0_swebench_grader_reachability");
+        let staged_agent = root.path.join("preflight_agent.py");
+        write_preflight_result_agent(&staged_agent);
+        runtime_profile.agent_runtime.command_raw = vec![
+            "python3".to_string(),
+            format!("{}/preflight_agent.py", AGENTLAB_CONTRACT_DEPS_DIR),
+        ];
         runtime_profile.agent_runtime.dependency_file_staging = vec![
             DependencyFileStagingSpec {
-                source_from_host: PathBuf::from(
-                    env!("CARGO_MANIFEST_DIR")
-                        .replace("/rust/crates/lab-runner", "/adapters/swebench/swebench_task_container_grader.py"),
-                ),
+                source_from_host: staged_agent,
+                destination_path: format!("{}/preflight_agent.py", AGENTLAB_CONTRACT_DEPS_DIR),
+                required: true,
+                read_only: true,
+            },
+            DependencyFileStagingSpec {
+                source_from_host: PathBuf::from(env!("CARGO_MANIFEST_DIR").replace(
+                    "/rust/crates/lab-runner",
+                    "/adapters/swebench/swebench_task_container_grader.py",
+                )),
                 destination_path: format!(
                     "{}/swebench_task_container_grader.py",
                     AGENTLAB_CONTRACT_DEPS_DIR
@@ -7223,17 +7639,17 @@ mod tests {
                 read_only: true,
             },
             DependencyFileStagingSpec {
-                source_from_host: PathBuf::from(
-                    env!("CARGO_MANIFEST_DIR")
-                        .replace("/rust/crates/lab-runner", "/adapters/swebench/_swebench_meta.py"),
-                ),
+                source_from_host: PathBuf::from(env!("CARGO_MANIFEST_DIR").replace(
+                    "/rust/crates/lab-runner",
+                    "/adapters/swebench/_swebench_meta.py",
+                )),
                 destination_path: format!("{}/_swebench_meta.py", AGENTLAB_CONTRACT_DEPS_DIR),
                 required: true,
                 read_only: true,
             },
         ];
         let tasks = vec![json!({
-            "schema_version": "task_boundary_v2",
+            "schema_version": "task_boundary_v3",
             "task": {
                 "id": "swebench_astropy_astropy_12907",
                 "benchmark": {
@@ -7249,20 +7665,27 @@ mod tests {
                     }
                 }
             },
-            "workspace_files": [],
-            "mount_references": []
+            "environment": {
+                "image": "swebench/sweb.eval.x86_64.astropy__astropy-12907:latest"
+            },
+            "workspace": {
+                "mode": "scratch",
+                "base": { "kind": "empty" },
+                "overlays": [],
+                "aux_mounts": []
+            },
+            "limits": {}
         })];
         let check = check_benchmark_grader_reachable(
             &benchmark_config,
             &runtime_profile,
             &variant,
             &tasks,
-            false,
             &root.path,
         );
         assert!(
             check.passed,
-            "swebench grader probe should pass with seeded probe result: {}",
+            "swebench grader contract smoke should pass with staged agent result: {}",
             check.message
         );
     }
@@ -7394,7 +7817,6 @@ mod tests {
                 input_arg: "--input".to_string(),
                 output_arg: "--output".to_string(),
             },
-            clean_contract_v1: false,
             integration_level: "cli_basic".to_string(),
             launch_mode: AgentLaunchMode::File,
             env: BTreeMap::new(),
@@ -7455,6 +7877,109 @@ mod tests {
     }
 
     #[test]
+    fn p0_i03_local_builtin_command_rewrites_contract_mount_env_values() {
+        let (_root, paths) = create_trial_paths_fixture("agentlab_p0_local_env_rewrite");
+        let runtime = AgentRuntimeConfig {
+            adapter_ref: AgentAdapterRef::default(),
+            command_raw: vec![
+                "/bin/sh".to_string(),
+                "-lc".to_string(),
+                "exit 0".to_string(),
+            ],
+            container_image: Some("image:latest".to_string()),
+            image_source: ImageSource::Global,
+            agent_artifact: None,
+            agent_artifact_digest: None,
+            agent_artifact_resolved_path: None,
+            io: AgentRuntimeIoConfig {
+                input_arg: "--input".to_string(),
+                output_arg: "--output".to_string(),
+            },
+            integration_level: "cli_basic".to_string(),
+            launch_mode: AgentLaunchMode::File,
+            env: BTreeMap::new(),
+            env_from_host: Vec::new(),
+            bindings_to_args: Vec::new(),
+            workspace_patches: Vec::new(),
+            trajectory_path: None,
+            causal_extraction: None,
+            default_timeout_ms: None,
+            tracing_mode: None,
+            force_container: true,
+            dependency_file_staging: Vec::new(),
+            dependency_services: Vec::new(),
+        };
+        let runtime_env = BTreeMap::new();
+        let overrides = BTreeMap::from([
+            ("HOME".to_string(), AGENTLAB_CONTRACT_DEPS_DIR.to_string()),
+            (
+                "CUSTOM_RESULT_PATH".to_string(),
+                AGENTLAB_RESULT_PATH.to_string(),
+            ),
+        ]);
+        let io_paths = PreparedTrialIo {
+            input_host: PathBuf::from("/tmp/trial_input.json"),
+            output_host: paths.out.join("result.json"),
+            events_host: paths.state.join("events.jsonl"),
+            task_path: AGENTLAB_TASK_PATH.to_string(),
+            bindings_path: AGENTLAB_BINDINGS_PATH.to_string(),
+            dependencies_path: AGENTLAB_DEPENDENCIES_PATH.to_string(),
+            policy_path: AGENTLAB_POLICY_PATH.to_string(),
+            result_path: AGENTLAB_RESULT_PATH.to_string(),
+            trajectory_path: AGENTLAB_TRAJECTORY_PATH.to_string(),
+        };
+        let empty_json = json!({});
+        let request = AdapterRunRequest {
+            runtime_experiment: &empty_json,
+            runtime: &runtime,
+            variant_args: &[],
+            runtime_env: &runtime_env,
+            runtime_overrides_env: &overrides,
+            container_mode: true,
+            trial_paths: &paths,
+            dynamic_mounts: &[],
+            io_paths: &io_paths,
+            network_mode: "none",
+            setup_command: None,
+            benchmark_adapter: None,
+            benchmark_grading_enabled: false,
+            run_id: "run_1",
+            task_image: None,
+            agent_artifact: None,
+        };
+
+        let cmd = build_builtin_adapter_local_command(&request, &runtime.command_raw)
+            .expect("build local command");
+        let envs = cmd
+            .get_envs()
+            .filter_map(|(key, value)| {
+                Some((
+                    key.to_string_lossy().to_string(),
+                    value?.to_string_lossy().to_string(),
+                ))
+            })
+            .collect::<BTreeMap<_, _>>();
+
+        let home = PathBuf::from(envs.get("HOME").expect("HOME env present"));
+        let custom_result = PathBuf::from(
+            envs.get("CUSTOM_RESULT_PATH")
+                .expect("CUSTOM_RESULT_PATH env present"),
+        );
+        assert_eq!(
+            home.components().collect::<Vec<_>>(),
+            paths.deps.components().collect::<Vec<_>>()
+        );
+        assert_eq!(
+            custom_result.components().collect::<Vec<_>>(),
+            paths
+                .out
+                .join("result.json")
+                .components()
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
     fn p0_i03_injected_container_grader_wrapper_exports_agent_path() {
         let (_root, paths) = create_trial_paths_fixture("agentlab_p0_path_wrapper");
         let runtime = AgentRuntimeConfig {
@@ -7469,7 +7994,6 @@ mod tests {
                 input_arg: "--input".to_string(),
                 output_arg: "--output".to_string(),
             },
-            clean_contract_v1: false,
             integration_level: "cli_basic".to_string(),
             launch_mode: AgentLaunchMode::File,
             env: BTreeMap::new(),
@@ -7575,7 +8099,6 @@ mod tests {
                 input_arg: "--input".to_string(),
                 output_arg: "--output".to_string(),
             },
-            clean_contract_v1: false,
             integration_level: "cli_basic".to_string(),
             launch_mode: AgentLaunchMode::File,
             env: BTreeMap::new(),
@@ -7633,106 +8156,18 @@ mod tests {
         .map(|value| value.to_string_lossy().to_string())
         .collect::<Vec<_>>();
         assert!(
-            baked_args.windows(2).any(|pair| pair == ["--platform", "linux/amd64"]),
+            baked_args
+                .windows(2)
+                .any(|pair| pair == ["--platform", "linux/amd64"]),
             "baked task container command missing explicit platform: {:?}",
             baked_args
         );
 
-        let mounted_args = build_injected_container_mounted_command(
-            &request,
-            "swebench/sweb.eval.x86_64.astropy__astropy-12907:latest",
-            None,
-            Path::new("/tmp/agent-artifact"),
-            &["rex".to_string(), "run".to_string()],
-            None,
-        )
-        .get_args()
-        .map(|value| value.to_string_lossy().to_string())
-        .collect::<Vec<_>>();
         assert!(
-            mounted_args
-                .windows(2)
-                .any(|pair| pair == ["--platform", "linux/amd64"]),
-            "mounted task container command missing explicit platform: {:?}",
-            mounted_args
+            !baked_args.iter().any(|arg| arg.contains("/opt/agent")),
+            "task sandbox command must not mount the agent bundle: {:?}",
+            baked_args
         );
-    }
-
-    #[test]
-    fn build_non_destructive_probe_variants_supports_binary_path_script_and_module() {
-        assert_eq!(
-            build_non_destructive_probe_variants(&["rex".to_string()]).expect("bare binary probe"),
-            vec![
-                vec!["rex".to_string(), "--help".to_string()],
-                vec!["rex".to_string(), "--version".to_string()],
-                vec!["rex".to_string(), "-h".to_string()],
-            ]
-        );
-        assert_eq!(
-            build_non_destructive_probe_variants(&["/opt/agent/bin/rex".to_string()])
-                .expect("absolute path probe"),
-            vec![
-                vec!["/opt/agent/bin/rex".to_string(), "--help".to_string()],
-                vec!["/opt/agent/bin/rex".to_string(), "--version".to_string()],
-                vec!["/opt/agent/bin/rex".to_string(), "-h".to_string()],
-            ]
-        );
-        assert_eq!(
-            build_non_destructive_probe_variants(&[
-                "python3".to_string(),
-                "/agentlab/deps/grader.py".to_string(),
-                "--input".to_string(),
-                "/agentlab/task.json".to_string(),
-            ])
-            .expect("script probe"),
-            vec![
-                vec![
-                    "python3".to_string(),
-                    "/agentlab/deps/grader.py".to_string(),
-                    "--help".to_string(),
-                ],
-                vec![
-                    "python3".to_string(),
-                    "/agentlab/deps/grader.py".to_string(),
-                    "--version".to_string(),
-                ],
-                vec![
-                    "python3".to_string(),
-                    "/agentlab/deps/grader.py".to_string(),
-                    "-h".to_string(),
-                ],
-            ]
-        );
-        assert_eq!(
-            build_non_destructive_probe_variants(&[
-                "python3".to_string(),
-                "-m".to_string(),
-                "agentlab.grader".to_string(),
-                "--input".to_string(),
-            ])
-            .expect("module probe"),
-            vec![
-                vec![
-                    "python3".to_string(),
-                    "-m".to_string(),
-                    "agentlab.grader".to_string(),
-                    "--help".to_string(),
-                ],
-                vec![
-                    "python3".to_string(),
-                    "-m".to_string(),
-                    "agentlab.grader".to_string(),
-                    "--version".to_string(),
-                ],
-                vec![
-                    "python3".to_string(),
-                    "-m".to_string(),
-                    "agentlab.grader".to_string(),
-                    "-h".to_string(),
-                ],
-            ]
-        );
-        assert!(build_non_destructive_probe_variants(&["   ".to_string()]).is_err());
     }
 
     #[test]
@@ -7755,7 +8190,6 @@ mod tests {
                 input_arg: "--input".to_string(),
                 output_arg: "--output".to_string(),
             },
-            clean_contract_v1: false,
             integration_level: "cli_basic".to_string(),
             launch_mode: AgentLaunchMode::File,
             env: BTreeMap::new(),
@@ -7889,7 +8323,6 @@ mod tests {
                 input_arg: "--input".to_string(),
                 output_arg: "--output".to_string(),
             },
-            clean_contract_v1: false,
             integration_level: "cli_basic".to_string(),
             launch_mode: AgentLaunchMode::File,
             env: BTreeMap::new(),
@@ -8005,20 +8438,22 @@ mod tests {
 
     #[test]
     fn experiment_workload_type_reads_explicit_value() {
-        let spec = json!({"version": "1.0", "experiment": {"workload_type": "agent_runtime"}});
+        let spec = json!({"version": "0.5", "experiment": {"workload_type": "agent_runtime"}});
         assert_eq!(experiment_workload_type(&spec).unwrap(), "agent_runtime");
     }
 
     #[test]
-    fn experiment_workload_type_clean_contract_defaults_to_agent_runtime() {
+    fn experiment_workload_type_rejects_legacy_version_without_field() {
         let spec = json!({"version": "1.0", "experiment": {"id": "e1"}});
-        assert_eq!(experiment_workload_type(&spec).unwrap(), "agent_runtime");
+        let err = experiment_workload_type(&spec).unwrap_err();
+        assert!(err.to_string().contains("legacy experiment version '1.0'"));
     }
 
     #[test]
-    fn experiment_workload_type_empty_string_falls_back() {
+    fn experiment_workload_type_empty_string_rejects_legacy_version() {
         let spec = json!({"version": "1.0", "experiment": {"workload_type": "  "}});
-        assert_eq!(experiment_workload_type(&spec).unwrap(), "agent_runtime");
+        let err = experiment_workload_type(&spec).unwrap_err();
+        assert!(err.to_string().contains("legacy experiment version '1.0'"));
     }
 
     #[test]
@@ -8029,14 +8464,14 @@ mod tests {
 
     #[test]
     fn experiment_workload_type_trimmed() {
-        let spec = json!({"version": "1.0", "experiment": {"workload_type": "  agent_runtime  "}});
+        let spec = json!({"version": "0.5", "experiment": {"workload_type": "  agent_runtime  "}});
         assert_eq!(experiment_workload_type(&spec).unwrap(), "agent_runtime");
     }
 
     #[test]
-    fn experiment_random_seed_clean_contract_reads_design_seed() {
-        let spec = json!({"version": "1.0", "design": {"seed": 42}});
-        assert_eq!(experiment_random_seed(&spec), 42);
+    fn reject_legacy_experiment_version_rejects_numeric_v1() {
+        let err = reject_legacy_experiment_version(&json!({"version": 1.0})).unwrap_err();
+        assert!(err.to_string().contains("legacy experiment version '1.0'"));
     }
 
     #[test]
@@ -8074,21 +8509,16 @@ mod tests {
     }
 
     #[test]
-    fn configured_network_mode_clean_contract_reads_runtime_network() {
+    fn configured_network_mode_rejects_legacy_version() {
         let spec = json!({"version": "1.0", "runtime": {"network": "bridge"}});
-        assert_eq!(configured_network_mode(&spec).unwrap(), "bridge");
+        let err = configured_network_mode(&spec).unwrap_err();
+        assert!(err.to_string().contains("legacy experiment version '1.0'"));
     }
 
     #[test]
     fn configured_network_mode_legacy_reads_policy_path() {
-        let spec = json!({"runtime": {"policy": {"network": {"mode": "host"}}}});
+        let spec = json!({"runtime": {"sandbox": {"network": "host"}}});
         assert_eq!(configured_network_mode(&spec).unwrap(), "host");
-    }
-
-    #[test]
-    fn configured_network_mode_clean_contract_defaults_to_none() {
-        let spec = json!({"version": "1.0"});
-        assert_eq!(configured_network_mode(&spec).unwrap(), "none");
     }
 
     #[test]
@@ -8098,7 +8528,7 @@ mod tests {
 
     #[test]
     fn configured_network_mode_legacy_reads_value() {
-        let spec = json!({"runtime": {"policy": {"network": {"mode": "none"}}}});
+        let spec = json!({"runtime": {"sandbox": {"network": "none"}}});
         assert_eq!(configured_network_mode(&spec).unwrap(), "none");
     }
 
@@ -8250,23 +8680,15 @@ mod tests {
     }
 
     #[test]
-    fn is_clean_contract_experiment_version_1_0() {
-        assert!(is_clean_contract_experiment(&json!({"version": "1.0"})));
+    fn reject_legacy_experiment_version_rejects_string_v1() {
+        let err = reject_legacy_experiment_version(&json!({"version": "1.0"})).unwrap_err();
+        assert!(err.to_string().contains("legacy experiment version '1.0'"));
     }
 
     #[test]
-    fn is_clean_contract_experiment_numeric_1_0() {
-        assert!(is_clean_contract_experiment(&json!({"version": 1.0})));
-    }
-
-    #[test]
-    fn is_clean_contract_experiment_no_version() {
-        assert!(!is_clean_contract_experiment(&json!({})));
-    }
-
-    #[test]
-    fn is_clean_contract_experiment_wrong_version() {
-        assert!(!is_clean_contract_experiment(&json!({"version": "2.0"})));
+    fn reject_legacy_experiment_version_allows_non_v1() {
+        assert!(reject_legacy_experiment_version(&json!({"version": "2.0"})).is_ok());
+        assert!(reject_legacy_experiment_version(&json!({})).is_ok());
     }
 
     #[test]
@@ -8824,91 +9246,37 @@ mod tests {
     // Batch 3: Experiment Validation & Normalization
     // ───────────────────────────────────────────────────────────────────
 
-    fn clean_contract_base() -> Value {
-        json!({
-            "version": "1.0",
-            "experiment": {"id": "e1", "name": "test"},
-            "dataset": {"path": "tasks.jsonl"},
-            "design": {"replications": 1},
-            "baseline": {"variant_id": "baseline"},
-            "runtime": {"image": "img:latest", "command": ["python", "main.py"]}
-        })
-    }
-
     fn legacy_experiment_base() -> Value {
         json!({
             "experiment": {"workload_type": "agent_runtime"},
             "design": {"sanitization_profile": "standard", "replications": 1},
             "runtime": {
-                "policy": {"timeout_ms": 60000, "network": {"mode": "none"}, "sandbox": {"mode": "local"}},
-                "agent": {"command": ["python", "main.py"], "image": "img:latest"}
+                "policy": {"timeout_ms": 60000},
+                "sandbox": {
+                    "executor": "docker",
+                    "image_source": "global",
+                    "image": "img:latest",
+                    "profile": "workspace_write",
+                    "network": "none"
+                },
+                "agent": {"command": ["python", "main.py"], "bundle": ".lab/agents/rex-current.tar.gz"}
             },
             "baseline": {"variant_id": "baseline"}
         })
     }
 
     #[test]
-    fn validate_required_fields_v1_empty_command_array_fails() {
-        let mut spec = clean_contract_base();
-        spec["runtime"]["command"] = json!([]);
-        assert!(validate_required_fields(&spec).is_err());
-    }
-
-    #[test]
-    fn validate_required_fields_v1_whitespace_command_fails() {
-        let mut spec = clean_contract_base();
-        spec["runtime"]["command"] = json!(["  "]);
-        assert!(validate_required_fields(&spec).is_err());
-    }
-
-    #[test]
-    fn validate_required_fields_v1_zero_replications_fails() {
-        let mut spec = clean_contract_base();
-        spec["design"]["replications"] = json!(0);
-        assert!(validate_required_fields(&spec).is_err());
-    }
-
-    #[test]
-    fn validate_required_fields_v1_string_command_accepted() {
-        let mut spec = clean_contract_base();
-        spec["runtime"]["command"] = json!("python main.py");
-        assert!(validate_required_fields(&spec).is_ok());
-    }
-
-    #[test]
-    fn validate_required_fields_v1_missing_image_for_container_mode() {
-        let mut spec = clean_contract_base();
-        spec["runtime"].as_object_mut().unwrap().remove("image");
-        assert!(validate_required_fields(&spec).is_err());
-    }
-
-    #[test]
-    fn validate_required_fields_v1_valid_spec_passes() {
-        assert!(validate_required_fields(&clean_contract_base()).is_ok());
-    }
-
-    #[test]
-    fn validate_required_fields_v1_missing_experiment_id_fails() {
-        let mut spec = clean_contract_base();
-        spec["experiment"].as_object_mut().unwrap().remove("id");
-        assert!(validate_required_fields(&spec).is_err());
-    }
-
-    #[test]
-    fn validate_required_fields_v1_missing_dataset_path_fails() {
-        let mut spec = clean_contract_base();
-        spec["dataset"].as_object_mut().unwrap().remove("path");
-        assert!(validate_required_fields(&spec).is_err());
-    }
-
-    #[test]
-    fn validate_required_fields_v1_missing_baseline_variant_id_fails() {
-        let mut spec = clean_contract_base();
-        spec["baseline"]
-            .as_object_mut()
-            .unwrap()
-            .remove("variant_id");
-        assert!(validate_required_fields(&spec).is_err());
+    fn validate_required_fields_batch3_rejects_legacy_v1_shape() {
+        let spec = json!({
+            "version": "1.0",
+            "experiment": {"id": "e1", "name": "test"},
+            "dataset": {"path": "tasks.jsonl"},
+            "design": {"replications": 1},
+            "baseline": {"variant_id": "baseline"},
+            "runtime": {"image": "img:latest", "command": ["python", "main.py"]}
+        });
+        let err = validate_required_fields(&spec).unwrap_err();
+        assert!(err.to_string().contains("legacy experiment version '1.0'"));
     }
 
     #[test]
@@ -8976,10 +9344,12 @@ mod tests {
     #[test]
     fn validate_required_fields_per_task_image_requires_container() {
         let mut spec = legacy_experiment_base();
-        spec["runtime"]["agent"]["image_source"] = json!("per_task");
+        spec["runtime"]["sandbox"]["image_source"] = json!("per_task");
+        spec["runtime"]["sandbox"]["image"] = Value::Null;
+        spec["runtime"]["sandbox"]["executor"] = json!("local");
         let err = validate_required_fields(&spec).expect_err("per_task needs container");
         assert!(
-            err.to_string().contains("per_task"),
+            err.to_string().contains("executor"),
             "unexpected error: {}",
             err
         );
@@ -8988,11 +9358,15 @@ mod tests {
     #[test]
     fn validate_required_fields_per_task_image_requires_artifact() {
         let mut spec = legacy_experiment_base();
-        spec["runtime"]["policy"]["sandbox"]["mode"] = json!("container");
-        spec["runtime"]["agent"]["image_source"] = json!("per_task");
+        spec["runtime"]["sandbox"]["image_source"] = json!("per_task");
+        spec["runtime"]["sandbox"]["image"] = Value::Null;
+        spec["runtime"]["agent"]
+            .as_object_mut()
+            .unwrap()
+            .remove("bundle");
         let err = validate_required_fields(&spec).expect_err("per_task needs artifact");
         assert!(
-            err.to_string().contains("artifact"),
+            err.to_string().contains("bundle"),
             "unexpected error: {}",
             err
         );
@@ -9001,7 +9375,7 @@ mod tests {
     #[test]
     fn validate_required_fields_invalid_image_source_fails() {
         let mut spec = legacy_experiment_base();
-        spec["runtime"]["agent"]["image_source"] = json!("custom");
+        spec["runtime"]["sandbox"]["image_source"] = json!("custom");
         let err = validate_required_fields(&spec).expect_err("invalid image_source");
         assert!(
             err.to_string().contains("image_source"),
@@ -9038,10 +9412,10 @@ mod tests {
     #[test]
     fn validate_required_fields_legacy_missing_network_mode_fails() {
         let mut spec = legacy_experiment_base();
-        spec["runtime"]["policy"]["network"]
+        spec["runtime"]["sandbox"]
             .as_object_mut()
             .unwrap()
-            .remove("mode");
+            .remove("network");
         assert!(validate_required_fields(&spec).is_err());
     }
 
@@ -10471,7 +10845,10 @@ mod tests {
             0,
             "rows without slot identity must not be routed into sqlite evidence table"
         );
-        assert!(!evidence_path.exists(), "no fallback file should be created");
+        assert!(
+            !evidence_path.exists(),
+            "no fallback file should be created"
+        );
     }
 
     #[test]
@@ -10983,15 +11360,10 @@ mod tests {
     }
 
     #[test]
-    fn materialize_workspace_files_utf8() {
+    fn materialize_workspace_overlays_utf8() {
         let (_root, paths) = create_trial_paths_fixture("mat_utf8");
-        let files = vec![WorkspaceFileSpec {
-            path: "hello.txt".to_string(),
-            content: "hello world".to_string(),
-            encoding: None,
-            executable: false,
-        }];
-        materialize_workspace_files(&paths, &files).unwrap();
+        let files = vec![workspace_overlay("hello.txt", "hello world", None)];
+        materialize_workspace_overlays(&paths, &files).unwrap();
         assert_eq!(
             fs::read_to_string(paths.workspace.join("hello.txt")).unwrap(),
             "hello world"
@@ -10999,16 +11371,11 @@ mod tests {
     }
 
     #[test]
-    fn materialize_workspace_files_base64() {
+    fn materialize_workspace_overlays_base64() {
         let (_root, paths) = create_trial_paths_fixture("mat_b64");
         let encoded = BASE64_STANDARD.encode(b"binary content");
-        let files = vec![WorkspaceFileSpec {
-            path: "data.bin".to_string(),
-            content: encoded,
-            encoding: Some("base64".to_string()),
-            executable: false,
-        }];
-        materialize_workspace_files(&paths, &files).unwrap();
+        let files = vec![workspace_overlay("data.bin", &encoded, Some("base64"))];
+        materialize_workspace_overlays(&paths, &files).unwrap();
         assert_eq!(
             fs::read(paths.workspace.join("data.bin")).unwrap(),
             b"binary content"
@@ -11016,15 +11383,14 @@ mod tests {
     }
 
     #[test]
-    fn materialize_workspace_files_creates_parent_dirs() {
+    fn materialize_workspace_overlays_create_parent_dirs() {
         let (_root, paths) = create_trial_paths_fixture("mat_nested");
-        let files = vec![WorkspaceFileSpec {
-            path: "deep/nested/dir/file.txt".to_string(),
-            content: "nested".to_string(),
-            encoding: None,
-            executable: false,
-        }];
-        materialize_workspace_files(&paths, &files).unwrap();
+        let files = vec![workspace_overlay(
+            "deep/nested/dir/file.txt",
+            "nested",
+            None,
+        )];
+        materialize_workspace_overlays(&paths, &files).unwrap();
         assert_eq!(
             fs::read_to_string(
                 paths
@@ -11040,9 +11406,9 @@ mod tests {
     }
 
     #[test]
-    fn materialize_workspace_files_empty_list() {
+    fn materialize_workspace_overlays_empty_list() {
         let (_root, paths) = create_trial_paths_fixture("mat_empty");
-        materialize_workspace_files(&paths, &[]).unwrap();
+        materialize_workspace_overlays(&paths, &[]).unwrap();
     }
 
     #[test]
@@ -11061,11 +11427,7 @@ mod tests {
             "unexpected error: {}",
             msg
         );
-        assert!(
-            msg.contains("large.bin"),
-            "unexpected error: {}",
-            msg
-        );
+        assert!(msg.contains("large.bin"), "unexpected error: {}", msg);
     }
 
     #[test]
@@ -11225,8 +11587,21 @@ mod tests {
     fn build_runtime_contract_env_legacy_includes_all_agentlab_keys() {
         let input = json!({
             "ids": { "trial_id": "t1", "variant_id": "v1", "task_id": "task_a", "repl_idx": 2 },
-            "task": { "image": "myimg:1" },
-            "policy": { "timeout_ms": 30000 }
+            "task": { "id": "task_a" },
+            "policy": { "timeout_ms": 30000 },
+            "ext": {
+                "task_boundary_v3": {
+                    "schema_version": "task_boundary_v3",
+                    "environment": { "image": "myimg:1" },
+                    "workspace": {
+                        "mode": "scratch",
+                        "base": { "kind": "empty" },
+                        "overlays": [],
+                        "aux_mounts": []
+                    },
+                    "limits": {}
+                }
+            }
         });
         let io = PreparedTrialIo {
             input_host: PathBuf::from("/tmp/trial_input.json"),
@@ -11239,7 +11614,7 @@ mod tests {
             result_path: "/agentlab/out/result.json".to_string(),
             trajectory_path: "/agentlab/out/trajectory.jsonl".to_string(),
         };
-        let env = build_runtime_contract_env("run_1", &input, &io, Some(30000), false);
+        let env = build_runtime_contract_env("run_1", &input, &io, Some(30000));
         assert_eq!(env.get(AGENTLAB_ENV_RUN_ID).unwrap(), "run_1");
         assert_eq!(env.get(AGENTLAB_ENV_TRIAL_ID).unwrap(), "t1");
         assert_eq!(env.get(AGENTLAB_ENV_VARIANT_ID).unwrap(), "v1");
@@ -11254,21 +11629,24 @@ mod tests {
     }
 
     #[test]
-    fn build_runtime_contract_env_clean_contract_returns_empty() {
+    fn build_runtime_contract_env_minimal_input_still_projects_contract_keys() {
         let input = json!({ "ids": { "trial_id": "t1" } });
         let io = PreparedTrialIo {
             input_host: PathBuf::from("/tmp/trial_input.json"),
             output_host: PathBuf::from("/out"),
             events_host: PathBuf::from("/events"),
-            task_path: "/in/task.json".to_string(),
-            bindings_path: "/in/bindings.json".to_string(),
-            dependencies_path: "/deps".to_string(),
-            policy_path: "/in/policy.json".to_string(),
-            result_path: "/out/result.json".to_string(),
-            trajectory_path: "/out/trajectory.jsonl".to_string(),
+            task_path: "/agentlab/in/task.json".to_string(),
+            bindings_path: "/agentlab/in/bindings.json".to_string(),
+            dependencies_path: "/agentlab/deps".to_string(),
+            policy_path: "/agentlab/in/policy.json".to_string(),
+            result_path: "/agentlab/out/result.json".to_string(),
+            trajectory_path: "/agentlab/out/trajectory.jsonl".to_string(),
         };
-        let env = build_runtime_contract_env("run_1", &input, &io, Some(5000), true);
-        assert!(env.is_empty());
+        let env = build_runtime_contract_env("run_1", &input, &io, Some(5000));
+        assert_eq!(
+            env.get(AGENTLAB_ENV_TASK_PATH).unwrap(),
+            "/agentlab/in/task.json"
+        );
     }
 
     #[test]
@@ -11285,7 +11663,7 @@ mod tests {
             result_path: "/out/result.json".to_string(),
             trajectory_path: "/out/trajectory.jsonl".to_string(),
         };
-        let env = build_runtime_contract_env("run_1", &input, &io, None, false);
+        let env = build_runtime_contract_env("run_1", &input, &io, None);
         assert!(!env.contains_key(AGENTLAB_ENV_TIMEOUT_MS));
     }
 
@@ -11303,7 +11681,7 @@ mod tests {
             result_path: "/out/result.json".to_string(),
             trajectory_path: "/out/trajectory.jsonl".to_string(),
         };
-        let env = build_runtime_contract_env("run_1", &input, &io, None, false);
+        let env = build_runtime_contract_env("run_1", &input, &io, None);
         assert!(!env.contains_key(AGENTLAB_ENV_TASK_IMAGE));
     }
 
@@ -11368,6 +11746,51 @@ mod tests {
         let checksums = guard.path.join("checksums.json");
         fs::write(
             guard.path.join("resolved_experiment.json"),
+            r#"{"version":"0.5","experiment":{"id":"e1","workload_type":"agent_runtime"}}"#,
+        )
+        .unwrap();
+        let resolved_digest = sha256_file(&guard.path.join("resolved_experiment.json")).unwrap();
+        let package_digest =
+            canonical_json_digest(&json!({"resolved_experiment.json": resolved_digest}));
+        fs::write(
+            &checksums,
+            format!(
+                "{{\"schema_version\":\"sealed_package_checksums_v2\",\"files\":{{\"resolved_experiment.json\":\"{}\"}}}}",
+                resolved_digest
+            ),
+        )
+        .unwrap();
+        fs::write(
+            guard.path.join("package.lock"),
+            format!(
+                "{{\"schema_version\":\"sealed_package_lock_v1\",\"package_digest\":\"{}\"}}",
+                package_digest
+            ),
+        )
+        .unwrap();
+        fs::write(
+            &manifest,
+            format!(
+                "{{\"schema_version\":\"sealed_run_package_v2\",\"created_at\":\"2026-03-04T00:00:00Z\",\"resolved_experiment\":{{\"version\":\"0.5\",\"experiment\":{{\"id\":\"e1\",\"workload_type\":\"agent_runtime\"}}}},\"checksums_ref\":\"checksums.json\",\"package_digest\":\"{}\"}}",
+                package_digest
+            ),
+        )
+        .unwrap();
+        let loaded = load_sealed_package_for_run(&guard.path).unwrap();
+        assert_eq!(loaded.json_value.pointer("/version"), Some(&json!("0.5")));
+        assert_eq!(
+            loaded.json_value.pointer("/experiment/id"),
+            Some(&json!("e1"))
+        );
+    }
+
+    #[test]
+    fn load_sealed_package_for_run_rejects_legacy_v1_experiment() {
+        let guard = TempDirGuard::new("load_exp_pkg_v1_reject");
+        let manifest = guard.path.join("manifest.json");
+        let checksums = guard.path.join("checksums.json");
+        fs::write(
+            guard.path.join("resolved_experiment.json"),
             r#"{"version":"1.0","experiment":{"id":"e1"}}"#,
         )
         .unwrap();
@@ -11398,12 +11821,9 @@ mod tests {
             ),
         )
         .unwrap();
-        let loaded = load_sealed_package_for_run(&guard.path).unwrap();
-        assert_eq!(loaded.json_value.pointer("/version"), Some(&json!("1.0")));
-        assert_eq!(
-            loaded.json_value.pointer("/experiment/id"),
-            Some(&json!("e1"))
-        );
+
+        let err = load_sealed_package_for_run(&guard.path).unwrap_err();
+        assert!(err.to_string().contains("legacy experiment version '1.0'"));
     }
 
     #[test]
@@ -11412,7 +11832,7 @@ mod tests {
         let resolved_path = guard.path.join("resolved_experiment.json");
         fs::write(
             &resolved_path,
-            r#"{"version":"1.0","experiment":{"id":"from_checksums"}}"#,
+            r#"{"version":"0.5","experiment":{"id":"from_checksums","workload_type":"agent_runtime"}}"#,
         )
         .unwrap();
         let resolved_digest = sha256_file(&resolved_path).unwrap();
@@ -11437,7 +11857,7 @@ mod tests {
         fs::write(
             guard.path.join("manifest.json"),
             format!(
-                "{{\"schema_version\":\"sealed_run_package_v2\",\"created_at\":\"2026-03-04T00:00:00Z\",\"resolved_experiment\":{{\"version\":\"1.0\",\"experiment\":{{\"id\":\"tampered_manifest\"}}}},\"checksums_ref\":\"checksums.json\",\"package_digest\":\"{}\"}}",
+                "{{\"schema_version\":\"sealed_run_package_v2\",\"created_at\":\"2026-03-04T00:00:00Z\",\"resolved_experiment\":{{\"version\":\"0.5\",\"experiment\":{{\"id\":\"tampered_manifest\",\"workload_type\":\"agent_runtime\"}}}},\"checksums_ref\":\"checksums.json\",\"package_digest\":\"{}\"}}",
                 package_digest
             ),
         )
@@ -11789,19 +12209,36 @@ mod tests {
 
     #[test]
     fn validate_required_fields_v1_whitespace_experiment_id_fails() {
-        let mut spec = clean_contract_base();
+        let mut spec = json!({
+            "version": "1.0",
+            "experiment": {"id": "e1", "name": "test"},
+            "dataset": {"path": "tasks.jsonl"},
+            "design": {"replications": 1},
+            "baseline": {"variant_id": "baseline"},
+            "runtime": {"image": "img:latest", "command": ["python", "main.py"]}
+        });
         spec["experiment"]["id"] = json!("  ");
         let err = validate_required_fields(&spec).unwrap_err();
-        assert!(err.to_string().contains("/experiment/id"), "err: {err}");
+        assert!(
+            err.to_string().contains("legacy experiment version '1.0'"),
+            "err: {err}"
+        );
     }
 
     #[test]
     fn validate_required_fields_v1_whitespace_baseline_variant_id_fails() {
-        let mut spec = clean_contract_base();
+        let mut spec = json!({
+            "version": "1.0",
+            "experiment": {"id": "e1", "name": "test"},
+            "dataset": {"path": "tasks.jsonl"},
+            "design": {"replications": 1},
+            "baseline": {"variant_id": "baseline"},
+            "runtime": {"image": "img:latest", "command": ["python", "main.py"]}
+        });
         spec["baseline"]["variant_id"] = json!("  ");
         let err = validate_required_fields(&spec).unwrap_err();
         assert!(
-            err.to_string().contains("/baseline/variant_id"),
+            err.to_string().contains("legacy experiment version '1.0'"),
             "err: {err}"
         );
     }

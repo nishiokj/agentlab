@@ -20,7 +20,7 @@ Use these names consistently in docs, code comments, and UX.
 | Primitive | Definition | Owner |
 | --- | --- | --- |
 | `Experiment` | Declarative config: DX authoring (`benchmark + agent + baseline + variants + overrides`) normalized to internal dataset/design/runtime/policy. | User |
-| `Task` | One dataset row (`task_jsonl_v1`). | Dataset provider |
+| `Task` | One dataset row (`task_boundary_v3`). | Dataset provider |
 | `Variant` | Bindings/image override applied across tasks. | Experiment design |
 | `Trial` | `Task x Variant x Replication` execution unit. | Runner |
 | `Runtime` | The single command invocation contract (`runtime.agent`). | Runtime author |
@@ -37,15 +37,17 @@ Use these names consistently in docs, code comments, and UX.
 4. Runner appends immutable facts; analysis computes aggregates and live views.
 5. Benchmark-specific logic stays in adapters, not runner core.
 
-## Phase 2 Isolation Contract (Strict)
+## Task Sandbox Hard Cutover
 
-`task_boundary_v2` is now a strict boundary type. The runner owns runtime topology.
+`task_boundary_v3` is now the only accepted runner boundary. The runner owns sandbox topology.
 
-1. Allowed task-boundary keys are fixed: `schema_version`, `task`, `workspace_seed`, `workspace_files`, `mount_references`, `limits`.
-2. `task.workspace` is not a boundary field and has no runtime meaning.
-3. Runner never seeds workspace by reading paths from inside a task image.
-4. Per-task image mode requires materialization via `workspace_seed` or `workspace_files` or `mount_references`; preflight fails otherwise.
-5. Agent-visible filesystem remains runner-owned workspace only (`/agentlab/workspace`) plus runner-managed deps/io mounts.
+1. Allowed task-boundary keys are fixed: `schema_version`, `task`, `environment`, `workspace`, `limits`.
+2. `environment.image` replaces `task.image`.
+3. `workspace.base`, `workspace.overlays`, and `workspace.aux_mounts` replace `workspace_seed`, `workspace_files`, and `mount_references`.
+4. `task.workspace` is deleted; sandbox topology is selected by runner-owned `runtime.sandbox.profile`.
+5. `workspace.mode = "patch"` requires a real base (`dataset_pack` or `git_checkout`), not overlays-only materialization.
+6. The logical writable task root inside the sandbox is always `/agentlab/workspace`.
+7. Agents run outside the task sandbox; compatibility aliases such as `/testbed` are runner-owned profile behavior.
 
 ### Rebuild Bench v0 Dataset For `/jesus`
 
@@ -54,9 +56,8 @@ Run from `Experiments` root:
 ```bash
 python3 bench/integration/agentlab/export_bench_suite_to_jsonl.py \
   --suite v0 \
-  --output /Users/jevinnishioka/Desktop/jesus/.lab/experiments/data/bench_v0.task_boundary_v2.jsonl \
+  --output /Users/jevinnishioka/Desktop/jesus/.lab/experiments/data/bench_v0.task_boundary_v3.jsonl \
   --default-task-image bench-v0-workspace \
-  --require-task-image \
   --dataset-pack-root /Users/jevinnishioka/Desktop/jesus/.lab/dataset_packs/sha256
 ```
 
@@ -133,8 +134,9 @@ DX authoring notes:
 4. `agent.provider_env` appends `--provider-env provider=ENV` and auto-adds those env vars to `agent.env_from_host`.
 5. If staged config files include `.config/...` and `agent.env.HOME` is unset, HOME defaults to `/agentlab/deps` for runtime auth lookup.
 6. In DX mode, legacy fields (`dataset`, `design`, `runtime`, `variant_plan`, `baseline.variant_id`) are rejected.
-7. `arg_map` is the canonical authoring name. `bindings_to_args` with `binding:` is accepted as a compatibility alias during the transition.
-8. Persistent workspace carry-forward stores full workspace file contents. By default the runner fails fast above `AGENTLAB_MAX_WORKSPACE_BUNDLE_BYTES=268435456` bytes to avoid unbounded memory growth during bundle capture.
+7. `arg_map` items must use `key` + `flag`. Legacy aliases are not accepted.
+8. DX authoring has no top-level `version` field.
+9. Persistent workspace carry-forward stores full workspace file contents. By default the runner fails fast above `AGENTLAB_MAX_WORKSPACE_BUNDLE_BYTES=268435456` bytes to avoid unbounded memory growth during bundle capture.
 
 ## Runtime Contract
 
@@ -191,7 +193,7 @@ rust/target/release/lab-cli run .lab/experiments/bench_v0_qwen35b_a3b_only.yaml 
 Notes:
 
 1. If `preflight` reports `container_ready=false`, use `local_process` or start Docker.
-2. If `local_process` fails with command-not-found for `rex`, verify `agent.artifact` resolves under `.lab/agents/` and the artifact contains an executable `bin/rex`.
+2. If `local_process` fails with command-not-found for `rex`, verify `runtime.agent.bundle` resolves under `.lab/agents/` and the bundle contains an executable `bin/rex`.
 3. If `preflight` reports missing config files, place them under `.lab/experiments/overrides/` or use absolute paths.
 
 ## Run Outputs (Contract-Level)

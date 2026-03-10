@@ -33,28 +33,33 @@
     }
   },
   "dataset_task_row": {
-    "schema_version": "task_boundary_v2",
+    "schema_version": "task_boundary_v3",
     "task": {
       "id": "swebench__django__12345",
-      "prompt": "Fix failing tests without changing expected behavior.",
+      "prompt": "Fix failing tests without changing expected behavior."
+    },
+    "environment": {
       "image": "ghcr.io/acme/swebench-task:20260222"
     },
-    "workspace_seed": {
-      "dataset_pack_ref": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    "workspace": {
+      "mode": "patch",
+      "base": {
+        "kind": "dataset_pack",
+        "dataset_pack_ref": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+      },
+      "overlays": [
+        {
+          "path": "README.md",
+          "content": "Task-scoped fixture for P0 baseline freeze."
+        }
+      ],
+      "aux_mounts": [
+        {
+          "dataset_pack_ref": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "mount_path": "/agentlab/workspace/deps"
+        }
+      ]
     },
-    "workspace_files": [
-      {
-        "path": "README.md",
-        "content": "Task-scoped fixture for P0 baseline freeze."
-      }
-    ],
-    "mount_references": [
-      {
-        "dataset_pack_ref": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        "mount_path": "/agentlab/workspace/deps",
-        "read_only": true
-      }
-    ],
     "limits": {
       "max_steps": 12,
       "max_total_tokens": 16000,

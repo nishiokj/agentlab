@@ -97,8 +97,12 @@ It only promises that the package can satisfy the minimal execution contract in 
 
 The runner now treats the following as blocking in `agent_runtime_reachable`:
 
-1. non-launchable agent entrypoints,
-2. known deterministic compatibility blockers emitted by bootstrap probes.
+1. the real adapter command failing to complete a bounded contract smoke run,
+2. missing or malformed `result.json` during that smoke run,
+3. known deterministic compatibility blockers emitted in harness stdout/stderr.
+
+The benchmark preflight check now runs the real benchmark wrapper contract too. It must produce the
+runner-owned prediction and score artifacts during smoke, not merely launch the grader command.
 
 The benchmark wrapper also treats missing `result.json` as a contract failure owned by the runner,
 not as a grader traceback.

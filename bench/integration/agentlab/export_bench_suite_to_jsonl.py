@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
-"""Export bench task bundles as strict AgentLab task_boundary_v2 JSONL.
+"""Export bench task bundles as strict AgentLab task_boundary_v3 JSONL.
 
-Phase 2 hard-cut:
-- task workspace is runner-owned (no task.workspace emission)
-- rows must include runner-owned workspace_seed.dataset_pack_ref
-- dataset packs are materialized at export/build time (not at run time)
+Hard cut:
+- task boundaries emit `environment.image`
+- workspace state emits `workspace.{mode,base,overlays,aux_mounts}`
+- sandbox topology remains runner-owned
 """
 
 from __future__ import annotations
@@ -24,8 +24,8 @@ import yaml
 DEFAULT_SUITE = "v0"
 DEFAULT_SPLIT = "test"
 DEFAULT_BENCHMARK_NAME = "bench"
-TASK_BOUNDARY_SCHEMA_VERSION = "task_boundary_v2"
-PACK_FORMAT_VERSION = "bench_workspace_seed_pack_v1"
+TASK_BOUNDARY_SCHEMA_VERSION = "task_boundary_v3"
+PACK_FORMAT_VERSION = "bench_workspace_base_pack_v1"
 DEFAULT_DATASET_PACK_ROOT = ".lab/dataset_packs/sha256"
 
 
@@ -129,15 +129,15 @@ def _resolve_task_image(
     default_task_image: str | None,
     task_id: str,
     require_task_image: bool,
-) -> str | None:
+) -> str:
     explicit = _candidate_string(task_yaml.get("image"))
     if explicit:
         return explicit
     if default_task_image:
         return _per_task_image_name(default_task_image, task_id)
-    if require_task_image:
-        raise ValueError(f"task.image missing for task '{task_id}'")
-    return None
+    raise ValueError(
+        f"environment.image could not be resolved for task '{task_id}'"
+    )
 
 
 def _resolve_repo_snapshot_path(root: Path, task_dir: Path, task_yaml: dict[str, Any]) -> Path:
@@ -182,7 +182,7 @@ def _sha256_file(path: Path) -> str:
     return hasher.hexdigest()
 
 
-def _workspace_seed_digest(repo_snapshot: Path, injection_patch: Path | None) -> str:
+def _workspace_base_digest(repo_snapshot: Path, injection_patch: Path | None) -> str:
     hasher = hashlib.sha256()
     hasher.update(PACK_FORMAT_VERSION.encode("utf-8"))
     hasher.update(b"\0")
@@ -259,7 +259,7 @@ def _remove_sensitive_paths(workspace_root: Path) -> None:
 def _hash_directory_tree(root: Path) -> str:
     hasher = hashlib.sha256()
     for path in sorted(p for p in root.rglob("*") if p.is_file()):
-        if path.name == ".agentlab_workspace_seed_pack.json":
+        if path.name == ".agentlab_workspace_base_pack.json":
             continue
         rel = path.relative_to(root).as_posix().encode("utf-8")
         hasher.update(rel)
@@ -276,7 +276,7 @@ def _dataset_pack_root(root: Path, dataset_pack_root: str) -> Path:
     return root / path
 
 
-def _materialize_workspace_seed_pack(
+def _materialize_workspace_base_pack(
     root: Path,
     task_dir: Path,
     task_yaml: dict[str, Any],
@@ -284,7 +284,7 @@ def _materialize_workspace_seed_pack(
 ) -> str:
     repo_snapshot = _resolve_repo_snapshot_path(root, task_dir, task_yaml)
     injection_patch = _resolve_injection_patch_path(task_dir, task_yaml)
-    digest = _workspace_seed_digest(repo_snapshot, injection_patch)
+    digest = _workspace_base_digest(repo_snapshot, injection_patch)
 
     pack_root = _dataset_pack_root(root, dataset_pack_root)
     pack_root.mkdir(parents=True, exist_ok=True)
@@ -302,7 +302,7 @@ def _materialize_workspace_seed_pack(
         _remove_sensitive_paths(tmp_dir)
         tree_hash = _hash_directory_tree(tmp_dir)
         metadata = {
-            "schema_version": "workspace_seed_pack_v1",
+            "schema_version": "workspace_base_pack_v1",
             "pack_format_version": PACK_FORMAT_VERSION,
             "digest": digest,
             "tree_hash": tree_hash,
@@ -313,7 +313,7 @@ def _materialize_workspace_seed_pack(
                 else (str(injection_patch) if injection_patch is not None else None)
             ),
         }
-        (tmp_dir / ".agentlab_workspace_seed_pack.json").write_text(
+        (tmp_dir / ".agentlab_workspace_base_pack.json").write_text(
             json.dumps(metadata, separators=(",", ":"), sort_keys=True) + "\n",
             encoding="utf-8",
         )
@@ -349,7 +349,7 @@ def _build_task_row(
         task_id=task_id,
         require_task_image=require_task_image,
     )
-    workspace_seed_digest = _materialize_workspace_seed_pack(
+    workspace_base_digest = _materialize_workspace_base_pack(
         root=root,
         task_dir=task_dir,
         task_yaml=task_yaml,
@@ -374,9 +374,6 @@ def _build_task_row(
         },
     }
 
-    if task_image:
-        task_payload["image"] = task_image
-
     public_command = task_yaml.get("public_command")
     if isinstance(public_command, str) and public_command.strip():
         task_payload["public_command"] = public_command.strip()
@@ -388,11 +385,19 @@ def _build_task_row(
     row: dict[str, Any] = {
         "schema_version": TASK_BOUNDARY_SCHEMA_VERSION,
         "task": task_payload,
-        "workspace_seed": {
-            "dataset_pack_ref": f"sha256:{workspace_seed_digest}",
+        "environment": {
+            "image": task_image,
         },
-        "workspace_files": _workspace_overlay_files(task_dir),
-        "mount_references": [],
+        "workspace": {
+            "mode": "patch",
+            "base": {
+                "kind": "dataset_pack",
+                "dataset_pack_ref": f"sha256:{workspace_base_digest}",
+            },
+            "overlays": _workspace_overlay_files(task_dir),
+            "aux_mounts": [],
+        },
+        "limits": {},
     }
     return row
 
@@ -428,7 +433,7 @@ def main() -> int:
     parser.add_argument(
         "--output",
         default=None,
-        help="Output JSONL path (default: data/bench_<suite>.task_boundary_v2.jsonl)",
+        help="Output JSONL path (default: data/bench_<suite>.task_boundary_v3.jsonl)",
     )
     parser.add_argument(
         "--image",
@@ -462,7 +467,7 @@ def main() -> int:
         "--require-task-image",
         action="store_true",
         default=False,
-        help="Fail export when task.image cannot be resolved",
+        help="Deprecated/ignored: environment.image is always required",
     )
     parser.add_argument(
         "--limit",

@@ -1,6 +1,6 @@
 # AgentLab Onboarding
 
-This repo is `runtime.agent`-first.
+This repo is `runtime.agent` plus `runtime.sandbox`.
 
 ## Starter File
 
@@ -23,10 +23,13 @@ Your runtime program should:
 
 ## Runtime Contract
 
-Use `runtime.agent` in `experiment.yaml`:
+Use the split hard-cut contract in `experiment.yaml`:
 
+- `runtime.agent.bundle` (required)
 - `runtime.agent.command` (required)
-- `runtime.agent.image` (required for container mode)
+- `runtime.sandbox.executor: docker` (required)
+- `runtime.sandbox.image_source` plus `runtime.sandbox.image` for global-image mode
+- `runtime.sandbox.profile` and `runtime.sandbox.network`
 - optional `runtime.agent.io.input_arg` / `output_arg`
 - optional `runtime.agent.env` / `env_from_host`
 
@@ -50,7 +53,7 @@ rust/target/release/lab-cli describe .lab/experiment.yaml --json
 # docker path
 rust/target/release/lab-cli run .lab/experiment.yaml --executor local_docker --json
 
-# fallback when Docker is unavailable
+# fallback when Docker is unavailable for the external agent runtime
 rust/target/release/lab-cli run .lab/experiment.yaml --executor local_process --json
 ```
 

@@ -8,7 +8,7 @@ For compatibility monitoring lanes, see `docs/HARBOR_PHASE3_RUNBOOK.md`.
 
 1. Per-task image mode coverage:
    1. `.lab/experiments/terminal_bench2_harbor_per_task.yaml`
-   2. exporter guardrails for `task.image`
+   2. exporter guardrails for missing `environment.image`
 2. One-task smoke fixture:
    1. `scripts/harbor/fixtures/tb2_smoke_task/task.toml`
    2. `.lab/experiments/terminal_bench2_harbor_smoke.yaml`
@@ -18,13 +18,12 @@ For compatibility monitoring lanes, see `docs/HARBOR_PHASE3_RUNBOOK.md`.
 
 ## Per-Task Image Dataset Build
 
-Use `--require-task-image` to fail fast when any task does not define `task.image`:
+Export Harbor tasks to `task_boundary_v3` rows:
 
 ```bash
 python3 adapters/harbor/export_harbor_to_agentlab_jsonl.py \
   --tasks-root /path/to/harbor/tasks \
-  --output .lab/experiments/data/terminal_bench2_harbor.task_boundary_v2.jsonl \
-  --require-task-image
+  --output .lab/experiments/data/terminal_bench2_harbor.task_boundary_v3.jsonl
 ```
 
 If your Harbor tasks are missing image fields and you want a default:
@@ -32,7 +31,7 @@ If your Harbor tasks are missing image fields and you want a default:
 ```bash
 python3 adapters/harbor/export_harbor_to_agentlab_jsonl.py \
   --tasks-root /path/to/harbor/tasks \
-  --output .lab/experiments/data/terminal_bench2_harbor.task_boundary_v2.jsonl \
+  --output .lab/experiments/data/terminal_bench2_harbor.task_boundary_v3.jsonl \
   --default-task-image python:3.11-slim
 ```
 
@@ -85,9 +84,8 @@ harbor_benchmark_adapter.py error_code=evaluator.command_failed message=...
 `scripts/harbor/run_terminal_bench2_harbor.sh` now supports:
 
 1. `PYTHON_BIN`
-2. `HARBOR_REQUIRE_TASK_IMAGE=1`
-3. `HARBOR_DEFAULT_TASK_IMAGE=<image>`
-4. `HARBOR_DEFAULT_TASK_WORKSPACE=<path>`
+2. `HARBOR_DEFAULT_TASK_IMAGE=<image>`
+3. `HARBOR_AGENT_BUNDLE=<bundle>`
 
 ## Tests
 

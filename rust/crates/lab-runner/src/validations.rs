@@ -119,7 +119,6 @@ fn check_benchmark_grader_reachable_for_variants(
     variant_runtime_profiles: &[VariantRuntimeProfile],
     tasks: &[Value],
     per_task_scan: Option<&PerTaskImageScanResult>,
-    is_clean: bool,
     project_root: &Path,
 ) -> Vec<PreflightCheck> {
     if variants.len() != variant_runtime_profiles.len() {
@@ -140,7 +139,6 @@ fn check_benchmark_grader_reachable_for_variants(
                 variant,
                 tasks,
                 per_task_scan,
-                is_clean,
                 project_root,
             );
             check.message = format!("variant '{}': {}", variant.id, check.message);
@@ -211,18 +209,11 @@ fn collect_per_task_images_for_preflight(tasks: &[Value]) -> PerTaskImageScanRes
             .filter(|value| !value.is_empty())
             .map(ToString::to_string)
             .unwrap_or_else(|| format!("line {}", idx + 1));
-        match boundary
-            .task_image
-            .as_deref()
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-        {
-            Some(image) => {
-                if unique_images.insert(image.to_string()) {
-                    result.unique_images.push(image.to_string());
-                }
-            }
-            None => result.missing_task_ids.push(task_id),
+        let image = boundary.task_image.trim();
+        if image.is_empty() {
+            result.missing_task_ids.push(task_id);
+        } else if unique_images.insert(image.to_string()) {
+            result.unique_images.push(image.to_string());
         }
     }
     result.unique_images.sort();
@@ -271,7 +262,7 @@ fn resolve_preflight_images(
                     passed: false,
                     severity: PreflightSeverity::Error,
                     message: format!(
-                        "tasks missing task.image in per-task mode: {}",
+                        "tasks missing environment.image in per-task sandbox mode: {}",
                         format_preview(&scan.missing_task_ids, 5)
                     ),
                 });
@@ -697,7 +688,6 @@ fn collect_preflight_checks(
         });
         return checks;
     }
-    let is_clean = is_clean_contract_experiment(json_value);
     let needs_per_task_scan = variant_runtime_profiles.iter().any(|profile| {
         profile.container_mode && profile.agent_runtime.image_source == ImageSource::PerTask
     });
@@ -706,7 +696,7 @@ fn collect_preflight_checks(
     } else {
         None
     };
-    let skip_container_shell_probe = benchmark_config.adapter.is_some() && !is_clean;
+    let skip_container_shell_probe = benchmark_config.adapter.is_some();
 
     // Structural checks (probe_trial_input, dataset_task_ids) are now
     // validated at build time in build_swebench_curated_ab_experiment.mjs.
@@ -800,7 +790,6 @@ fn collect_preflight_checks(
                 variant_runtime_profiles,
                 tasks,
                 per_task_scan.as_ref(),
-                is_clean,
                 project_root,
             ))
         );
@@ -873,9 +862,8 @@ fn check_dataset_task_ids(
             }
         }
         if require_materialization
-            && parsed.workspace_seed.is_none()
-            && parsed.workspace_files.is_empty()
-            && parsed.mount_references.is_empty()
+            && parsed.workspace.mode == WorkspaceMode::Patch
+            && parsed.workspace.base.kind == WorkspaceBaseKind::Empty
         {
             missing_materialization_lines.push(line_num);
         }
@@ -887,7 +875,7 @@ fn check_dataset_task_ids(
             passed: false,
             severity: PreflightSeverity::Error,
             message: format!(
-                "malformed task boundary rows (expected strict task_boundary_v2): {}",
+                "malformed task boundary rows (expected strict task_boundary_v3): {}",
                 format_preview(&malformed_boundary_rows, 3)
             ),
         });
@@ -907,7 +895,7 @@ fn check_dataset_task_ids(
             passed: false,
             severity: PreflightSeverity::Error,
             message: format!(
-                "tasks missing workspace materialization (workspace_seed, workspace_files, or mount_references) at lines: {:?}",
+                "patch tasks missing a real workspace base (workspace.base.kind cannot be 'empty') at lines: {:?}",
                 missing_materialization_lines
             ),
         });
@@ -963,7 +951,6 @@ fn check_benchmark_grader_reachable(
     runtime_profile: &VariantRuntimeProfile,
     variant: &Variant,
     tasks: &[Value],
-    is_clean: bool,
     project_root: &Path,
 ) -> PreflightCheck {
     check_benchmark_grader_reachable_with_scan(
@@ -972,7 +959,6 @@ fn check_benchmark_grader_reachable(
         variant,
         tasks,
         None,
-        is_clean,
         project_root,
     )
 }
@@ -1036,7 +1022,7 @@ fn check_agent_runtime_reachable_with_scan(
         Err(check) => return check,
     };
     emit_preflight_log(format!(
-        "agent_runtime_reachable: probing {} image(s) via shared runtime launch construction",
+        "agent_runtime_reachable: running contract smoke in {} image(s)",
         images.len()
     ));
     let failures = run_bounded_image_probes(&images, "agent_runtime_reachable", |idx, image| {
@@ -1055,22 +1041,13 @@ fn check_agent_runtime_reachable_with_scan(
                 Err(err) => return Some(format!("{} ({})", image, err)),
             };
         let request = build_preflight_probe_request(&context, runtime_profile, None, false);
-        let resolved_command = match resolve_runtime_agent_command(&request) {
-            Ok(command) => command,
-            Err(err) => return Some(format!("{} ({})", image, err)),
-        };
-        match run_preflight_container_probe(&request, image, &resolved_command) {
+        match run_preflight_contract_smoke(&request) {
             Ok(report) => {
-                let blockers = detect_known_probe_output_blockers(&report);
-                if blockers.is_empty() {
+                let smoke_failures = collect_preflight_contract_smoke_failures(&request, &report);
+                if smoke_failures.is_empty() {
                     None
                 } else {
-                    Some(format!(
-                        "{} (probe {} emitted deterministic compatibility blockers: {})",
-                        image,
-                        shell_join(&report.probe_command),
-                        format_preview(&blockers, 3)
-                    ))
+                    Some(format!("{} ({})", image, format_preview(&smoke_failures, 3)))
                 }
             }
             Err(err) => Some(format!("{} ({})", image, err)),
@@ -1084,7 +1061,7 @@ fn check_agent_runtime_reachable_with_scan(
             passed: false,
             severity: PreflightSeverity::Error,
             message: format!(
-                "runtime agent launch is not reachable in required images: {}",
+                "runtime agent contract smoke failed in required images: {}",
                 format_preview(&failures, 3)
             ),
         };
@@ -1095,10 +1072,10 @@ fn check_agent_runtime_reachable_with_scan(
         passed: true,
         severity: PreflightSeverity::Error,
         message: if images.len() == 1 {
-            format!("runtime agent launch reachable in image '{}'", images[0])
+            format!("runtime agent contract smoke passed in image '{}'", images[0])
         } else {
             format!(
-                "runtime agent launch reachable in all {} required images",
+                "runtime agent contract smoke passed in all {} required images",
                 images.len(),
             )
         },
@@ -1111,7 +1088,6 @@ fn check_benchmark_grader_reachable_with_scan(
     variant: &Variant,
     tasks: &[Value],
     per_task_scan: Option<&PerTaskImageScanResult>,
-    is_clean: bool,
     project_root: &Path,
 ) -> PreflightCheck {
     let name = "benchmark_grader_reachable";
@@ -1127,16 +1103,6 @@ fn check_benchmark_grader_reachable_with_scan(
             };
         }
     };
-
-    if is_clean {
-        return PreflightCheck {
-            name,
-            passed: true,
-            severity: PreflightSeverity::Warning,
-            message: "clean_contract_v1 experiment — benchmark grading will be silently skipped"
-                .to_string(),
-        };
-    }
 
     if !runtime_profile.container_mode {
         return PreflightCheck {
@@ -1160,7 +1126,7 @@ fn check_benchmark_grader_reachable_with_scan(
         Err(check) => return check,
     };
     emit_preflight_log(format!(
-        "benchmark_grader_reachable: probing {} image(s) via shared runtime launch construction",
+        "benchmark_grader_reachable: running benchmark contract smoke in {} image(s)",
         images.len()
     ));
     let failures = run_bounded_image_probes(&images, "benchmark_grader_reachable", |idx, image| {
@@ -1180,16 +1146,15 @@ fn check_benchmark_grader_reachable_with_scan(
             };
         let request =
             build_preflight_probe_request(&context, runtime_profile, Some(adapter), true);
-        let grader_command = match resolve_benchmark_grader_command(&request) {
-            Ok(Some(command)) => command,
-            Ok(None) => return None,
-            Err(err) => return Some(format!("{} ({})", image, err)),
-        };
-        if let Err(err) = seed_preflight_probe_result(&context.io_paths.output_host) {
-            return Some(format!("{} ({})", image, err));
-        }
-        match run_preflight_container_probe(&request, image, &grader_command) {
-            Ok(_) => None,
+        match run_preflight_contract_smoke(&request) {
+            Ok(report) => {
+                let smoke_failures = collect_preflight_contract_smoke_failures(&request, &report);
+                if smoke_failures.is_empty() {
+                    None
+                } else {
+                    Some(format!("{} ({})", image, format_preview(&smoke_failures, 3)))
+                }
+            }
             Err(err) => Some(format!("{} ({})", image, err)),
         }
     });
@@ -1201,7 +1166,7 @@ fn check_benchmark_grader_reachable_with_scan(
             passed: false,
             severity: PreflightSeverity::Error,
             message: format!(
-                "benchmark grader launch is not reachable in required images: {}",
+                "benchmark grader contract smoke failed in required images: {}",
                 format_preview(&failures, 3)
             ),
         };
@@ -1212,10 +1177,10 @@ fn check_benchmark_grader_reachable_with_scan(
         passed: true,
         severity: PreflightSeverity::Error,
         message: if images.len() == 1 {
-            format!("benchmark grader launch reachable in image '{}'", images[0])
+            format!("benchmark grader contract smoke passed in image '{}'", images[0])
         } else {
             format!(
-                "benchmark grader launch reachable in all {} required images",
+                "benchmark grader contract smoke passed in all {} required images",
                 images.len()
             )
         },
@@ -1450,14 +1415,6 @@ fn check_container_ready(
         _docker_total.elapsed().as_secs_f64()
     ));
     checks
-}
-
-fn seed_preflight_probe_result(path: &Path) -> Result<()> {
-    if let Some(parent) = path.parent() {
-        ensure_dir(parent)?;
-    }
-    fs::write(path, b"{\"output\":{\"patch\":\"\"}}\n")?;
-    Ok(())
 }
 
 fn check_dependency_files_exist(json_value: &Value, exp_dir: &Path) -> Vec<PreflightCheck> {
@@ -1952,10 +1909,44 @@ fn count_tasks(path: &Path, json_value: &Value) -> Result<usize> {
     Ok(count)
 }
 
-const TASK_BOUNDARY_V2_SCHEMA_VERSION: &str = "task_boundary_v2";
+const TASK_BOUNDARY_V3_SCHEMA_VERSION: &str = "task_boundary_v3";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct WorkspaceFileSpec {
+#[serde(deny_unknown_fields)]
+struct TaskEnvironmentSpec {
+    image: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum WorkspaceMode {
+    Scratch,
+    Patch,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+enum WorkspaceBaseKind {
+    Empty,
+    DatasetPack,
+    GitCheckout,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorkspaceBaseSpec {
+    kind: WorkspaceBaseKind,
+    #[serde(default)]
+    dataset_pack_ref: Option<String>,
+    #[serde(default)]
+    repo: Option<String>,
+    #[serde(default)]
+    commit: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct WorkspaceOverlaySpec {
     path: String,
     content: String,
     #[serde(default)]
@@ -1965,14 +1956,19 @@ struct WorkspaceFileSpec {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct MountReferenceSpec {
+#[serde(deny_unknown_fields)]
+struct WorkspaceAuxMountSpec {
     dataset_pack_ref: String,
     mount_path: String,
-    #[serde(default)]
-    read_only: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct WorkspaceSeedSpec {
-    dataset_pack_ref: String,
+#[serde(deny_unknown_fields)]
+struct WorkspaceSpec {
+    mode: WorkspaceMode,
+    base: WorkspaceBaseSpec,
+    #[serde(default)]
+    overlays: Vec<WorkspaceOverlaySpec>,
+    #[serde(default)]
+    aux_mounts: Vec<WorkspaceAuxMountSpec>,
 }

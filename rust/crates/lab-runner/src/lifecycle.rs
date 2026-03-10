@@ -127,11 +127,8 @@ impl TrialExecutor {
         let task_idx = slot.task_idx;
         let task = &tasks[task_idx];
         let task_boundary = parse_task_boundary_from_dataset_task(task)?;
-        validate_task_boundary_workspace_materialization(
-            &task_boundary,
-            task_boundary_policy,
-            agent_runtime.image_source,
-        )?;
+        let _ = task_boundary_policy;
+        validate_task_boundary_workspace_materialization(&task_boundary)?;
         let repl = slot.repl_idx;
         let task_id = task_boundary
             .task_payload
@@ -139,15 +136,7 @@ impl TrialExecutor {
             .and_then(|v| v.as_str())
             .map(|s| s.to_string())
             .unwrap_or_else(|| format!("task_{}", task_idx));
-        if agent_runtime.image_source == ImageSource::PerTask && task_boundary.task_image.is_none()
-        {
-            return Err(anyhow!(
-                "task.image is required for task '{}' when runtime.agent.image_source='per_task'",
-                task_id
-            ));
-        }
         let benchmark_grading_enabled = benchmark_config.adapter.is_some()
-            && !is_clean_contract_experiment(trial_experiment)
             && task_boundary
                 .task_payload
                 .pointer("/grading/enabled")
@@ -183,11 +172,7 @@ impl TrialExecutor {
         if matches!(effective_policy.state_policy, StatePolicy::IsolatePerTrial)
             || !has_chain_snapshot
         {
-            materialize_workspace_seed(
-                project_root,
-                &trial_paths,
-                task_boundary.workspace_seed.as_ref(),
-            )?;
+            materialize_workspace_base(project_root, &trial_paths, &task_boundary.workspace.base)?;
         }
         if !matches!(effective_policy.state_policy, StatePolicy::IsolatePerTrial) {
             if let Some(chain_state) = chain_states.get(&chain_key) {
@@ -201,11 +186,11 @@ impl TrialExecutor {
             }
         }
 
-        materialize_workspace_files(&trial_paths, &task_boundary.workspace_files)?;
+        materialize_workspace_overlays(&trial_paths, &task_boundary.workspace.overlays)?;
         stage_workspace_patches_for_trial(agent_runtime, &trial_paths)?;
-        let dynamic_mounts = resolve_task_mounts(
+        let dynamic_mounts = resolve_workspace_aux_mounts(
             project_root,
-            &task_boundary.mount_references,
+            &task_boundary.workspace.aux_mounts,
             container_mode,
         )?;
 
@@ -289,12 +274,7 @@ impl TrialExecutor {
         });
         atomic_write_json_pretty(&trial_dir.join("trial_metadata.json"), &trial_metadata)?;
 
-        let io_paths = prepare_io_paths(
-            &trial_paths,
-            container_mode,
-            &input_bytes,
-            is_clean_contract_experiment(trial_experiment),
-        )?;
+        let io_paths = prepare_io_paths(&trial_paths, container_mode, &input_bytes)?;
         stage_benchmark_trial_preflight(
             benchmark_config,
             &trial_dir,
@@ -303,6 +283,7 @@ impl TrialExecutor {
             schedule_idx,
             &variant.id,
             &task_boundary.task_payload,
+            Some(task_boundary.task_image.as_str()),
             &io_paths.input_host,
         )?;
         let runtime_env = build_runtime_contract_env(
@@ -310,10 +291,6 @@ impl TrialExecutor {
             &input,
             &io_paths,
             resolve_trial_timeout_ms(&input, invocation_default_timeout_ms),
-            trial_experiment
-                .pointer("/version")
-                .and_then(|v| v.as_str())
-                == Some("1.0"),
         );
         let benchmark_prediction_path = trial_paths.out.join(BENCHMARK_PREDICTION_FILENAME);
         let benchmark_score_path = trial_paths.out.join(BENCHMARK_SCORE_FILENAME);
@@ -348,7 +325,7 @@ impl TrialExecutor {
             if agent_runtime.tracing_mode == Some("otlp".to_string()) {
                 if container_mode
                     && trial_experiment
-                        .pointer("/runtime/policy/network/mode")
+                        .pointer("/runtime/sandbox/network")
                         .and_then(|v| v.as_str())
                         == Some("none")
                 {
@@ -358,10 +335,8 @@ impl TrialExecutor {
                         "reason": "network_none",
                     }));
                 } else {
-                    let receiver = lab_otel::OtlpReceiver::start(
-                        4318,
-                        ArtifactStore::new(trial_dir.join("artifacts")),
-                    )?;
+                    let receiver =
+                        lab_otel::OtlpReceiver::start(0, ArtifactStore::new(trial_dir.join("artifacts")))?;
                     let endpoint = receiver.endpoint.clone();
                     otel_receiver = Some(receiver);
                     otel_manifest = Some(json!({
@@ -395,7 +370,7 @@ impl TrialExecutor {
                 benchmark_adapter: benchmark_config.adapter.as_ref(),
                 benchmark_grading_enabled,
                 run_id,
-                task_image: task_boundary.task_image.as_deref(),
+                task_image: Some(task_boundary.task_image.as_str()),
                 agent_artifact: agent_runtime.agent_artifact.as_deref(),
             };
             let proc_result = adapter.run_trial(&run_request)?;
@@ -2402,10 +2377,7 @@ fn rewrite_runtime_paths_for_package(
     artifact_counter: &mut usize,
     file_counter: &mut usize,
 ) -> Result<()> {
-    if let Some(raw) = runtime_root
-        .pointer("/agent/artifact")
-        .and_then(Value::as_str)
-    {
+    if let Some(raw) = runtime_root.pointer("/agent/bundle").and_then(Value::as_str) {
         let rel = stage_source_into_package(
             raw,
             exp_dir,
@@ -2415,8 +2387,8 @@ fn rewrite_runtime_paths_for_package(
             artifact_copies,
             artifact_counter,
         )?;
-        set_json_pointer_value(runtime_root, "/agent/artifact", json!(rel.clone()))?;
-        set_json_pointer_value(runtime_root, "/agent/artifact_resolved_path", json!(rel))?;
+        set_json_pointer_value(runtime_root, "/agent/bundle", json!(rel.clone()))?;
+        set_json_pointer_value(runtime_root, "/agent/bundle_resolved_path", json!(rel))?;
     }
 
     if let Some(file_staging) = runtime_root
@@ -2771,7 +2743,7 @@ fn run_experiment_with_behavior(
             &json_value,
             &run_dir,
             &run_dir,
-            &run_dir,
+            &project_root,
             &tasks,
             &benchmark_config,
             &variants,
@@ -3005,7 +2977,6 @@ pub fn describe_experiment(path: &Path) -> Result<ExperimentSummary> {
     // Collect preflight warnings (lightweight: dataset + config checks only, no Docker)
     let benchmark_config = parse_benchmark_config(&json_value);
     let tasks_for_preflight = load_tasks(&dataset_path, &json_value).unwrap_or_default();
-    let is_clean = is_clean_contract_experiment(&json_value);
     let mut preflight_warnings = Vec::new();
     for check in check_dataset_task_ids(
         &tasks_for_preflight,
@@ -3029,7 +3000,6 @@ pub fn describe_experiment(path: &Path) -> Result<ExperimentSummary> {
             )?,
             baseline_variant,
             &tasks_for_preflight,
-            is_clean,
             &exp_dir,
         );
         if matches!(grader_check.severity, PreflightSeverity::Warning)

@@ -41,6 +41,11 @@ def _workspace_root() -> Path:
     return Path.cwd()
 
 
+def _is_preflight_smoke() -> bool:
+    raw = os.environ.get("AGENTLAB_PREFLIGHT_SMOKE", "").strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
 def _task_id(task_payload: dict[str, Any]) -> str:
     candidate = task_payload.get("id")
     if isinstance(candidate, str) and candidate.strip():
@@ -242,6 +247,8 @@ def main() -> int:
         },
     )
 
+    preflight_smoke = _is_preflight_smoke()
+
     if _coerce_bool(bindings.get("emit_invalid_trajectory_json"), False):
         _write_raw_trajectory_line("{invalid trajectory json")
     _write_trajectory(
@@ -303,11 +310,26 @@ def main() -> int:
         }
 
     exit_code = _coerce_int(bindings.get("exit_code"), 0)
-    if _coerce_bool(bindings.get("emit_invalid_result_json"), False):
+    if not preflight_smoke:
+        exit_code = _coerce_int(bindings.get("runtime_only_exit_code"), exit_code)
+
+    emit_invalid_result_json = _coerce_bool(bindings.get("emit_invalid_result_json"), False)
+    skip_result_write = _coerce_bool(bindings.get("skip_result_write"), False)
+    if not preflight_smoke:
+        emit_invalid_result_json = _coerce_bool(
+            bindings.get("runtime_only_emit_invalid_result_json"),
+            emit_invalid_result_json,
+        )
+        skip_result_write = _coerce_bool(
+            bindings.get("runtime_only_skip_result_write"),
+            skip_result_write,
+        )
+
+    if emit_invalid_result_json:
         target = Path(args.output)
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text("{invalid result json\n", encoding="utf-8")
-    elif exit_code == 0 and not _coerce_bool(bindings.get("skip_result_write"), False):
+    elif exit_code == 0 and not skip_result_write:
         _write_json(args.output, result)
 
     _write_trajectory(

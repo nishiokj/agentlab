@@ -116,8 +116,13 @@ pub(crate) fn experiment_version_string(json_value: &Value) -> Option<String> {
     }
 }
 
-pub(crate) fn is_clean_contract_experiment(json_value: &Value) -> bool {
-    experiment_version_string(json_value).as_deref() == Some("1.0")
+pub(crate) fn reject_legacy_experiment_version(json_value: &Value) -> Result<()> {
+    if experiment_version_string(json_value).as_deref() == Some("1.0") {
+        return Err(anyhow!(
+            "legacy experiment version '1.0' is not supported; rebuild the package with task_boundary_v3 plus runtime.agent/runtime.sandbox"
+        ));
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -133,19 +138,11 @@ pub(crate) fn experiment_workload_type(json_value: &Value) -> Result<String> {
     {
         return Ok(value.to_string());
     }
-    if is_clean_contract_experiment(json_value) {
-        return Ok("agent_runtime".to_string());
-    }
+    reject_legacy_experiment_version(json_value)?;
     Err(anyhow!("missing /experiment/workload_type"))
 }
 
 pub(crate) fn experiment_random_seed(json_value: &Value) -> u64 {
-    if is_clean_contract_experiment(json_value) {
-        return json_value
-            .pointer("/design/seed")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(1);
-    }
     json_value
         .pointer("/design/random_seed")
         .and_then(|v| v.as_u64())
@@ -165,62 +162,14 @@ pub(crate) fn experiment_max_concurrency(json_value: &Value) -> usize {
 // ---------------------------------------------------------------------------
 
 pub(crate) fn validate_required_fields(json_value: &Value) -> Result<()> {
-    if is_clean_contract_experiment(json_value) {
-        let required_v1: &[&str] = &[
-            "/experiment/id",
-            "/experiment/name",
-            "/dataset/path",
-            "/design/replications",
-            "/baseline/variant_id",
-            "/runtime/image",
-            "/runtime/command",
-        ];
-        let mut missing = Vec::new();
-        for pointer in required_v1 {
-            let value = json_value.pointer(pointer);
-            let is_missing = match value {
-                None => true,
-                Some(Value::String(s)) => s.trim().is_empty(),
-                Some(Value::Array(items)) if *pointer == "/runtime/command" => items.is_empty(),
-                Some(Value::Number(n)) if *pointer == "/design/replications" => {
-                    n.as_u64() == Some(0)
-                }
-                _ => false,
-            };
-            if is_missing {
-                missing.push(*pointer);
-            }
-        }
-
-        let has_command = match json_value.pointer("/runtime/command") {
-            Some(Value::String(s)) => !s.trim().is_empty(),
-            Some(Value::Array(parts)) if !parts.is_empty() => parts
-                .iter()
-                .all(|part| part.as_str().map(|s| !s.trim().is_empty()).unwrap_or(false)),
-            _ => false,
-        };
-        if !has_command {
-            missing.push("/runtime/command");
-        }
-        if missing.is_empty() {
-            return Ok(());
-        }
-        let lines = missing
-            .iter()
-            .map(|p| format!("  - {}", p))
-            .collect::<Vec<_>>();
-        return Err(anyhow!(
-            "experiment.yaml missing required fields:\n{}",
-            lines.join("\n")
-        ));
-    }
+    reject_legacy_experiment_version(json_value)?;
 
     let required: &[&str] = &[
         "/experiment/workload_type",
         "/design/sanitization_profile",
         "/design/replications",
         "/runtime/policy/timeout_ms",
-        "/runtime/policy/network/mode",
+        "/runtime/sandbox/network",
         "/baseline/variant_id",
     ];
     let mut missing = Vec::new();
@@ -243,6 +192,9 @@ pub(crate) fn validate_required_fields(json_value: &Value) -> Result<()> {
     if json_value.pointer("/runtime/agent").is_none() {
         missing.push("/runtime/agent");
     }
+    if json_value.pointer("/runtime/sandbox").is_none() {
+        missing.push("/runtime/sandbox");
+    }
     let has_command = match json_value.pointer("/runtime/agent/command") {
         Some(Value::String(s)) => !s.trim().is_empty(),
         Some(Value::Array(parts)) if !parts.is_empty() => parts
@@ -253,22 +205,30 @@ pub(crate) fn validate_required_fields(json_value: &Value) -> Result<()> {
     if !has_command {
         missing.push("/runtime/agent/command");
     }
+    let bundle = json_value
+        .pointer("/runtime/agent/bundle")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .unwrap_or("");
+    if bundle.is_empty() {
+        missing.push("/runtime/agent/bundle");
+    }
 
     let mut invalid = Vec::new();
     if json_value.pointer("/runtime/agent/mode").is_some() {
         invalid
-            .push("/runtime/agent/mode (removed; use runtime.agent.command + runtime.agent.image)");
+            .push("/runtime/agent/mode (removed; use runtime.agent.command + runtime.agent.bundle)");
     }
     if json_value
         .pointer("/runtime/agent/known_agent_ref")
         .is_some()
     {
         invalid.push(
-            "/runtime/agent/known_agent_ref (removed; ship built runtime in container image)",
+            "/runtime/agent/known_agent_ref (removed; ship an agent bundle and configure runtime.sandbox separately)",
         );
     }
     if json_value.pointer("/runtime/agent/custom_image").is_some() {
-        invalid.push("/runtime/agent/custom_image (removed; use runtime.agent.image)");
+        invalid.push("/runtime/agent/custom_image (removed; use runtime.agent.bundle + runtime.sandbox.image)");
     }
     if json_value.pointer("/runtime/agent/adapter").is_some() {
         invalid.push("/runtime/agent/adapter (removed from user-facing spec)");
@@ -279,43 +239,67 @@ pub(crate) fn validate_required_fields(json_value: &Value) -> Result<()> {
     if json_value.pointer("/runtime/agent/overrides").is_some() {
         invalid.push("/runtime/agent/overrides (removed; package runtime concerns in the image)");
     }
+    if json_value.pointer("/runtime/agent/image").is_some() {
+        invalid.push("/runtime/agent/image (removed; use runtime.sandbox.image)");
+    }
+    if json_value.pointer("/runtime/agent/image_source").is_some() {
+        invalid.push("/runtime/agent/image_source (removed; use runtime.sandbox.image_source)");
+    }
+    if json_value.pointer("/runtime/agent/artifact").is_some() {
+        invalid.push("/runtime/agent/artifact (removed; use runtime.agent.bundle)");
+    }
+    if json_value.pointer("/runtime/agent/artifact_digest").is_some() {
+        invalid.push("/runtime/agent/artifact_digest (removed; use runtime.agent.bundle_digest)");
+    }
+    if json_value.pointer("/runtime/agent/artifact_resolved_path").is_some() {
+        invalid.push("/runtime/agent/artifact_resolved_path (removed; use runtime.agent.bundle_resolved_path)");
+    }
+    if json_value.pointer("/runtime/policy/network/mode").is_some() {
+        invalid.push("/runtime/policy/network/mode (moved to runtime.sandbox.network)");
+    }
+    if json_value.pointer("/runtime/policy/sandbox").is_some() {
+        invalid.push("/runtime/policy/sandbox (removed; use runtime.sandbox + runner-owned profiles)");
+    }
 
-    let sandbox_mode = json_value
-        .pointer("/runtime/policy/sandbox/mode")
+    let sandbox_executor = json_value
+        .pointer("/runtime/sandbox/executor")
         .and_then(|v| v.as_str())
-        .unwrap_or("local");
+        .unwrap_or("");
+    if sandbox_executor.is_empty() {
+        missing.push("/runtime/sandbox/executor");
+    } else if sandbox_executor != "docker" {
+        invalid.push("/runtime/sandbox/executor (must be 'docker')");
+    }
     let image_source = json_value
-        .pointer("/runtime/agent/image_source")
+        .pointer("/runtime/sandbox/image_source")
         .and_then(|v| v.as_str())
         .unwrap_or("global");
     if image_source != "global" && image_source != "per_task" {
-        invalid.push("/runtime/agent/image_source (must be 'global' or 'per_task')");
+        invalid.push("/runtime/sandbox/image_source (must be 'global' or 'per_task')");
     }
-    if image_source == "per_task" && sandbox_mode != "container" {
-        invalid.push(
-            "/runtime/agent/image_source (value 'per_task' requires /runtime/policy/sandbox/mode='container')",
-        );
+    let sandbox_profile = json_value
+        .pointer("/runtime/sandbox/profile")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .unwrap_or("");
+    if sandbox_profile.is_empty() {
+        missing.push("/runtime/sandbox/profile");
     }
-    if sandbox_mode == "container" {
-        let runtime_agent_image = json_value
-            .pointer("/runtime/agent/image")
+    let sandbox_network = json_value
+        .pointer("/runtime/sandbox/network")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .unwrap_or("");
+    if sandbox_network.is_empty() {
+        missing.push("/runtime/sandbox/network");
+    }
+    let sandbox_image = json_value
+            .pointer("/runtime/sandbox/image")
             .and_then(|v| v.as_str())
             .map(|v| v.trim().to_string())
             .unwrap_or_default();
-        let has_container_image = !runtime_agent_image.is_empty();
-        if image_source != "per_task" && !has_container_image {
-            missing.push("/runtime/agent/image");
-        }
-        if image_source == "per_task" {
-            let agent_artifact = json_value
-                .pointer("/runtime/agent/artifact")
-                .and_then(|v| v.as_str())
-                .map(str::trim)
-                .unwrap_or("");
-            if agent_artifact.is_empty() {
-                missing.push("/runtime/agent/artifact");
-            }
-        }
+    if image_source != "per_task" && sandbox_image.is_empty() {
+        missing.push("/runtime/sandbox/image");
     }
     if json_value.pointer("/benchmark").is_some() {
         let has_adapter_command = match json_value.pointer("/benchmark/adapter/command") {
@@ -597,6 +581,7 @@ pub(crate) fn load_sealed_package_for_run(path: &Path) -> Result<LoadedExperimen
     };
     let manifest = load_json_file(&manifest_path)?;
     let json_value = verify_sealed_package_integrity(&exp_dir, &manifest)?;
+    reject_legacy_experiment_version(&json_value)?;
     let project_root = find_project_root(&exp_dir)
         .canonicalize()
         .unwrap_or_else(|_| find_project_root(&exp_dir));
@@ -1102,6 +1087,7 @@ pub(crate) fn variant_digest(variant: &Variant) -> Result<String> {
 }
 
 pub(crate) fn resolve_variant_plan(json_value: &Value) -> Result<(Vec<Variant>, String)> {
+    reject_legacy_experiment_version(json_value)?;
     if !matches!(json_value.pointer("/variants"), None | Some(Value::Null)) {
         return Err(anyhow!(
             "legacy alias '/variants' is not allowed; use '/variant_plan'"
@@ -1121,57 +1107,35 @@ pub(crate) fn resolve_variant_plan(json_value: &Value) -> Result<(Vec<Variant>, 
         .ok_or_else(|| anyhow!("missing /baseline/variant_id"))?
         .to_string();
 
-    let clean_contract = is_clean_contract_experiment(json_value);
-
     let mut variants = Vec::new();
-    if clean_contract {
-        let baseline_args =
-            parse_string_array_field(json_value.pointer("/baseline/args"), "/baseline/args")?;
-        let baseline_env =
-            parse_string_map_field(json_value.pointer("/baseline/env"), "/baseline/env")?;
-        let baseline_image = parse_optional_nonempty_string(
-            json_value.pointer("/baseline/image"),
-            "/baseline/image",
-        )?;
-        variants.push(Variant {
-            id: baseline.clone(),
-            bindings: json!({}),
-            args: baseline_args,
-            env: baseline_env,
-            image: baseline_image,
-            runtime_overrides: None,
-        });
-    } else {
-        let baseline_bindings = json_value
-            .pointer("/baseline/bindings")
-            .cloned()
-            .unwrap_or(json!({}));
-        if !baseline_bindings.is_object() {
-            return Err(anyhow!("invalid /baseline/bindings: expected object"));
-        }
-        let mut baseline_runtime_overrides = match json_value.pointer("/baseline/runtime_overrides")
-        {
-            None | Some(Value::Null) => None,
-            Some(Value::Object(_)) => json_value.pointer("/baseline/runtime_overrides").cloned(),
-            Some(_) => return Err(anyhow!("/baseline/runtime_overrides must be an object")),
-        };
-        if let Some(image) = parse_optional_nonempty_string(
-            json_value.pointer("/baseline/image"),
-            "/baseline/image",
-        )? {
-            let mut overrides = baseline_runtime_overrides.unwrap_or_else(|| json!({}));
-            set_json_pointer_value(&mut overrides, "/agent/image", json!(image))?;
-            baseline_runtime_overrides = Some(overrides);
-        }
-        variants.push(Variant {
-            id: baseline.clone(),
-            bindings: baseline_bindings,
-            args: Vec::new(),
-            env: BTreeMap::new(),
-            image: None,
-            runtime_overrides: baseline_runtime_overrides,
-        });
+    let baseline_bindings = json_value
+        .pointer("/baseline/bindings")
+        .cloned()
+        .unwrap_or(json!({}));
+    if !baseline_bindings.is_object() {
+        return Err(anyhow!("invalid /baseline/bindings: expected object"));
     }
+    let mut baseline_runtime_overrides = match json_value.pointer("/baseline/runtime_overrides") {
+        None | Some(Value::Null) => None,
+        Some(Value::Object(_)) => json_value.pointer("/baseline/runtime_overrides").cloned(),
+        Some(_) => return Err(anyhow!("/baseline/runtime_overrides must be an object")),
+    };
+    if let Some(image) = parse_optional_nonempty_string(
+        json_value.pointer("/baseline/image"),
+        "/baseline/image",
+    )? {
+        let mut overrides = baseline_runtime_overrides.unwrap_or_else(|| json!({}));
+        set_json_pointer_value(&mut overrides, "/agent/image", json!(image))?;
+        baseline_runtime_overrides = Some(overrides);
+    }
+    variants.push(Variant {
+        id: baseline.clone(),
+        bindings: baseline_bindings,
+        args: Vec::new(),
+        env: BTreeMap::new(),
+        image: None,
+        runtime_overrides: baseline_runtime_overrides,
+    });
 
     let variant_list: &[Value] = match json_value.pointer("/variant_plan") {
         Some(value) => value
@@ -1205,57 +1169,36 @@ pub(crate) fn resolve_variant_plan(json_value: &Value) -> Result<(Vec<Variant>, 
                 )
             })?
             .to_string();
-        if clean_contract {
-            let args = parse_string_array_field(
-                item.get("args"),
-                &format!("/variant_plan[{}].args", idx),
-            )?;
-            let env =
-                parse_string_map_field(item.get("env"), &format!("/variant_plan[{}].env", idx))?;
-            let image = parse_optional_nonempty_string(
-                item.get("image"),
-                &format!("/variant_plan[{}].image", idx),
-            )?;
-            variants.push(Variant {
-                id,
-                bindings: json!({}),
-                args,
-                env,
-                image,
-                runtime_overrides: None,
-            });
-        } else {
-            let bindings = item.get("bindings").cloned().unwrap_or(json!({}));
-            if !bindings.is_object() {
-                return Err(anyhow!("/variant_plan[{}].bindings must be an object", idx));
-            }
-            let mut runtime_overrides = match item.get("runtime_overrides") {
-                None | Some(Value::Null) => None,
-                Some(Value::Object(_)) => item.get("runtime_overrides").cloned(),
-                Some(_) => {
-                    return Err(anyhow!(
-                        "/variant_plan[{}].runtime_overrides must be an object",
-                        idx
-                    ))
-                }
-            };
-            if let Some(image) = parse_optional_nonempty_string(
-                item.get("image"),
-                &format!("/variant_plan[{}].image", idx),
-            )? {
-                let mut overrides = runtime_overrides.unwrap_or_else(|| json!({}));
-                set_json_pointer_value(&mut overrides, "/agent/image", json!(image))?;
-                runtime_overrides = Some(overrides);
-            }
-            variants.push(Variant {
-                id,
-                bindings,
-                args: Vec::new(),
-                env: BTreeMap::new(),
-                image: None,
-                runtime_overrides,
-            });
+        let bindings = item.get("bindings").cloned().unwrap_or(json!({}));
+        if !bindings.is_object() {
+            return Err(anyhow!("/variant_plan[{}].bindings must be an object", idx));
         }
+        let mut runtime_overrides = match item.get("runtime_overrides") {
+            None | Some(Value::Null) => None,
+            Some(Value::Object(_)) => item.get("runtime_overrides").cloned(),
+            Some(_) => {
+                return Err(anyhow!(
+                    "/variant_plan[{}].runtime_overrides must be an object",
+                    idx
+                ))
+            }
+        };
+        if let Some(image) = parse_optional_nonempty_string(
+            item.get("image"),
+            &format!("/variant_plan[{}].image", idx),
+        )? {
+            let mut overrides = runtime_overrides.unwrap_or_else(|| json!({}));
+            set_json_pointer_value(&mut overrides, "/agent/image", json!(image))?;
+            runtime_overrides = Some(overrides);
+        }
+        variants.push(Variant {
+            id,
+            bindings,
+            args: Vec::new(),
+            env: BTreeMap::new(),
+            image: None,
+            runtime_overrides,
+        });
     }
     Ok((variants, baseline))
 }
@@ -1406,14 +1349,7 @@ pub(crate) fn set_json_pointer_value(
 // ---------------------------------------------------------------------------
 
 pub(crate) fn resolve_runtime_for_variant(experiment: &Value, variant: &Variant) -> Result<Value> {
-    if is_clean_contract_experiment(experiment) {
-        let mut resolved = experiment.clone();
-        if let Some(image) = variant.image.as_ref() {
-            set_json_pointer_value(&mut resolved, "/runtime/image", json!(image))?;
-        }
-        return Ok(resolved);
-    }
-
+    reject_legacy_experiment_version(experiment)?;
     let mut resolved = experiment.clone();
     let Some(runtime_overrides) = variant.runtime_overrides.as_ref() else {
         return Ok(resolved);
@@ -1427,7 +1363,32 @@ pub(crate) fn resolve_runtime_for_variant(experiment: &Value, variant: &Variant)
         return Err(anyhow!("invalid /runtime: expected object"));
     }
 
+    let base_file_staging = runtime.pointer("/dependencies/file_staging").cloned();
+    let override_file_staging = runtime_overrides.pointer("/dependencies/file_staging").cloned();
     merge_json_value(&mut runtime, runtime_overrides);
+    if let (Some(Value::Array(base_entries)), Some(Value::Array(override_entries))) =
+        (base_file_staging, override_file_staging)
+    {
+        let mut merged_entries = base_entries;
+        for override_entry in override_entries {
+            let override_destination = override_entry
+                .get("destination_path")
+                .and_then(Value::as_str);
+            if let Some(destination_path) = override_destination {
+                if let Some(existing_idx) = merged_entries.iter().position(|existing| {
+                    existing
+                        .get("destination_path")
+                        .and_then(Value::as_str)
+                        == Some(destination_path)
+                }) {
+                    merged_entries[existing_idx] = override_entry;
+                    continue;
+                }
+            }
+            merged_entries.push(override_entry);
+        }
+        set_json_pointer_value(&mut runtime, "/dependencies/file_staging", Value::Array(merged_entries))?;
+    }
     set_json_pointer_value(&mut resolved, "/runtime", runtime)?;
     Ok(resolved)
 }

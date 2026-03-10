@@ -17,13 +17,13 @@ if [[ -z "${PYTHON_BIN}" ]]; then
 fi
 
 TASKS_ROOT="${HARBOR_SMOKE_TASKS_ROOT:-scripts/harbor/fixtures/tb2_smoke_task}"
-SMOKE_DATASET="${HARBOR_SMOKE_DATASET:-.lab/experiments/data/terminal_bench2_harbor_smoke.task_boundary_v2.jsonl}"
+SMOKE_DATASET="${HARBOR_SMOKE_DATASET:-.lab/experiments/data/terminal_bench2_harbor_smoke.task_boundary_v3.jsonl}"
 SMOKE_EXPERIMENT="${HARBOR_SMOKE_EXPERIMENT:-.lab/experiments/terminal_bench2_harbor_smoke.yaml}"
 PER_TASK_EXPERIMENT="${HARBOR_PER_TASK_EXPERIMENT:-.lab/experiments/terminal_bench2_harbor_per_task.yaml}"
 DEFAULT_TASK_IMAGE="${HARBOR_DEFAULT_TASK_IMAGE:-python:3.11-slim}"
 RUN_SMOKE="${HARBOR_SMOKE_RUN:-0}"
 RUN_PER_TASK="${HARBOR_SMOKE_RUN_PER_TASK:-0}"
-PER_TASK_ARTIFACT="${HARBOR_AGENT_ARTIFACT:-.lab/agents/agent-runtime.tar.gz}"
+AGENT_BUNDLE="${HARBOR_AGENT_BUNDLE:-${HARBOR_AGENT_ARTIFACT:-.lab/agents/agent-runtime.tar.gz}}"
 export HARBOR_EVALUATOR_CMD="${HARBOR_EVALUATOR_CMD:-}"
 export HARBOR_EVALUATOR_CMD_JSON="${HARBOR_EVALUATOR_CMD_JSON:-}"
 
@@ -31,30 +31,42 @@ echo "building smoke dataset: ${SMOKE_DATASET}"
 "${PYTHON_BIN}" adapters/harbor/export_harbor_to_agentlab_jsonl.py \
   --tasks-root "${TASKS_ROOT}" \
   --output "${SMOKE_DATASET}" \
-  --require-task-image \
   --default-task-image "${DEFAULT_TASK_IMAGE}" \
   --limit 1
 
+if [[ ! -f "${AGENT_BUNDLE}" ]]; then
+  echo "missing agent bundle: ${AGENT_BUNDLE}"
+  exit 1
+fi
+
+TMP_SMOKE_EXP="$(mktemp ".lab/experiments/_tmp_terminal_bench2_harbor_smoke.XXXXXX.yaml")"
 TMP_PER_TASK_EXP="$(mktemp ".lab/experiments/_tmp_terminal_bench2_harbor_per_task.XXXXXX.yaml")"
-trap 'rm -f "${TMP_PER_TASK_EXP}"' EXIT
+trap 'rm -f "${TMP_SMOKE_EXP}" "${TMP_PER_TASK_EXP}"' EXIT
+SMOKE_DATASET_ABS="$(cd "$(dirname "${SMOKE_DATASET}")" && pwd)/$(basename "${SMOKE_DATASET}")"
+AGENT_BUNDLE_ABS="$(cd "$(dirname "${AGENT_BUNDLE}")" && pwd)/$(basename "${AGENT_BUNDLE}")"
 sed \
-  -e "s|path: .*|path: data/terminal_bench2_harbor_smoke.task_boundary_v2.jsonl|" \
+  -e "s|^  path: .*|  path: ${SMOKE_DATASET_ABS}|" \
+  -e "s|^    bundle: .*|    bundle: ${AGENT_BUNDLE_ABS}|" \
+  "${SMOKE_EXPERIMENT}" > "${TMP_SMOKE_EXP}"
+sed \
+  -e "s|^  path: .*|  path: ${SMOKE_DATASET_ABS}|" \
+  -e "s|^    bundle: .*|    bundle: ${AGENT_BUNDLE_ABS}|" \
   "${PER_TASK_EXPERIMENT}" > "${TMP_PER_TASK_EXP}"
 
 if command -v lab-cli >/dev/null 2>&1; then
-  DESCRIBE_CMD=(lab-cli describe "${SMOKE_EXPERIMENT}")
+  DESCRIBE_CMD=(lab-cli describe "${TMP_SMOKE_EXP}")
   DESCRIBE_PER_TASK_CMD=(lab-cli describe "${TMP_PER_TASK_EXP}")
-  RUN_CMD=(lab-cli run "${SMOKE_EXPERIMENT}" --executor "${AGENTLAB_EXECUTOR:-local_docker}")
+  RUN_CMD=(lab-cli run "${TMP_SMOKE_EXP}" --executor "${AGENTLAB_EXECUTOR:-local_docker}")
   RUN_PER_TASK_CMD=(lab-cli run "${TMP_PER_TASK_EXP}" --executor "${AGENTLAB_EXECUTOR:-local_docker}")
 elif [[ -x rust/target/release/lab-cli ]]; then
-  DESCRIBE_CMD=(rust/target/release/lab-cli describe "${SMOKE_EXPERIMENT}")
+  DESCRIBE_CMD=(rust/target/release/lab-cli describe "${TMP_SMOKE_EXP}")
   DESCRIBE_PER_TASK_CMD=(rust/target/release/lab-cli describe "${TMP_PER_TASK_EXP}")
-  RUN_CMD=(rust/target/release/lab-cli run "${SMOKE_EXPERIMENT}" --executor "${AGENTLAB_EXECUTOR:-local_docker}")
+  RUN_CMD=(rust/target/release/lab-cli run "${TMP_SMOKE_EXP}" --executor "${AGENTLAB_EXECUTOR:-local_docker}")
   RUN_PER_TASK_CMD=(rust/target/release/lab-cli run "${TMP_PER_TASK_EXP}" --executor "${AGENTLAB_EXECUTOR:-local_docker}")
 else
-  DESCRIBE_CMD=(cargo run --manifest-path rust/Cargo.toml -p lab-cli -- describe "${SMOKE_EXPERIMENT}")
+  DESCRIBE_CMD=(cargo run --manifest-path rust/Cargo.toml -p lab-cli -- describe "${TMP_SMOKE_EXP}")
   DESCRIBE_PER_TASK_CMD=(cargo run --manifest-path rust/Cargo.toml -p lab-cli -- describe "${TMP_PER_TASK_EXP}")
-  RUN_CMD=(cargo run --manifest-path rust/Cargo.toml -p lab-cli -- run "${SMOKE_EXPERIMENT}" --executor "${AGENTLAB_EXECUTOR:-local_docker}")
+  RUN_CMD=(cargo run --manifest-path rust/Cargo.toml -p lab-cli -- run "${TMP_SMOKE_EXP}" --executor "${AGENTLAB_EXECUTOR:-local_docker}")
   RUN_PER_TASK_CMD=(cargo run --manifest-path rust/Cargo.toml -p lab-cli -- run "${TMP_PER_TASK_EXP}" --executor "${AGENTLAB_EXECUTOR:-local_docker}")
 fi
 
@@ -72,13 +84,6 @@ else
 fi
 
 if [[ "${RUN_PER_TASK}" == "1" ]]; then
-  if [[ ! -f "${PER_TASK_ARTIFACT}" ]]; then
-    echo "missing per-task artifact: ${PER_TASK_ARTIFACT}"
-    exit 1
-  fi
-  sed -i.bak "s|artifact: .*|artifact: ${PER_TASK_ARTIFACT}|" "${TMP_PER_TASK_EXP}"
-  rm -f "${TMP_PER_TASK_EXP}.bak"
-
   if command -v lab-cli >/dev/null 2>&1; then
     RUN_PER_TASK_CMD=(lab-cli run "${TMP_PER_TASK_EXP}" --executor "${AGENTLAB_EXECUTOR:-local_docker}")
   elif [[ -x rust/target/release/lab-cli ]]; then

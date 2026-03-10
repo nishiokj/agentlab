@@ -11,7 +11,9 @@ import type { DesignPolicies, MetricDef } from '../src/experiment-builder.js';
 function validBuilder(): ExperimentBuilder {
   return ExperimentBuilder.create('exp-1', 'My Experiment')
     .datasetJsonl('tasks.jsonl', { suiteId: 'suite', splitId: 'dev', limit: 50 })
-    .agentLoop(['node', './agent_loop.js', 'run']);
+    .agentLoop(['node', './agent_loop.js', 'run'])
+    .agentBundle('./agents/agent-runtime.tar.gz')
+    .sandboxImage('ghcr.io/acme/task-sandbox:latest');
 }
 
 function validFromBuilder(policies: DesignPolicies): ExperimentBuilder {
@@ -19,14 +21,16 @@ function validFromBuilder(policies: DesignPolicies): ExperimentBuilder {
     .id('exp-from')
     .name('From Preset')
     .datasetJsonl('tasks.jsonl', { suiteId: 'suite', splitId: 'dev', limit: 50 })
-    .agentLoop(['node', './agent_loop.js', 'run']);
+    .agentLoop(['node', './agent_loop.js', 'run'])
+    .agentBundle('./agents/agent-runtime.tar.gz')
+    .sandboxImage('ghcr.io/acme/task-sandbox:latest');
 }
 
 describe('ExperimentBuilder defaults', () => {
   const spec = validBuilder().build();
 
-  test('version is 0.5', () => {
-    assert.equal(spec.version, '0.5');
+  test('top-level version field is omitted', () => {
+    assert.equal('version' in spec, false);
   });
 
   test('design defaults are set', () => {
@@ -36,13 +40,18 @@ describe('ExperimentBuilder defaults', () => {
     assert.equal(spec.design.comparison, 'paired');
     assert.equal(spec.design.shuffle_tasks, true);
     assert.equal(spec.design.max_concurrency, 1);
+    assert.equal(spec.dataset.schema_version, 'task_boundary_v3');
   });
 
   test('runtime defaults are set', () => {
     assert.deepEqual(spec.runtime.agent.command, ['node', './agent_loop.js', 'run']);
+    assert.equal(spec.runtime.agent.bundle, './agents/agent-runtime.tar.gz');
     assert.equal(spec.runtime.policy.timeout_ms, 600_000);
-    assert.equal(spec.runtime.policy.sandbox.mode, 'local');
-    assert.equal(spec.runtime.policy.network.mode, 'none');
+    assert.equal(spec.runtime.sandbox.executor, 'docker');
+    assert.equal(spec.runtime.sandbox.image_source, 'global');
+    assert.equal(spec.runtime.sandbox.image, 'ghcr.io/acme/task-sandbox:latest');
+    assert.equal(spec.runtime.sandbox.profile, 'default');
+    assert.equal(spec.runtime.sandbox.network, 'none');
     assert.deepEqual(spec.runtime.policy.network.allowed_hosts, []);
   });
 
@@ -61,6 +70,7 @@ describe('ExperimentBuilder validation', () => {
         assert.ok(err.message.includes('required fields not set'));
         assert.ok(err.message.includes('dataset path'));
         assert.ok(err.message.includes('runtime.agent.command'));
+        assert.ok(err.message.includes('runtime.agent.bundle'));
         return true;
       },
     );
@@ -111,8 +121,8 @@ describe('ExperimentBuilder runtime APIs', () => {
   test('customAgentImage sets container mode + image', () => {
     const spec = validBuilder().customAgentImage('ghcr.io/acme/agent:latest', ['python', 'run.py']).build();
     assert.deepEqual(spec.runtime.agent.command, ['python', 'run.py']);
-    assert.equal(spec.runtime.agent.image, 'ghcr.io/acme/agent:latest');
-    assert.equal(spec.runtime.policy.sandbox.mode, 'container');
+    assert.equal(spec.runtime.sandbox.image, 'ghcr.io/acme/agent:latest');
+    assert.equal(spec.runtime.sandbox.executor, 'docker');
   });
 
   test('networkMode and timeoutMs are applied', () => {
@@ -120,17 +130,16 @@ describe('ExperimentBuilder runtime APIs', () => {
       .networkMode('allowlist_enforced', ['api.openai.com'])
       .timeoutMs(42_000)
       .build();
-    assert.equal(spec.runtime.policy.network.mode, 'allowlist_enforced');
+    assert.equal(spec.runtime.sandbox.network, 'allowlist_enforced');
     assert.deepEqual(spec.runtime.policy.network.allowed_hosts, ['api.openai.com']);
     assert.equal(spec.runtime.policy.timeout_ms, 42_000);
   });
 
-  test('sandboxImage/localSandbox round trip', () => {
-    const spec = validBuilder()
-      .sandboxImage('ghcr.io/acme/agent:sha256:abc')
-      .localSandbox()
-      .build();
-    assert.equal(spec.runtime.policy.sandbox.mode, 'local');
+  test('localSandbox is rejected after hard cutover', () => {
+    assert.throws(
+      () => validBuilder().localSandbox(),
+      /localSandbox\(\) was removed/,
+    );
   });
 });
 
@@ -284,7 +293,7 @@ describe('YAML serialization', () => {
       .metric(Metric.DURATION_MS)
       .toYaml();
 
-    assert.ok(yaml.includes('version: "0.5"'));
+    assert.ok(!yaml.includes('version: "0.5"'));
     assert.ok(yaml.includes('runtime:'));
     assert.ok(yaml.includes('agent:'));
     assert.ok(yaml.includes('baseline:'));

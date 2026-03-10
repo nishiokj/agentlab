@@ -37,15 +37,18 @@ Add a Harbor dataset exporter that maps Harbor task sources into AgentLab task J
 
 Output format:
 
-1. `task_boundary_v2` rows when per-task image/workspace is present.
+1. `task_boundary_v3` rows for task-sandbox workloads.
 2. Plain task rows when task boundary metadata is not needed.
 
 Primary output fields:
 
 1. `schema_version`
 2. `task.id`
-3. `task.image` (optional)
-4. `task.workspace` (optional)
+3. `environment.image` (required for per-task image mode)
+4. `workspace.mode`
+5. `workspace.base`
+6. optional `workspace.overlays`
+7. optional `workspace.aux_mounts`
 5. benchmark identity fields (`adapter_id`, `name`, `split`)
 6. benchmark/task payload needed by harness + evaluator
 
@@ -124,7 +127,7 @@ Support TB2 via a profile, not hard-coding TB2 into core integration:
 
 ## Phase 2: Hardening
 
-1. Add per-task image mode coverage (`image_source: per_task`).
+1. Add per-task image mode coverage (`runtime.sandbox.image_source: per_task`).
 2. Add smoke run fixture (single task) for end-to-end validation.
 3. Add strict error taxonomy in adapter (mapping/eval failures).
 
@@ -171,9 +174,9 @@ Minimal Harbor-backed experiment requirements:
 
 Optional for Harbor task images:
 
-1. `runtime.agent.image_source: per_task`
-2. `runtime.agent.artifact: <agent artifact tar path>`
-3. dataset rows include `task.image`
+1. `runtime.sandbox.image_source: per_task`
+2. `runtime.agent.bundle: <agent bundle tar path>`
+3. dataset rows include `environment.image`
 
 ## 11) Acceptance Criteria
 

@@ -18,13 +18,12 @@ pub(crate) const DEFAULT_CONTAINER_RESULT_PATH: &str = lab_core::AGENTLAB_RESULT
 pub(crate) const DEFAULT_CONTAINER_TRAJECTORY_PATH: &str = lab_core::AGENTLAB_TRAJECTORY_PATH;
 pub(crate) const DEFAULT_CONTAINER_TRIAL_INPUT_PATH: &str = lab_core::AGENTLAB_TRIAL_INPUT_PATH;
 pub(crate) const DEFAULT_CONTAINER_CONTROL_PATH: &str = lab_core::AGENTLAB_CONTROL_PATH;
-pub(crate) const DEFAULT_CLEAN_TASK_PATH: &str = lab_core::HARNESS_TASK_PATH;
-pub(crate) const DEFAULT_CLEAN_RESULT_PATH: &str = lab_core::HARNESS_RESULT_PATH;
 pub(crate) const AGENTLAB_ENV_TASK_IMAGE: &str = "AGENTLAB_TASK_IMAGE";
 pub(crate) const AGENTLAB_ENV_BENCHMARK_PREDICTION_PATH: &str =
     "AGENTLAB_BENCHMARK_PREDICTION_PATH";
 pub(crate) const AGENTLAB_ENV_BENCHMARK_SCORE_PATH: &str = "AGENTLAB_BENCHMARK_SCORE_PATH";
 pub(crate) const AGENTLAB_ENV_AGENT_EXIT_STATUS: &str = "AGENTLAB_AGENT_EXIT_STATUS";
+pub(crate) const AGENTLAB_ENV_PREFLIGHT_SMOKE: &str = "AGENTLAB_PREFLIGHT_SMOKE";
 pub(crate) const BENCHMARK_PREDICTION_FILENAME: &str = "benchmark_prediction.json";
 pub(crate) const BENCHMARK_SCORE_FILENAME: &str = "benchmark_score.json";
 pub(crate) const BENCHMARK_GRADE_ERROR_FILENAME: &str = "benchmark_grade_error.txt";
@@ -49,6 +48,7 @@ pub(crate) const DEFAULT_MIN_FREE_BYTES: u64 = 20 * 1024 * 1024 * 1024;
 pub(crate) const DEFAULT_MAX_WORKSPACE_BUNDLE_BYTES: u64 = 256 * 1024 * 1024;
 pub(crate) const DEFAULT_PREFLIGHT_IMAGE_PROBE_PARALLELISM: usize = 2;
 pub(crate) const MAX_PREFLIGHT_IMAGE_PROBE_PARALLELISM: usize = 8;
+pub(crate) const DEFAULT_PREFLIGHT_CONTRACT_SMOKE_TIMEOUT_MS: u64 = 10_000;
 pub(crate) const LOCAL_WORKER_CAPACITY_ERROR_PREFIX: &str = "local worker backend at capacity:";
 pub(crate) const LOCAL_WORKER_MAX_COMPLETIONS_PER_POLL: usize = 256;
 pub(crate) const RUNTIME_DISK_HEADROOM_CHECK_INTERVAL_SECONDS: u64 = 1;
@@ -882,7 +882,7 @@ impl ImageSource {
             "global" => Ok(Self::Global),
             "per_task" => Ok(Self::PerTask),
             other => Err(anyhow!(
-                "runtime.agent.image_source must be 'global' or 'per_task' (got '{}')",
+                "runtime.sandbox.image_source must be 'global' or 'per_task' (got '{}')",
                 other
             )),
         }

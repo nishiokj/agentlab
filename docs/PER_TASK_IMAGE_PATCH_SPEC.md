@@ -1,3 +1,22 @@
+# Obsolete Note
+
+This document is obsolete and must not be implemented further.
+
+It is superseded by:
+
+1. `docs/PATCH_SPEC_TASK_SANDBOX_WORKSPACE_ROOT_HARD_CUTOVER.md`
+
+The model below normalized concepts that are now explicitly deleted:
+
+1. `task.workspace`
+2. `task.image` under task payload
+3. `runtime.agent.image_source`
+4. `runtime.agent.artifact`
+5. agent execution inside the task sandbox
+6. agent bundle visibility inside the task sandbox
+
+---
+
 # Per-Task Image Patch Spec
 
 ## Problem

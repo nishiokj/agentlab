@@ -313,7 +313,6 @@ export const ExperimentType = {
 // ---------------------------------------------------------------------------
 
 export interface ExperimentSpec {
-  version: '0.5';
   experiment: {
     id: string;
     name: string;
@@ -363,10 +362,17 @@ export interface ExperimentSpec {
   runtime: {
     agent: {
       command: string[];
-      image?: string;
+      bundle?: string;
       io?: AgentIoConfig;
       env?: Record<string, string>;
       env_from_host?: string[];
+    };
+    sandbox: {
+      executor: 'docker';
+      image_source: 'global' | 'per_task';
+      image?: string;
+      profile: string;
+      network: 'none' | 'full' | 'allowlist_enforced';
     };
     dependencies: {
       file_staging?: DependencyFileStagingEntry[];
@@ -379,23 +385,7 @@ export interface ExperimentSpec {
     policy: {
       timeout_ms: number;
       network: {
-        mode: 'none' | 'full' | 'allowlist_enforced';
         allowed_hosts: string[];
-      };
-      sandbox: {
-        mode: 'container' | 'local';
-        engine?: 'docker';
-        image?: string;
-        root_read_only?: boolean;
-        run_as_user?: string;
-        hardening?: {
-          no_new_privileges: boolean;
-          drop_all_caps: boolean;
-        };
-        resources?: {
-          cpu_count: number;
-          memory_mb: number;
-        };
       };
     };
     telemetry?: {
@@ -431,7 +421,6 @@ export class ExperimentBuilder {
 
   private constructor(id: string, name: string) {
     this.spec = {
-      version: '0.5',
       experiment: {
         id,
         name,
@@ -441,7 +430,7 @@ export class ExperimentBuilder {
         suite_id: '',
         provider: 'local_jsonl',
         path: '',
-        schema_version: 'task_jsonl_v1',
+        schema_version: 'task_boundary_v3',
         split_id: '',
         limit: 0,
       },
@@ -465,15 +454,19 @@ export class ExperimentBuilder {
           env: {},
           env_from_host: [],
         },
+        sandbox: {
+          executor: 'docker',
+          image_source: 'global',
+          profile: 'default',
+          network: 'none',
+        },
         dependencies: {
           file_staging: [],
           services: [],
         },
         policy: {
           timeout_ms: 600_000,
-          sandbox: { mode: 'local' },
           network: {
-            mode: 'none',
             allowed_hosts: [],
           },
         },
@@ -520,10 +513,15 @@ export class ExperimentBuilder {
     return this;
   }
 
+  agentBundle(bundle: string): this {
+    this.spec.runtime.agent.bundle = bundle;
+    return this;
+  }
+
   customAgentImage(image: string, command: string[]): this {
     this.spec.runtime.agent.command = [...command];
-    this.spec.runtime.agent.image = image;
-    this.spec.runtime.policy.sandbox.mode = 'container';
+    this.spec.runtime.sandbox.image_source = 'global';
+    this.spec.runtime.sandbox.image = image;
     return this;
   }
 
@@ -703,20 +701,21 @@ export class ExperimentBuilder {
   }
 
   networkMode(mode: 'none' | 'full' | 'allowlist_enforced', allowedHosts: string[] = []): this {
-    this.spec.runtime.policy.network.mode = mode;
+    this.spec.runtime.sandbox.network = mode;
     this.spec.runtime.policy.network.allowed_hosts = [...allowedHosts];
     return this;
   }
 
   sandboxImage(image: string): this {
-    this.spec.runtime.policy.sandbox.mode = 'container';
-    this.spec.runtime.agent.image = image;
+    this.spec.runtime.sandbox.image_source = 'global';
+    this.spec.runtime.sandbox.image = image;
     return this;
   }
 
   localSandbox(): this {
-    this.spec.runtime.policy.sandbox = { mode: 'local' };
-    return this;
+    throw new Error(
+      'ExperimentBuilder.localSandbox() was removed; task sandboxes are configured under runtime.sandbox and currently require docker. Choose local_process or local_docker when you run the experiment.',
+    );
   }
 
   timeoutMs(value: number): this {
@@ -736,14 +735,18 @@ export class ExperimentBuilder {
     if (command.length === 0 || command.some((part) => part.trim().length === 0)) {
       missing.push('runtime.agent.command (call .agentLoop() or .customAgentImage())');
     }
+    const bundle = this.spec.runtime.agent.bundle;
+    if (!bundle || bundle.trim().length === 0) {
+      missing.push('runtime.agent.bundle (call .agentBundle())');
+    }
     if (this.spec.runtime.policy.timeout_ms <= 0) {
       missing.push('policy timeout_ms (call .timeoutMs() with > 0)');
     }
-    if (this.spec.runtime.policy.sandbox.mode === 'container') {
-      const runtimeImage = this.spec.runtime.agent.image;
+    if (this.spec.runtime.sandbox.image_source !== 'per_task') {
+      const runtimeImage = this.spec.runtime.sandbox.image;
       const hasImage = !!runtimeImage && runtimeImage.trim().length > 0;
       if (!hasImage) {
-        missing.push('runtime.agent.image (call .customAgentImage() or .sandboxImage())');
+        missing.push('runtime.sandbox.image (call .customAgentImage() or .sandboxImage())');
       }
     }
     if (missing.length > 0) {
