@@ -13,6 +13,20 @@ Treat only these as stable:
 
 Everything else is internal implementation detail and may change without notice.
 
+### Variant Provenance Surface
+
+The following public surfaces define variant provenance and inspection:
+
+- `lab-cli variants <RUN> [VARIANT] [--against OTHER]`
+  - Lists resolved variants for a run
+  - Shows one resolved variant and its packaged behavior surface
+  - Diffs two variants from the same run across provenance/runtime fields
+- `.lab/runs/<run_id>/resolved_variants.json`
+  - Variant entries must include `variant_digest`
+  - `variant_digest` is the stable ref for the resolved behavior surface of that variant within the run
+
+Runs whose `resolved_variants.json` entries omit `variant_digest` are invalid under the current contract. There is no legacy derive-on-read path.
+
 ## Canonical Primitives
 
 Use these names consistently in docs, code comments, and UX.

@@ -50,12 +50,23 @@ mod tests {
         ]
     }
 
+    fn agent_execution_fixture(image: Option<&str>) -> AgentExecutionConfig {
+        AgentExecutionConfig {
+            executor: Some(AgentExecutionExecutor::Docker),
+            image: image.map(|value| value.to_string()),
+            network: "none".to_string(),
+            root_read_only: true,
+            user: None,
+        }
+    }
+
     fn legacy_contract_runtime_fixture() -> AgentRuntimeConfig {
         AgentRuntimeConfig {
             adapter_ref: AgentAdapterRef::default(),
             command_raw: vec!["sh".to_string(), "-lc".to_string(), "echo ok".to_string()],
-            container_image: Some("img:latest".to_string()),
+            sandbox_image: Some("img:latest".to_string()),
             image_source: ImageSource::Global,
+            execution: agent_execution_fixture(Some("img:latest")),
             agent_artifact: None,
             agent_artifact_digest: None,
             agent_artifact_resolved_path: None,
@@ -152,9 +163,9 @@ mod tests {
         bundle_root
     }
 
-    fn local_process_execution() -> RunExecutionOptions {
+    fn container_execution() -> RunExecutionOptions {
         RunExecutionOptions {
-            executor: Some(ExecutorKind::LocalProcess),
+            executor: Some(ExecutorKind::LocalDocker),
             ..RunExecutionOptions::default()
         }
     }
@@ -243,18 +254,11 @@ mod tests {
         atomic_write_json_pretty(&run_dir.join("resolved_experiment.json"), &resolved)
             .expect("write resolved");
         let (variants, baseline_id) = resolve_variant_plan(&resolved).expect("variant plan");
-        write_resolved_variants(run_dir, &baseline_id, &variants).expect("write resolved variants");
+        write_resolved_variants(run_dir, &resolved, &baseline_id, &variants)
+            .expect("write resolved variants");
     }
 
-    fn write_resolved_experiment_local_process(run_dir: &Path, integration_level: &str) {
-        write_resolved_experiment_local_process_with_command(
-            run_dir,
-            integration_level,
-            harness_success_command(),
-        );
-    }
-
-    fn write_resolved_experiment_local_process_with_command(
+    fn write_resolved_experiment_with_command(
         run_dir: &Path,
         integration_level: &str,
         command: Vec<String>,
@@ -283,7 +287,8 @@ mod tests {
         atomic_write_json_pretty(&run_dir.join("resolved_experiment.json"), &resolved)
             .expect("write resolved");
         let (variants, baseline_id) = resolve_variant_plan(&resolved).expect("variant plan");
-        write_resolved_variants(run_dir, &baseline_id, &variants).expect("write resolved variants");
+        write_resolved_variants(run_dir, &resolved, &baseline_id, &variants)
+            .expect("write resolved variants");
     }
 
     fn write_task_boundary_dataset(path: &Path, task_id: &str) {
@@ -494,9 +499,9 @@ mod tests {
         write_run_control_v2(run_dir, run_id, status, &active_trials, None).expect("run control");
     }
 
-    fn seed_continuable_local_process_run(prefix: &str) -> (TempDirGuard, PathBuf) {
+    fn seed_continuable_container_run(prefix: &str) -> (TempDirGuard, PathBuf) {
         let (root, run_dir) = create_run_dir(prefix, "run_1");
-        write_resolved_experiment_local_process_with_command(
+        write_resolved_experiment_with_command(
             &run_dir,
             "cli_basic",
             harness_success_output_command(),
@@ -530,7 +535,7 @@ mod tests {
             &run_dir,
             "run_1",
             &RunBehavior::default(),
-            &local_process_execution(),
+            &container_execution(),
         )
         .expect("run session");
 
@@ -760,6 +765,7 @@ mod tests {
             "sha256:test",
             "none",
             "runtime_agent",
+            Some("img:latest"),
         )
         .expect("write state inventory");
         let inventory = load_json_file(&paths.trial_dir.join("state_inventory.json"))
@@ -784,6 +790,33 @@ mod tests {
             "legacy dataset mount unexpectedly present: {:?}",
             mounts
         );
+        assert!(inventory.pointer("/planes/agent_runtime").is_some());
+        assert!(inventory.pointer("/planes/task_sandbox").is_some());
+        let agent_runtime_mounts = inventory
+            .pointer("/planes/agent_runtime/mounts")
+            .and_then(|v| v.as_array())
+            .expect("agent runtime mounts");
+        let task_sandbox_mounts = inventory
+            .pointer("/planes/task_sandbox/mounts")
+            .and_then(|v| v.as_array())
+            .expect("task sandbox mounts");
+        let agent_deps = agent_runtime_mounts
+            .iter()
+            .find(|row| row.get("name").and_then(|v| v.as_str()) == Some("deps"))
+            .expect("agent runtime deps mount");
+        let task_deps = task_sandbox_mounts
+            .iter()
+            .find(|row| row.get("name").and_then(|v| v.as_str()) == Some("deps"))
+            .expect("task sandbox deps mount");
+        assert_eq!(agent_deps.get("writable").and_then(Value::as_bool), Some(true));
+        assert_eq!(task_deps.get("writable").and_then(Value::as_bool), Some(true));
+        assert!(
+            !agent_runtime_mounts
+                .iter()
+                .any(|row| row.get("name").and_then(|v| v.as_str()) == Some("agent_bundle")),
+            "agent bundle mount should only appear when a bundle is configured: {:?}",
+            agent_runtime_mounts
+        );
     }
 
     #[test]
@@ -804,6 +837,7 @@ mod tests {
             "sha256:test",
             "full",
             "runtime_agent",
+            Some("img:latest"),
         )
         .expect("write state inventory");
         let inventory = load_json_file(&paths.trial_dir.join("state_inventory.json"))
@@ -827,18 +861,58 @@ mod tests {
             "legacy dataset mount unexpectedly present: {:?}",
             mounts
         );
+        assert!(inventory.pointer("/planes/agent_runtime").is_some());
+        assert!(inventory.pointer("/planes/task_sandbox").is_some());
+    }
+
+    #[test]
+    fn write_state_inventory_container_reports_agent_bundle_mount_when_present() {
+        let (root, paths) = create_trial_paths_fixture("agentlab_state_inventory_bundle");
+        let mut runtime = legacy_contract_runtime_fixture();
+        let bundle_dir = root.path.join("agent_bundle");
+        ensure_dir(&bundle_dir).expect("bundle dir");
+        runtime.agent_artifact = Some(bundle_dir);
+        let experiment = json!({
+            "version": "0.3",
+            "design": { "sanitization_profile": "hermetic_functional" },
+            "runtime": { "policy": { "network": { "mode": "none", "allowed_hosts": [] } } }
+        });
+        write_state_inventory(
+            &paths.trial_dir,
+            &experiment,
+            &runtime,
+            true,
+            &paths,
+            "sha256:test",
+            "none",
+            "runtime_agent",
+            Some("img:latest"),
+        )
+        .expect("write state inventory");
+        let inventory = load_json_file(&paths.trial_dir.join("state_inventory.json"))
+            .expect("load state inventory");
+        let agent_runtime_mounts = inventory
+            .pointer("/planes/agent_runtime/mounts")
+            .and_then(|v| v.as_array())
+            .expect("agent runtime mounts");
+        assert!(
+            agent_runtime_mounts
+                .iter()
+                .any(|row| row.get("name").and_then(|v| v.as_str()) == Some("agent_bundle")),
+            "agent bundle mount should be present when runtime.agent.bundle is configured: {:?}",
+            agent_runtime_mounts
+        );
     }
 
     #[test]
     fn run_session_state_roundtrip_normalizes_execution_options() {
         let (_root, run_dir) = create_run_dir("agentlab_run_session_state", "run_1");
         let behavior = RunBehavior {
-            setup_command: Some("echo setup".to_string()),
             network_mode_override: Some("full".to_string()),
             require_network_none: false,
         };
         let execution = RunExecutionOptions {
-            executor: Some(ExecutorKind::LocalProcess),
+            executor: Some(ExecutorKind::LocalDocker),
             materialize: None,
             runtime_env: BTreeMap::new(),
             runtime_env_files: Vec::new(),
@@ -847,12 +921,11 @@ mod tests {
         let state = load_run_session_state(&run_dir).expect("load state");
         assert_eq!(state.schema_version, "run_session_state_v1");
         assert_eq!(state.run_id, "run_1");
-        assert_eq!(state.behavior.setup_command.as_deref(), Some("echo setup"));
         assert_eq!(
             state.behavior.network_mode_override.as_deref(),
             Some("full")
         );
-        assert_eq!(state.execution.executor, Some(ExecutorKind::LocalProcess));
+        assert_eq!(state.execution.executor, Some(ExecutorKind::LocalDocker));
         assert_eq!(state.execution.materialize, Some(MaterializationMode::Full));
     }
 
@@ -935,11 +1008,10 @@ mod tests {
         };
         write_schedule_progress(&run_dir, &schedule_progress).expect("progress");
         let behavior = RunBehavior {
-            setup_command: None,
             network_mode_override: None,
             require_network_none: true,
         };
-        write_run_session_state(&run_dir, "run_1", &behavior, &local_process_execution())
+        write_run_session_state(&run_dir, "run_1", &behavior, &container_execution())
             .expect("run session");
 
         let err = continue_run(&run_dir).expect_err("continue should honor persisted behavior");
@@ -952,8 +1024,8 @@ mod tests {
     }
 
     #[test]
-    fn continue_run_e2e_executes_local_trial_and_persists_runtime_state() {
-        let (_root, run_dir) = seed_continuable_local_process_run("agentlab_continue_e2e_runtime");
+    fn continue_run_e2e_executes_container_trial_and_persists_runtime_state() {
+        let (_root, run_dir) = seed_continuable_container_run("agentlab_continue_e2e_runtime");
 
         let result = continue_run(&run_dir).expect("continue run");
         assert_eq!(result.run_id, "run_1");
@@ -1032,7 +1104,7 @@ mod tests {
 
     #[test]
     fn continue_run_e2e_commits_slot_identity_on_sqlite_json_rows() {
-        let (_root, run_dir) = seed_continuable_local_process_run("agentlab_continue_e2e_sqlite");
+        let (_root, run_dir) = seed_continuable_container_run("agentlab_continue_e2e_sqlite");
 
         continue_run(&run_dir).expect("continue run");
 
@@ -1199,56 +1271,6 @@ mod tests {
         };
         assert!(
             err.to_string().contains("runtime.agent.bundle is required"),
-            "unexpected error: {}",
-            err
-        );
-    }
-
-    #[test]
-    fn resolve_variant_runtime_profile_rejects_per_task_in_local_executor() {
-        let root = TempDirGuard::new("agentlab_per_task_local_reject");
-        let exp_dir = root.path.join("exp");
-        ensure_dir(&exp_dir).expect("exp dir");
-        let spec = json!({
-            "version": "0.3",
-            "experiment": { "id": "e", "name": "n", "workload_type": "agent_harness" },
-            "dataset": { "path": "tasks.jsonl", "provider": "local_jsonl", "suite_id": "s", "schema_version": "v1", "split_id": "dev", "limit": 1 },
-            "design": { "sanitization_profile": "hermetic_functional", "comparison": "paired", "replications": 1, "random_seed": 1, "shuffle_tasks": false, "max_concurrency": 1 },
-            "baseline": { "variant_id": "base", "bindings": {} },
-            "runtime": {
-                "agent": {
-                    "command": ["rex", "run"],
-                    "bundle": ".lab/agents/rex-current.tar.gz"
-                },
-                "sandbox": runtime_sandbox("per_task", None),
-                "policy": { "timeout_ms": 600000 }
-            }
-        });
-        let variant = Variant {
-            id: "base".to_string(),
-            bindings: json!({}),
-            args: Vec::new(),
-            env: BTreeMap::new(),
-            image: None,
-            runtime_overrides: None,
-        };
-        let err = match resolve_variant_runtime_profile(
-            &spec,
-            &variant,
-            &exp_dir,
-            false,
-            &RunBehavior::default(),
-            &RunExecutionOptions {
-                executor: Some(ExecutorKind::LocalProcess),
-                ..RunExecutionOptions::default()
-            },
-        ) {
-            Ok(_) => panic!("per-task local runtime should be rejected"),
-            Err(err) => err,
-        };
-        assert!(
-            err.to_string()
-                .contains("runtime.sandbox.image_source='per_task' requires container execution"),
             "unexpected error: {}",
             err
         );
@@ -1607,8 +1629,9 @@ mod tests {
         let agent_runtime = AgentRuntimeConfig {
             adapter_ref: AgentAdapterRef::default(),
             command_raw: vec![],
-            container_image: None,
+            sandbox_image: None,
             image_source: ImageSource::Global,
+            execution: agent_execution_fixture(None),
             agent_artifact: None,
             agent_artifact_digest: None,
             agent_artifact_resolved_path: None,
@@ -1862,7 +1885,7 @@ mod tests {
     fn replay_trial_succeeds_without_legacy_dataset_trial_dir() {
         let (_root, run_dir) =
             create_run_dir("agentlab_replay_no_legacy_dataset_trial_dir", "run_1");
-        write_resolved_experiment_local_process(&run_dir, "cli_events");
+        write_resolved_experiment(&run_dir, "cli_events", true);
         fs::write(run_dir.join("tasks.jsonl"), "{\"id\":\"task_1\"}\n").expect("dataset");
         let parent_trial_dir = seed_parent_trial(&run_dir, "trial_1", json!([]), "completed", None);
         assert!(
@@ -1899,7 +1922,7 @@ mod tests {
     #[test]
     fn fork_trial_non_strict_falls_back_to_input_only_when_checkpoint_missing() {
         let (_root, run_dir) = create_run_dir("agentlab_fork_input_fallback", "run_1");
-        write_resolved_experiment_local_process(&run_dir, "cli_events");
+        write_resolved_experiment(&run_dir, "cli_events", true);
         seed_parent_trial(
             &run_dir,
             "trial_1",
@@ -2178,7 +2201,7 @@ mod tests {
     #[test]
     fn resume_run_uses_pause_label_and_forks_with_binding_overrides() {
         let (_root, run_dir) = create_run_dir("agentlab_resume_success", "run_1");
-        write_resolved_experiment_local_process(&run_dir, "sdk_full");
+        write_resolved_experiment(&run_dir, "sdk_full", true);
         let trial_dir = seed_parent_trial(
             &run_dir,
             "trial_1",
@@ -2536,13 +2559,24 @@ mod tests {
     #[test]
     fn load_run_variants_prefers_resolved_manifest_over_experiment() {
         let (_root, run_dir) = create_run_dir("agentlab_variants_manifest_preferred", "run_1");
+        let project_root = find_project_root(&run_dir);
+        let bundle_root = ensure_test_agent_bundle(&project_root, "rex-current");
         let original = json!({
             "baseline": { "variant_id": "base", "bindings": {} },
-            "variant_plan": [{ "variant_id": "alt", "bindings": { "temperature": 1.2 } }]
+            "variant_plan": [{ "variant_id": "alt", "bindings": { "temperature": 1.2 } }],
+            "runtime": {
+                "agent": {
+                    "command": harness_success_command(),
+                    "bundle": bundle_root.to_string_lossy().to_string(),
+                    "io": { "input_arg": "--input", "output_arg": "--output" }
+                },
+                "sandbox": runtime_sandbox("global", Some("img")),
+                "policy": { "timeout_ms": 600000 }
+            }
         });
         let (resolved_variants, resolved_baseline) =
             resolve_variant_plan(&original).expect("resolve variants");
-        write_resolved_variants(&run_dir, &resolved_baseline, &resolved_variants)
+        write_resolved_variants(&run_dir, &original, &resolved_baseline, &resolved_variants)
             .expect("write manifest");
 
         let changed = json!({
@@ -2556,6 +2590,34 @@ mod tests {
         assert_eq!(loaded_variants.len(), 2);
         assert_eq!(loaded_variants[0].id, "base");
         assert_eq!(loaded_variants[1].id, "alt");
+    }
+
+    #[test]
+    fn load_run_variants_rejects_manifest_without_variant_digest() {
+        let (_root, run_dir) = create_run_dir("agentlab_variants_manifest_missing_digest", "run_1");
+        fs::write(
+            run_dir.join("resolved_variants.json"),
+            serde_json::to_vec_pretty(&json!({
+                "schema_version": "resolved_variants_v1",
+                "generated_at": "2026-03-10T00:00:00Z",
+                "baseline_id": "base",
+                "variants": [
+                    {
+                        "id": "base",
+                        "bindings": {},
+                        "args": [],
+                        "env": {},
+                        "image": null,
+                        "runtime_overrides": null
+                    }
+                ]
+            }))
+            .expect("serialize manifest"),
+        )
+        .expect("write manifest");
+
+        let err = load_run_variants(&run_dir, &json!({})).expect_err("missing variant_digest");
+        assert!(err.to_string().contains("variant_digest"), "{}", err);
     }
 
     #[test]
@@ -5757,7 +5819,7 @@ mod tests {
 
     fn preflight_test_runtime_profile(
         image_source: ImageSource,
-        container_image: Option<&str>,
+        sandbox_image: Option<&str>,
     ) -> VariantRuntimeProfile {
         VariantRuntimeProfile {
             experiment: json!({}),
@@ -5765,8 +5827,9 @@ mod tests {
             agent_runtime: AgentRuntimeConfig {
                 adapter_ref: AgentAdapterRef::default(),
                 command_raw: vec!["rex".to_string()],
-                container_image: container_image.map(|value| value.to_string()),
+                sandbox_image: sandbox_image.map(|value| value.to_string()),
                 image_source,
+                execution: agent_execution_fixture(Some("python:3.11-slim")),
                 agent_artifact: None,
                 agent_artifact_digest: None,
                 agent_artifact_resolved_path: None,
@@ -5796,6 +5859,105 @@ mod tests {
             configured_network_mode: "none".to_string(),
             effective_network_mode: "none".to_string(),
         }
+    }
+
+    #[test]
+    fn hermetic_preflight_requires_container_execution() {
+        let variant = preflight_test_variant();
+        let mut profile = preflight_test_runtime_profile(ImageSource::Global, Some("img:latest"));
+        profile.container_mode = false;
+
+        let checks = check_agent_runtime_hermetic_for_variants(&[variant], &[profile]);
+        assert_eq!(checks.len(), 1);
+        assert!(!checks[0].passed, "{:?}", checks[0]);
+        assert!(
+            checks[0].message.contains("container execution"),
+            "unexpected message: {}",
+            checks[0].message
+        );
+    }
+
+    #[test]
+    fn dangerous_mode_preflight_rejects_dangerous_command_tokens() {
+        let variant = preflight_test_variant();
+        let mut profile = preflight_test_runtime_profile(ImageSource::Global, Some("img:latest"));
+        profile.agent_runtime.command_raw = vec![
+            "rex".to_string(),
+            "run".to_string(),
+            "--dangerous".to_string(),
+        ];
+
+        let checks = check_dangerous_mode_forbidden_for_variants(&[variant], &[profile]);
+        assert_eq!(checks.len(), 1);
+        assert!(!checks[0].passed, "{:?}", checks[0]);
+        assert!(
+            checks[0].message.contains("--dangerous"),
+            "unexpected message: {}",
+            checks[0].message
+        );
+    }
+
+    #[test]
+    fn dangerous_mode_preflight_rejects_variant_appended_flags() {
+        let variant = preflight_test_variant();
+        let mut profile = preflight_test_runtime_profile(ImageSource::Global, Some("img:latest"));
+        profile.variant_args = vec!["--dangerous".to_string()];
+
+        let checks = check_dangerous_mode_forbidden_for_variants(&[variant], &[profile]);
+        assert_eq!(checks.len(), 1);
+        assert!(!checks[0].passed, "{:?}", checks[0]);
+        assert!(
+            checks[0].message.contains("--dangerous"),
+            "unexpected message: {}",
+            checks[0].message
+        );
+    }
+
+    #[test]
+    fn dangerous_mode_preflight_rejects_embedded_flags_in_string_command() {
+        let variant = preflight_test_variant();
+        let mut profile = preflight_test_runtime_profile(ImageSource::Global, Some("img:latest"));
+        profile.agent_runtime.command_raw = vec!["rex run --dangerous".to_string()];
+
+        let checks = check_dangerous_mode_forbidden_for_variants(&[variant], &[profile]);
+        assert_eq!(checks.len(), 1);
+        assert!(!checks[0].passed, "{:?}", checks[0]);
+        assert!(
+            checks[0].message.contains("--dangerous"),
+            "unexpected message: {}",
+            checks[0].message
+        );
+    }
+
+    #[test]
+    fn resolve_run_isolation_grade_rejects_dangerous_variant_args() {
+        let mut profile = preflight_test_runtime_profile(ImageSource::Global, Some("img:latest"));
+        profile.variant_args = vec!["--dangerous".to_string()];
+        assert_eq!(
+            resolve_run_isolation_grade(&[profile], &RunBehavior::default()),
+            "invalid"
+        );
+    }
+
+    #[test]
+    fn resolve_run_isolation_grade_marks_non_container_runs_invalid() {
+        let mut profile = preflight_test_runtime_profile(ImageSource::Global, Some("img:latest"));
+        profile.container_mode = false;
+        assert_eq!(
+            resolve_run_isolation_grade(&[profile], &RunBehavior::default()),
+            "invalid"
+        );
+    }
+
+    #[test]
+    fn resolve_run_isolation_grade_marks_scientific_container_runs_hermetic() {
+        let profile = preflight_test_runtime_profile(ImageSource::Global, Some("img:latest"));
+        let behavior = RunBehavior::default();
+
+        assert_eq!(
+            resolve_run_isolation_grade(&[profile], &behavior),
+            "hermetic"
+        );
     }
 
     fn preflight_test_variant() -> Variant {
@@ -6072,13 +6234,14 @@ mod tests {
         atomic_write_json_pretty(&run_dir.join("resolved_experiment.json"), &resolved)
             .expect("resolved experiment");
         let (variants, baseline_id) = resolve_variant_plan(&resolved).expect("variant plan");
-        write_resolved_variants(run_dir, &baseline_id, &variants).expect("write variants");
+        write_resolved_variants(run_dir, &resolved, &baseline_id, &variants)
+            .expect("write variants");
         write_run_control_v2(run_dir, run_id, run_status, &[], None).expect("run control");
         write_run_session_state(
             run_dir,
             run_id,
             &RunBehavior::default(),
-            &local_process_execution(),
+            &container_execution(),
         )
         .expect("run session");
         let schedule = build_trial_schedule(1, 1, 1, parse_policies(&resolved).scheduling, 1);
@@ -6319,6 +6482,86 @@ mod tests {
             .and_then(Value::as_u64)
             .unwrap_or(0);
         assert_eq!(file_count, 1, "excluded files should not bloat snapshot");
+    }
+
+    #[test]
+    fn copy_dir_filtered_preserves_directory_symlinks_without_recursing() {
+        let root = TempDirGuard::new("agentlab_copy_dir_filtered_symlink");
+        let workspace = root.path.join("workspace");
+        ensure_dir(&workspace).expect("workspace");
+        fs::write(workspace.join("keep.txt"), "keep").expect("keep");
+        symlink(Path::new("."), workspace.join("loop")).expect("loop symlink");
+
+        let copied = root.path.join("copied");
+        copy_dir_filtered(&workspace, &copied, &[]).expect("copy");
+
+        let copied_loop = copied.join("loop");
+        let metadata = fs::symlink_metadata(&copied_loop).expect("copied symlink metadata");
+        assert!(metadata.file_type().is_symlink(), "{:?}", metadata.file_type());
+        assert_eq!(fs::read_link(&copied_loop).expect("copied symlink target"), PathBuf::from("."));
+    }
+
+    #[test]
+    fn outputs_only_materialization_preserves_out_dir_after_scratch_cleanup() {
+        let root = TempDirGuard::new("agentlab_outputs_only_materialization");
+        let run_dir = root.path.join(".lab").join("runs").join("run_1");
+        let trial_dir = run_dir.join("trials").join("trial_1");
+        ensure_dir(&trial_dir).expect("trial dir");
+
+        let trial_paths = TrialPaths::new(&trial_dir, &root.path).expect("trial paths");
+        trial_paths.prepare(false).expect("prepare trial paths");
+        fs::write(
+            trial_paths.runtime.result.clone(),
+            "{\"schema_version\":\"agent_result_v1\",\"outcome\":\"success\"}\n",
+        )
+        .expect("write result");
+        fs::write(
+            trial_paths.out.join("agent_report.json"),
+            "{\"cwd\":\"/agentlab/workspace\"}\n",
+        )
+        .expect("write agent report");
+
+        materialize_trial_runtime_layout(&trial_dir, &trial_paths, MaterializationMode::OutputsOnly)
+            .expect("materialize outputs");
+        trial_paths.cleanup_scratch().expect("cleanup scratch");
+
+        assert!(
+            trial_dir.join("out").join("agent_report.json").exists(),
+            "out directory should be preserved after scratch cleanup"
+        );
+        assert!(
+            trial_dir.join("result.json").exists(),
+            "canonical result.json should be materialized into the stable trial dir"
+        );
+    }
+
+    #[test]
+    fn outputs_only_materialization_preserves_directory_symlinks_without_recursing() {
+        let root = TempDirGuard::new("agentlab_outputs_only_symlink_materialization");
+        let run_dir = root.path.join(".lab").join("runs").join("run_1");
+        let trial_dir = run_dir.join("trials").join("trial_1");
+        ensure_dir(&trial_dir).expect("trial dir");
+
+        let trial_paths = TrialPaths::new(&trial_dir, &root.path).expect("trial paths");
+        trial_paths.prepare(false).expect("prepare trial paths");
+        fs::write(
+            trial_paths.runtime.result.clone(),
+            "{\"schema_version\":\"agent_result_v1\",\"outcome\":\"success\"}\n",
+        )
+        .expect("write result");
+        fs::write(trial_paths.out.join("keep.txt"), "keep").expect("write out file");
+        symlink(Path::new("."), trial_paths.out.join("loop")).expect("loop symlink");
+
+        materialize_trial_runtime_layout(&trial_dir, &trial_paths, MaterializationMode::OutputsOnly)
+            .expect("materialize outputs");
+
+        let materialized_loop = trial_dir.join("out").join("loop");
+        let metadata = fs::symlink_metadata(&materialized_loop).expect("materialized symlink");
+        assert!(metadata.file_type().is_symlink(), "{:?}", metadata.file_type());
+        assert_eq!(
+            fs::read_link(&materialized_loop).expect("materialized symlink target"),
+            PathBuf::from(".")
+        );
     }
 
     #[test]
@@ -7448,8 +7691,9 @@ mod tests {
             agent_runtime: AgentRuntimeConfig {
                 adapter_ref: AgentAdapterRef::default(),
                 command_raw: vec!["rex".to_string()],
-                container_image: Some("python:3.11-slim".to_string()),
+                sandbox_image: Some("python:3.11-slim".to_string()),
                 image_source: ImageSource::Global,
+                execution: agent_execution_fixture(Some("python:3.11-slim")),
                 agent_artifact: None,
                 agent_artifact_digest: None,
                 agent_artifact_resolved_path: None,
@@ -7756,7 +8000,6 @@ mod tests {
             dynamic_mounts: &dynamic_mounts,
             io_paths: &io_paths,
             network_mode: "none",
-            setup_command: None,
             benchmark_adapter: None,
             benchmark_grading_enabled: false,
             run_id: "run_1",
@@ -7764,7 +8007,12 @@ mod tests {
             agent_artifact: None,
         };
         let mut cmd = Command::new("docker");
-        append_container_sandbox_args(&mut cmd, &request, Some(AGENTLAB_CONTRACT_WORKSPACE_DIR));
+        append_container_sandbox_args(
+            &mut cmd,
+            &request,
+            ContainerPlane::TaskSandbox,
+            Some(AGENTLAB_CONTRACT_WORKSPACE_DIR),
+        );
         let args = cmd
             .get_args()
             .map(|value| value.to_string_lossy().to_string())
@@ -7808,8 +8056,9 @@ mod tests {
         let runtime = AgentRuntimeConfig {
             adapter_ref: AgentAdapterRef::default(),
             command_raw: vec!["rex".to_string(), "run".to_string()],
-            container_image: Some("image:latest".to_string()),
+            sandbox_image: Some("image:latest".to_string()),
             image_source: ImageSource::Global,
+            execution: agent_execution_fixture(Some("image:latest")),
             agent_artifact: Some(PathBuf::from("/tmp/agent-artifact")),
             agent_artifact_digest: None,
             agent_artifact_resolved_path: None,
@@ -7856,7 +8105,6 @@ mod tests {
             dynamic_mounts: &[],
             io_paths: &io_paths,
             network_mode: "none",
-            setup_command: None,
             benchmark_adapter: None,
             benchmark_grading_enabled: false,
             run_id: "run_1",
@@ -7877,116 +8125,14 @@ mod tests {
     }
 
     #[test]
-    fn p0_i03_local_builtin_command_rewrites_contract_mount_env_values() {
-        let (_root, paths) = create_trial_paths_fixture("agentlab_p0_local_env_rewrite");
-        let runtime = AgentRuntimeConfig {
-            adapter_ref: AgentAdapterRef::default(),
-            command_raw: vec![
-                "/bin/sh".to_string(),
-                "-lc".to_string(),
-                "exit 0".to_string(),
-            ],
-            container_image: Some("image:latest".to_string()),
-            image_source: ImageSource::Global,
-            agent_artifact: None,
-            agent_artifact_digest: None,
-            agent_artifact_resolved_path: None,
-            io: AgentRuntimeIoConfig {
-                input_arg: "--input".to_string(),
-                output_arg: "--output".to_string(),
-            },
-            integration_level: "cli_basic".to_string(),
-            launch_mode: AgentLaunchMode::File,
-            env: BTreeMap::new(),
-            env_from_host: Vec::new(),
-            bindings_to_args: Vec::new(),
-            workspace_patches: Vec::new(),
-            trajectory_path: None,
-            causal_extraction: None,
-            default_timeout_ms: None,
-            tracing_mode: None,
-            force_container: true,
-            dependency_file_staging: Vec::new(),
-            dependency_services: Vec::new(),
-        };
-        let runtime_env = BTreeMap::new();
-        let overrides = BTreeMap::from([
-            ("HOME".to_string(), AGENTLAB_CONTRACT_DEPS_DIR.to_string()),
-            (
-                "CUSTOM_RESULT_PATH".to_string(),
-                AGENTLAB_RESULT_PATH.to_string(),
-            ),
-        ]);
-        let io_paths = PreparedTrialIo {
-            input_host: PathBuf::from("/tmp/trial_input.json"),
-            output_host: paths.out.join("result.json"),
-            events_host: paths.state.join("events.jsonl"),
-            task_path: AGENTLAB_TASK_PATH.to_string(),
-            bindings_path: AGENTLAB_BINDINGS_PATH.to_string(),
-            dependencies_path: AGENTLAB_DEPENDENCIES_PATH.to_string(),
-            policy_path: AGENTLAB_POLICY_PATH.to_string(),
-            result_path: AGENTLAB_RESULT_PATH.to_string(),
-            trajectory_path: AGENTLAB_TRAJECTORY_PATH.to_string(),
-        };
-        let empty_json = json!({});
-        let request = AdapterRunRequest {
-            runtime_experiment: &empty_json,
-            runtime: &runtime,
-            variant_args: &[],
-            runtime_env: &runtime_env,
-            runtime_overrides_env: &overrides,
-            container_mode: true,
-            trial_paths: &paths,
-            dynamic_mounts: &[],
-            io_paths: &io_paths,
-            network_mode: "none",
-            setup_command: None,
-            benchmark_adapter: None,
-            benchmark_grading_enabled: false,
-            run_id: "run_1",
-            task_image: None,
-            agent_artifact: None,
-        };
-
-        let cmd = build_builtin_adapter_local_command(&request, &runtime.command_raw)
-            .expect("build local command");
-        let envs = cmd
-            .get_envs()
-            .filter_map(|(key, value)| {
-                Some((
-                    key.to_string_lossy().to_string(),
-                    value?.to_string_lossy().to_string(),
-                ))
-            })
-            .collect::<BTreeMap<_, _>>();
-
-        let home = PathBuf::from(envs.get("HOME").expect("HOME env present"));
-        let custom_result = PathBuf::from(
-            envs.get("CUSTOM_RESULT_PATH")
-                .expect("CUSTOM_RESULT_PATH env present"),
-        );
-        assert_eq!(
-            home.components().collect::<Vec<_>>(),
-            paths.deps.components().collect::<Vec<_>>()
-        );
-        assert_eq!(
-            custom_result.components().collect::<Vec<_>>(),
-            paths
-                .out
-                .join("result.json")
-                .components()
-                .collect::<Vec<_>>()
-        );
-    }
-
-    #[test]
     fn p0_i03_injected_container_grader_wrapper_exports_agent_path() {
         let (_root, paths) = create_trial_paths_fixture("agentlab_p0_path_wrapper");
         let runtime = AgentRuntimeConfig {
             adapter_ref: AgentAdapterRef::default(),
             command_raw: vec!["rex".to_string(), "run".to_string()],
-            container_image: Some("image:latest".to_string()),
+            sandbox_image: Some("image:latest".to_string()),
             image_source: ImageSource::Global,
+            execution: agent_execution_fixture(Some("image:latest")),
             agent_artifact: Some(PathBuf::from("/tmp/agent-artifact")),
             agent_artifact_digest: None,
             agent_artifact_resolved_path: None,
@@ -8033,7 +8179,6 @@ mod tests {
             dynamic_mounts: &[],
             io_paths: &io_paths,
             network_mode: "none",
-            setup_command: None,
             benchmark_adapter: None,
             benchmark_grading_enabled: true,
             run_id: "run_1",
@@ -8088,10 +8233,13 @@ mod tests {
         let runtime = AgentRuntimeConfig {
             adapter_ref: AgentAdapterRef::default(),
             command_raw: vec!["rex".to_string(), "run".to_string()],
-            container_image: Some(
+            sandbox_image: Some(
                 "swebench/sweb.eval.x86_64.astropy__astropy-12907:latest".to_string(),
             ),
             image_source: ImageSource::Global,
+            execution: agent_execution_fixture(Some(
+                "swebench/sweb.eval.x86_64.astropy__astropy-12907:latest",
+            )),
             agent_artifact: Some(PathBuf::from("/tmp/agent-artifact")),
             agent_artifact_digest: None,
             agent_artifact_resolved_path: None,
@@ -8138,7 +8286,6 @@ mod tests {
             dynamic_mounts: &[],
             io_paths: &io_paths,
             network_mode: "none",
-            setup_command: None,
             benchmark_adapter: None,
             benchmark_grading_enabled: false,
             run_id: "run_1",
@@ -8147,6 +8294,7 @@ mod tests {
         };
         let baked_args = build_baked_container_command(
             &request,
+            ContainerPlane::TaskSandbox,
             "swebench/sweb.eval.x86_64.astropy__astropy-12907:latest",
             None,
             &["rex".to_string(), "run".to_string()],
@@ -8181,8 +8329,9 @@ mod tests {
         let runtime = AgentRuntimeConfig {
             adapter_ref: AgentAdapterRef::default(),
             command_raw: vec!["rex".to_string()],
-            container_image: Some("image".to_string()),
+            sandbox_image: Some("image".to_string()),
             image_source: ImageSource::Global,
+            execution: agent_execution_fixture(Some("image")),
             agent_artifact: Some(artifact_dir.clone()),
             agent_artifact_digest: Some(format!("sha256:{}", digest_before)),
             agent_artifact_resolved_path: Some(artifact_dir.clone()),
@@ -8314,8 +8463,9 @@ mod tests {
         let runtime = AgentRuntimeConfig {
             adapter_ref: AgentAdapterRef::default(),
             command_raw: vec!["rex".to_string()],
-            container_image: None,
+            sandbox_image: None,
             image_source: ImageSource::Global,
+            execution: agent_execution_fixture(None),
             agent_artifact: None,
             agent_artifact_digest: None,
             agent_artifact_resolved_path: None,
@@ -10525,6 +10675,60 @@ mod tests {
     }
 
     #[test]
+    fn write_resolved_variants_persists_behavior_surface_digests() {
+        let root = TempDirGuard::new("agentlab_variant_behavior_digests");
+        let run_dir = root.path.join("run");
+        ensure_dir(&run_dir).expect("run dir");
+        let project_root = find_project_root(&run_dir);
+        let bundle_root = ensure_test_agent_bundle(&project_root, "rex-current");
+        let resolved = json!({
+            "baseline": { "variant_id": "base", "bindings": {} },
+            "variant_plan": [
+                {
+                    "variant_id": "alt",
+                    "bindings": { "temperature": 1.2 },
+                    "runtime_overrides": {
+                        "agent": {
+                            "command": ["rex", "run", "--alternate"],
+                            "env": { "PARALLEL_TOOLS": "1" }
+                        }
+                    }
+                }
+            ],
+            "runtime": {
+                "agent": {
+                    "command": harness_success_command(),
+                    "bundle": bundle_root.to_string_lossy().to_string(),
+                    "io": { "input_arg": "--input", "output_arg": "--output" }
+                },
+                "sandbox": runtime_sandbox("global", Some("img")),
+                "policy": { "timeout_ms": 600000 }
+            }
+        });
+        let (variants, baseline_id) = resolve_variant_plan(&resolved).expect("variant plan");
+        write_resolved_variants(&run_dir, &resolved, &baseline_id, &variants)
+            .expect("write resolved variants");
+
+        let manifest =
+            load_json_file(&run_dir.join("resolved_variants.json")).expect("resolved variants");
+        let manifest_variants = manifest
+            .pointer("/variants")
+            .and_then(Value::as_array)
+            .expect("variant array");
+        assert_eq!(manifest_variants.len(), variants.len());
+        for (idx, variant) in variants.iter().enumerate() {
+            let expected = resolved_variant_behavior_digest(&resolved, variant)
+                .expect("behavior surface digest");
+            assert_eq!(
+                manifest_variants[idx]
+                    .get("variant_digest")
+                    .and_then(Value::as_str),
+                Some(expected.as_str())
+            );
+        }
+    }
+
+    #[test]
     fn find_variant_by_id_finds_match() {
         let variants = vec![
             Variant {
@@ -11005,7 +11209,6 @@ mod tests {
         let run_dir = root.path.join("run");
         ensure_dir(&run_dir.join("runtime")).unwrap();
         let behavior = RunBehavior {
-            setup_command: Some("echo setup".to_string()),
             network_mode_override: Some("bridge".to_string()),
             require_network_none: false,
         };
@@ -11027,7 +11230,6 @@ mod tests {
         let run_dir = root.path.join("run");
         ensure_dir(&run_dir.join("runtime")).unwrap();
         let behavior = RunBehavior {
-            setup_command: Some("echo hi".to_string()),
             network_mode_override: Some("host".to_string()),
             require_network_none: true,
         };
@@ -11044,7 +11246,7 @@ mod tests {
         )
         .unwrap();
         let loaded = load_run_session_state(&run_dir).unwrap();
-        assert_eq!(loaded.behavior.setup_command, Some("echo hi".to_string()));
+        assert_eq!(loaded.behavior.network_mode_override, Some("host".to_string()));
         assert!(loaded.behavior.require_network_none);
     }
 
@@ -11054,12 +11256,11 @@ mod tests {
         let run_dir = root.path.join("run");
         ensure_dir(&run_dir.join("runtime")).unwrap();
         let behavior = RunBehavior {
-            setup_command: None,
             network_mode_override: None,
             require_network_none: false,
         };
         let execution = RunExecutionOptions {
-            executor: Some(ExecutorKind::LocalProcess),
+            executor: Some(ExecutorKind::LocalDocker),
             materialize: Some(MaterializationMode::MetadataOnly),
             runtime_env: BTreeMap::new(),
             runtime_env_files: Vec::new(),
@@ -11067,7 +11268,7 @@ mod tests {
         write_run_session_state(&run_dir, "run_003", &behavior, &execution).unwrap();
         assert_eq!(
             load_run_session_state(&run_dir).unwrap().execution.executor,
-            Some(ExecutorKind::LocalProcess)
+            Some(ExecutorKind::LocalDocker)
         );
     }
 

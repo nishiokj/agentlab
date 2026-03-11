@@ -249,19 +249,13 @@ export interface BenchmarkTypePolicy {
   chain_failure_policy?: 'stop_on_error' | 'continue_with_flag';
 }
 
-export interface BenchmarkAdapterConfig {
+export interface BenchmarkGraderConfig {
   command: string[];
-  manifest?: Record<string, unknown>;
 }
 
 export interface BenchmarkConfig {
   policy?: BenchmarkTypePolicy;
-  adapter?: BenchmarkAdapterConfig;
-}
-
-export interface AgentIoConfig {
-  input_arg?: string;
-  output_arg?: string;
+  grader?: BenchmarkGraderConfig;
 }
 
 function copyPolicies(p: DesignPolicies): DesignPolicies {
@@ -357,40 +351,30 @@ export interface ExperimentSpec {
   }>;
   benchmark?: {
     policy?: BenchmarkTypePolicy;
-    adapter?: BenchmarkAdapterConfig;
+    grader?: BenchmarkGraderConfig;
   };
   runtime: {
-    agent: {
+    agent_runtime: {
       command: string[];
-      bundle?: string;
-      io?: AgentIoConfig;
+      artifact?: string;
+      image?: string;
       env?: Record<string, string>;
       env_from_host?: string[];
-    };
-    sandbox: {
-      executor: 'docker';
-      image_source: 'global' | 'per_task';
-      image?: string;
-      profile: string;
-      network: 'none' | 'full' | 'allowlist_enforced';
-    };
-    dependencies: {
-      file_staging?: DependencyFileStagingEntry[];
-      services?: Array<{
-        id: string;
-        kind: string;
-        path: string;
-      }>;
-    };
-    policy: {
-      timeout_ms: number;
-      network: {
-        allowed_hosts: string[];
-      };
+      binding_args?: Array<{ key: string; flag: string }>;
+      network?: 'none' | 'full' | 'allowlist_enforced';
+      root_read_only?: boolean;
     };
     telemetry?: {
       trajectory_path?: string;
       causal_extraction?: string;
+    };
+  };
+  policy: {
+    timeout_ms: number;
+    task_sandbox: {
+      profile: string;
+      network: 'none' | 'full' | 'allowlist_enforced';
+      allowed_hosts?: string[];
     };
   };
   validity: {
@@ -430,7 +414,7 @@ export class ExperimentBuilder {
         suite_id: '',
         provider: 'local_jsonl',
         path: '',
-        schema_version: 'task_boundary_v3',
+        schema_version: 'task_spec_v1',
         split_id: '',
         limit: 0,
       },
@@ -449,26 +433,21 @@ export class ExperimentBuilder {
       },
       variant_plan: [],
       runtime: {
-        agent: {
+        agent_runtime: {
           command: [],
+          binding_args: [],
           env: {},
           env_from_host: [],
+          network: 'none',
+          root_read_only: true,
         },
-        sandbox: {
-          executor: 'docker',
-          image_source: 'global',
+      },
+      policy: {
+        timeout_ms: 600_000,
+        task_sandbox: {
           profile: 'default',
           network: 'none',
-        },
-        dependencies: {
-          file_staging: [],
-          services: [],
-        },
-        policy: {
-          timeout_ms: 600_000,
-          network: {
-            allowed_hosts: [],
-          },
+          allowed_hosts: [],
         },
       },
       validity: {
@@ -514,29 +493,28 @@ export class ExperimentBuilder {
   }
 
   agentBundle(bundle: string): this {
-    this.spec.runtime.agent.bundle = bundle;
+    this.spec.runtime.agent_runtime.artifact = bundle;
     return this;
   }
 
   customAgentImage(image: string, command: string[]): this {
-    this.spec.runtime.agent.command = [...command];
-    this.spec.runtime.sandbox.image_source = 'global';
-    this.spec.runtime.sandbox.image = image;
+    this.spec.runtime.agent_runtime.command = [...command];
+    this.spec.runtime.agent_runtime.image = image;
     return this;
   }
 
   agentLoop(command: string[]): this {
-    this.spec.runtime.agent.command = [...command];
+    this.spec.runtime.agent_runtime.command = [...command];
     return this;
   }
 
   agentArgs(args: string[]): this {
-    this.spec.runtime.agent.command.push(...args);
+    this.spec.runtime.agent_runtime.command.push(...args);
     return this;
   }
 
   agentEnv(env: Record<string, string>): this {
-    this.spec.runtime.agent.env = { ...env };
+    this.spec.runtime.agent_runtime.env = { ...env };
     return this;
   }
 
@@ -545,7 +523,7 @@ export class ExperimentBuilder {
   }
 
   agentEnvFromHost(keys: string[]): this {
-    this.spec.runtime.agent.env_from_host = [...keys];
+    this.spec.runtime.agent_runtime.env_from_host = [...keys];
     return this;
   }
 
@@ -554,29 +532,21 @@ export class ExperimentBuilder {
   }
 
   agentIo(inputArg: string, outputArg: string): this {
-    this.spec.runtime.agent.io = {
-      input_arg: inputArg,
-      output_arg: outputArg,
-    };
-    return this;
+    throw new Error(
+      `ExperimentBuilder.agentIo(${inputArg}, ${outputArg}) was removed; commands are literal argv and must consume the trial contract directly.`,
+    );
   }
 
   dependencyAssets(entries: DependencyAssetEntry[]): this {
-    this.spec.runtime.dependencies.file_staging = entries.map((entry) => ({
-      source_from_host: entry.source_from_host,
-      destination_path: entry.mount_path,
-      required: entry.required ?? true,
-    }));
-    return this;
+    throw new Error(
+      `ExperimentBuilder.dependencyAssets(${entries.length}) was removed; task-owned dependencies must be embedded in task_spec_v1 rows.`,
+    );
   }
 
   dependencyFileStaging(entries: DependencyFileStagingEntry[]): this {
-    this.spec.runtime.dependencies.file_staging = entries.map((entry) => ({
-      source_from_host: entry.source_from_host,
-      destination_path: entry.destination_path,
-      required: entry.required ?? true,
-    }));
-    return this;
+    throw new Error(
+      `ExperimentBuilder.dependencyFileStaging(${entries.length}) was removed; task-owned dependencies must be embedded in task_spec_v1 rows.`,
+    );
   }
 
   stageDependencyAsset(
@@ -584,15 +554,9 @@ export class ExperimentBuilder {
     mountPath: string,
     options?: { id?: string; readOnly?: boolean; required?: boolean },
   ): this {
-    if (!this.spec.runtime.dependencies.file_staging) {
-      this.spec.runtime.dependencies.file_staging = [];
-    }
-    this.spec.runtime.dependencies.file_staging.push({
-      source_from_host: sourceFromHost,
-      destination_path: mountPath,
-      required: options?.required ?? true,
-    });
-    return this;
+    throw new Error(
+      `ExperimentBuilder.stageDependencyAsset(${sourceFromHost}, ${mountPath}) was removed; task-owned dependencies must be embedded in task_spec_v1 rows.`,
+    );
   }
 
   stageDependencyFile(
@@ -625,12 +589,9 @@ export class ExperimentBuilder {
               : undefined,
           }
         : undefined,
-      adapter: config.adapter
+      grader: config.grader
         ? {
-            command: [...config.adapter.command],
-            manifest: config.adapter.manifest
-              ? JSON.parse(JSON.stringify(config.adapter.manifest)) as Record<string, unknown>
-              : undefined,
+            command: [...config.grader.command],
           }
         : undefined,
     };
@@ -701,25 +662,26 @@ export class ExperimentBuilder {
   }
 
   networkMode(mode: 'none' | 'full' | 'allowlist_enforced', allowedHosts: string[] = []): this {
-    this.spec.runtime.sandbox.network = mode;
-    this.spec.runtime.policy.network.allowed_hosts = [...allowedHosts];
+    this.spec.runtime.agent_runtime.network = mode;
+    this.spec.policy.task_sandbox.network = mode;
+    this.spec.policy.task_sandbox.allowed_hosts = [...allowedHosts];
     return this;
   }
 
   sandboxImage(image: string): this {
-    this.spec.runtime.sandbox.image_source = 'global';
-    this.spec.runtime.sandbox.image = image;
-    return this;
+    throw new Error(
+      `ExperimentBuilder.sandboxImage(${image}) was removed; task sandbox images now come from task_spec_v1.environment.image.`,
+    );
   }
 
   localSandbox(): this {
     throw new Error(
-      'ExperimentBuilder.localSandbox() was removed; task sandboxes are configured under runtime.sandbox and currently require docker. Choose local_process or local_docker when you run the experiment.',
+      'ExperimentBuilder.localSandbox() was removed; task sandboxes are configured under policy.task_sandbox and always execute in docker-backed task images from task_spec_v1.',
     );
   }
 
   timeoutMs(value: number): this {
-    this.spec.runtime.policy.timeout_ms = value;
+    this.spec.policy.timeout_ms = value;
     return this;
   }
 
@@ -731,23 +693,20 @@ export class ExperimentBuilder {
     if (!this.spec.dataset.suite_id) missing.push('dataset suite_id (call .datasetJsonl() with suiteId)');
     if (!this.spec.dataset.split_id) missing.push('dataset split_id (call .datasetJsonl() with splitId)');
     if (this.spec.dataset.limit <= 0) missing.push('dataset limit (call .datasetJsonl() with limit > 0)');
-    const command = this.spec.runtime.agent.command ?? [];
+    const command = this.spec.runtime.agent_runtime.command ?? [];
     if (command.length === 0 || command.some((part) => part.trim().length === 0)) {
-      missing.push('runtime.agent.command (call .agentLoop() or .customAgentImage())');
+      missing.push('runtime.agent_runtime.command (call .agentLoop() or .customAgentImage())');
     }
-    const bundle = this.spec.runtime.agent.bundle;
+    const bundle = this.spec.runtime.agent_runtime.artifact;
     if (!bundle || bundle.trim().length === 0) {
-      missing.push('runtime.agent.bundle (call .agentBundle())');
+      missing.push('runtime.agent_runtime.artifact (call .agentBundle())');
     }
-    if (this.spec.runtime.policy.timeout_ms <= 0) {
-      missing.push('policy timeout_ms (call .timeoutMs() with > 0)');
+    const agentImage = this.spec.runtime.agent_runtime.image;
+    if (!agentImage || agentImage.trim().length === 0) {
+      missing.push('runtime.agent_runtime.image (call .customAgentImage())');
     }
-    if (this.spec.runtime.sandbox.image_source !== 'per_task') {
-      const runtimeImage = this.spec.runtime.sandbox.image;
-      const hasImage = !!runtimeImage && runtimeImage.trim().length > 0;
-      if (!hasImage) {
-        missing.push('runtime.sandbox.image (call .customAgentImage() or .sandboxImage())');
-      }
+    if (this.spec.policy.timeout_ms <= 0) {
+      missing.push('policy.timeout_ms (call .timeoutMs() with > 0)');
     }
     if (missing.length > 0) {
       throw new Error(

@@ -41,6 +41,15 @@ def _workspace_root() -> Path:
     return Path.cwd()
 
 
+def _contract_path(env_name: str, cli_value: str | None) -> Path:
+    raw = os.environ.get(env_name, "").strip()
+    if raw:
+        return Path(raw)
+    if cli_value:
+        return Path(cli_value)
+    raise SystemExit(f"missing required contract path: {env_name}")
+
+
 def _is_preflight_smoke() -> bool:
     raw = os.environ.get("AGENTLAB_PREFLIGHT_SMOKE", "").strip().lower()
     return raw in {"1", "true", "yes", "on"}
@@ -161,11 +170,13 @@ def _write_raw_trajectory_line(line: str) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="AgentLab E2E agent fixture")
-    parser.add_argument("--input", required=True)
-    parser.add_argument("--output", required=True)
+    parser.add_argument("--input")
+    parser.add_argument("--output")
     args = parser.parse_args()
 
-    task_payload = _read_json(args.input)
+    task_path = _contract_path("AGENTLAB_TASK_PATH", args.input)
+    result_path = _contract_path("AGENTLAB_RESULT_PATH", args.output)
+    task_payload = _read_json(task_path)
     if not isinstance(task_payload, dict):
         raise SystemExit("task payload must be an object")
     bindings = _load_bindings()
@@ -214,6 +225,7 @@ def main() -> int:
         "objective_value": objective_value,
         "bindings": bindings,
         "observations": observations,
+        "cwd": str(Path.cwd()),
         "env": {
             "run_id": os.environ.get("AGENTLAB_RUN_ID", ""),
             "trial_id": os.environ.get("AGENTLAB_TRIAL_ID", ""),
@@ -235,6 +247,7 @@ def main() -> int:
             )
     report_path = workspace / "artifacts" / "agent_report.json"
     _write_json(report_path, report)
+    _write_json(result_path.parent / "agent_report.json", report)
 
     checkpoint_rel = Path(".agentlab_generated") / "checkpoints" / "final.json"
     checkpoint_abs = workspace / checkpoint_rel
@@ -326,11 +339,11 @@ def main() -> int:
         )
 
     if emit_invalid_result_json:
-        target = Path(args.output)
+        target = result_path
         target.parent.mkdir(parents=True, exist_ok=True)
         target.write_text("{invalid result json\n", encoding="utf-8")
     elif exit_code == 0 and not skip_result_write:
-        _write_json(args.output, result)
+        _write_json(result_path, result)
 
     _write_trajectory(
         "e2e_agent.finish",

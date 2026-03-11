@@ -1,7 +1,7 @@
 use anyhow::{anyhow, Result};
 use clap::{ArgAction, Parser, Subcommand, ValueEnum};
 use rusqlite::{params, Connection, OptionalExtension};
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -14,23 +14,6 @@ mod tui;
 struct Cli {
     #[command(subcommand)]
     command: Commands,
-}
-
-#[derive(Clone, Copy, Debug, ValueEnum)]
-enum ExecutorArg {
-    #[value(name = "local_docker")]
-    LocalDocker,
-    #[value(name = "local_process")]
-    LocalProcess,
-}
-
-impl From<ExecutorArg> for lab_runner::ExecutorKind {
-    fn from(value: ExecutorArg) -> Self {
-        match value {
-            ExecutorArg::LocalDocker => lab_runner::ExecutorKind::LocalDocker,
-            ExecutorArg::LocalProcess => lab_runner::ExecutorKind::LocalProcess,
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -66,8 +49,6 @@ enum InitProfileArg {
     Sweep,
     #[value(name = "regression")]
     Regression,
-    #[value(name = "local-dev")]
-    LocalDev,
 }
 
 #[derive(Subcommand)]
@@ -87,10 +68,6 @@ enum Commands {
         out: Option<PathBuf>,
         #[arg(long)]
         overrides: Option<PathBuf>,
-        #[arg(long)]
-        container: bool,
-        #[arg(long, value_enum)]
-        executor: Option<ExecutorArg>,
         #[arg(long, value_enum)]
         materialize: Option<MaterializeArg>,
         #[arg(long = "env", value_name = "KEY=VALUE", action = ArgAction::Append)]
@@ -102,23 +79,8 @@ enum Commands {
     },
     Run {
         package: PathBuf,
-        #[arg(long)]
-        container: bool,
-        #[arg(long, value_enum)]
-        executor: Option<ExecutorArg>,
         #[arg(long, value_enum)]
         materialize: Option<MaterializeArg>,
-        #[arg(long = "env", value_name = "KEY=VALUE", action = ArgAction::Append)]
-        runtime_env: Vec<String>,
-        #[arg(long = "env-file", value_name = "PATH", action = ArgAction::Append)]
-        runtime_env_file: Vec<PathBuf>,
-        #[arg(long)]
-        json: bool,
-    },
-    RunDev {
-        package: PathBuf,
-        #[arg(long)]
-        setup: Option<String>,
         #[arg(long = "env", value_name = "KEY=VALUE", action = ArgAction::Append)]
         runtime_env: Vec<String>,
         #[arg(long = "env-file", value_name = "PATH", action = ArgAction::Append)]
@@ -217,6 +179,21 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+    #[command(about = "Inspect resolved variants for a run; pass VARIANT and optionally --against to show or diff")]
+    Variants {
+        run: String,
+        variant: Option<String>,
+        #[arg(long)]
+        against: Option<String>,
+        #[arg(long)]
+        json: bool,
+        #[arg(long)]
+        csv: bool,
+        #[arg(long, alias = "markdown")]
+        md: bool,
+        #[arg(long)]
+        html: bool,
+    },
     Views {
         run: String,
         view: Option<String>,
@@ -233,7 +210,9 @@ enum Commands {
         #[arg(long)]
         html: bool,
     },
-    #[command(about = "Live refresh for a view; omit run/view in a TTY to browse active runs and views")]
+    #[command(
+        about = "Live refresh for a view; omit run/view in a TTY to browse active runs and views"
+    )]
     ViewsLive {
         run: Option<String>,
         view: Option<String>,
@@ -849,8 +828,6 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
             experiment,
             out,
             overrides,
-            container,
-            executor,
             materialize,
             runtime_env,
             runtime_env_file,
@@ -865,7 +842,6 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
                 out.as_deref(),
             )?;
             let execution = build_run_execution_options(
-                executor,
                 materialize,
                 &runtime_env,
                 &runtime_env_file,
@@ -877,7 +853,6 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
             }
             let result = lab_runner::run_experiment_with_options(
                 &build.package_dir,
-                container,
                 execution.clone(),
             )?;
             if json {
@@ -891,8 +866,6 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
                     "summary": summary_to_json(&summary),
                     "run": run_result_to_json(&result),
                     "artifacts": run_artifacts_to_json(&result),
-                    "container": container,
-                    "executor": execution.executor.map(|e| e.as_str()),
                     "materialize": execution.materialize.map(|m| m.as_str()),
                     "post_run_stats": post_run
                 })));
@@ -906,8 +879,6 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
         }
         Commands::Run {
             package,
-            container,
-            executor,
             materialize,
             runtime_env,
             runtime_env_file,
@@ -918,7 +889,6 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
             }
             let summary = lab_runner::describe_experiment(&package)?;
             let execution = build_run_execution_options(
-                executor,
                 materialize,
                 &runtime_env,
                 &runtime_env_file,
@@ -927,8 +897,7 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
                 print_summary(&summary);
                 eprintln!("launching run...");
             }
-            let result =
-                lab_runner::run_experiment_with_options(&package, container, execution.clone())?;
+            let result = lab_runner::run_experiment_with_options(&package, execution.clone())?;
             if json {
                 let post_run = try_post_run_stats_json(&result.run_dir);
                 return Ok(Some(json!({
@@ -937,55 +906,10 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
                     "summary": summary_to_json(&summary),
                     "run": run_result_to_json(&result),
                     "artifacts": run_artifacts_to_json(&result),
-                    "container": container,
-                    "executor": execution.executor.map(|e| e.as_str()),
                     "materialize": execution.materialize.map(|m| m.as_str()),
                     "post_run_stats": post_run
                 })));
             }
-            println!("run_id: {}", result.run_id);
-            println!("run_dir: {}", result.run_dir.display());
-            try_print_post_run_stats(&result.run_dir, &result.run_id);
-        }
-        Commands::RunDev {
-            package,
-            setup,
-            runtime_env,
-            runtime_env_file,
-            json,
-        } => {
-            if !json {
-                eprintln!("loading package: {}", package.display());
-            }
-            let summary = lab_runner::describe_experiment(&package)?;
-            let setup_for_json = setup.clone();
-            if !json {
-                print_summary(&summary);
-                eprintln!("launching dev run...");
-            }
-            let execution =
-                build_run_execution_options(None, None, &runtime_env, &runtime_env_file)?;
-            let result =
-                lab_runner::run_experiment_dev_with_options(&package, setup.clone(), execution)?;
-            if json {
-                let post_run = try_post_run_stats_json(&result.run_dir);
-                return Ok(Some(json!({
-                    "ok": true,
-                    "command": "run-dev",
-                    "summary": summary_to_json(&summary),
-                    "run": run_result_to_json(&result),
-                    "artifacts": run_artifacts_to_json(&result),
-                    "dev_setup": setup_for_json,
-                    "dev_network_mode": "full",
-                    "post_run_stats": post_run
-                })));
-            }
-            if let Some(s) = &setup {
-                println!("dev_setup: {}", s);
-            } else {
-                println!("dev_setup: none");
-            }
-            println!("dev_network_mode: full");
             println!("run_id: {}", result.run_id);
             println!("run_dir: {}", result.run_dir.display());
             try_print_post_run_stats(&result.run_dir, &result.run_id);
@@ -1004,8 +928,11 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
                 print_summary(&summary);
                 eprintln!("launching strict experiment run...");
             }
-            let execution =
-                build_run_execution_options(None, None, &runtime_env, &runtime_env_file)?;
+            let execution = build_run_execution_options(
+                None,
+                &runtime_env,
+                &runtime_env_file,
+            )?;
             let result = lab_runner::run_experiment_strict_with_options(&package, execution)?;
             if json {
                 let post_run = try_post_run_stats_json(&result.run_dir);
@@ -1136,8 +1063,11 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
             runtime_env_file,
             json,
         } => {
-            let execution =
-                build_run_execution_options(None, None, &runtime_env, &runtime_env_file)?;
+            let execution = build_run_execution_options(
+                None,
+                &runtime_env,
+                &runtime_env_file,
+            )?;
             let result = lab_runner::continue_run_with_options(&run_dir, execution)?;
             if json {
                 return Ok(Some(json!({
@@ -1212,6 +1142,102 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
                 })));
             }
             print_summary(&summary);
+        }
+        Commands::Variants {
+            run,
+            variant,
+            against,
+            json,
+            csv,
+            md,
+            html,
+        } => {
+            if [json, csv, md, html].into_iter().filter(|flag| *flag).count() > 1 {
+                return Err(anyhow!(
+                    "--json, --csv, --md, and --html are mutually exclusive"
+                ));
+            }
+            if variant.is_none() && against.is_some() {
+                return Err(anyhow!("--against requires a variant id"));
+            }
+
+            let run_dir = resolve_run_dir_arg(&run)?;
+            let inspection = load_variant_inspection_set(&run_dir)?;
+            let render_format = table_render_format(csv, md, html);
+
+            match (variant.as_deref(), against.as_deref()) {
+                (None, None) => {
+                    if json {
+                        return Ok(Some(json!({
+                            "ok": true,
+                            "command": "variants",
+                            "mode": "list",
+                            "run_dir": run_dir.display().to_string(),
+                            "experiment_id": inspection.experiment_id,
+                            "baseline_id": inspection.baseline_id,
+                            "variants": inspection
+                                .variants
+                                .iter()
+                                .map(variant_inspection_to_json)
+                                .collect::<Vec<_>>()
+                        })));
+                    }
+                    let table = build_variants_list_table(&inspection);
+                    render_variants_table("variants", &table, render_format);
+                }
+                (Some(variant_id), None) => {
+                    let item = find_variant_inspection(&inspection, variant_id)?;
+                    if json {
+                        return Ok(Some(json!({
+                            "ok": true,
+                            "command": "variants",
+                            "mode": "show",
+                            "run_dir": run_dir.display().to_string(),
+                            "experiment_id": inspection.experiment_id,
+                            "baseline_id": inspection.baseline_id,
+                            "variant": variant_inspection_to_json(item)
+                        })));
+                    }
+                    let table = build_variant_show_table(item);
+                    render_variants_table(
+                        &format!("variant {}", item.id),
+                        &table,
+                        render_format,
+                    );
+                }
+                (Some(variant_id), Some(against_id)) => {
+                    let left = find_variant_inspection(&inspection, variant_id)?;
+                    let right = find_variant_inspection(&inspection, against_id)?;
+                    let diffs = diff_variant_surfaces(left, right);
+                    if json {
+                        return Ok(Some(json!({
+                            "ok": true,
+                            "command": "variants",
+                            "mode": "diff",
+                            "run_dir": run_dir.display().to_string(),
+                            "experiment_id": inspection.experiment_id,
+                            "baseline_id": inspection.baseline_id,
+                            "left": variant_inspection_to_json(left),
+                            "right": variant_inspection_to_json(right),
+                            "diff": diffs
+                                .iter()
+                                .map(|entry| json!({
+                                    "path": entry.path,
+                                    "left": entry.left,
+                                    "right": entry.right,
+                                }))
+                                .collect::<Vec<_>>()
+                        })));
+                    }
+                    let table = build_variant_diff_table(left, right, &diffs);
+                    render_variants_table(
+                        &format!("variant diff {} vs {}", left.id, right.id),
+                        &table,
+                        render_format,
+                    );
+                }
+                (None, Some(_)) => unreachable!("validated above"),
+            }
         }
         Commands::Views {
             run,
@@ -1428,9 +1454,7 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
                     Some(requested) => {
                         resolve_requested_view(run_view_set, &raw_view_names, requested)?
                     }
-                    None => {
-                        resolve_requested_view(run_view_set, &raw_view_names, "run_progress")?
-                    }
+                    None => resolve_requested_view(run_view_set, &raw_view_names, "run_progress")?,
                 };
                 // Plain text fallback (--once, --no-clear, non-TTY)
                 loop {
@@ -1644,13 +1668,12 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
         } => {
             let Some(profile) = profile else {
                 println!("available profiles:");
-                println!("  - agent-eval  : single-variant agent evaluation in container mode");
+                println!("  - agent-eval  : single-variant isolated agent evaluation");
                 println!(
                     "  - ab-test     : paired two-variant comparison (variant_a vs variant_b)"
                 );
                 println!("  - sweep       : independent parameter sweep over variants");
                 println!("  - regression  : fixed-suite pass-rate tracking over time");
-                println!("  - local-dev   : fast local iteration (single worker)");
                 println!("usage: lab init --profile <name>");
                 return Ok(None);
             };
@@ -1748,7 +1771,7 @@ dataset:
   suite_id: local_suite
   provider: local_jsonl
   path: tasks.jsonl
-  schema_version: task_boundary_v3
+  schema_version: task_spec_v1
   split_id: dev
   limit: 50
 design:
@@ -1763,24 +1786,17 @@ baseline:
   bindings: {}
 variant_plan: []
 runtime:
-  agent:
+  agent_runtime:
     command: [python, harness.py]
-    bundle: ./agents/my-agent-runtime.tar.gz
-    io:
-      input_arg: --input
-      output_arg: --output
-  sandbox:
-    executor: docker
-    image_source: global
-    image: ghcr.io/acme/task-sandbox:latest
+    artifact: ./agents/my-agent-runtime.tar.gz
+    image: ghcr.io/acme/agent-runtime:latest
+    network: none
+    root_read_only: true
+policy:
+  timeout_ms: 300000
+  task_sandbox:
     profile: default
     network: none
-  dependencies:
-    file_staging: []
-    services: []
-  policy:
-    timeout_ms: 300000
-    root_read_only: true
 validity:
   fail_on_state_leak: true
   fail_on_profile_invariant_violation: true
@@ -1795,7 +1811,7 @@ dataset:
   suite_id: local_suite
   provider: local_jsonl
   path: tasks.jsonl
-  schema_version: task_boundary_v3
+  schema_version: task_spec_v1
   split_id: dev
   limit: 100
 design:
@@ -1813,24 +1829,17 @@ variant_plan:
     bindings:
       model: claude-4
 runtime:
-  agent:
+  agent_runtime:
     command: [python, harness.py]
-    bundle: ./agents/my-agent-runtime.tar.gz
-    io:
-      input_arg: --input
-      output_arg: --output
-  sandbox:
-    executor: docker
-    image_source: global
-    image: ghcr.io/acme/task-sandbox:latest
+    artifact: ./agents/my-agent-runtime.tar.gz
+    image: ghcr.io/acme/agent-runtime:latest
+    network: none
+    root_read_only: true
+policy:
+  timeout_ms: 300000
+  task_sandbox:
     profile: default
     network: none
-  dependencies:
-    file_staging: []
-    services: []
-  policy:
-    timeout_ms: 300000
-    root_read_only: true
 validity:
   fail_on_state_leak: true
   fail_on_profile_invariant_violation: true
@@ -1845,7 +1854,7 @@ dataset:
   suite_id: local_suite
   provider: local_jsonl
   path: tasks.jsonl
-  schema_version: task_boundary_v3
+  schema_version: task_spec_v1
   split_id: dev
   limit: 100
 design:
@@ -1866,24 +1875,17 @@ variant_plan:
     bindings:
       temperature: 0.9
 runtime:
-  agent:
+  agent_runtime:
     command: [python, harness.py]
-    bundle: ./agents/my-agent-runtime.tar.gz
-    io:
-      input_arg: --input
-      output_arg: --output
-  sandbox:
-    executor: docker
-    image_source: global
-    image: ghcr.io/acme/task-sandbox:latest
+    artifact: ./agents/my-agent-runtime.tar.gz
+    image: ghcr.io/acme/agent-runtime:latest
+    network: none
+    root_read_only: true
+policy:
+  timeout_ms: 300000
+  task_sandbox:
     profile: default
     network: none
-  dependencies:
-    file_staging: []
-    services: []
-  policy:
-    timeout_ms: 300000
-    root_read_only: true
 validity:
   fail_on_state_leak: true
   fail_on_profile_invariant_violation: true
@@ -1898,7 +1900,7 @@ dataset:
   suite_id: local_suite
   provider: local_jsonl
   path: tasks.jsonl
-  schema_version: task_boundary_v3
+  schema_version: task_spec_v1
   split_id: dev
   limit: 50
 design:
@@ -1913,71 +1915,17 @@ baseline:
   bindings: {}
 variant_plan: []
 runtime:
-  agent:
+  agent_runtime:
     command: [python, harness.py]
-    bundle: ./agents/my-agent-runtime.tar.gz
-    io:
-      input_arg: --input
-      output_arg: --output
-  sandbox:
-    executor: docker
-    image_source: global
-    image: ghcr.io/acme/task-sandbox:latest
+    artifact: ./agents/my-agent-runtime.tar.gz
+    image: ghcr.io/acme/agent-runtime:latest
+    network: none
+    root_read_only: true
+policy:
+  timeout_ms: 300000
+  task_sandbox:
     profile: default
     network: none
-  dependencies:
-    file_staging: []
-    services: []
-  policy:
-    timeout_ms: 300000
-    root_read_only: true
-validity:
-  fail_on_state_leak: true
-  fail_on_profile_invariant_violation: true
-"
-        }
-        InitProfileArg::LocalDev => {
-            "experiment:
-  id: my_local_dev
-  name: Local Development
-  workload_type: agent_runtime
-dataset:
-  suite_id: local_suite
-  provider: local_jsonl
-  path: tasks.jsonl
-  schema_version: task_boundary_v3
-  split_id: dev
-  limit: 10
-design:
-  sanitization_profile: hermetic_functional
-  comparison: paired
-  replications: 1
-  random_seed: 42
-  shuffle_tasks: true
-  max_concurrency: 1
-baseline:
-  variant_id: control
-  bindings: {}
-variant_plan: []
-runtime:
-  agent:
-    command: [python, harness.py]
-    bundle: ./agents/my-agent-runtime.tar.gz
-    io:
-      input_arg: --input
-      output_arg: --output
-  sandbox:
-    executor: docker
-    image_source: global
-    image: ghcr.io/acme/task-sandbox:latest
-    profile: default
-    network: full
-  dependencies:
-    file_staging: []
-    services: []
-  policy:
-    timeout_ms: 120000
-    root_read_only: false
 validity:
   fail_on_state_leak: true
   fail_on_profile_invariant_violation: true
@@ -2011,7 +1959,6 @@ fn command_json_mode(command: &Commands) -> bool {
         Commands::Build { json, .. }
         | Commands::BuildRun { json, .. }
         | Commands::Run { json, .. }
-        | Commands::RunDev { json, .. }
         | Commands::RunExperiment { json, .. }
         | Commands::Replay { json, .. }
         | Commands::Fork { json, .. }
@@ -2165,13 +2112,11 @@ fn parse_runtime_env_bindings(values: &[String]) -> Result<BTreeMap<String, Stri
 }
 
 fn build_run_execution_options(
-    executor: Option<ExecutorArg>,
     materialize: Option<MaterializeArg>,
     runtime_env: &[String],
     runtime_env_files: &[PathBuf],
 ) -> Result<lab_runner::RunExecutionOptions> {
     Ok(lab_runner::RunExecutionOptions {
-        executor: executor.map(Into::into),
         materialize: materialize.map(Into::into),
         runtime_env: parse_runtime_env_bindings(runtime_env)?,
         runtime_env_files: runtime_env_files.to_vec(),
@@ -2243,6 +2188,443 @@ fn print_preflight_report(report: &lab_runner::PreflightReport) {
         println!("\npreflight: all checks passed");
     } else {
         println!("\npreflight: FAILED — resolve errors above before running");
+    }
+}
+
+#[derive(Debug, Clone)]
+struct VariantInspectionSet {
+    experiment_id: Option<String>,
+    baseline_id: String,
+    variants: Vec<VariantInspection>,
+}
+
+#[derive(Debug, Clone)]
+struct VariantInspection {
+    id: String,
+    is_baseline: bool,
+    variant_digest: String,
+    agent_ref: Option<String>,
+    raw_variant: Value,
+    behavior_surface: Value,
+    code_surface: Value,
+}
+
+#[derive(Debug, Clone)]
+struct JsonDiffRow {
+    path: String,
+    left: Value,
+    right: Value,
+}
+
+fn load_variant_inspection_set(run_dir: &Path) -> Result<VariantInspectionSet> {
+    let resolved_path = run_dir.join("resolved_experiment.json");
+    let resolved_experiment = read_json_file(&resolved_path)
+        .ok_or_else(|| anyhow!("missing or invalid {}", resolved_path.display()))?;
+    let variants_path = run_dir.join("resolved_variants.json");
+    let manifest = read_json_file(&variants_path)
+        .ok_or_else(|| anyhow!("missing or invalid {}", variants_path.display()))?;
+
+    let baseline_id = manifest
+        .pointer("/baseline_id")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .ok_or_else(|| anyhow!("resolved_variants.json missing baseline_id"))?;
+    let variant_values = manifest
+        .pointer("/variants")
+        .and_then(Value::as_array)
+        .ok_or_else(|| anyhow!("resolved_variants.json missing variants array"))?;
+    let experiment_id = resolved_experiment
+        .pointer("/experiment/id")
+        .or_else(|| resolved_experiment.pointer("/id"))
+        .and_then(Value::as_str)
+        .map(str::to_string);
+
+    let variants = variant_values
+        .iter()
+        .map(|variant| build_variant_inspection(&resolved_experiment, &baseline_id, variant))
+        .collect::<Result<Vec<_>>>()?;
+
+    Ok(VariantInspectionSet {
+        experiment_id,
+        baseline_id,
+        variants,
+    })
+}
+
+fn build_variant_inspection(
+    resolved_experiment: &Value,
+    baseline_id: &str,
+    variant: &Value,
+) -> Result<VariantInspection> {
+    let id = variant
+        .get("id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow!("variant entry missing id"))?
+        .to_string();
+    let behavior_surface = build_variant_behavior_surface(resolved_experiment, variant)?;
+    let code_surface = build_variant_code_surface(&behavior_surface);
+    let variant_digest = variant
+        .get("variant_digest")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .ok_or_else(|| anyhow!("variant '{}' missing variant_digest", id))?;
+    let agent_ref = variant
+        .get("agent_ref")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .or_else(|| {
+            behavior_surface
+                .pointer("/runtime/agent_ref")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        });
+
+    Ok(VariantInspection {
+        id: id.clone(),
+        is_baseline: id == baseline_id,
+        variant_digest,
+        agent_ref,
+        raw_variant: variant.clone(),
+        behavior_surface,
+        code_surface,
+    })
+}
+
+fn build_variant_behavior_surface(resolved_experiment: &Value, variant: &Value) -> Result<Value> {
+    let mut runtime = resolved_experiment
+        .pointer("/runtime")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    if !runtime.is_object() {
+        return Err(anyhow!("invalid /runtime in resolved_experiment.json: expected object"));
+    }
+    if let Some(runtime_overrides) = variant.get("runtime_overrides") {
+        if runtime_overrides.is_null() {
+            return Ok(json!({
+                "bindings": variant.get("bindings").cloned().unwrap_or_else(|| json!({})),
+                "args": variant.get("args").cloned().unwrap_or_else(|| json!([])),
+                "env": variant.get("env").cloned().unwrap_or_else(|| json!({})),
+                "image": variant.get("image").cloned().unwrap_or(Value::Null),
+                "agent_ref": variant.get("agent_ref").cloned().unwrap_or(Value::Null),
+                "runtime": runtime,
+            }));
+        }
+        if !runtime_overrides.is_object() {
+            return Err(anyhow!(
+                "variant '{}' runtime_overrides must be an object",
+                variant.get("id").and_then(Value::as_str).unwrap_or("unknown")
+            ));
+        }
+        merge_json_value(&mut runtime, runtime_overrides);
+    }
+
+    Ok(json!({
+        "bindings": variant.get("bindings").cloned().unwrap_or_else(|| json!({})),
+        "args": variant.get("args").cloned().unwrap_or_else(|| json!([])),
+        "env": variant.get("env").cloned().unwrap_or_else(|| json!({})),
+        "image": variant.get("image").cloned().unwrap_or(Value::Null),
+        "agent_ref": variant.get("agent_ref").cloned().unwrap_or(Value::Null),
+        "runtime": runtime,
+    }))
+}
+
+fn build_variant_code_surface(behavior_surface: &Value) -> Value {
+    let runtime = behavior_surface.pointer("/runtime").unwrap_or(&Value::Null);
+    let mut out = Map::new();
+    insert_first_pointer(
+        runtime,
+        &["/agent_runtime/artifact", "/agent/bundle"],
+        "artifact",
+        &mut out,
+    );
+    insert_first_pointer(
+        runtime,
+        &[
+            "/agent_runtime/artifact_digest",
+            "/agent/bundle_digest",
+        ],
+        "artifact_digest",
+        &mut out,
+    );
+    insert_first_pointer(
+        runtime,
+        &[
+            "/agent_runtime/artifact_resolved_path",
+            "/agent/bundle_resolved_path",
+        ],
+        "artifact_resolved_path",
+        &mut out,
+    );
+    insert_first_pointer(
+        runtime,
+        &["/agent_runtime/image", "/sandbox/image", "/agent/image"],
+        "image",
+        &mut out,
+    );
+    insert_first_pointer(
+        runtime,
+        &["/agent_runtime/command", "/agent/command"],
+        "command",
+        &mut out,
+    );
+    insert_first_pointer(
+        runtime,
+        &["/agent_runtime/env_from_host", "/agent/env_from_host"],
+        "env_from_host",
+        &mut out,
+    );
+    insert_first_pointer(
+        runtime,
+        &["/agent_runtime/binding_args", "/agent/binding_args"],
+        "binding_args",
+        &mut out,
+    );
+    insert_first_pointer(
+        runtime,
+        &["/agent_runtime/source_commit", "/agent/source_commit"],
+        "source_commit",
+        &mut out,
+    );
+    insert_first_pointer(
+        runtime,
+        &["/agent_runtime/source_branch", "/agent/source_branch"],
+        "source_branch",
+        &mut out,
+    );
+    insert_first_pointer(
+        runtime,
+        &["/agent_runtime/source_impl", "/agent/source_impl"],
+        "source_impl",
+        &mut out,
+    );
+    insert_first_pointer(
+        runtime,
+        &["/agent_runtime/dirty", "/agent/dirty"],
+        "dirty",
+        &mut out,
+    );
+    Value::Object(out)
+}
+
+fn insert_first_pointer(
+    root: &Value,
+    pointers: &[&str],
+    key: &str,
+    out: &mut Map<String, Value>,
+) {
+    if let Some(value) = pointer_first(root, pointers) {
+        out.insert(key.to_string(), value.clone());
+    }
+}
+
+fn pointer_first<'a>(root: &'a Value, pointers: &[&str]) -> Option<&'a Value> {
+    for pointer in pointers {
+        if let Some(value) = root.pointer(pointer) {
+            if !value.is_null() {
+                return Some(value);
+            }
+        }
+    }
+    None
+}
+
+fn find_variant_inspection<'a>(
+    inspection: &'a VariantInspectionSet,
+    variant_id: &str,
+) -> Result<&'a VariantInspection> {
+    let wanted = variant_id.trim();
+    inspection
+        .variants
+        .iter()
+        .find(|variant| variant.id == wanted)
+        .ok_or_else(|| anyhow!("variant '{}' not found in resolved_variants.json", variant_id))
+}
+
+fn build_variants_list_table(inspection: &VariantInspectionSet) -> lab_analysis::QueryTable {
+    let rows = inspection
+        .variants
+        .iter()
+        .map(|variant| {
+            vec![
+                Value::String(if variant.is_baseline { "yes" } else { "no" }.to_string()),
+                Value::String(variant.id.clone()),
+                Value::String(variant.variant_digest.clone()),
+                variant
+                    .code_surface
+                    .get("artifact_digest")
+                    .cloned()
+                    .unwrap_or(Value::Null),
+                variant
+                    .code_surface
+                    .get("image")
+                    .cloned()
+                    .unwrap_or(Value::Null),
+                variant
+                    .agent_ref
+                    .as_ref()
+                    .map(|value| Value::String(value.clone()))
+                    .unwrap_or(Value::Null),
+            ]
+        })
+        .collect();
+
+    lab_analysis::QueryTable {
+        columns: vec![
+            "baseline".to_string(),
+            "variant_id".to_string(),
+            "variant_digest".to_string(),
+            "artifact_digest".to_string(),
+            "image".to_string(),
+            "agent_ref".to_string(),
+        ],
+        rows,
+    }
+}
+
+fn build_variant_show_table(variant: &VariantInspection) -> lab_analysis::QueryTable {
+    let mut rows = Vec::new();
+    rows.push(vec![json!("variant_id"), json!(variant.id)]);
+    rows.push(vec![json!("is_baseline"), json!(variant.is_baseline)]);
+    rows.push(vec![json!("variant_digest"), json!(variant.variant_digest)]);
+    rows.push(vec![json!("agent_ref"), json!(variant.agent_ref)]);
+    rows.push(vec![json!("code_surface"), variant.code_surface.clone()]);
+    rows.push(vec![json!("bindings"), variant.behavior_surface["bindings"].clone()]);
+    rows.push(vec![json!("args"), variant.behavior_surface["args"].clone()]);
+    rows.push(vec![json!("env"), variant.behavior_surface["env"].clone()]);
+    rows.push(vec![json!("image"), variant.behavior_surface["image"].clone()]);
+    rows.push(vec![json!("runtime"), variant.behavior_surface["runtime"].clone()]);
+    rows.push(vec![json!("raw_variant"), variant.raw_variant.clone()]);
+
+    lab_analysis::QueryTable {
+        columns: vec!["field".to_string(), "value".to_string()],
+        rows,
+    }
+}
+
+fn diff_variant_surfaces(left: &VariantInspection, right: &VariantInspection) -> Vec<JsonDiffRow> {
+    let mut rows = Vec::new();
+    collect_json_diffs(
+        "",
+        &left.behavior_surface,
+        &right.behavior_surface,
+        &mut rows,
+    );
+    rows
+}
+
+fn collect_json_diffs(path: &str, left: &Value, right: &Value, out: &mut Vec<JsonDiffRow>) {
+    if left == right {
+        return;
+    }
+
+    match (left, right) {
+        (Value::Object(left_map), Value::Object(right_map)) => {
+            let mut keys = BTreeSet::new();
+            keys.extend(left_map.keys().cloned());
+            keys.extend(right_map.keys().cloned());
+            for key in keys {
+                let next_path = if path.is_empty() {
+                    key.clone()
+                } else {
+                    format!("{}.{}", path, key)
+                };
+                match (left_map.get(&key), right_map.get(&key)) {
+                    (Some(next_left), Some(next_right)) => {
+                        collect_json_diffs(&next_path, next_left, next_right, out);
+                    }
+                    (Some(next_left), None) => out.push(JsonDiffRow {
+                        path: next_path,
+                        left: next_left.clone(),
+                        right: Value::Null,
+                    }),
+                    (None, Some(next_right)) => out.push(JsonDiffRow {
+                        path: next_path,
+                        left: Value::Null,
+                        right: next_right.clone(),
+                    }),
+                    (None, None) => {}
+                }
+            }
+        }
+        (Value::Array(_), Value::Array(_)) => out.push(JsonDiffRow {
+            path: path.to_string(),
+            left: left.clone(),
+            right: right.clone(),
+        }),
+        _ => out.push(JsonDiffRow {
+            path: path.to_string(),
+            left: left.clone(),
+            right: right.clone(),
+        }),
+    }
+}
+
+fn build_variant_diff_table(
+    left: &VariantInspection,
+    right: &VariantInspection,
+    diffs: &[JsonDiffRow],
+) -> lab_analysis::QueryTable {
+    let mut rows = vec![vec![
+        json!("variant_digest"),
+        json!(left.variant_digest),
+        json!(right.variant_digest),
+    ]];
+    rows.extend(diffs.iter().map(|entry| {
+        vec![
+            Value::String(entry.path.clone()),
+            entry.left.clone(),
+            entry.right.clone(),
+        ]
+    }));
+    lab_analysis::QueryTable {
+        columns: vec!["path".to_string(), left.id.clone(), right.id.clone()],
+        rows,
+    }
+}
+
+fn render_variants_table(
+    title: &str,
+    table: &lab_analysis::QueryTable,
+    render_format: TableRenderFormat,
+) {
+    match render_format {
+        TableRenderFormat::Csv => print_query_table_csv(table),
+        TableRenderFormat::Markdown => print_table_markdown(table),
+        TableRenderFormat::Html => print_table_html_document(title, table),
+        TableRenderFormat::Text => print_query_table(table),
+    }
+}
+
+fn variant_inspection_to_json(variant: &VariantInspection) -> Value {
+    json!({
+        "id": variant.id,
+        "is_baseline": variant.is_baseline,
+        "variant_digest": variant.variant_digest,
+        "agent_ref": variant.agent_ref,
+        "code_surface": variant.code_surface,
+        "behavior_surface": variant.behavior_surface,
+        "raw_variant": variant.raw_variant,
+    })
+}
+
+fn merge_json_value(base: &mut Value, patch: &Value) {
+    match (base, patch) {
+        (Value::Object(base_map), Value::Object(patch_map)) => {
+            for (key, patch_value) in patch_map {
+                if let Some(base_value) = base_map.get_mut(key) {
+                    merge_json_value(base_value, patch_value);
+                } else {
+                    base_map.insert(key.clone(), patch_value.clone());
+                }
+            }
+        }
+        (base_slot, patch_value) => {
+            *base_slot = patch_value.clone();
+        }
     }
 }
 
@@ -2436,7 +2818,10 @@ fn run_interactive_views_browser(
     let mut selected_view_idx = 0usize;
 
     if let Some(run_dir) = current_run_dir.as_ref() {
-        if let Some(idx) = run_entries.iter().position(|entry| entry.run_dir == *run_dir) {
+        if let Some(idx) = run_entries
+            .iter()
+            .position(|entry| entry.run_dir == *run_dir)
+        {
             selected_run_idx = idx;
         }
         if let Some(requested_view) = initial_view {
@@ -2459,7 +2844,10 @@ fn run_interactive_views_browser(
     term.set_selected(match screen {
         ViewsBrowserScreen::RunPicker => selection_for_len(
             selected_run_idx,
-            run_entries.iter().filter(|entry| entry.control.is_active).count(),
+            run_entries
+                .iter()
+                .filter(|entry| entry.control.is_active)
+                .count(),
         ),
         ViewsBrowserScreen::ViewPicker => Some(selected_view_idx),
         ViewsBrowserScreen::Viewer => Some(0),
@@ -2486,7 +2874,10 @@ fn run_interactive_views_browser(
                     active_run_entries.len(),
                 );
                 let run_items = build_run_browser_items(&active_run_entries);
-                term.set_selected(selection_for_len(selected_run_idx, active_run_entries.len()));
+                term.set_selected(selection_for_len(
+                    selected_run_idx,
+                    active_run_entries.len(),
+                ));
                 term.draw(&tui::Screen::RunBrowser(tui::RunBrowserState {
                     items: &run_items,
                     refresh_secs: sleep_interval.as_secs(),
@@ -2547,8 +2938,10 @@ fn run_interactive_views_browser(
                     tui::Action::Back => {
                         if can_return_to_run_picker {
                             screen = ViewsBrowserScreen::RunPicker;
-                            let active_len =
-                                run_entries.iter().filter(|entry| entry.control.is_active).count();
+                            let active_len = run_entries
+                                .iter()
+                                .filter(|entry| entry.control.is_active)
+                                .count();
                             term.set_selected(selection_for_len(selected_run_idx, active_len));
                         } else {
                             break;
@@ -2701,8 +3094,14 @@ fn build_view_browser_items(view_set: lab_analysis::ViewSet) -> Vec<tui::ViewBro
         .collect()
 }
 
-fn lookup_run_inventory(entries: &[RunInventoryEntry], run_dir: &Path) -> Option<RunInventoryEntry> {
-    entries.iter().find(|entry| entry.run_dir == run_dir).cloned()
+fn lookup_run_inventory(
+    entries: &[RunInventoryEntry],
+    run_dir: &Path,
+) -> Option<RunInventoryEntry> {
+    entries
+        .iter()
+        .find(|entry| entry.run_dir == run_dir)
+        .cloned()
 }
 
 fn query_source_view(
@@ -4637,8 +5036,8 @@ fn inspect_run_inventory_entry(run_dir: &Path) -> RunInventoryEntry {
         .unwrap_or("unknown_run")
         .to_string();
     let manifest = read_json_file(&run_dir.join("manifest.json")).unwrap_or_else(|| json!({}));
-    let resolved = read_json_file(&run_dir.join("resolved_experiment.json"))
-        .unwrap_or_else(|| json!({}));
+    let resolved =
+        read_json_file(&run_dir.join("resolved_experiment.json")).unwrap_or_else(|| json!({}));
 
     let run_id = manifest
         .get("run_id")
@@ -4753,7 +5152,9 @@ fn read_run_metrics(run_dir: &Path) -> RunMetrics {
                 )
                 .unwrap_or(0_i64) as usize;
             let baseline_id: Option<String> = conn
-                .query_row("SELECT baseline_id FROM trial_rows LIMIT 1", [], |row| row.get(0))
+                .query_row("SELECT baseline_id FROM trial_rows LIMIT 1", [], |row| {
+                    row.get(0)
+                })
                 .optional()
                 .unwrap_or(None);
             let pass_rate = match baseline_id {
@@ -4909,35 +5310,35 @@ fn write_knob_files(
       "scientific_role": "control"
     },
     {
-      "id": "runtime.sandbox.network",
+      "id": "policy.task_sandbox.network",
       "label": "Network Mode",
-      "json_pointer": "/runtime/sandbox/network",
+      "json_pointer": "/policy/task_sandbox/network",
       "type": "string",
       "options": ["none", "full", "allowlist_enforced"],
       "role": "infra",
       "scientific_role": "invariant"
     },
     {
-      "id": "runtime.agent.command",
+      "id": "runtime.agent_runtime.command",
       "label": "Agent Command",
-      "json_pointer": "/runtime/agent/command",
+      "json_pointer": "/runtime/agent_runtime/command",
       "type": "json",
       "role": "agent",
       "scientific_role": "treatment"
     },
     {
-      "id": "runtime.agent.bundle",
-      "label": "Agent Bundle",
-      "json_pointer": "/runtime/agent/bundle",
+      "id": "runtime.agent_runtime.artifact",
+      "label": "Agent Artifact",
+      "json_pointer": "/runtime/agent_runtime/artifact",
       "type": "string",
       "role": "infra",
       "scientific_role": "treatment",
       "autotune": { "enabled": false, "requires_human_approval": true }
     },
     {
-      "id": "runtime.sandbox.image",
-      "label": "Sandbox Image",
-      "json_pointer": "/runtime/sandbox/image",
+      "id": "runtime.agent_runtime.image",
+      "label": "Agent Image",
+      "json_pointer": "/runtime/agent_runtime/image",
       "type": "string",
       "role": "infra",
       "scientific_role": "treatment",
@@ -5117,6 +5518,190 @@ mod tests {
         .expect("write runtime run_control_v2");
     }
 
+    fn seed_variant_run(run_dir: &Path) {
+        std::fs::create_dir_all(run_dir).expect("run dir");
+        std::fs::write(
+            run_dir.join("resolved_experiment.json"),
+            serde_json::to_vec_pretty(&json!({
+                "experiment": { "id": "exp_variants" },
+                "runtime": {
+                    "agent_runtime": {
+                        "artifact": "baseline.tar.gz",
+                        "artifact_digest": "sha256:base",
+                        "image": "img:base",
+                        "command": ["rex", "run"]
+                    },
+                    "policy": {
+                        "timeout_ms": 600000
+                    }
+                }
+            }))
+            .expect("serialize resolved experiment"),
+        )
+        .expect("write resolved experiment");
+        std::fs::write(
+            run_dir.join("resolved_variants.json"),
+            serde_json::to_vec_pretty(&json!({
+                "schema_version": "resolved_variants_v1",
+                "generated_at": "2026-03-10T00:00:00Z",
+                "baseline_id": "baseline",
+                "variants": [
+                    {
+                        "id": "baseline",
+                        "variant_digest": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                        "bindings": { "model": "glm-5" },
+                        "args": [],
+                        "env": {},
+                        "image": null,
+                        "runtime_overrides": null
+                    },
+                    {
+                        "id": "candidate",
+                        "variant_digest": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+                        "bindings": { "model": "glm-5" },
+                        "args": [],
+                        "env": {},
+                        "image": null,
+                        "agent_ref": "candidate_build",
+                        "runtime_overrides": {
+                            "agent_runtime": {
+                                "artifact": "candidate.tar.gz",
+                                "artifact_digest": "sha256:candidate",
+                                "image": "img:candidate",
+                                "env": { "PARALLEL_TOOLS": "1" }
+                            }
+                        }
+                    }
+                ]
+            }))
+            .expect("serialize resolved variants"),
+        )
+        .expect("write resolved variants");
+    }
+
+    #[test]
+    fn load_variant_inspection_set_reads_stored_variant_digests() {
+        let run_dir = temp_dir("variant_inspection");
+        seed_variant_run(&run_dir);
+
+        let inspection = load_variant_inspection_set(&run_dir).expect("load inspection");
+        assert_eq!(inspection.experiment_id.as_deref(), Some("exp_variants"));
+        assert_eq!(inspection.baseline_id, "baseline");
+        assert_eq!(inspection.variants.len(), 2);
+
+        let baseline = find_variant_inspection(&inspection, "baseline").expect("baseline");
+        let candidate = find_variant_inspection(&inspection, "candidate").expect("candidate");
+
+        assert!(baseline.is_baseline);
+        assert_eq!(
+            baseline
+                .code_surface
+                .get("artifact_digest")
+                .and_then(Value::as_str),
+            Some("sha256:base")
+        );
+        assert_eq!(
+            candidate
+                .code_surface
+                .get("artifact_digest")
+                .and_then(Value::as_str),
+            Some("sha256:candidate")
+        );
+        assert_eq!(candidate.agent_ref.as_deref(), Some("candidate_build"));
+        assert_eq!(
+            baseline.variant_digest,
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        );
+        assert_eq!(
+            candidate.variant_digest,
+            "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        );
+        assert_eq!(
+            candidate
+                .behavior_surface
+                .pointer("/runtime/agent_runtime/env/PARALLEL_TOOLS")
+                .and_then(Value::as_str),
+            Some("1")
+        );
+
+        let _ = std::fs::remove_dir_all(&run_dir);
+    }
+
+    #[test]
+    fn diff_variant_surfaces_reports_nested_runtime_changes() {
+        let run_dir = temp_dir("variant_diff");
+        seed_variant_run(&run_dir);
+        let inspection = load_variant_inspection_set(&run_dir).expect("load inspection");
+        let baseline = find_variant_inspection(&inspection, "baseline").expect("baseline");
+        let candidate = find_variant_inspection(&inspection, "candidate").expect("candidate");
+
+        let diffs = diff_variant_surfaces(baseline, candidate);
+        assert!(
+            diffs.iter().any(|entry| entry.path == "runtime.agent_runtime.artifact_digest"),
+            "expected artifact digest diff, got {:?}",
+            diffs
+        );
+        assert!(
+            diffs.iter().any(|entry| entry.path == "agent_ref"),
+            "expected agent_ref diff, got {:?}",
+            diffs
+        );
+
+        let _ = std::fs::remove_dir_all(&run_dir);
+    }
+
+    #[test]
+    fn load_variant_inspection_set_rejects_missing_variant_digest() {
+        let run_dir = temp_dir("variant_missing_digest");
+        seed_variant_run(&run_dir);
+        let mut manifest =
+            read_json_file(&run_dir.join("resolved_variants.json")).expect("resolved variants");
+        let variants = manifest
+            .pointer_mut("/variants")
+            .and_then(Value::as_array_mut)
+            .expect("variant array");
+        variants[0]
+            .as_object_mut()
+            .expect("variant object")
+            .remove("variant_digest");
+        std::fs::write(
+            run_dir.join("resolved_variants.json"),
+            serde_json::to_vec_pretty(&manifest).expect("serialize manifest"),
+        )
+        .expect("write manifest");
+
+        let err = load_variant_inspection_set(&run_dir).expect_err("missing variant_digest");
+        assert!(err.to_string().contains("missing variant_digest"), "{}", err);
+
+        let _ = std::fs::remove_dir_all(&run_dir);
+    }
+
+    #[test]
+    fn build_variants_list_table_exposes_baseline_and_variant_digest() {
+        let run_dir = temp_dir("variant_list_table");
+        seed_variant_run(&run_dir);
+        let inspection = load_variant_inspection_set(&run_dir).expect("load inspection");
+        let table = build_variants_list_table(&inspection);
+
+        assert_eq!(
+            table.columns,
+            vec![
+                "baseline".to_string(),
+                "variant_id".to_string(),
+                "variant_digest".to_string(),
+                "artifact_digest".to_string(),
+                "image".to_string(),
+                "agent_ref".to_string(),
+            ]
+        );
+        assert_eq!(table.rows.len(), 2);
+        assert_eq!(table.rows[0][0], Value::String("yes".to_string()));
+        assert_eq!(table.rows[0][1], Value::String("baseline".to_string()));
+        assert_eq!(table.rows[1][5], Value::String("candidate_build".to_string()));
+
+        let _ = std::fs::remove_dir_all(&run_dir);
+    }
+
     #[test]
     fn query_run_sqlite_cleans_temp_exports_and_keeps_real_run_id_in_metadata() {
         let run_dir = temp_dir("sqlite_query_cleanup");
@@ -5202,7 +5787,10 @@ mod tests {
         let summary = summarize_run_control(Some(&control));
         assert_eq!(summary.status, "running");
         assert_eq!(summary.active_trials, 1);
-        assert_eq!(summary.status_display, "running (active_trials=1, workers=worker_a)");
+        assert_eq!(
+            summary.status_display,
+            "running (active_trials=1, workers=worker_a)"
+        );
         assert_eq!(summary.live_summary, "1 active / worker_a");
         assert!(summary.is_active);
     }

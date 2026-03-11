@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import os
@@ -248,6 +249,35 @@ def _aux_mount(dataset_pack_ref: str, mount_path: str) -> dict[str, Any]:
     }
 
 
+def _dependency_file(
+    path: str,
+    content: str,
+    *,
+    encoding: str = "utf8",
+    executable: bool = False,
+) -> dict[str, Any]:
+    return {
+        "path": path,
+        "content": content,
+        "encoding": encoding,
+        "executable": executable,
+    }
+
+
+def _dependency_file_from_host(
+    path: str,
+    source: Path,
+    *,
+    executable: bool = False,
+) -> dict[str, Any]:
+    return _dependency_file(
+        path,
+        base64.b64encode(source.read_bytes()).decode("ascii"),
+        encoding="base64",
+        executable=executable,
+    )
+
+
 def _task_row(
     *,
     task_id: str,
@@ -256,6 +286,7 @@ def _task_row(
     workspace_base_ref: str | None = None,
     workspace_overlays: list[dict[str, Any]] | None = None,
     workspace_aux_mounts: list[dict[str, Any]] | None = None,
+    dependency_files: list[dict[str, Any]] | None = None,
     observe: dict[str, Any] | None = None,
     resolved_if_match: float = 1.0,
     resolved_if_miss: float = 0.0,
@@ -284,13 +315,16 @@ def _task_row(
         workspace_mode = "scratch"
         workspace_base = {"kind": "empty"}
     row: dict[str, Any] = {
-        "schema_version": "task_boundary_v3",
+        "schema_version": "task_spec_v1",
         "task": task,
         "workspace": {
             "mode": workspace_mode,
             "base": workspace_base,
             "overlays": workspace_overlays or [],
             "aux_mounts": workspace_aux_mounts or [],
+        },
+        "dependencies": {
+            "files": dependency_files or [],
         },
         "limits": {},
     }
@@ -305,35 +339,29 @@ def _base_experiment(
     dataset_path: str,
     artifact_path: str,
     image_tag: str,
-    image_source: str = "global",
     agent_command: list[str] | None = None,
+    agent_network: str = "none",
+    agent_root_read_only: bool = True,
+    agent_user: str | None = None,
     baseline_bindings: dict[str, Any] | None = None,
     variant_plan: list[dict[str, Any]] | None = None,
     comparison: str = "paired",
-    require_workspace_materialization: bool = False,
     benchmark: bool = False,
     state_policy: str | None = None,
 ) -> dict[str, Any]:
-    runtime_agent: dict[str, Any] = {
+    runtime_agent_runtime: dict[str, Any] = {
         "command": agent_command or ["e2e-agent"],
-        "bundle": artifact_path,
-        "io": {
-            "input_arg": "--input",
-            "output_arg": "--output",
-        },
+        "artifact": artifact_path,
+        "image": image_tag,
+        "network": agent_network,
+        "root_read_only": agent_root_read_only,
         "env": {},
         "env_from_host": [],
     }
-    runtime_sandbox: dict[str, Any] = {
-        "executor": "docker",
-        "image_source": image_source,
-        "profile": "default",
-        "network": "none",
-    }
-    if image_source != "per_task":
-        runtime_sandbox["image"] = image_tag
+    if agent_user is not None:
+        runtime_agent_runtime["user"] = agent_user
     experiment: dict[str, Any] = {
-        "version": "0.5",
+        "version": "0.6",
         "experiment": {
             "id": exp_id,
             "name": exp_id,
@@ -346,7 +374,7 @@ def _base_experiment(
             "suite_id": exp_id,
             "provider": "local_jsonl",
             "path": dataset_path,
-            "schema_version": "task_boundary_v3",
+            "schema_version": "task_spec_v1",
             "split_id": "test",
             "limit": 10,
         },
@@ -374,17 +402,13 @@ def _base_experiment(
         },
         "variant_plan": variant_plan or [],
         "runtime": {
-            "agent": runtime_agent,
-            "sandbox": runtime_sandbox,
-            "dependencies": {
-                "file_staging": [],
-                "services": [],
-            },
-            "policy": {
-                "timeout_ms": DEFAULT_RUN_TIMEOUT_SECONDS * 1000,
-                "network": {
-                    "allowed_hosts": [],
-                },
+            "agent_runtime": runtime_agent_runtime,
+        },
+        "policy": {
+            "timeout_ms": DEFAULT_RUN_TIMEOUT_SECONDS * 1000,
+            "task_sandbox": {
+                "profile": "default",
+                "network": "none",
             },
         },
         "validity": {
@@ -397,10 +421,6 @@ def _base_experiment(
         },
     }
     policies: dict[str, Any] = {}
-    if require_workspace_materialization:
-        policies["task_boundary"] = {
-            "require_workspace_materialization": True,
-        }
     if state_policy is not None:
         policies["state"] = state_policy
     if policies:
@@ -411,10 +431,10 @@ def _base_experiment(
                 "evaluator_mode": "custom",
                 "scoring_lifecycle": "predict_then_score",
             },
-            "adapter": {
+            "grader": {
                 "command": [
                     "python3",
-                    "/opt/agent/bench/integration/agentlab/bench_benchmark_adapter.py",
+                    "/agentlab/deps/bench_benchmark_adapter.py",
                 ]
             },
         }
@@ -445,20 +465,36 @@ def _run_package(
     lab_cli_bin: Path,
     project: ProjectLayout,
     package_dir: Path,
+    *,
+    expected_exit: int = 0,
 ) -> dict[str, Any]:
     payload = _run_lab(
         lab_cli_bin,
         "run",
         package_dir,
-        "--executor",
-        "local_docker",
         "--materialize",
         "full",
         "--json",
         cwd=project.root,
+        expected_exit=expected_exit,
     )
-    assert payload["ok"] is True
+    if expected_exit == 0:
+        assert payload["ok"] is True
     return payload
+
+
+def _load_agent_report(trial_dir: Path) -> dict[str, Any]:
+    return _read_json(trial_dir / "out" / "agent_report.json")
+
+
+def _assert_trial_hermetic(run_dir: Path, trial_dir: Path) -> None:
+    attestation = _read_json(run_dir / "attestation.json")
+    grades = attestation.get("grades") or attestation.get("grades_summary") or {}
+    assert grades.get("isolation_grade") == "hermetic"
+
+    inventory = _read_json(trial_dir / "state_inventory.json")
+    assert inventory["planes"]["agent_runtime"]["executor"] == "docker"
+    assert inventory["planes"]["task_sandbox"]["executor"] == "docker"
 
 
 def _create_simple_project(
@@ -468,17 +504,18 @@ def _create_simple_project(
     *,
     exp_id: str,
     rows: list[dict[str, Any]],
-    image_source: str = "global",
     baseline_bindings: dict[str, Any] | None = None,
     variant_plan: list[dict[str, Any]] | None = None,
     comparison: str = "paired",
     benchmark: bool = False,
-    require_workspace_materialization: bool = False,
     agent_command: list[str] | None = None,
+    agent_network: str = "none",
+    agent_root_read_only: bool = True,
+    agent_user: str | None = None,
     state_policy: str | None = None,
 ) -> tuple[ProjectLayout, Path]:
     project = _make_project(tmp_path, artifact_bundle)
-    dataset_path = project.experiment_data_dir / f"{exp_id}.task_boundary_v3.jsonl"
+    dataset_path = project.experiment_data_dir / f"{exp_id}.task_spec_v1.jsonl"
     _write_jsonl(dataset_path, rows)
     experiment_path = project.experiments_dir / f"{exp_id}.yaml"
     experiment = _base_experiment(
@@ -486,13 +523,14 @@ def _create_simple_project(
         dataset_path=_relpath(dataset_path, project.experiments_dir),
         artifact_path=_relpath(project.agents_dir / "agent-runtime.tar.gz", project.experiments_dir),
         image_tag=image_tag,
-        image_source=image_source,
         baseline_bindings=baseline_bindings,
         variant_plan=variant_plan,
         comparison=comparison,
         benchmark=benchmark,
-        require_workspace_materialization=require_workspace_materialization,
         agent_command=agent_command,
+        agent_network=agent_network,
+        agent_root_read_only=agent_root_read_only,
+        agent_user=agent_user,
         state_policy=state_policy,
     )
     experiment["dataset"]["limit"] = len(rows)
@@ -506,14 +544,15 @@ def _export_benchmark_dataset(
     base_task_image: str,
     limit: int = 1,
 ) -> tuple[Path, list[dict[str, Any]]]:
-    dataset_path = project.experiment_data_dir / "bench_v0.task_boundary_v3.jsonl"
+    exported_path = project.experiment_data_dir / "bench_v0.exported.task_boundary_v3.jsonl"
+    dataset_path = project.experiment_data_dir / "bench_v0.task_spec_v1.jsonl"
     script = REPO_ROOT / "bench" / "integration" / "agentlab" / "export_bench_suite_to_jsonl.py"
     _run_python(
         script,
         "--suite",
         "v0",
         "--output",
-        dataset_path,
+        exported_path,
         "--default-task-image",
         base_task_image,
         "--dataset-pack-root",
@@ -522,12 +561,19 @@ def _export_benchmark_dataset(
         str(limit),
         cwd=REPO_ROOT,
     )
-    rows = [
+    exported_rows = [
         json.loads(line)
-        for line in dataset_path.read_text(encoding="utf-8").splitlines()
+        for line in exported_path.read_text(encoding="utf-8").splitlines()
         if line.strip()
     ]
-    assert rows, "expected exported benchmark dataset rows"
+    assert exported_rows, "expected exported benchmark dataset rows"
+    rows: list[dict[str, Any]] = []
+    for row in exported_rows:
+        converted = dict(row)
+        converted["schema_version"] = "task_spec_v1"
+        converted.setdefault("dependencies", {"files": []})
+        rows.append(converted)
+    _write_jsonl(dataset_path, rows)
     return dataset_path, rows
 
 
@@ -572,7 +618,6 @@ def _prepare_benchmark_experiment(
         dataset_path=_relpath(dataset_path, project.experiments_dir),
         artifact_path=_relpath(project.agents_dir / "agent-runtime.tar.gz", project.experiments_dir),
         image_tag=image_tag,
-        image_source="per_task",
         benchmark=True,
         agent_command=[
             "python3",
@@ -583,21 +628,18 @@ def _prepare_benchmark_experiment(
             "bench_agent_command": ["write-empty-patch"],
         },
     )
-    experiment["runtime"]["dependencies"]["file_staging"] = [
-        {
-            "source_from_host": _relpath(grader_wrapper, project.experiments_dir),
-            "destination_path": "/agentlab/deps/bench_benchmark_adapter_entry.py",
-            "required": True,
-            "read_only": True,
-        },
-        {
-            "source_from_host": _relpath(support_archive, project.experiments_dir),
-            "destination_path": "/agentlab/deps/bench_support.tar.gz",
-            "required": True,
-            "read_only": True,
-        },
+    dependency_files = [
+        _dependency_file(
+            "bench_benchmark_adapter_entry.py",
+            grader_wrapper.read_text(encoding="utf-8"),
+        ),
+        _dependency_file_from_host("bench_support.tar.gz", support_archive),
     ]
-    experiment["benchmark"]["adapter"]["command"] = [
+    for row in rows:
+        row.setdefault("dependencies", {"files": []})
+        row["dependencies"]["files"].extend(dependency_files)
+    _write_jsonl(dataset_path, rows)
+    experiment["benchmark"]["grader"]["command"] = [
         "python3",
         "/agentlab/deps/bench_benchmark_adapter_entry.py",
     ]
@@ -725,7 +767,7 @@ def artifact_bundle(tmp_path_factory: pytest.TempPathFactory) -> Path:
         "    echo \"warn: CPU lacks AVX support, strange crashes may occur.\" >&2\n"
         "    echo \"[harness] Agent 'coding' references tool 'Skill' which is not available\"\n"
         "fi\n"
-        "out=''\n"
+        "out=\"${AGENTLAB_RESULT_PATH:-}\"\n"
         "while [ \"$#\" -gt 0 ]; do\n"
         "  case \"$1\" in\n"
         "    --output)\n"
@@ -874,8 +916,6 @@ def test_run_plane_rejects_authoring_input(
         lab_cli_bin,
         "run",
         experiment_path,
-        "--executor",
-        "local_docker",
         "--json",
         cwd=project.root,
         expected_exit=1,
@@ -942,7 +982,6 @@ def test_missing_per_task_image_fails_preflight(
         fixture_image,
         exp_id="missing_per_task_image_fails_preflight",
         rows=rows,
-        image_source="per_task",
     )
 
     package_dir = _build_package(
@@ -962,7 +1001,7 @@ def test_missing_per_task_image_fails_preflight(
     _assert_failed_check_contains(
         preflight,
         "container_ready",
-        "failed to parse task image boundary rows",
+        "environment.image must be a non-empty string",
     )
 
 
@@ -997,7 +1036,7 @@ def test_build_rejects_legacy_experiment_version(
         cwd=project.root,
         expected_exit=1,
     )
-    _assert_command_failed(build, "legacy experiment version '1.0'")
+    _assert_command_failed(build, "unsupported resolved experiment version '1.0'")
 
 
 @pytest.mark.e2e_build_preflight
@@ -1157,6 +1196,46 @@ def test_preflight_rejects_missing_result_payload_contract_smoke(
     )
 
 
+@pytest.mark.e2e_build_preflight
+def test_preflight_rejects_dangerous_agent_command(
+    tmp_path: Path,
+    lab_cli_bin: Path,
+    artifact_bundle: Path,
+    fixture_image: str,
+) -> None:
+    rows = [
+        _task_row(task_id="TASK_DANGEROUS_REJECT", task_image=fixture_image),
+    ]
+    project, experiment_path = _create_simple_project(
+        tmp_path,
+        artifact_bundle,
+        fixture_image,
+        exp_id="preflight_rejects_dangerous_agent_command",
+        rows=rows,
+        agent_command=["e2e-agent", "--dangerous"],
+    )
+
+    package_dir = _build_package(
+        lab_cli_bin,
+        project,
+        experiment_path,
+        "preflight_rejects_dangerous_agent_command_pkg",
+    )
+    preflight = _run_lab(
+        lab_cli_bin,
+        "preflight",
+        package_dir,
+        "--json",
+        cwd=project.root,
+    )
+    assert preflight["ok"] is False
+    _assert_failed_check_contains(
+        preflight,
+        "dangerous_mode_forbidden",
+        "--dangerous",
+    )
+
+
 #
 # Runtime contract boundaries
 #
@@ -1219,30 +1298,46 @@ def test_run_happy_path_writes_sqlite_and_artifacts(
     assert variant_summary["ok"] is True
     assert len(variant_summary["result"]["rows"]) == 1
 
-    query = _run_lab(
-        lab_cli_bin,
-        "query",
-        run_dir,
-        "SELECT COUNT(*) AS n FROM trials",
-        "--json",
-        cwd=project.root,
-    )
-    assert query["ok"] is True
-    assert int(_table_rows(query["result"])[0]["n"]) == 1
 
-    trials = _run_lab(
-        lab_cli_bin,
-        "query",
-        run_dir,
-        "SELECT outcome, primary_metric_name, primary_metric_value, bindings FROM trials LIMIT 1",
-        "--json",
-        cwd=project.root,
+@pytest.mark.e2e_runtime
+def test_scientific_run_executes_agent_in_container_not_host(
+    tmp_path: Path,
+    lab_cli_bin: Path,
+    artifact_bundle: Path,
+    fixture_image: str,
+) -> None:
+    rows = [
+        _task_row(task_id="TASK_HERMETIC_AGENT_RUNTIME", task_image=fixture_image),
+    ]
+    project, experiment_path = _create_simple_project(
+        tmp_path,
+        artifact_bundle,
+        fixture_image,
+        exp_id="scientific_run_executes_agent_in_container_not_host",
+        rows=rows,
     )
-    row = _table_rows(trials["result"])[0]
-    assert row["outcome"] == "success"
-    assert row["primary_metric_name"] == "resolved"
-    assert float(row["primary_metric_value"]) == 1.0
-    assert row["bindings"]["variant_label"] == "control"
+
+    package_dir = _build_package(
+        lab_cli_bin,
+        project,
+        experiment_path,
+        "scientific_run_executes_agent_in_container_not_host_pkg",
+    )
+    run_payload = _run_package(lab_cli_bin, project, package_dir)
+    run_dir = Path(run_payload["run"]["run_dir"])
+    trial_dir = _only_trial_dir(run_dir)
+    agent_report = _load_agent_report(trial_dir)
+
+    assert agent_report["env"]["workspace"] == "/agentlab/workspace"
+    assert agent_report["cwd"] == "/agentlab/workspace"
+    assert ".scratch" not in json.dumps(agent_report, sort_keys=True)
+
+    harness_stdout = (trial_dir / "harness_stdout.log").read_text(encoding="utf-8")
+    harness_stderr = (trial_dir / "harness_stderr.log").read_text(encoding="utf-8")
+    assert ".scratch" not in harness_stdout
+    assert ".scratch" not in harness_stderr
+
+    _assert_trial_hermetic(run_dir, trial_dir)
 
 
 @pytest.mark.e2e_runtime
@@ -1498,7 +1593,7 @@ def test_materialize_full_persists_workspace_base_overlays_and_aux_mounts(
     project = _make_project(tmp_path, artifact_bundle)
     seed_ref = _materialize_dataset_pack(project, {"seed/README.txt": "seed ready\n"})
     mount_ref = _materialize_dataset_pack(project, {"reference.txt": "mounted reference\n"})
-    dataset_path = project.experiment_data_dir / "materialize_full.task_boundary_v3.jsonl"
+    dataset_path = project.experiment_data_dir / "materialize_full.task_spec_v1.jsonl"
     rows = [
         _task_row(
             task_id="TASK_MATERIALIZE",
@@ -1530,7 +1625,6 @@ def test_materialize_full_persists_workspace_base_overlays_and_aux_mounts(
         dataset_path=_relpath(dataset_path, project.experiments_dir),
         artifact_path=_relpath(project.agents_dir / "agent-runtime.tar.gz", project.experiments_dir),
         image_tag=fixture_image,
-        require_workspace_materialization=True,
     )
     experiment["dataset"]["limit"] = 1
     _write_yaml(experiment_path, experiment)
@@ -1568,9 +1662,9 @@ def test_materialize_full_persists_workspace_base_overlays_and_aux_mounts(
     assert observed["obs_seed_file_text_match"] == 1
     assert observed["obs_overlay_file_exists"] == 1
     assert observed["obs_overlay_file_text_match"] == 1
-    assert observed["obs_mount_file_exists"] == 0
-    assert "obs_mount_file_text_match" not in observed
-    assert "obs_mount_file_write_blocked" not in observed
+    assert observed["obs_mount_file_exists"] == 1
+    assert observed["obs_mount_file_text_match"] == 1
+    assert observed["obs_mount_file_write_blocked"] == 1
 
 
 @pytest.mark.e2e_cli_surface
@@ -1689,7 +1783,7 @@ def test_benchmark_export_build_run_writes_prediction_and_score(
         artifact_bundle,
         fixture_image,
     )
-    assert rows[0]["schema_version"] == "task_boundary_v3"
+    assert rows[0]["schema_version"] == "task_spec_v1"
     assert rows[0]["environment"]["image"]
     assert rows[0]["workspace"]["base"]["dataset_pack_ref"].startswith("sha256:")
 
@@ -1758,7 +1852,7 @@ def test_benchmark_preflight_rejects_unreachable_grader_command(
         fixture_image,
     )
     experiment = yaml.safe_load(experiment_path.read_text(encoding="utf-8"))
-    experiment["benchmark"]["adapter"]["command"] = [
+    experiment["benchmark"]["grader"]["command"] = [
         "python3",
         "/agentlab/deps/missing_benchmark_adapter_entry.py",
     ]
@@ -1781,12 +1875,7 @@ def test_benchmark_preflight_rejects_unreachable_grader_command(
     _assert_failed_check_contains(
         preflight,
         "benchmark_grader_reachable",
-        "benchmark grader contract smoke failed in required images",
-    )
-    _assert_failed_check_contains(
-        preflight,
-        "benchmark_grader_reachable",
-        "contract smoke exited with status 125",
+        "benchmark grader contract smoke failed in required task images",
     )
 
 
@@ -1803,13 +1892,23 @@ def test_benchmark_preflight_rejects_grader_that_never_writes_score_contract(
         artifact_bundle,
         fixture_image,
     )
-    support_root = project.root / "bench_support"
-    grader_wrapper = support_root / "bench_benchmark_adapter_entry.py"
-    grader_wrapper.write_text(
-        "from __future__ import annotations\n"
-        "print('grader launched but wrote nothing')\n",
-        encoding="utf-8",
+    experiment = yaml.safe_load(experiment_path.read_text(encoding="utf-8"))
+    dataset_path = project.experiments_dir / experiment["dataset"]["path"]
+    rows = [
+        json.loads(line)
+        for line in dataset_path.read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    files = rows[0]["dependencies"]["files"]
+    grader_wrapper = next(
+        entry for entry in files if entry["path"] == "bench_benchmark_adapter_entry.py"
     )
+    grader_wrapper["content"] = (
+        "from __future__ import annotations\n"
+        "print('grader launched but wrote nothing')\n"
+    )
+    grader_wrapper["encoding"] = "utf8"
+    _write_jsonl(dataset_path, rows)
 
     package_dir = _build_package(
         lab_cli_bin,
@@ -1843,7 +1942,7 @@ def test_benchmark_run_marks_missing_result_before_grader_executes(
     rows = [
         _task_row(task_id="TASK_BENCH_RESULT_MISSING", task_image=fixture_image),
     ]
-    dataset_path = project.experiment_data_dir / "benchmark_missing_result.task_boundary_v3.jsonl"
+    dataset_path = project.experiment_data_dir / "benchmark_missing_result.task_spec_v1.jsonl"
     _write_jsonl(dataset_path, rows)
 
     support_root = project.root / "bench_support"
@@ -1865,6 +1964,16 @@ def test_benchmark_run_marks_missing_result_before_grader_executes(
         "runpy.run_path(str(adapter_path), run_name='__main__')\n",
         encoding="utf-8",
     )
+    rows[0]["dependencies"]["files"].extend(
+        [
+            _dependency_file(
+                "bench_benchmark_adapter_entry.py",
+                grader_wrapper.read_text(encoding="utf-8"),
+            ),
+            _dependency_file_from_host("bench_support.tar.gz", support_archive),
+        ]
+    )
+    _write_jsonl(dataset_path, rows)
 
     experiment_path = project.experiments_dir / "benchmark_missing_result.yaml"
     experiment = _base_experiment(
@@ -1879,21 +1988,7 @@ def test_benchmark_run_marks_missing_result_before_grader_executes(
         },
     )
     experiment["dataset"]["limit"] = 1
-    experiment["runtime"]["dependencies"]["file_staging"] = [
-        {
-            "source_from_host": _relpath(grader_wrapper, project.experiments_dir),
-            "destination_path": "/agentlab/deps/bench_benchmark_adapter_entry.py",
-            "required": True,
-            "read_only": True,
-        },
-        {
-            "source_from_host": _relpath(support_archive, project.experiments_dir),
-            "destination_path": "/agentlab/deps/bench_support.tar.gz",
-            "required": True,
-            "read_only": True,
-        },
-    ]
-    experiment["benchmark"]["adapter"]["command"] = [
+    experiment["benchmark"]["grader"]["command"] = [
         "python3",
         "/agentlab/deps/bench_benchmark_adapter_entry.py",
     ]
@@ -1954,8 +2049,6 @@ def test_build_run_executes_end_to_end_in_one_command(
         experiment_path,
         "--out",
         project.builds_dir / "build_run_pkg",
-        "--executor",
-        "local_docker",
         "--materialize",
         "full",
         "--json",

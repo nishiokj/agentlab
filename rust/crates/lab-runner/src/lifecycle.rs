@@ -119,9 +119,6 @@ impl TrialExecutor {
         let agent_runtime_env = &variant_runtime.agent_runtime_env;
         let trial_experiment = &variant_runtime.experiment;
         let invocation_source = variant_runtime.invocation_source.clone();
-        let invocation_default_timeout_ms = variant_runtime.invocation_default_timeout_ms;
-        let executor_kind = variant_runtime.executor_kind;
-        let container_mode = variant_runtime.container_mode;
         let configured_network_mode = variant_runtime.configured_network_mode.as_str();
         let effective_network_mode = variant_runtime.effective_network_mode.as_str();
         let task_idx = slot.task_idx;
@@ -136,7 +133,7 @@ impl TrialExecutor {
             .and_then(|v| v.as_str())
             .map(|s| s.to_string())
             .unwrap_or_else(|| format!("task_{}", task_idx));
-        let benchmark_grading_enabled = benchmark_config.adapter.is_some()
+        let benchmark_grading_enabled = benchmark_config.grader.is_some()
             && task_boundary
                 .task_payload
                 .pointer("/grading/enabled")
@@ -168,7 +165,7 @@ impl TrialExecutor {
 
         let trial_paths = TrialPaths::new(&trial_dir, project_root)?;
         trial_paths.prepare(false)?;
-        stage_dependencies_for_trial(agent_runtime, &trial_paths)?;
+        materialize_task_dependencies_for_trial(&task_boundary, &trial_paths)?;
         if matches!(effective_policy.state_policy, StatePolicy::IsolatePerTrial)
             || !has_chain_snapshot
         {
@@ -187,12 +184,8 @@ impl TrialExecutor {
         }
 
         materialize_workspace_overlays(&trial_paths, &task_boundary.workspace.overlays)?;
-        stage_workspace_patches_for_trial(agent_runtime, &trial_paths)?;
-        let dynamic_mounts = resolve_workspace_aux_mounts(
-            project_root,
-            &task_boundary.workspace.aux_mounts,
-            container_mode,
-        )?;
+        let dynamic_mounts =
+            resolve_workspace_aux_mounts(project_root, &task_boundary.workspace.aux_mounts)?;
 
         let input = build_agent_task(
             trial_experiment,
@@ -202,7 +195,6 @@ impl TrialExecutor {
             task_idx,
             repl,
             &task_boundary,
-            agent_runtime,
         );
         let input_bytes = serde_json::to_vec_pretty(&input)?;
         let trial_input_ref = artifact_store.put_bytes(&input_bytes)?;
@@ -230,10 +222,18 @@ impl TrialExecutor {
                 "task_index": task_idx
             },
             "runtime": {
-                "container_mode": container_mode,
                 "integration_level": agent_runtime.integration_level.as_str(),
                 "network_mode_requested": configured_network_mode,
-                "network_mode_effective": effective_network_mode
+                "network_mode_effective": effective_network_mode,
+                "agent_runtime": {
+                    "image": agent_runtime.image.clone(),
+                    "workspace": AGENTLAB_CONTRACT_WORKSPACE_DIR,
+                },
+                "task_sandbox": {
+                    "executor": "docker",
+                    "image": task_boundary.task_image.clone(),
+                    "workspace": AGENTLAB_CONTRACT_WORKSPACE_DIR
+                }
             },
             "policy_merge": {
                 "global_defaults": {
@@ -274,7 +274,7 @@ impl TrialExecutor {
         });
         atomic_write_json_pretty(&trial_dir.join("trial_metadata.json"), &trial_metadata)?;
 
-        let io_paths = prepare_io_paths(&trial_paths, container_mode, &input_bytes)?;
+        let io_paths = prepare_io_paths(&trial_paths, &input_bytes)?;
         stage_benchmark_trial_preflight(
             benchmark_config,
             &trial_dir,
@@ -290,7 +290,7 @@ impl TrialExecutor {
             run_id,
             &input,
             &io_paths,
-            resolve_trial_timeout_ms(&input, invocation_default_timeout_ms),
+            resolve_trial_timeout_ms(&input),
         );
         let benchmark_prediction_path = trial_paths.out.join(BENCHMARK_PREDICTION_FILENAME);
         let benchmark_score_path = trial_paths.out.join(BENCHMARK_SCORE_FILENAME);
@@ -320,37 +320,6 @@ impl TrialExecutor {
         let mut result_parse_error: Option<String> = None;
         let trial_started_at = Instant::now();
         for attempt in 0..policy_config.retry_max_attempts {
-            let mut otel_receiver = None;
-            let mut otel_manifest = None;
-            if agent_runtime.tracing_mode == Some("otlp".to_string()) {
-                if container_mode
-                    && trial_experiment
-                        .pointer("/runtime/sandbox/network")
-                        .and_then(|v| v.as_str())
-                        == Some("none")
-                {
-                    otel_manifest = Some(json!({
-                        "schema_version": "trace_manifest_v1",
-                        "mode": "none",
-                        "reason": "network_none",
-                    }));
-                } else {
-                    let receiver =
-                        lab_otel::OtlpReceiver::start(0, ArtifactStore::new(trial_dir.join("artifacts")))?;
-                    let endpoint = receiver.endpoint.clone();
-                    otel_receiver = Some(receiver);
-                    otel_manifest = Some(json!({
-                        "schema_version": "trace_manifest_v1",
-                        "mode": "otlp",
-                        "endpoint": endpoint,
-                    }));
-                }
-            }
-
-            let setup_command = match mode {
-                ScheduleEngineMode::FreshRun => behavior.setup_command.as_deref(),
-                ScheduleEngineMode::ContinueRun => None,
-            };
             let _ = fs::remove_file(&benchmark_prediction_path);
             let _ = fs::remove_file(&benchmark_score_path);
             let _ = fs::remove_file(&benchmark_grade_error_path);
@@ -361,32 +330,18 @@ impl TrialExecutor {
                 variant_args: &variant_runtime.variant_args,
                 runtime_env: &runtime_env,
                 runtime_overrides_env: agent_runtime_env,
-                container_mode: matches!(executor_kind, ExecutorKind::LocalDocker),
                 trial_paths: &trial_paths,
                 dynamic_mounts: &dynamic_mounts,
                 io_paths: &io_paths,
                 network_mode: effective_network_mode,
-                setup_command,
-                benchmark_adapter: benchmark_config.adapter.as_ref(),
+                benchmark_grader: benchmark_config.grader.as_ref(),
                 benchmark_grading_enabled,
                 run_id,
                 task_image: Some(task_boundary.task_image.as_str()),
-                agent_artifact: agent_runtime.agent_artifact.as_deref(),
+                agent_artifact: Some(agent_runtime.agent_artifact.as_path()),
             };
             let proc_result = adapter.run_trial(&run_request)?;
             status = proc_result.status;
-
-            if let Some(receiver) = otel_receiver {
-                let records = receiver.records();
-                receiver.stop();
-                if let Some(mut manifest) = otel_manifest {
-                    if let Some(obj) = manifest.as_object_mut() {
-                        obj.insert("records".to_string(), serde_json::to_value(records)?);
-                    }
-                    let path = trial_dir.join("trace_manifest.json");
-                    atomic_write_json_pretty(&path, &manifest)?;
-                }
-            }
 
             let (loaded_output, parse_error) = load_trial_output_resilient(&io_paths.output_host)?;
             trial_output = loaded_output;
@@ -545,7 +500,7 @@ impl TrialExecutor {
                 "chain_step_index": chain_step_index
             },
             "runtime": {
-                "executor": executor_kind.as_str(),
+                "executor": "docker",
                 "exit_status": status.as_str(),
                 "duration_ms": trial_duration_ms
             },
@@ -642,14 +597,14 @@ impl TrialExecutor {
             &trial_dir,
             trial_experiment,
             agent_runtime,
-            container_mode,
             &trial_paths,
             &resolve_exec_digest(&agent_runtime.command_raw, project_root)?,
             effective_network_mode,
             invocation_source.as_str(),
+            Some(task_boundary.task_image.as_str()),
         )?;
 
-        let manifest_path = resolve_agent_runtime_manifest_path(&trial_paths, container_mode)?;
+        let manifest_path = resolve_agent_runtime_manifest_path(&trial_paths)?;
         if manifest_path.exists() && io_paths.events_host.exists() {
             let manifest = load_manifest(&manifest_path)?;
             let schema = compile_schema("hook_events_v1.jsonschema")?;
@@ -777,7 +732,6 @@ impl TrialExecutor {
             outcome: outcome.clone(),
             success: outcome == "success" && grade_error_reason.is_none(),
             status_code: status.clone(),
-            container_mode,
             integration_level: agent_runtime.integration_level.clone(),
             network_mode_requested: configured_network_mode.to_string(),
             network_mode_effective: effective_network_mode.to_string(),
@@ -809,7 +763,7 @@ impl TrialExecutor {
             Some("result_error".to_string())
         };
 
-        let _ = materialize_mode;
+        materialize_trial_runtime_layout(&trial_dir, &trial_paths, materialize_mode)?;
         trial_paths.cleanup_scratch()?;
 
         let slot_status = if grade_error_reason.is_none() && status == "0" && outcome != "error" {
@@ -2377,7 +2331,12 @@ fn rewrite_runtime_paths_for_package(
     artifact_counter: &mut usize,
     file_counter: &mut usize,
 ) -> Result<()> {
-    if let Some(raw) = runtime_root.pointer("/agent/bundle").and_then(Value::as_str) {
+    let _ = file_copies;
+    let _ = file_counter;
+    if let Some(raw) = runtime_root
+        .pointer("/agent_runtime/artifact")
+        .and_then(Value::as_str)
+    {
         let rel = stage_source_into_package(
             raw,
             exp_dir,
@@ -2387,51 +2346,12 @@ fn rewrite_runtime_paths_for_package(
             artifact_copies,
             artifact_counter,
         )?;
-        set_json_pointer_value(runtime_root, "/agent/bundle", json!(rel.clone()))?;
-        set_json_pointer_value(runtime_root, "/agent/bundle_resolved_path", json!(rel))?;
-    }
-
-    if let Some(file_staging) = runtime_root
-        .pointer_mut("/dependencies/file_staging")
-        .and_then(Value::as_array_mut)
-    {
-        for entry in file_staging.iter_mut() {
-            if let Some(raw) = entry.get("source_from_host").and_then(Value::as_str) {
-                let rel = stage_source_into_package(
-                    raw,
-                    exp_dir,
-                    package_dir,
-                    "files",
-                    "dep",
-                    file_copies,
-                    file_counter,
-                )?;
-                if let Some(obj) = entry.as_object_mut() {
-                    obj.insert("source_from_host".to_string(), json!(rel));
-                }
-            }
-        }
-    }
-    if let Some(workspace_patches) = runtime_root
-        .pointer_mut("/agent/workspace_patches")
-        .and_then(Value::as_array_mut)
-    {
-        for entry in workspace_patches.iter_mut() {
-            if let Some(raw) = entry.get("source_from_host").and_then(Value::as_str) {
-                let rel = stage_source_into_package(
-                    raw,
-                    exp_dir,
-                    package_dir,
-                    "files",
-                    "patch",
-                    file_copies,
-                    file_counter,
-                )?;
-                if let Some(obj) = entry.as_object_mut() {
-                    obj.insert("source_from_host".to_string(), json!(rel));
-                }
-            }
-        }
+        set_json_pointer_value(runtime_root, "/agent_runtime/artifact", json!(rel.clone()))?;
+        set_json_pointer_value(
+            runtime_root,
+            "/agent_runtime/artifact_resolved_path",
+            json!(rel),
+        )?;
     }
     Ok(())
 }
@@ -2636,7 +2556,6 @@ pub fn build_experiment_package(
 
 fn run_experiment_with_behavior(
     path: &Path,
-    use_container: bool,
     behavior: RunBehavior,
     execution: RunExecutionOptions,
 ) -> Result<RunResult> {
@@ -2688,7 +2607,7 @@ fn run_experiment_with_behavior(
     let tasks = load_tasks(&dataset_path, &json_value)?;
 
     let (variants, baseline_id) = resolve_variant_plan(&json_value)?;
-    write_resolved_variants(&run_dir, &baseline_id, &variants)?;
+    write_resolved_variants(&run_dir, &json_value, &baseline_id, &variants)?;
     let replications = json_value
         .pointer("/design/replications")
         .and_then(|v| v.as_u64())
@@ -2717,7 +2636,6 @@ fn run_experiment_with_behavior(
             &json_value,
             variant,
             &run_dir,
-            use_container,
             &behavior,
             &execution,
         )?;
@@ -2728,9 +2646,7 @@ fn run_experiment_with_behavior(
         .first()
         .map(|profile| profile.agent_runtime.integration_level.clone())
         .unwrap_or_else(|| "cli_basic".to_string());
-    let all_container_mode = variant_runtime_profiles
-        .iter()
-        .all(|profile| profile.container_mode);
+    let isolation_grade = resolve_run_isolation_grade(&variant_runtime_profiles, &behavior);
 
     // Preflight checks — abort before trial execution if anything is fatally wrong
     {
@@ -2840,7 +2756,6 @@ fn run_experiment_with_behavior(
         completed_slots: Vec::new(),
         pruned_variants: Vec::new(),
         consecutive_failures: BTreeMap::new(),
-        use_container,
         updated_at: Utc::now().to_rfc3339(),
     };
     write_schedule_progress(&run_dir, &schedule_progress)?;
@@ -2891,11 +2806,19 @@ fn run_experiment_with_behavior(
         &task_chain_states_path,
     );
 
+    if isolation_grade != "hermetic" {
+        run_guard.complete("invalid_isolation")?;
+        return Err(anyhow!(
+            "scientific run completed without hermetic isolation (got {})",
+            isolation_grade
+        ));
+    }
+
     let grades = json!({
         "schema_version": "grades_v1",
         "integration_level": run_integration_level,
         "replay_grade": "best_effort",
-        "isolation_grade": if all_container_mode {"bounded"} else {"leaky"},
+        "isolation_grade": isolation_grade,
         "comparability_grade": "unknown",
         "provenance_grade": "recorded",
         "privacy_grade": "unknown"
@@ -2941,24 +2864,16 @@ pub fn describe_experiment(path: &Path) -> Result<ExperimentSummary> {
         &json_value,
         baseline_variant,
         &exp_dir,
-        false,
         &RunBehavior::default(),
         &RunExecutionOptions::default(),
     )?;
     let preflight_runtime_profiles = vec![runtime_profile.clone()];
     let VariantRuntimeProfile {
-        experiment: runtime_experiment,
         agent_runtime: runtime_agent,
-        container_mode,
         configured_network_mode: network_mode,
         ..
     } = runtime_profile;
-    let image = runtime_agent.container_image.clone().or_else(|| {
-        runtime_experiment
-            .pointer("/runtime/policy/sandbox/image")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string())
-    });
+    let image = Some(runtime_agent.image.clone());
 
     let exp_id = json_value
         .pointer("/experiment/id")
@@ -2994,7 +2909,6 @@ pub fn describe_experiment(path: &Path) -> Result<ExperimentSummary> {
                 &json_value,
                 baseline_variant,
                 &exp_dir,
-                false,
                 &RunBehavior::default(),
                 &RunExecutionOptions::default(),
             )?,
@@ -3023,7 +2937,6 @@ pub fn describe_experiment(path: &Path) -> Result<ExperimentSummary> {
         variant_count,
         total_trials,
         agent_runtime_command: runtime_agent.command_raw,
-        container_mode,
         image,
         network_mode,
         trajectory_path: runtime_agent.trajectory_path,

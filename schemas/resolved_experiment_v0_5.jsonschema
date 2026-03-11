@@ -141,14 +141,13 @@
     "runtime": {
       "type": "object",
       "additionalProperties": true,
-      "required": ["agent", "dependencies", "policy"],
+      "required": ["agent", "sandbox", "dependencies", "policy"],
       "properties": {
         "agent": {
           "type": "object",
           "additionalProperties": true,
-          "required": ["mode"],
+          "required": ["command"],
           "properties": {
-            "mode": { "type": "string", "enum": ["known_agent_ref", "custom_image"] },
             "command": {
               "oneOf": [
                 { "type": "string", "minLength": 1 },
@@ -159,67 +158,35 @@
                 }
               ]
             },
-            "aliases": {
-              "type": "object",
-              "additionalProperties": {
-                "oneOf": [
-                  { "type": "string", "minLength": 1 },
-                  {
-                    "type": "array",
-                    "items": { "type": "string", "minLength": 1 },
-                    "minItems": 1
-                  }
-                ]
-              }
-            },
-            "adapter": {
-              "type": "object",
-              "additionalProperties": false,
-              "required": ["id", "version"],
-              "properties": {
-                "id": { "type": "string", "minLength": 1 },
-                "version": { "type": "string", "minLength": 1 }
-              }
-            },
-            "known_agent_ref": {
-              "type": "object",
-              "additionalProperties": false,
-              "required": ["id", "version"],
-              "properties": {
-                "id": { "type": "string", "minLength": 1 },
-                "version": { "type": "string", "minLength": 1 },
-                "registry": { "type": "string", "minLength": 1 }
-              }
-            },
-            "custom_image": {
+            "bundle": { "type": "string", "minLength": 1 },
+            "bundle_digest": { "type": "string", "minLength": 1 },
+            "bundle_resolved_path": { "type": "string", "minLength": 1 },
+            "io": {
               "type": "object",
               "additionalProperties": true,
               "properties": {
+                "input_arg": { "type": "string", "minLength": 1 },
+                "output_arg": { "type": "string", "minLength": 1 }
+              }
+            },
+            "execution": {
+              "type": "object",
+              "additionalProperties": true,
+              "properties": {
+                "executor": { "type": "string", "enum": ["docker", "local_process"] },
                 "image": { "type": "string", "minLength": 1 },
-                "entrypoint": {
-                  "type": "array",
-                  "items": { "type": "string", "minLength": 1 },
-                  "minItems": 1
-                }
+                "network": { "type": "string", "minLength": 1 },
+                "root_read_only": { "type": "boolean" },
+                "user": { "type": "string", "minLength": 1 }
               }
             },
-            "overrides": {
+            "env": {
               "type": "object",
-              "additionalProperties": true,
-              "properties": {
-                "args": {
-                  "type": "array",
-                  "items": { "type": "string", "minLength": 1 }
-                },
-                "env": {
-                  "type": "object",
-                  "additionalProperties": { "type": "string" }
-                },
-                "env_from_host": {
-                  "type": "array",
-                  "items": { "type": "string", "minLength": 1 }
-                }
-              }
+              "additionalProperties": { "type": "string" }
+            },
+            "env_from_host": {
+              "type": "array",
+              "items": { "type": "string", "minLength": 1 }
             }
           }
         },

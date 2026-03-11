@@ -1,0 +1,112 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agent-lab.local/schemas/task_spec_v1.json",
+  "title": "Task Spec v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "task",
+    "environment",
+    "workspace",
+    "dependencies",
+    "limits"
+  ],
+  "properties": {
+    "schema_version": { "const": "task_spec_v1" },
+    "task": {
+      "type": "object",
+      "required": ["id"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1 }
+      },
+      "additionalProperties": true
+    },
+    "environment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["image"],
+      "properties": {
+        "image": { "type": "string", "minLength": 1 }
+      }
+    },
+    "workspace": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["mode", "base", "overlays", "aux_mounts"],
+      "properties": {
+        "mode": {
+          "type": "string",
+          "enum": ["scratch", "patch"]
+        },
+        "base": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind"],
+          "properties": {
+            "kind": {
+              "type": "string",
+              "enum": ["empty", "dataset_pack", "git_checkout"]
+            },
+            "dataset_pack_ref": {
+              "type": "string",
+              "pattern": "^sha256:[0-9a-f]{64}$"
+            },
+            "repo": { "type": "string", "minLength": 1 },
+            "commit": { "type": "string", "minLength": 1 }
+          }
+        },
+        "overlays": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["path", "content"],
+            "properties": {
+              "path": { "type": "string", "minLength": 1 },
+              "content": { "type": "string" },
+              "encoding": { "type": "string", "enum": ["utf8", "base64"] },
+              "executable": { "type": "boolean" }
+            }
+          }
+        },
+        "aux_mounts": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["dataset_pack_ref", "mount_path"],
+            "properties": {
+              "dataset_pack_ref": {
+                "type": "string",
+                "pattern": "^sha256:[0-9a-f]{64}$"
+              },
+              "mount_path": { "type": "string", "minLength": 1 }
+            }
+          }
+        }
+      }
+    },
+    "dependencies": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "files": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["path", "content"],
+            "properties": {
+              "path": { "type": "string", "minLength": 1 },
+              "content": { "type": "string" },
+              "encoding": { "type": "string", "enum": ["utf8", "base64"] },
+              "executable": { "type": "boolean" }
+            }
+          }
+        }
+      }
+    },
+    "limits": { "type": "object" }
+  }
+}

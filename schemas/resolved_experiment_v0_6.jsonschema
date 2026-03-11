@@ -1,0 +1,225 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agent-lab.local/schemas/resolved_experiment_v0_6.json",
+  "title": "Resolved Experiment v0.6",
+  "type": "object",
+  "additionalProperties": true,
+  "required": ["version", "experiment", "dataset", "design", "baseline", "runtime", "policy"],
+  "properties": {
+    "version": { "const": "0.6" },
+    "experiment": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["id", "name", "workload_type"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "name": { "type": "string", "minLength": 1 },
+        "workload_type": { "type": "string", "minLength": 1 },
+        "description": { "type": "string" },
+        "owner": { "type": "string" }
+      }
+    },
+    "dataset": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["path", "provider", "suite_id", "schema_version", "split_id"],
+      "properties": {
+        "path": { "type": "string", "minLength": 1 },
+        "provider": { "type": "string", "minLength": 1 },
+        "suite_id": { "type": "string", "minLength": 1 },
+        "schema_version": { "const": "task_spec_v1" },
+        "split_id": { "type": "string", "minLength": 1 },
+        "limit": { "type": "integer", "minimum": 1 }
+      }
+    },
+    "design": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["sanitization_profile", "comparison", "replications", "random_seed", "shuffle_tasks", "max_concurrency"],
+      "properties": {
+        "sanitization_profile": { "type": "string", "minLength": 1 },
+        "comparison": { "type": "string", "enum": ["paired", "unpaired", "none"] },
+        "replications": { "type": "integer", "minimum": 1 },
+        "random_seed": { "type": "integer" },
+        "shuffle_tasks": { "type": "boolean" },
+        "max_concurrency": { "type": "integer", "minimum": 1 },
+        "policies": {
+          "type": "object",
+          "additionalProperties": true,
+          "properties": {
+            "scheduling": {
+              "type": "string",
+              "enum": ["paired_interleaved", "variant_sequential", "randomized"]
+            },
+            "retry": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "max_attempts": { "type": "integer", "minimum": 1 },
+                "retry_on": {
+                  "type": "array",
+                  "items": { "type": "string", "enum": ["error", "timeout", "failure"] }
+                }
+              }
+            },
+            "pruning": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "max_consecutive_failures": { "type": "integer", "minimum": 1 }
+              }
+            },
+            "concurrency": {
+              "type": "object",
+              "additionalProperties": false,
+              "properties": {
+                "max_in_flight_per_variant": { "type": "integer", "minimum": 1 },
+                "require_chain_lease": { "type": "boolean" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "baseline": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["variant_id", "bindings"],
+      "properties": {
+        "variant_id": { "type": "string", "minLength": 1 },
+        "bindings": { "type": "object" }
+      }
+    },
+    "variant_plan": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": true,
+        "required": ["variant_id", "bindings"],
+        "properties": {
+          "variant_id": { "type": "string", "minLength": 1 },
+          "bindings": { "type": "object" },
+          "runtime_overrides": {
+            "type": "object",
+            "additionalProperties": true
+          }
+        }
+      }
+    },
+    "benchmark": {
+      "type": "object",
+      "additionalProperties": true,
+      "properties": {
+        "policy": {
+          "type": "object",
+          "additionalProperties": true,
+          "properties": {
+            "task_model": { "type": "string", "enum": ["independent", "dependent"] },
+            "evaluator_mode": { "type": "string", "enum": ["official", "custom"] },
+            "scoring_lifecycle": { "type": "string", "enum": ["predict_then_score", "integrated_score"] },
+            "required_evidence_classes": {
+              "type": "array",
+              "items": { "type": "string", "minLength": 1 }
+            },
+            "chain_failure_policy": { "type": "string", "enum": ["stop_on_error", "continue_with_flag"] }
+          }
+        },
+        "grader": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["command"],
+          "properties": {
+            "command": {
+              "type": "array",
+              "items": { "type": "string", "minLength": 1 },
+              "minItems": 1
+            }
+          }
+        }
+      }
+    },
+    "runtime": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["agent_runtime"],
+      "properties": {
+        "agent_runtime": {
+          "type": "object",
+          "additionalProperties": true,
+          "required": ["artifact", "image", "command"],
+          "properties": {
+            "artifact": { "type": "string", "minLength": 1 },
+            "artifact_digest": { "type": "string", "minLength": 1 },
+            "artifact_resolved_path": { "type": "string", "minLength": 1 },
+            "image": { "type": "string", "minLength": 1 },
+            "command": {
+              "oneOf": [
+                { "type": "string", "minLength": 1 },
+                {
+                  "type": "array",
+                  "items": { "type": "string", "minLength": 1 },
+                  "minItems": 1
+                }
+              ]
+            },
+            "network": { "type": "string", "minLength": 1 },
+            "root_read_only": { "type": "boolean" },
+            "user": { "type": "string", "minLength": 1 },
+            "env": {
+              "type": "object",
+              "additionalProperties": { "type": "string" }
+            },
+            "env_from_host": {
+              "type": "array",
+              "items": { "type": "string", "minLength": 1 }
+            },
+            "binding_args": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["key", "flag"],
+                "properties": {
+                  "key": { "type": "string", "minLength": 1 },
+                  "flag": { "type": "string", "minLength": 1 }
+                }
+              }
+            }
+          }
+        },
+        "telemetry": {
+          "type": "object",
+          "additionalProperties": true,
+          "properties": {
+            "trajectory_path": { "type": "string", "minLength": 1 },
+            "causal_extraction": { "type": "string", "minLength": 1 }
+          }
+        }
+      }
+    },
+    "policy": {
+      "type": "object",
+      "additionalProperties": true,
+      "required": ["timeout_ms", "task_sandbox"],
+      "properties": {
+        "timeout_ms": { "type": "integer", "minimum": 1 },
+        "task_sandbox": {
+          "type": "object",
+          "additionalProperties": true,
+          "required": ["profile", "network"],
+          "properties": {
+            "profile": { "type": "string", "minLength": 1 },
+            "network": {
+              "type": "string",
+              "enum": ["none", "full", "allowlist_enforced"]
+            },
+            "allowed_hosts": {
+              "type": "array",
+              "items": { "type": "string", "minLength": 1 }
+            }
+          }
+        }
+      }
+    }
+  }
+}

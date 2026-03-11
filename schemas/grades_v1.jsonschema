@@ -25,7 +25,7 @@
     },
     "isolation_grade": {
       "type": "string",
-      "enum": ["hermetic", "bounded", "leaky"]
+      "enum": ["hermetic", "non_hermetic_dev", "invalid"]
     },
     "comparability_grade": {
       "type": "string",

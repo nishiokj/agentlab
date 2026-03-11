@@ -1,4 +1,3 @@
-use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -177,29 +176,6 @@ pub(crate) struct WorkerPauseAck {
     pub(crate) accepted: bool,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum AgentLaunchMode {
-    File,
-    Stdio,
-}
-
-impl AgentLaunchMode {
-    pub(crate) fn as_str(self) -> &'static str {
-        match self {
-            Self::File => "file",
-            Self::Stdio => "stdio",
-        }
-    }
-
-    pub(crate) fn parse(raw: Option<&str>) -> Result<Self> {
-        match raw.unwrap_or("file") {
-            "file" => Ok(Self::File),
-            "stdio" => Ok(Self::Stdio),
-            other => Err(anyhow!("unsupported launch mode: {}", other)),
-        }
-    }
-}
-
 #[derive(Debug)]
 pub struct RunResult {
     pub run_dir: PathBuf,
@@ -359,23 +335,22 @@ pub(crate) struct PendingTrialCompletionRecord {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RunBehavior {
-    pub setup_command: Option<String>,
     pub network_mode_override: Option<String>,
     pub require_network_none: bool,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum ExecutorKind {
+pub(crate) enum ExecutorKind {
     LocalDocker,
-    LocalProcess,
 }
 
+#[cfg(test)]
 impl ExecutorKind {
-    pub fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::LocalDocker => "local_docker",
-            Self::LocalProcess => "local_process",
         }
     }
 }
@@ -402,6 +377,7 @@ impl MaterializationMode {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RunExecutionOptions {
+    #[cfg(test)]
     pub executor: Option<ExecutorKind>,
     pub materialize: Option<MaterializationMode>,
     #[serde(skip, default)]
@@ -507,7 +483,6 @@ pub struct ExperimentSummary {
     pub variant_count: usize,
     pub total_trials: usize,
     pub agent_runtime_command: Vec<String>,
-    pub container_mode: bool,
     pub image: Option<String>,
     pub network_mode: String,
     pub trajectory_path: Option<String>,
@@ -729,15 +704,19 @@ impl Default for BenchmarkPolicyConfig {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct BenchmarkAdapterConfig {
+pub(crate) struct BenchmarkGraderConfig {
     pub(crate) command: Vec<String>,
-    pub(crate) manifest: Option<Value>,
 }
+
+#[cfg(test)]
+type BenchmarkAdapterConfig = BenchmarkGraderConfig;
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct BenchmarkConfig {
     pub(crate) policy: BenchmarkPolicyConfig,
-    pub(crate) adapter: Option<BenchmarkAdapterConfig>,
+    pub(crate) grader: Option<BenchmarkGraderConfig>,
+    #[cfg(test)]
+    pub(crate) adapter: Option<BenchmarkGraderConfig>,
 }
 
 #[derive(Debug, Clone)]
@@ -760,6 +739,7 @@ pub(crate) struct ChainRuntimeState {
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct TaskBoundaryPolicy {
+    #[cfg(test)]
     pub(crate) require_workspace_materialization: bool,
 }
 
@@ -836,7 +816,6 @@ pub(crate) struct ScheduleProgress {
     pub(crate) completed_slots: Vec<SlotCompletion>,
     pub(crate) pruned_variants: Vec<usize>,
     pub(crate) consecutive_failures: BTreeMap<usize, usize>,
-    pub(crate) use_container: bool,
     pub(crate) updated_at: String,
 }
 
@@ -845,7 +824,14 @@ pub(crate) struct ResolvedVariantsManifest {
     pub(crate) schema_version: String,
     pub(crate) generated_at: String,
     pub(crate) baseline_id: String,
-    pub(crate) variants: Vec<Variant>,
+    pub(crate) variants: Vec<ResolvedVariant>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct ResolvedVariant {
+    pub(crate) variant_digest: String,
+    #[serde(flatten)]
+    pub(crate) variant: Variant,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -869,25 +855,6 @@ pub(crate) struct Variant {
 // ---------------------------------------------------------------------------
 // Type declarations from runner_part5_runtime_io.rs
 // ---------------------------------------------------------------------------
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) enum ImageSource {
-    Global,
-    PerTask,
-}
-
-impl ImageSource {
-    pub(crate) fn parse(raw: Option<&str>) -> Result<Self> {
-        match raw.unwrap_or("global") {
-            "global" => Ok(Self::Global),
-            "per_task" => Ok(Self::PerTask),
-            other => Err(anyhow!(
-                "runtime.sandbox.image_source must be 'global' or 'per_task' (got '{}')",
-                other
-            )),
-        }
-    }
-}
 
 #[derive(Debug, Clone)]
 pub(crate) struct ResolvedMountReference {

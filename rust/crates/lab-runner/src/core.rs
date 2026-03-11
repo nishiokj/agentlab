@@ -181,13 +181,11 @@ struct AdapterRunRequest<'a> {
     variant_args: &'a [String],
     runtime_env: &'a BTreeMap<String, String>,
     runtime_overrides_env: &'a BTreeMap<String, String>,
-    container_mode: bool,
     trial_paths: &'a TrialPaths,
     dynamic_mounts: &'a [ResolvedMountReference],
     io_paths: &'a PreparedTrialIo,
     network_mode: &'a str,
-    setup_command: Option<&'a str>,
-    benchmark_adapter: Option<&'a BenchmarkAdapterConfig>,
+    benchmark_grader: Option<&'a BenchmarkGraderConfig>,
     benchmark_grading_enabled: bool,
     run_id: &'a str,
     task_image: Option<&'a str>,
@@ -1044,6 +1042,7 @@ fn commit_record_by_schedule(records: &[SlotCommitRecord]) -> BTreeMap<usize, Sl
 }
 fn normalize_execution_options(execution: &RunExecutionOptions) -> RunExecutionOptions {
     RunExecutionOptions {
+        #[cfg(test)]
         executor: execution.executor,
         materialize: Some(execution.materialize.unwrap_or(MaterializationMode::Full)),
         runtime_env: execution.runtime_env.clone(),
@@ -1053,6 +1052,7 @@ fn normalize_execution_options(execution: &RunExecutionOptions) -> RunExecutionO
 
 fn execution_options_for_session_state(execution: &RunExecutionOptions) -> RunExecutionOptions {
     RunExecutionOptions {
+        #[cfg(test)]
         executor: execution.executor,
         materialize: Some(execution.materialize.unwrap_or(MaterializationMode::Full)),
         runtime_env: BTreeMap::new(),
@@ -1441,38 +1441,12 @@ fn create_unique_run_dir(project_root: &Path) -> Result<(String, PathBuf)> {
 }
 
 
-pub fn run_experiment(path: &Path, use_container: bool) -> Result<RunResult> {
-    run_experiment_with_behavior(
-        path,
-        use_container,
-        RunBehavior::default(),
-        RunExecutionOptions::default(),
-    )
+pub fn run_experiment(path: &Path) -> Result<RunResult> {
+    run_experiment_with_behavior(path, RunBehavior::default(), RunExecutionOptions::default())
 }
 
-pub fn run_experiment_dev(path: &Path, setup_command: Option<String>) -> Result<RunResult> {
-    run_experiment_dev_with_options(path, setup_command, RunExecutionOptions::default())
-}
-
-pub fn run_experiment_dev_with_options(
-    path: &Path,
-    setup_command: Option<String>,
-    options: RunExecutionOptions,
-) -> Result<RunResult> {
-    let behavior = RunBehavior {
-        setup_command,
-        network_mode_override: Some("full".to_string()),
-        require_network_none: false,
-    };
-    run_experiment_with_behavior(path, true, behavior, options)
-}
-
-pub fn run_experiment_with_options(
-    path: &Path,
-    use_container: bool,
-    options: RunExecutionOptions,
-) -> Result<RunResult> {
-    run_experiment_with_behavior(path, use_container, RunBehavior::default(), options)
+pub fn run_experiment_with_options(path: &Path, options: RunExecutionOptions) -> Result<RunResult> {
+    run_experiment_with_behavior(path, RunBehavior::default(), options)
 }
 
 pub fn run_experiment_strict(path: &Path) -> Result<RunResult> {
@@ -1484,11 +1458,10 @@ pub fn run_experiment_strict_with_options(
     options: RunExecutionOptions,
 ) -> Result<RunResult> {
     let behavior = RunBehavior {
-        setup_command: None,
         network_mode_override: None,
         require_network_none: true,
     };
-    run_experiment_with_behavior(path, true, behavior, options)
+    run_experiment_with_behavior(path, behavior, options)
 }
 
 /// Derive the project root from a run directory path.

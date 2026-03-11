@@ -28,7 +28,6 @@ pub fn preflight_experiment(path: &Path) -> Result<PreflightReport> {
             &json_value,
             variant,
             &exp_dir,
-            false,
             &RunBehavior::default(),
             &RunExecutionOptions::default(),
         )?);
@@ -71,13 +70,6 @@ pub fn preflight_experiment(path: &Path) -> Result<PreflightReport> {
     Ok(PreflightReport { passed, checks })
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
-struct ContainerReadinessCheckKey {
-    container_mode: bool,
-    image_source: ImageSource,
-    container_image: Option<String>,
-}
-
 #[derive(Debug, Default)]
 struct PerTaskImageScanResult {
     unique_images: Vec<String>,
@@ -111,6 +103,247 @@ fn annotate_preflight_check_with_variants(
         format!("variants [{}]: ", variant_ids.join(", "))
     };
     check.message = format!("{}{}", prefix, check.message);
+}
+
+fn check_agent_runtime_hermetic_for_variants(
+    variants: &[Variant],
+    variant_runtime_profiles: &[VariantRuntimeProfile],
+) -> Vec<PreflightCheck> {
+    if variants.len() != variant_runtime_profiles.len() {
+        return vec![PreflightCheck {
+            name: "agent_runtime_hermetic",
+            passed: false,
+            severity: PreflightSeverity::Error,
+            message: "internal error: variant/runtime profile count mismatch".to_string(),
+        }];
+    }
+
+    variants
+        .iter()
+        .zip(variant_runtime_profiles.iter())
+        .map(|(variant, profile)| {
+            let mut check = check_agent_runtime_hermetic(profile);
+            check.message = format!("variant '{}': {}", variant.id, check.message);
+            check
+        })
+        .collect()
+}
+
+fn check_agent_runtime_hermetic(runtime_profile: &VariantRuntimeProfile) -> PreflightCheck {
+    let name = "agent_runtime_hermetic";
+    if runtime_profile
+        .agent_runtime
+        .image
+        .trim()
+        .is_empty()
+    {
+        return PreflightCheck {
+            name,
+            passed: false,
+            severity: PreflightSeverity::Error,
+            message: "runtime.agent_runtime.image is required in scientific runs".to_string(),
+        };
+    }
+    PreflightCheck {
+        name,
+        passed: true,
+        severity: PreflightSeverity::Error,
+        message: "agent runtime is pinned to a container image".to_string(),
+    }
+}
+
+fn check_dangerous_mode_forbidden_for_variants(
+    variants: &[Variant],
+    variant_runtime_profiles: &[VariantRuntimeProfile],
+) -> Vec<PreflightCheck> {
+    if variants.len() != variant_runtime_profiles.len() {
+        return vec![PreflightCheck {
+            name: "dangerous_mode_forbidden",
+            passed: false,
+            severity: PreflightSeverity::Error,
+            message: "internal error: variant/runtime profile count mismatch".to_string(),
+        }];
+    }
+
+    variants
+        .iter()
+        .zip(variant_runtime_profiles.iter())
+        .map(|(variant, profile)| {
+            let mut check = check_dangerous_mode_forbidden(profile);
+            check.message = format!("variant '{}': {}", variant.id, check.message);
+            check
+        })
+        .collect()
+}
+
+fn check_dangerous_mode_forbidden(runtime_profile: &VariantRuntimeProfile) -> PreflightCheck {
+    let name = "dangerous_mode_forbidden";
+    let command = preview_agent_command(runtime_profile);
+    if let Some(token) = command_contains_scientific_bypass(&command) {
+        return PreflightCheck {
+            name,
+            passed: false,
+            severity: PreflightSeverity::Error,
+            message: format!(
+                "resolved agent argv contains forbidden scientific bypass token '{}'",
+                token
+            ),
+        };
+    }
+    PreflightCheck {
+        name,
+        passed: true,
+        severity: PreflightSeverity::Error,
+        message: "resolved agent argv does not enable dangerous mode".to_string(),
+    }
+}
+
+fn check_workspace_contract_not_host_path_for_variants(
+    variants: &[Variant],
+    variant_runtime_profiles: &[VariantRuntimeProfile],
+) -> Vec<PreflightCheck> {
+    if variants.len() != variant_runtime_profiles.len() {
+        return vec![PreflightCheck {
+            name: "workspace_contract_not_host_path",
+            passed: false,
+            severity: PreflightSeverity::Error,
+            message: "internal error: variant/runtime profile count mismatch".to_string(),
+        }];
+    }
+
+    variants
+        .iter()
+        .zip(variant_runtime_profiles.iter())
+        .map(|(variant, profile)| {
+            let mut check = check_workspace_contract_not_host_path(profile);
+            check.message = format!("variant '{}': {}", variant.id, check.message);
+            check
+        })
+        .collect()
+}
+
+fn check_workspace_contract_not_host_path(
+    runtime_profile: &VariantRuntimeProfile,
+) -> PreflightCheck {
+    let name = "workspace_contract_not_host_path";
+    let command = preview_agent_command(runtime_profile);
+    if command
+        .iter()
+        .any(|value| value_contains_host_scratch_path(value))
+    {
+        return PreflightCheck {
+            name,
+            passed: false,
+            severity: PreflightSeverity::Error,
+            message: "agent argv contains runner scratch host paths".to_string(),
+        };
+    }
+    if runtime_profile
+        .agent_runtime_env
+        .values()
+        .any(|value| value_contains_host_scratch_path(value))
+    {
+        return PreflightCheck {
+            name,
+            passed: false,
+            severity: PreflightSeverity::Error,
+            message: "agent env contains runner scratch host paths".to_string(),
+        };
+    }
+    PreflightCheck {
+        name,
+        passed: true,
+        severity: PreflightSeverity::Error,
+        message: "agent-visible argv/env do not expose runner scratch host paths".to_string(),
+    }
+}
+
+fn check_agent_bundle_container_compatible_for_variants(
+    variants: &[Variant],
+    variant_runtime_profiles: &[VariantRuntimeProfile],
+) -> Vec<PreflightCheck> {
+    if variants.len() != variant_runtime_profiles.len() {
+        return vec![PreflightCheck {
+            name: "agent_bundle_container_compatible",
+            passed: false,
+            severity: PreflightSeverity::Error,
+            message: "internal error: variant/runtime profile count mismatch".to_string(),
+        }];
+    }
+
+    variants
+        .iter()
+        .zip(variant_runtime_profiles.iter())
+        .map(|(variant, profile)| {
+            let mut check = check_agent_bundle_container_compatible(profile);
+            check.message = format!("variant '{}': {}", variant.id, check.message);
+            check
+        })
+        .collect()
+}
+
+fn check_agent_bundle_container_compatible(
+    runtime_profile: &VariantRuntimeProfile,
+) -> PreflightCheck {
+    let name = "agent_bundle_container_compatible";
+    let artifact_name = runtime_profile
+        .agent_runtime
+        .agent_artifact
+        .file_name()
+        .and_then(|value| value.to_str())
+        .unwrap_or_default();
+    if artifact_name.ends_with(".host.tar.gz") || artifact_name.ends_with(".host.tgz") {
+        return PreflightCheck {
+            name,
+            passed: false,
+            severity: PreflightSeverity::Error,
+            message: format!(
+                "host-specific runtime.agent_runtime.artifact '{}' is forbidden in scientific runs",
+                artifact_name
+            ),
+        };
+    }
+    PreflightCheck {
+        name,
+        passed: true,
+        severity: PreflightSeverity::Error,
+        message: "runtime.agent_runtime.artifact is compatible with container execution"
+            .to_string(),
+    }
+}
+
+fn check_task_sandbox_bash_plane_for_variants(
+    variants: &[Variant],
+    variant_runtime_profiles: &[VariantRuntimeProfile],
+) -> Vec<PreflightCheck> {
+    if variants.len() != variant_runtime_profiles.len() {
+        return vec![PreflightCheck {
+            name: "task_sandbox_bash_plane",
+            passed: false,
+            severity: PreflightSeverity::Error,
+            message: "internal error: variant/runtime profile count mismatch".to_string(),
+        }];
+    }
+
+    variants
+        .iter()
+        .zip(variant_runtime_profiles.iter())
+        .map(|(variant, profile)| {
+            let mut check = check_task_sandbox_bash_plane(profile);
+            check.message = format!("variant '{}': {}", variant.id, check.message);
+            check
+        })
+        .collect()
+}
+
+fn check_task_sandbox_bash_plane(runtime_profile: &VariantRuntimeProfile) -> PreflightCheck {
+    let name = "task_sandbox_bash_plane";
+    PreflightCheck {
+        name,
+        passed: true,
+        severity: PreflightSeverity::Error,
+        message: "task-sandbox shell operations are constrained to docker execution".to_string(),
+    }
 }
 
 fn check_benchmark_grader_reachable_for_variants(
@@ -157,31 +390,16 @@ fn check_container_ready_for_variants(
     if variants.is_empty() || variant_runtime_profiles.is_empty() {
         return Vec::new();
     }
-    let mut grouped: BTreeMap<ContainerReadinessCheckKey, Vec<usize>> = BTreeMap::new();
-    for (idx, profile) in variant_runtime_profiles.iter().enumerate() {
-        let key = ContainerReadinessCheckKey {
-            container_mode: profile.container_mode,
-            image_source: profile.agent_runtime.image_source,
-            container_image: profile.agent_runtime.container_image.clone(),
-        };
-        grouped.entry(key).or_default().push(idx);
-    }
-
     let mut checks = Vec::new();
-    for indices in grouped.values() {
-        let representative = indices[0];
+    for (variant, runtime_profile) in variants.iter().zip(variant_runtime_profiles.iter()) {
         let mut scoped_checks = check_container_ready(
-            &variant_runtime_profiles[representative],
+            runtime_profile,
             tasks,
             per_task_scan,
             skip_shell_probe,
         );
-        let variant_ids = indices
-            .iter()
-            .filter_map(|idx| variants.get(*idx).map(|variant| variant.id.clone()))
-            .collect::<Vec<_>>();
         for check in &mut scoped_checks {
-            annotate_preflight_check_with_variants(check, &variant_ids, variants.len());
+            check.message = format!("variant '{}': {}", variant.id, check.message);
         }
         checks.extend(scoped_checks);
     }
@@ -222,62 +440,49 @@ fn collect_per_task_images_for_preflight(tasks: &[Value]) -> PerTaskImageScanRes
 
 fn resolve_preflight_images(
     check_name: &'static str,
-    runtime_profile: &VariantRuntimeProfile,
+    _runtime_profile: &VariantRuntimeProfile,
     tasks: &[Value],
     per_task_scan: Option<&PerTaskImageScanResult>,
-    missing_global_image_message: &'static str,
+    _missing_global_image_message: &'static str,
 ) -> Result<Vec<String>, PreflightCheck> {
-    match runtime_profile.agent_runtime.image_source {
-        ImageSource::Global => match runtime_profile.agent_runtime.container_image.as_deref() {
-            Some(image) => Ok(vec![image.to_string()]),
-            None => Err(PreflightCheck {
-                name: check_name,
-                passed: false,
-                severity: PreflightSeverity::Error,
-                message: missing_global_image_message.to_string(),
-            }),
-        },
-        ImageSource::PerTask => {
-            let owned_scan;
-            let scan = if let Some(scan) = per_task_scan {
-                scan
-            } else {
-                owned_scan = collect_per_task_images_for_preflight(tasks);
-                &owned_scan
-            };
-            if !scan.parse_errors.is_empty() {
-                return Err(PreflightCheck {
-                    name: check_name,
-                    passed: false,
-                    severity: PreflightSeverity::Error,
-                    message: format!(
-                        "failed to parse task image boundary rows: {}",
-                        format_preview(&scan.parse_errors, 3)
-                    ),
-                });
-            }
-            if !scan.missing_task_ids.is_empty() {
-                return Err(PreflightCheck {
-                    name: check_name,
-                    passed: false,
-                    severity: PreflightSeverity::Error,
-                    message: format!(
-                        "tasks missing environment.image in per-task sandbox mode: {}",
-                        format_preview(&scan.missing_task_ids, 5)
-                    ),
-                });
-            }
-            if scan.unique_images.is_empty() {
-                return Err(PreflightCheck {
-                    name: check_name,
-                    passed: false,
-                    severity: PreflightSeverity::Error,
-                    message: "no task images found in dataset for per-task image mode".to_string(),
-                });
-            }
-            Ok(scan.unique_images.clone())
-        }
+    let owned_scan;
+    let scan = if let Some(scan) = per_task_scan {
+        scan
+    } else {
+        owned_scan = collect_per_task_images_for_preflight(tasks);
+        &owned_scan
+    };
+    if !scan.parse_errors.is_empty() {
+        return Err(PreflightCheck {
+            name: check_name,
+            passed: false,
+            severity: PreflightSeverity::Error,
+            message: format!(
+                "failed to parse task specs while collecting task images: {}",
+                format_preview(&scan.parse_errors, 3)
+            ),
+        });
     }
+    if !scan.missing_task_ids.is_empty() {
+        return Err(PreflightCheck {
+            name: check_name,
+            passed: false,
+            severity: PreflightSeverity::Error,
+            message: format!(
+                "tasks missing environment.image: {}",
+                format_preview(&scan.missing_task_ids, 5)
+            ),
+        });
+    }
+    if scan.unique_images.is_empty() {
+        return Err(PreflightCheck {
+            name: check_name,
+            passed: false,
+            severity: PreflightSeverity::Error,
+            message: "no task images found in dataset".to_string(),
+        });
+    }
+    Ok(scan.unique_images.clone())
 }
 
 fn has_blocking_preflight_error(checks: &[PreflightCheck], name: &str) -> bool {
@@ -688,15 +893,12 @@ fn collect_preflight_checks(
         });
         return checks;
     }
-    let needs_per_task_scan = variant_runtime_profiles.iter().any(|profile| {
-        profile.container_mode && profile.agent_runtime.image_source == ImageSource::PerTask
-    });
-    let per_task_scan = if needs_per_task_scan {
+    let per_task_scan = if !tasks.is_empty() {
         Some(collect_per_task_images_for_preflight(tasks))
     } else {
         None
     };
-    let skip_container_shell_probe = benchmark_config.adapter.is_some();
+    let skip_container_shell_probe = benchmark_config.grader.is_some();
 
     // Structural checks (probe_trial_input, dataset_task_ids) are now
     // validated at build time in build_swebench_curated_ab_experiment.mjs.
@@ -731,6 +933,46 @@ fn collect_preflight_checks(
         "provider_model_wiring",
         checks.push(check_provider_model_wiring(
             json_value,
+            variants,
+            variant_runtime_profiles,
+        ))
+    );
+    emit_preflight_log("running check: agent_runtime_hermetic");
+    timed_check!(
+        "agent_runtime_hermetic",
+        checks.extend(check_agent_runtime_hermetic_for_variants(
+            variants,
+            variant_runtime_profiles,
+        ))
+    );
+    emit_preflight_log("running check: dangerous_mode_forbidden");
+    timed_check!(
+        "dangerous_mode_forbidden",
+        checks.extend(check_dangerous_mode_forbidden_for_variants(
+            variants,
+            variant_runtime_profiles,
+        ))
+    );
+    emit_preflight_log("running check: workspace_contract_not_host_path");
+    timed_check!(
+        "workspace_contract_not_host_path",
+        checks.extend(check_workspace_contract_not_host_path_for_variants(
+            variants,
+            variant_runtime_profiles,
+        ))
+    );
+    emit_preflight_log("running check: task_sandbox_bash_plane");
+    timed_check!(
+        "task_sandbox_bash_plane",
+        checks.extend(check_task_sandbox_bash_plane_for_variants(
+            variants,
+            variant_runtime_profiles,
+        ))
+    );
+    emit_preflight_log("running check: agent_bundle_container_compatible");
+    timed_check!(
+        "agent_bundle_container_compatible",
+        checks.extend(check_agent_bundle_container_compatible_for_variants(
             variants,
             variant_runtime_profiles,
         ))
@@ -821,11 +1063,7 @@ fn check_dataset_task_ids(
     let mut malformed_boundary_rows = Vec::new();
     let mut missing_ids = Vec::new();
     let mut grading_disabled_lines = Vec::new();
-    let mut missing_materialization_lines = Vec::new();
-    let has_benchmark = benchmark_config.adapter.is_some();
-    let require_materialization = variant_runtime_profiles
-        .iter()
-        .any(|profile| profile.agent_runtime.image_source == ImageSource::PerTask);
+    let has_benchmark = benchmark_config.grader.is_some();
 
     for (idx, task) in tasks.iter().enumerate() {
         let line_num = idx + 1;
@@ -861,12 +1099,6 @@ fn check_dataset_task_ids(
                 }
             }
         }
-        if require_materialization
-            && parsed.workspace.mode == WorkspaceMode::Patch
-            && parsed.workspace.base.kind == WorkspaceBaseKind::Empty
-        {
-            missing_materialization_lines.push(line_num);
-        }
     }
 
     if !malformed_boundary_rows.is_empty() {
@@ -875,7 +1107,7 @@ fn check_dataset_task_ids(
             passed: false,
             severity: PreflightSeverity::Error,
             message: format!(
-                "malformed task boundary rows (expected strict task_boundary_v3): {}",
+                "malformed task spec rows (expected strict task_spec_v1): {}",
                 format_preview(&malformed_boundary_rows, 3)
             ),
         });
@@ -889,18 +1121,6 @@ fn check_dataset_task_ids(
             message: format!("tasks missing 'id' field at lines: {:?}", missing_ids),
         });
     }
-    if !missing_materialization_lines.is_empty() {
-        checks.push(PreflightCheck {
-            name: "dataset_task_ids",
-            passed: false,
-            severity: PreflightSeverity::Error,
-            message: format!(
-                "patch tasks missing a real workspace base (workspace.base.kind cannot be 'empty') at lines: {:?}",
-                missing_materialization_lines
-            ),
-        });
-    }
-
     let duplicates: Vec<_> = seen_ids
         .iter()
         .filter(|(_, lines)| lines.len() > 1)
@@ -921,7 +1141,6 @@ fn check_dataset_task_ids(
     if missing_ids.is_empty()
         && duplicates.is_empty()
         && malformed_boundary_rows.is_empty()
-        && missing_materialization_lines.is_empty()
     {
         checks.push(PreflightCheck {
             name: "dataset_task_ids",
@@ -1002,21 +1221,20 @@ fn check_agent_runtime_reachable_with_scan(
     project_root: &Path,
 ) -> PreflightCheck {
     let name = "agent_runtime_reachable";
-    if !runtime_profile.container_mode {
+    if runtime_profile.agent_runtime.image.trim().is_empty() {
         return PreflightCheck {
             name,
-            passed: true,
-            severity: PreflightSeverity::Warning,
-            message: "local process mode — container agent bootstrap not applicable".to_string(),
+            passed: false,
+            severity: PreflightSeverity::Error,
+            message: "no container image resolved for agent runtime".to_string(),
         };
     }
-
     let images = match resolve_preflight_images(
         name,
         runtime_profile,
         tasks,
         per_task_scan,
-        "no container image resolved for agent runtime",
+        "task images are required for contract smoke",
     ) {
         Ok(images) => images,
         Err(check) => return check,
@@ -1072,10 +1290,13 @@ fn check_agent_runtime_reachable_with_scan(
         passed: true,
         severity: PreflightSeverity::Error,
         message: if images.len() == 1 {
-            format!("runtime agent contract smoke passed in image '{}'", images[0])
+            format!(
+                "runtime agent contract smoke passed against task image '{}'",
+                images[0]
+            )
         } else {
             format!(
-                "runtime agent contract smoke passed in all {} required images",
+                "runtime agent contract smoke passed against all {} required task images",
                 images.len(),
             )
         },
@@ -1092,35 +1313,24 @@ fn check_benchmark_grader_reachable_with_scan(
 ) -> PreflightCheck {
     let name = "benchmark_grader_reachable";
 
-    let adapter = match benchmark_config.adapter.as_ref() {
-        Some(a) => a,
+    let grader = match benchmark_config.grader.as_ref() {
+        Some(grader) => grader,
         None => {
             return PreflightCheck {
                 name,
                 passed: true,
                 severity: PreflightSeverity::Warning,
-                message: "no benchmark adapter configured — grading skipped".to_string(),
+                message: "no benchmark grader configured — grading skipped".to_string(),
             };
         }
     };
-
-    if !runtime_profile.container_mode {
-        return PreflightCheck {
-            name,
-            passed: true,
-            severity: PreflightSeverity::Warning,
-            message:
-                "local process mode — inline grading won't run, only post-run batch processing"
-                    .to_string(),
-        };
-    }
 
     let images = match resolve_preflight_images(
         name,
         runtime_profile,
         tasks,
         per_task_scan,
-        "benchmark adapter configured but no container image specified",
+        "benchmark grader configured but no task images specified",
     ) {
         Ok(images) => images,
         Err(check) => return check,
@@ -1145,7 +1355,7 @@ fn check_benchmark_grader_reachable_with_scan(
                 Err(err) => return Some(format!("{} ({})", image, err)),
             };
         let request =
-            build_preflight_probe_request(&context, runtime_profile, Some(adapter), true);
+            build_preflight_probe_request(&context, runtime_profile, Some(grader), true);
         match run_preflight_contract_smoke(&request) {
             Ok(report) => {
                 let smoke_failures = collect_preflight_contract_smoke_failures(&request, &report);
@@ -1166,7 +1376,7 @@ fn check_benchmark_grader_reachable_with_scan(
             passed: false,
             severity: PreflightSeverity::Error,
             message: format!(
-                "benchmark grader contract smoke failed in required images: {}",
+                "benchmark grader contract smoke failed in required task images: {}",
                 format_preview(&failures, 3)
             ),
         };
@@ -1201,15 +1411,6 @@ fn check_container_ready(
     skip_shell_probe: bool,
 ) -> Vec<PreflightCheck> {
     let name = "container_ready";
-
-    if !runtime_profile.container_mode {
-        return vec![PreflightCheck {
-            name,
-            passed: true,
-            severity: PreflightSeverity::Error,
-            message: "local process mode — Docker checks skipped".to_string(),
-        }];
-    }
 
     let mut checks = Vec::new();
     let active_container_context = Command::new("docker")
@@ -1273,12 +1474,35 @@ fn check_container_ready(
         return checks;
     }
 
+    if let Err(err) = ensure_container_image_ready(runtime_profile.agent_runtime.image.as_str()) {
+        checks.push(PreflightCheck {
+            name,
+            passed: false,
+            severity: PreflightSeverity::Error,
+            message: format!(
+                "agent runtime image '{}' is not available: {}",
+                runtime_profile.agent_runtime.image,
+                err
+            ),
+        });
+        return checks;
+    }
+    checks.push(PreflightCheck {
+        name,
+        passed: true,
+        severity: PreflightSeverity::Error,
+        message: format!(
+            "agent runtime image '{}' is available",
+            runtime_profile.agent_runtime.image
+        ),
+    });
+
     let images = match resolve_preflight_images(
         name,
         runtime_profile,
         tasks,
         per_task_scan,
-        "no container image resolved for container execution",
+        "no task images resolved for container execution",
     ) {
         Ok(images) => images,
         Err(check) => {
@@ -1327,14 +1551,7 @@ fn check_container_ready(
         name,
         passed: true,
         severity: PreflightSeverity::Error,
-        message: if runtime_profile.agent_runtime.image_source == ImageSource::PerTask {
-            format!(
-                "all {} per-task images available for execution",
-                images.len()
-            )
-        } else {
-            format!("image '{}' available for execution", images[0])
-        },
+        message: format!("all {} task image(s) available for execution", images.len()),
     });
 
     if skip_shell_probe {
@@ -1392,11 +1609,7 @@ fn check_container_ready(
             name,
             passed: true,
             severity: PreflightSeverity::Error,
-            message: if runtime_profile.agent_runtime.image_source == ImageSource::PerTask {
-                format!("/bin/sh available in all {} per-task images", images.len())
-            } else {
-                "/bin/sh available in image".to_string()
-            },
+            message: format!("/bin/sh available in all {} task image(s)", images.len()),
         });
     } else {
         checks.push(PreflightCheck {
@@ -1419,64 +1632,14 @@ fn check_container_ready(
 
 fn check_dependency_files_exist(json_value: &Value, exp_dir: &Path) -> Vec<PreflightCheck> {
     let name = "dependency_files_exist";
-    let staging = match parse_dependency_file_staging(json_value, exp_dir) {
-        Ok(s) => s,
-        Err(e) => {
-            return vec![PreflightCheck {
-                name,
-                passed: false,
-                severity: PreflightSeverity::Error,
-                message: format!("failed to parse dependency staging config: {}", e),
-            }];
-        }
-    };
-
-    if staging.is_empty() {
-        return vec![PreflightCheck {
-            name,
-            passed: true,
-            severity: PreflightSeverity::Error,
-            message: "no dependency file staging configured".to_string(),
-        }];
-    }
-
-    let mut checks = Vec::new();
-    for spec in &staging {
-        let exists = spec.source_from_host.exists();
-        if spec.required {
-            checks.push(PreflightCheck {
-                name,
-                passed: exists,
-                severity: PreflightSeverity::Error,
-                message: if exists {
-                    format!("required file exists: {}", spec.source_from_host.display())
-                } else {
-                    format!(
-                        "required file missing: {} — trial execution will fail",
-                        spec.source_from_host.display()
-                    )
-                },
-            });
-        } else if !exists {
-            checks.push(PreflightCheck {
-                name,
-                passed: true,
-                severity: PreflightSeverity::Warning,
-                message: format!("optional file missing: {}", spec.source_from_host.display()),
-            });
-        }
-    }
-
-    if checks.is_empty() {
-        checks.push(PreflightCheck {
-            name,
-            passed: true,
-            severity: PreflightSeverity::Error,
-            message: format!("all {} dependency staging entries present", staging.len()),
-        });
-    }
-
-    checks
+    let _ = (json_value, exp_dir);
+    vec![PreflightCheck {
+        name,
+        passed: true,
+        severity: PreflightSeverity::Error,
+        message: "task dependencies are embedded in task specs; no host file staging is used"
+            .to_string(),
+    }]
 }
 
 fn check_workspace_patch_sources_exist(
@@ -1484,48 +1647,13 @@ fn check_workspace_patch_sources_exist(
     variant_runtime_profiles: &[VariantRuntimeProfile],
 ) -> Vec<PreflightCheck> {
     let name = "workspace_patch_sources_exist";
-    if variants.is_empty() || variant_runtime_profiles.is_empty() {
-        return Vec::new();
-    }
-    let mut checks = Vec::new();
-    let mut any_patch = false;
-    for (idx, profile) in variant_runtime_profiles.iter().enumerate() {
-        let variant_id = variants
-            .get(idx)
-            .map(|v| v.id.clone())
-            .unwrap_or_else(|| format!("variant_{}", idx));
-        for patch in &profile.agent_runtime.workspace_patches {
-            any_patch = true;
-            let exists = patch.source_from_host.exists();
-            checks.push(PreflightCheck {
-                name,
-                passed: exists,
-                severity: PreflightSeverity::Error,
-                message: if exists {
-                    format!(
-                        "variant '{}': workspace patch source exists: {}",
-                        variant_id,
-                        patch.source_from_host.display()
-                    )
-                } else {
-                    format!(
-                        "variant '{}': workspace patch source missing: {}",
-                        variant_id,
-                        patch.source_from_host.display()
-                    )
-                },
-            });
-        }
-    }
-    if !any_patch {
-        checks.push(PreflightCheck {
-            name,
-            passed: true,
-            severity: PreflightSeverity::Error,
-            message: "no workspace_patches configured".to_string(),
-        });
-    }
-    checks
+    let _ = (variants, variant_runtime_profiles);
+    vec![PreflightCheck {
+        name,
+        passed: true,
+        severity: PreflightSeverity::Error,
+        message: "runtime workspace patches are disabled in the hard cutover".to_string(),
+    }]
 }
 
 // ---------------------------------------------------------------------------
@@ -1803,14 +1931,11 @@ fn synthesize_benchmark_manifest_from_scores(score_rows: &[Value]) -> Option<Val
     }))
 }
 
-fn default_benchmark_manifest(adapter: &BenchmarkAdapterConfig, score_rows: &[Value]) -> Value {
-    if let Some(manifest) = adapter.manifest.clone() {
-        return manifest;
-    }
+fn default_benchmark_manifest(grader: &BenchmarkGraderConfig, score_rows: &[Value]) -> Value {
     if let Some(manifest) = synthesize_benchmark_manifest_from_scores(score_rows) {
         return manifest;
     }
-    let fallback_adapter_id = adapter
+    let fallback_adapter_id = grader
         .command
         .first()
         .map(|s| s.as_str())
@@ -1840,7 +1965,7 @@ fn process_benchmark_outputs(
     _project_root: &Path,
     run_dir: &Path,
     run_id: &str,
-    adapter: &BenchmarkAdapterConfig,
+    grader: &BenchmarkGraderConfig,
     _evidence_records_path: &Path,
     _task_chain_states_path: &Path,
 ) -> Result<PathBuf> {
@@ -1865,7 +1990,7 @@ fn process_benchmark_outputs(
     validate_jsonl_against_schema("benchmark_score_record_v1.jsonschema", &scores_path)?;
 
     let scores = read_jsonl_records(&scores_path)?;
-    let manifest = default_benchmark_manifest(adapter, &scores);
+    let manifest = default_benchmark_manifest(grader, &scores);
     atomic_write_json_pretty(&manifest_path, &manifest)?;
     validate_json_file_against_schema("benchmark_adapter_manifest_v1.jsonschema", &manifest_path)?;
 
@@ -1909,7 +2034,7 @@ fn count_tasks(path: &Path, json_value: &Value) -> Result<usize> {
     Ok(count)
 }
 
-const TASK_BOUNDARY_V3_SCHEMA_VERSION: &str = "task_boundary_v3";
+const TASK_SPEC_V1_SCHEMA_VERSION: &str = "task_spec_v1";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

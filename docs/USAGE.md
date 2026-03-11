@@ -40,11 +40,11 @@ python -m bench.cli admit-task bench/benchmark/tasks/v0/TASK001
 
 ## Runner Contract After Hard Cutover
 
-Task datasets consumed by the runner must now use `task_boundary_v3`. The accepted top-level shape is:
+Task datasets consumed by the runner must now use `task_spec_v1`. The accepted top-level shape is:
 
 ```json
 {
-  "schema_version": "task_boundary_v3",
+  "schema_version": "task_spec_v1",
   "task": { "id": "TASK001" },
   "environment": { "image": "ghcr.io/example/task-image:latest" },
   "workspace": {
@@ -58,6 +58,7 @@ Task datasets consumed by the runner must now use `task_boundary_v3`. The accept
     ],
     "aux_mounts": []
   },
+  "dependencies": { "files": [] },
   "limits": {}
 }
 ```
@@ -74,32 +75,31 @@ Patch tasks must declare a real workspace base. `workspace.mode = "patch"` with 
 
 ## Runtime Contract After Hard Cutover
 
-Runtime configuration is split between the external agent runtime and the task sandbox:
+Runtime configuration is split between the external agent runtime and runner-owned task sandbox policy:
 
 ```yaml
 runtime:
-  agent:
-    bundle: .lab/agents/rex-current.tar.gz
+  agent_runtime:
+    artifact: .lab/agents/rex-current.tar.gz
     command: [rex, run]
-    io:
-      input_arg: --input
-      output_arg: --output
-  sandbox:
-    executor: docker
-    image_source: per_task
-    image: null
+    image: ghcr.io/example/agent-runtime:sha256-...
+    network: none
+    root_read_only: true
+policy:
+  timeout_ms: 600000
+  task_sandbox:
     profile: default
     network: none
-  policy:
-    timeout_ms: 600000
 ```
 
 Hard-cut runtime rules:
 
-- `runtime.agent.bundle` replaces `runtime.agent.artifact`
-- `runtime.sandbox.image_source` replaces `runtime.agent.image_source`
-- `runtime.sandbox.image` replaces `runtime.agent.image`
-- `runtime.sandbox.profile` is runner-owned topology selection
-- the agent runs outside the sandbox; the sandbox owns task-image execution
+- `runtime.agent_runtime.artifact` and `runtime.agent_runtime.image` are required for scientific `run` and `build-run`
+- commands are literal argv; there is no `runtime.agent.io` command synthesis
+- task sandbox images come only from `task_spec_v1.environment.image`
+- `policy.task_sandbox.profile` is runner-owned topology selection
+- scientific `run` and `build-run` launch the agent inside the hermetic `agent_runtime` container, never as a host process
+- `--dangerous` and similar bypass flags are rejected in scientific runs
+- the task sandbox owns task-image execution, graders, and bash-plane work
 
-The logical writable workspace root inside the sandbox is always `/agentlab/workspace`. Profiles may add compatibility aliases such as `/testbed`, but tasks must not author those paths directly.
+The logical writable workspace root inside both the `agent_runtime` and `task_sandbox` planes is always `/agentlab/workspace`. Profiles may add compatibility aliases such as `/testbed`, but tasks must not author those paths directly.

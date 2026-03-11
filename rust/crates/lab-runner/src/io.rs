@@ -24,6 +24,7 @@ struct TaskBoundaryMaterialization {
     task_payload: Value,
     environment: TaskEnvironmentSpec,
     workspace: WorkspaceSpec,
+    dependencies: Value,
     limits: TaskBoundaryLimits,
     task_image: String,
 }
@@ -33,10 +34,10 @@ fn parse_task_boundary_from_dataset_task(task: &Value) -> Result<TaskBoundaryMat
         .as_object()
         .ok_or_else(|| anyhow!("task boundary must be an object"))?;
     let schema_version = obj.get("schema_version").and_then(|v| v.as_str());
-    if schema_version != Some(TASK_BOUNDARY_V3_SCHEMA_VERSION) {
+    if schema_version != Some(TASK_SPEC_V1_SCHEMA_VERSION) {
         return Err(anyhow!(
-            "task boundary schema_version must be '{}' (got {:?})",
-            TASK_BOUNDARY_V3_SCHEMA_VERSION,
+            "task spec schema_version must be '{}' (got {:?})",
+            TASK_SPEC_V1_SCHEMA_VERSION,
             schema_version
         ));
     }
@@ -46,6 +47,7 @@ fn parse_task_boundary_from_dataset_task(task: &Value) -> Result<TaskBoundaryMat
         "task",
         "environment",
         "workspace",
+        "dependencies",
         "limits",
     ];
     for key in obj.keys() {
@@ -81,6 +83,7 @@ fn parse_task_boundary_from_dataset_task(task: &Value) -> Result<TaskBoundaryMat
         task_image: environment.image.clone(),
         environment,
         workspace: parse_workspace_spec(obj.get("workspace"))?,
+        dependencies: parse_task_dependencies(obj.get("dependencies"))?,
         limits: parse_task_limits(obj.get("limits"))?,
     })
 }
@@ -91,18 +94,17 @@ fn parse_task_boundary_from_trial_input(input: &Value) -> Result<TaskBoundaryMat
             return Err(anyhow!("trial_input /task must be an object"));
         }
         let ext = input
-            .pointer("/ext/task_boundary_v3")
-            .ok_or_else(|| anyhow!("trial_input /ext/task_boundary_v3 is required"))?;
+            .pointer("/ext/task_spec_v1")
+            .ok_or_else(|| anyhow!("trial_input /ext/task_spec_v1 is required"))?;
         parse_task_boundary_ext(ext, task_payload)
     } else if input.is_object() {
-        if input.get("schema_version").and_then(|v| v.as_str())
-            == Some(TASK_BOUNDARY_V3_SCHEMA_VERSION)
+        if input.get("schema_version").and_then(|v| v.as_str()) == Some(TASK_SPEC_V1_SCHEMA_VERSION)
         {
             parse_task_boundary_from_dataset_task(input)
         } else {
             Err(anyhow!(
-                "trial_input must provide '/task' + '/ext/task_boundary_v3' or be a '{}' object",
-                TASK_BOUNDARY_V3_SCHEMA_VERSION
+                "trial_input must provide '/task' + '/ext/task_spec_v1' or be a '{}' object",
+                TASK_SPEC_V1_SCHEMA_VERSION
             ))
         }
     } else {
@@ -116,26 +118,26 @@ fn parse_task_boundary_ext(
 ) -> Result<TaskBoundaryMaterialization> {
     let obj = ext
         .as_object()
-        .ok_or_else(|| anyhow!("trial_input /ext/task_boundary_v3 must be an object"))?;
+        .ok_or_else(|| anyhow!("trial_input /ext/task_spec_v1 must be an object"))?;
     let schema_version = obj.get("schema_version").and_then(|v| v.as_str());
-    if schema_version != Some(TASK_BOUNDARY_V3_SCHEMA_VERSION) {
+    if schema_version != Some(TASK_SPEC_V1_SCHEMA_VERSION) {
         return Err(anyhow!(
-            "trial_input /ext/task_boundary_v3 schema_version must be '{}'",
-            TASK_BOUNDARY_V3_SCHEMA_VERSION
+            "trial_input /ext/task_spec_v1 schema_version must be '{}'",
+            TASK_SPEC_V1_SCHEMA_VERSION
         ));
     }
-    let allowed = ["schema_version", "environment", "workspace", "limits"];
+    let allowed = ["schema_version", "environment", "workspace", "dependencies", "limits"];
     for key in obj.keys() {
         if !allowed.contains(&key.as_str()) {
             return Err(anyhow!(
-                "trial_input /ext/task_boundary_v3 contains unsupported key '{}'",
+                "trial_input /ext/task_spec_v1 contains unsupported key '{}'",
                 key
             ));
         }
     }
     if task_payload.get("image").is_some() {
         return Err(anyhow!(
-            "trial_input /task.image was removed; use /ext/task_boundary_v3/environment.image"
+            "trial_input /task.image was removed; use /ext/task_spec_v1/environment.image"
         ));
     }
     if task_payload.get("workspace").is_some() {
@@ -150,6 +152,7 @@ fn parse_task_boundary_ext(
         task_image: environment.image.clone(),
         environment,
         workspace: parse_workspace_spec(obj.get("workspace"))?,
+        dependencies: parse_task_dependencies(obj.get("dependencies"))?,
         limits: parse_task_limits(obj.get("limits"))?,
     })
 }
@@ -182,6 +185,14 @@ fn parse_task_environment(value: Option<&Value>) -> Result<TaskEnvironmentSpec> 
         return Err(anyhow!("environment.image must be a non-empty string"));
     }
     Ok(environment)
+}
+
+fn parse_task_dependencies(value: Option<&Value>) -> Result<Value> {
+    match value {
+        None => Ok(json!({})),
+        Some(raw) if raw.is_object() => Ok(raw.clone()),
+        Some(_) => Err(anyhow!("task dependencies must be an object")),
+    }
 }
 
 fn validate_workspace_base(base: &WorkspaceBaseSpec) -> Result<()> {
@@ -382,13 +393,9 @@ fn resolve_dataset_pack_host_path(project_root: &Path, dataset_pack_ref: &str) -
 fn resolve_workspace_aux_mounts(
     project_root: &Path,
     aux_mounts: &[WorkspaceAuxMountSpec],
-    container_mode: bool,
 ) -> Result<Vec<ResolvedMountReference>> {
     if aux_mounts.is_empty() {
         return Ok(Vec::new());
-    }
-    if !container_mode {
-        return Err(anyhow!("workspace.aux_mounts require container executor"));
     }
     let mut mounts = Vec::with_capacity(aux_mounts.len());
     for mount in aux_mounts {
@@ -650,92 +657,144 @@ fn copy_staged_host_file(src: &Path, dst: &Path, required: bool, label: &str) ->
     Ok(true)
 }
 
-fn stage_dependencies_for_trial(
-    runtime_agent: &AgentRuntimeConfig,
+#[derive(Debug, Clone, Deserialize)]
+struct TaskDependencyFileSpec {
+    path: String,
+    content: String,
+    #[serde(default = "default_task_dependency_encoding")]
+    encoding: String,
+    #[serde(default)]
+    executable: bool,
+}
+
+fn default_task_dependency_encoding() -> String {
+    "utf8".to_string()
+}
+
+fn parse_task_dependency_files(task_boundary: &TaskBoundaryMaterialization) -> Result<Vec<TaskDependencyFileSpec>> {
+    let Some(files) = task_boundary
+        .dependencies
+        .get("files")
+        .filter(|value| !value.is_null())
+    else {
+        return Ok(Vec::new());
+    };
+    serde_json::from_value(files.clone())
+        .map_err(|err| anyhow!("invalid task dependencies.files: {}", err))
+}
+
+fn materialize_task_dependencies_for_trial(
+    task_boundary: &TaskBoundaryMaterialization,
     paths: &TrialPaths,
 ) -> Result<()> {
-    for (idx, spec) in runtime_agent.dependency_file_staging.iter().enumerate() {
-        let dst = map_container_path_to_host(&spec.destination_path, paths)?;
-        copy_staged_host_file(
-            &spec.source_from_host,
-            &dst,
-            spec.required,
-            &format!("#{}", idx),
-        )?;
+    for (idx, spec) in parse_task_dependency_files(task_boundary)?.iter().enumerate() {
+        let rel = validate_workspace_relative_path(&spec.path).map_err(|err| {
+            anyhow!(
+                "task dependencies.files[{}].path '{}' invalid: {}",
+                idx,
+                spec.path,
+                err
+            )
+        })?;
+        let bytes = match spec.encoding.as_str() {
+            "utf8" => spec.content.as_bytes().to_vec(),
+            "base64" => BASE64_STANDARD
+                .decode(spec.content.as_bytes())
+                .map_err(|err| anyhow!("task dependencies.files[{}] base64 decode failed: {}", idx, err))?,
+            other => {
+                return Err(anyhow!(
+                    "task dependencies.files[{}].encoding must be 'utf8' or 'base64' (got '{}')",
+                    idx,
+                    other
+                ))
+            }
+        };
+        let dst = paths.deps.join(rel);
+        atomic_write_bytes(&dst, &bytes)?;
         #[cfg(unix)]
-        if dst
-            .file_name()
-            .and_then(|n| n.to_str())
-            .map(|name| name == "master.key")
-            .unwrap_or(false)
-            && dst.exists()
         {
             let mut perms = fs::metadata(&dst)?.permissions();
-            perms.set_mode(0o600);
-            fs::set_permissions(&dst, perms)?;
-        }
-        #[cfg(unix)]
-        if spec.read_only && dst.exists() {
-            let mut perms = fs::metadata(&dst)?.permissions();
-            perms.set_mode(0o444);
+            perms.set_mode(if spec.executable { 0o555 } else { 0o444 });
             fs::set_permissions(&dst, perms)?;
         }
     }
     Ok(())
 }
 
-fn ensure_workspace_patch_target_safe(workspace_root: &Path, rel: &Path) -> Result<()> {
-    let mut current = workspace_root.to_path_buf();
-    for component in rel.components() {
-        current.push(component.as_os_str());
-        if !current.exists() {
-            continue;
-        }
-        let meta = fs::symlink_metadata(&current)?;
-        if meta.file_type().is_symlink() {
-            return Err(anyhow!(
-                "workspace patch target '{}' traverses symlink path '{}'",
-                rel.display(),
-                current.display()
-            ));
-        }
-    }
+fn stage_workspace_inputs_for_trial(_task_boundary: &TaskBoundaryMaterialization, _paths: &TrialPaths) -> Result<()> {
     Ok(())
 }
 
-fn stage_workspace_patches_for_trial(
-    runtime_agent: &AgentRuntimeConfig,
-    paths: &TrialPaths,
-) -> Result<()> {
-    for (idx, patch) in runtime_agent.workspace_patches.iter().enumerate() {
-        let rel = validate_workspace_relative_path(&patch.target_path)?;
-        ensure_workspace_patch_target_safe(&paths.workspace, &rel)?;
-        let dst = paths.workspace.join(rel);
-        copy_staged_host_file(
-            &patch.source_from_host,
+#[cfg(test)]
+fn parse_workspace_patches(value: Option<&Value>, exp_dir: &Path) -> Result<Vec<WorkspacePatchSpec>> {
+    let Some(value) = value else {
+        return Ok(Vec::new());
+    };
+    let items = value
+        .as_array()
+        .ok_or_else(|| anyhow!("workspace_patches must be an array"))?;
+    let mut patches = Vec::with_capacity(items.len());
+    for (idx, item) in items.iter().enumerate() {
+        let obj = item
+            .as_object()
+            .ok_or_else(|| anyhow!("workspace_patches[{}] must be an object", idx))?;
+        let source = obj
+            .get("source_from_host")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("workspace_patches[{}].source_from_host is required", idx))?;
+        let target = obj
+            .get("target_path")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("workspace_patches[{}].target_path is required", idx))?;
+        patches.push(WorkspacePatchSpec {
+            source_from_host: normalize_path(&exp_dir.join(source)),
+            target_path: target.to_string(),
+        });
+    }
+    Ok(patches)
+}
+
+#[cfg(test)]
+fn stage_dependencies_for_trial(runtime: &AgentRuntimeConfig, paths: &TrialPaths) -> Result<()> {
+    for entry in &runtime.dependency_file_staging {
+        let dst = map_container_path_to_host(&entry.destination_path, paths)?;
+        let copied = copy_staged_host_file(
+            &entry.source_from_host,
             &dst,
-            true,
-            &format!("workspace_patch#{}", idx),
+            entry.required,
+            &entry.destination_path,
         )?;
+        if copied && entry.read_only {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mut perms = fs::metadata(&dst)?.permissions();
+                perms.set_mode(0o444);
+                fs::set_permissions(&dst, perms)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn stage_workspace_patches_for_trial(runtime: &AgentRuntimeConfig, paths: &TrialPaths) -> Result<()> {
+    for patch in &runtime.workspace_patches {
+        let rel = validate_workspace_relative_path(&patch.target_path)?;
+        let dst = paths.workspace.join(rel);
+        copy_staged_host_file(&patch.source_from_host, &dst, true, &patch.target_path)?;
     }
     Ok(())
 }
 
 fn task_boundary_ext_value(task_boundary: &TaskBoundaryMaterialization) -> Value {
     json!({
-        "schema_version": TASK_BOUNDARY_V3_SCHEMA_VERSION,
+        "schema_version": TASK_SPEC_V1_SCHEMA_VERSION,
         "environment": task_boundary.environment,
         "workspace": task_boundary.workspace,
+        "dependencies": task_boundary.dependencies,
         "limits": task_boundary.limits,
     })
-}
-
-#[derive(Clone)]
-struct DependencyFileStagingSpec {
-    source_from_host: PathBuf,
-    destination_path: String,
-    required: bool,
-    read_only: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -744,40 +803,97 @@ struct BindingArgProjectionSpec {
     flag: String,
 }
 
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ImageSource {
+    Global,
+    PerTask,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AgentExecutionExecutor {
+    Docker,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone)]
+struct AgentExecutionConfig {
+    executor: Option<AgentExecutionExecutor>,
+    image: Option<String>,
+    network: String,
+    root_read_only: bool,
+    user: Option<String>,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone)]
+struct AgentRuntimeIoConfig {
+    input_arg: String,
+    output_arg: String,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AgentLaunchMode {
+    File,
+    Stdio,
+}
+
+#[cfg(test)]
 #[derive(Debug, Clone)]
 struct WorkspacePatchSpec {
     source_from_host: PathBuf,
     target_path: String,
 }
 
-#[derive(Clone)]
-struct AgentRuntimeIoConfig {
-    input_arg: String,
-    output_arg: String,
+#[cfg(test)]
+#[derive(Debug, Clone)]
+struct DependencyFileStagingSpec {
+    source_from_host: PathBuf,
+    destination_path: String,
+    required: bool,
+    read_only: bool,
 }
 
 #[derive(Clone)]
 struct AgentRuntimeConfig {
     adapter_ref: AgentAdapterRef,
     command_raw: Vec<String>,
-    container_image: Option<String>,
-    image_source: ImageSource,
-    agent_artifact: Option<PathBuf>,
+    image: String,
+    network: String,
+    root_read_only: bool,
+    user: Option<String>,
+    agent_artifact: PathBuf,
     agent_artifact_digest: Option<String>,
     agent_artifact_resolved_path: Option<PathBuf>,
-    io: AgentRuntimeIoConfig,
     integration_level: String,
-    launch_mode: AgentLaunchMode,
     env: BTreeMap<String, String>,
     env_from_host: Vec<String>,
     bindings_to_args: Vec<BindingArgProjectionSpec>,
-    workspace_patches: Vec<WorkspacePatchSpec>,
     trajectory_path: Option<String>,
     causal_extraction: Option<String>,
+    #[cfg(test)]
+    sandbox_image: Option<String>,
+    #[cfg(test)]
+    image_source: ImageSource,
+    #[cfg(test)]
+    execution: AgentExecutionConfig,
+    #[cfg(test)]
+    io: AgentRuntimeIoConfig,
+    #[cfg(test)]
+    launch_mode: AgentLaunchMode,
+    #[cfg(test)]
+    workspace_patches: Vec<WorkspacePatchSpec>,
+    #[cfg(test)]
     default_timeout_ms: Option<u64>,
+    #[cfg(test)]
     tracing_mode: Option<String>,
+    #[cfg(test)]
     force_container: bool,
+    #[cfg(test)]
     dependency_file_staging: Vec<DependencyFileStagingSpec>,
+    #[cfg(test)]
     dependency_services: Vec<Value>,
 }
 
@@ -834,102 +950,6 @@ fn ensure_path_within_project_root(path: &Path, project_root: &Path) -> Result<(
     ))
 }
 
-fn validate_dependency_destination_path(destination_path: &str, field_name: &str) -> Result<()> {
-    let trimmed = destination_path.trim();
-    if trimmed.is_empty() {
-        return Err(anyhow!("{} must not be empty", field_name));
-    }
-    if !trimmed.starts_with('/') {
-        return Err(anyhow!("{} must be absolute", field_name));
-    }
-    let Some((root, rest)) = resolve_contract_path_components(trimmed) else {
-        return Err(anyhow!(
-            "{} must be under {} or {}",
-            field_name,
-            AGENTLAB_CONTRACT_DEPS_DIR,
-            AGENTLAB_CONTRACT_STATE_DIR
-        ));
-    };
-    if !matches!(root, ContractPathRoot::Deps | ContractPathRoot::State) {
-        return Err(anyhow!(
-            "{} must be under {} or {}",
-            field_name,
-            AGENTLAB_CONTRACT_DEPS_DIR,
-            AGENTLAB_CONTRACT_STATE_DIR
-        ));
-    }
-    let rel = rest.trim_start_matches('/');
-    if rel.is_empty() {
-        return Err(anyhow!(
-            "{} must target a file path (not a mount root)",
-            field_name
-        ));
-    }
-    for component in Path::new(rel).components() {
-        if matches!(component, Component::ParentDir) {
-            return Err(anyhow!("{} cannot contain '..'", field_name));
-        }
-    }
-    Ok(())
-}
-
-fn parse_dependency_file_staging_entries(
-    value: Option<&Value>,
-    source_name: &str,
-    exp_dir: &Path,
-    default_required: bool,
-    default_read_only: bool,
-) -> Result<Vec<DependencyFileStagingSpec>> {
-    let Some(raw_items) = value else {
-        return Ok(Vec::new());
-    };
-    let items = raw_items
-        .as_array()
-        .ok_or_else(|| anyhow!("{} must be an array", source_name))?;
-
-    let mut parsed = Vec::with_capacity(items.len());
-    for (idx, item) in items.iter().enumerate() {
-        let obj = item
-            .as_object()
-            .ok_or_else(|| anyhow!("{}[{}] must be an object", source_name, idx))?;
-        let source_raw = obj
-            .get("source_from_host")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow!("{}[{}].source_from_host missing", source_name, idx))?;
-        let destination_path = obj
-            .get("destination_path")
-            .and_then(|v| v.as_str())
-            .ok_or_else(|| anyhow!("{}[{}].destination_path missing", source_name, idx))?
-            .trim()
-            .to_string();
-        if destination_path.is_empty() {
-            return Err(anyhow!(
-                "{}[{}].destination_path must not be empty",
-                source_name,
-                idx
-            ));
-        }
-        validate_dependency_destination_path(
-            &destination_path,
-            &format!("{}[{}].destination_path", source_name, idx),
-        )?;
-        let required = obj
-            .get("required")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(default_required);
-        let read_only = obj
-            .get("read_only")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(default_read_only);
-        parsed.push(DependencyFileStagingSpec {
-            source_from_host: resolve_host_path_from_spec(source_raw, exp_dir)?,
-            destination_path,
-            required,
-            read_only,
-        });
-    }
-    Ok(parsed)
-}
 fn parse_command_field(value: Option<&Value>, field: &str) -> Result<Option<Vec<String>>> {
     match value {
         None => Ok(None),
@@ -951,40 +971,18 @@ fn parse_command_field(value: Option<&Value>, field: &str) -> Result<Option<Vec<
     }
 }
 
-fn parse_dependency_file_staging(
-    json_value: &Value,
-    exp_dir: &Path,
-) -> Result<Vec<DependencyFileStagingSpec>> {
-    let mut parsed = parse_dependency_file_staging_entries(
-        json_value.pointer("/runtime/dependencies/file_staging"),
-        "runtime.dependencies.file_staging",
-        exp_dir,
-        true,
-        false,
-    )?;
-    let mut secret_file_entries = parse_dependency_file_staging_entries(
-        json_value.pointer("/runtime/dependencies/secret_files"),
-        "runtime.dependencies.secret_files",
-        exp_dir,
-        true,
-        true,
-    )?;
-    parsed.append(&mut secret_file_entries);
-    Ok(parsed)
-}
-
 fn parse_bindings_to_args(value: Option<&Value>) -> Result<Vec<BindingArgProjectionSpec>> {
     let Some(raw) = value else {
         return Ok(Vec::new());
     };
     let items = raw
         .as_array()
-        .ok_or_else(|| anyhow!("runtime.agent.arg_map must be an array"))?;
+        .ok_or_else(|| anyhow!("runtime.agent_runtime.binding_args must be an array"))?;
     let mut parsed = Vec::with_capacity(items.len());
     for (idx, item) in items.iter().enumerate() {
         let obj = item
             .as_object()
-            .ok_or_else(|| anyhow!("runtime.agent.arg_map[{}] must be an object", idx))?;
+            .ok_or_else(|| anyhow!("runtime.agent_runtime.binding_args[{}] must be an object", idx))?;
         let binding = obj
             .get("key")
             .and_then(Value::as_str)
@@ -992,7 +990,7 @@ fn parse_bindings_to_args(value: Option<&Value>) -> Result<Vec<BindingArgProject
             .filter(|v| !v.is_empty())
             .ok_or_else(|| {
                 anyhow!(
-                    "runtime.agent.arg_map[{}].key must be a non-empty string",
+                    "runtime.agent_runtime.binding_args[{}].key must be a non-empty string",
                     idx
                 )
             })?;
@@ -1003,64 +1001,13 @@ fn parse_bindings_to_args(value: Option<&Value>) -> Result<Vec<BindingArgProject
             .filter(|v| !v.is_empty())
             .ok_or_else(|| {
                 anyhow!(
-                    "runtime.agent.arg_map[{}].flag must be a non-empty string",
+                    "runtime.agent_runtime.binding_args[{}].flag must be a non-empty string",
                     idx
                 )
             })?;
         parsed.push(BindingArgProjectionSpec {
             binding: binding.to_string(),
             flag: flag.to_string(),
-        });
-    }
-    Ok(parsed)
-}
-
-fn parse_workspace_patches(
-    value: Option<&Value>,
-    exp_dir: &Path,
-) -> Result<Vec<WorkspacePatchSpec>> {
-    let Some(raw) = value else {
-        return Ok(Vec::new());
-    };
-    let items = raw
-        .as_array()
-        .ok_or_else(|| anyhow!("runtime.agent.workspace_patches must be an array"))?;
-    let mut parsed = Vec::with_capacity(items.len());
-    for (idx, item) in items.iter().enumerate() {
-        let obj = item
-            .as_object()
-            .ok_or_else(|| anyhow!("runtime.agent.workspace_patches[{}] must be an object", idx))?;
-        let source_raw = obj
-            .get("source_from_host")
-            .and_then(Value::as_str)
-            .ok_or_else(|| {
-                anyhow!(
-                    "runtime.agent.workspace_patches[{}].source_from_host missing",
-                    idx
-                )
-            })?;
-        let target_path = obj
-            .get("target_path")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|v| !v.is_empty())
-            .ok_or_else(|| {
-                anyhow!(
-                    "runtime.agent.workspace_patches[{}].target_path missing",
-                    idx
-                )
-            })?;
-        let _ = validate_workspace_relative_path(target_path).map_err(|e| {
-            anyhow!(
-                "runtime.agent.workspace_patches[{}].target_path '{}' invalid: {}",
-                idx,
-                target_path,
-                e
-            )
-        })?;
-        parsed.push(WorkspacePatchSpec {
-            source_from_host: resolve_host_path_from_spec(source_raw, exp_dir)?,
-            target_path: target_path.to_string(),
         });
     }
     Ok(parsed)
@@ -1085,7 +1032,7 @@ fn project_bindings_to_args(
     for spec in specs {
         let value = binding_lookup(bindings, &spec.binding).ok_or_else(|| {
             anyhow!(
-                "missing required config key '{}' for runtime.agent.arg_map",
+                "missing required config key '{}' for runtime.agent_runtime.binding_args",
                 spec.binding
             )
         })?;
@@ -1112,24 +1059,19 @@ fn resolve_agent_runtime(json_value: &Value, exp_dir: &Path) -> Result<AgentRunt
 
     if json_value.pointer("/runtime/harness").is_some() {
         return Err(anyhow!(
-            "runtime.harness is not supported; use runtime.agent"
+            "runtime.harness is not supported; use runtime.agent_runtime"
         ));
     }
     let agent = json_value
-        .pointer("/runtime/agent")
-        .ok_or_else(|| anyhow!("runtime.agent is required"))?;
-    let sandbox = json_value
-        .pointer("/runtime/sandbox")
-        .ok_or_else(|| anyhow!("runtime.sandbox is required"))?;
-    if agent.pointer("/mode").is_some()
-        || agent.pointer("/known_agent_ref").is_some()
-        || agent.pointer("/custom_image").is_some()
-        || agent.pointer("/adapter").is_some()
-        || agent.pointer("/aliases").is_some()
-        || agent.pointer("/overrides").is_some()
+        .pointer("/runtime/agent_runtime")
+        .ok_or_else(|| anyhow!("runtime.agent_runtime is required"))?;
+    if agent.pointer("/io").is_some()
+        || agent.pointer("/execution").is_some()
+        || agent.pointer("/workspace_patches").is_some()
+        || agent.pointer("/launch").is_some()
     {
         return Err(anyhow!(
-            "runtime.agent hard cut: use runtime.agent.command + runtime.agent.bundle (+ optional runtime.agent.io) and move sandbox settings under runtime.sandbox"
+            "runtime.agent_runtime hard cut: use runtime.agent_runtime.{{artifact,image,command,env,env_from_host,binding_args,network,root_read_only,user}}"
         ));
     }
 
@@ -1142,40 +1084,51 @@ fn resolve_agent_runtime(json_value: &Value, exp_dir: &Path) -> Result<AgentRunt
         .pointer("/runtime/telemetry/causal_extraction")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
-    let tracing_mode = None;
 
-    let force_container = sandbox.pointer("/executor").and_then(|v| v.as_str()) == Some("docker");
-    let mut dependency_file_staging = parse_dependency_file_staging(json_value, exp_dir)?;
-    let dependency_services = json_value
-        .pointer("/runtime/dependencies/services")
-        .and_then(|v| v.as_array())
-        .cloned()
-        .unwrap_or_default();
-    let runtime_agent_image = sandbox
-        .pointer("/image")
+    let execution_image = parse_optional_nonempty_string(
+        agent.pointer("/image"),
+        "runtime.agent_runtime.image",
+    )?
+    .ok_or_else(|| anyhow!("runtime.agent_runtime.image is required"))?;
+    let execution_network = agent
+        .pointer("/network")
         .and_then(|v| v.as_str())
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty());
-    let image_source =
-        ImageSource::parse(sandbox.pointer("/image_source").and_then(|v| v.as_str()))?;
-    let agent_artifact =
-        parse_optional_nonempty_string(agent.pointer("/bundle"), "runtime.agent.bundle")?.map(
-            |p| {
-                let raw = p.trim();
-                if raw.starts_with("./") || raw.starts_with("../") || raw.contains('/') {
-                    normalize_path(&exp_dir.join(raw))
-                } else {
-                    resolve_dx_artifact_path(raw, exp_dir, exp_dir)
-                }
-            },
-        );
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .unwrap_or("none")
+        .to_string();
+    let execution_root_read_only = agent
+        .pointer("/root_read_only")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
+    let execution_user = parse_optional_nonempty_string(
+        agent.pointer("/user"),
+        "runtime.agent_runtime.user",
+    )?;
+    #[cfg(test)]
+    let execution_network_for_test = execution_network.clone();
+    #[cfg(test)]
+    let execution_user_for_test = execution_user.clone();
+    let artifact_raw = parse_optional_nonempty_string(
+        agent.pointer("/artifact"),
+        "runtime.agent_runtime.artifact",
+    )?
+    .ok_or_else(|| anyhow!("runtime.agent_runtime.artifact is required"))?;
+    let agent_artifact = {
+        let raw = artifact_raw.trim();
+        if raw.starts_with("./") || raw.starts_with("../") || raw.contains('/') {
+            normalize_path(&exp_dir.join(raw))
+        } else {
+            resolve_dx_artifact_path(raw, exp_dir, exp_dir)
+        }
+    };
     let agent_artifact_digest = parse_optional_nonempty_string(
-        agent.pointer("/bundle_digest"),
-        "runtime.agent.bundle_digest",
+        agent.pointer("/artifact_digest"),
+        "runtime.agent_runtime.artifact_digest",
     )?;
     let agent_artifact_resolved_path = parse_optional_nonempty_string(
-        agent.pointer("/bundle_resolved_path"),
-        "runtime.agent.bundle_resolved_path",
+        agent.pointer("/artifact_resolved_path"),
+        "runtime.agent_runtime.artifact_resolved_path",
     )?
     .map(|raw| {
         let path = PathBuf::from(raw);
@@ -1185,30 +1138,19 @@ fn resolve_agent_runtime(json_value: &Value, exp_dir: &Path) -> Result<AgentRunt
             normalize_path(&exp_dir.join(path))
         }
     });
-    if image_source == ImageSource::PerTask && agent_artifact.is_none() {
-        return Err(anyhow!(
-            "runtime.agent.bundle is required when runtime.sandbox.image_source='per_task'"
-        ));
-    }
 
-    let mut command = parse_command_field(agent.pointer("/command"), "runtime.agent.command")?
-        .ok_or_else(|| anyhow!("runtime.agent.command is required"))?;
+    let command = parse_command_field(agent.pointer("/command"), "runtime.agent_runtime.command")?
+        .ok_or_else(|| anyhow!("runtime.agent_runtime.command is required"))?;
     let integration_level = agent
         .pointer("/integration_level")
         .and_then(|v| v.as_str())
         .unwrap_or("cli_basic")
         .to_string();
     let adapter_ref = AgentAdapterRef::default();
-    let launch_mode =
-        AgentLaunchMode::parse(agent.pointer("/launch/mode").and_then(|v| v.as_str()))?;
-    let default_timeout_ms = agent
-        .pointer("/default_timeout_ms")
-        .and_then(|v| v.as_u64())
-        .filter(|v| *v > 0);
-    let mut env = parse_string_map_field(agent.pointer("/env"), "runtime.agent.env")?;
+    let env = parse_string_map_field(agent.pointer("/env"), "runtime.agent_runtime.env")?;
     let env_from_host = parse_string_array_field(
         agent.pointer("/env_from_host"),
-        "runtime.agent.env_from_host",
+        "runtime.agent_runtime.env_from_host",
     )?;
     if agent
         .pointer("/secret_env")
@@ -1216,132 +1158,58 @@ fn resolve_agent_runtime(json_value: &Value, exp_dir: &Path) -> Result<AgentRunt
         .unwrap_or(false)
     {
         return Err(anyhow!(
-            "runtime.agent.secret_env is not supported; use runtime.agent.env_from_host and provide values via --env/--env-file"
+            "runtime.agent_runtime.secret_env is not supported; use runtime.agent_runtime.env_from_host and provide values via --env/--env-file"
         ));
     }
-    if json_value
-        .pointer("/runtime/dependencies/secret_env")
-        .map(|value| !value.is_null())
-        .unwrap_or(false)
-    {
-        return Err(anyhow!(
-            "runtime.dependencies.secret_env is not supported; use runtime.agent.env_from_host and provide values via --env/--env-file"
-        ));
-    }
-    let mut config_files =
-        parse_string_array_field(agent.pointer("/config_files"), "runtime.agent.config_files")?;
-    for (idx, file) in config_files.iter().enumerate() {
-        if Path::new(file).is_absolute() {
-            return Err(anyhow!(
-                "runtime.agent.config_files[{}] must be a relative path",
-                idx
-            ));
-        }
-    }
-    if let Some(default_config) = parse_optional_nonempty_string(
-        agent.pointer("/default_config"),
-        "runtime.agent.default_config",
-    )? {
-        if Path::new(default_config.as_str()).is_absolute() {
-            return Err(anyhow!(
-                "runtime.agent.default_config must be a relative path"
-            ));
-        }
-        if !config_files.iter().any(|entry| entry == &default_config) {
-            config_files.push(default_config.clone());
-        }
-        if !command_contains_flag(&command, "--config") {
-            append_flag_value_once(
-                &mut command,
-                "--config",
-                deps_destination_for_config_file(&default_config),
-            );
-        }
-    }
-    ensure_home_for_staged_auth_files(&mut env, &config_files);
-    for (idx, file) in config_files.iter().enumerate() {
-        let source = resolve_host_path_from_spec(file, exp_dir).map_err(|e| {
-            anyhow!(
-                "runtime.agent.config_files[{}] invalid '{}': {}",
-                idx,
-                file,
-                e
-            )
-        })?;
-        let destination = deps_destination_for_config_file(file);
-        if let Some(conflict) = dependency_file_staging
-            .iter()
-            .find(|spec| spec.destination_path == destination && spec.source_from_host != source)
-        {
-            return Err(anyhow!(
-                "runtime.agent.config_files[{}] destination '{}' conflicts with dependency staging source '{}'",
-                idx,
-                destination,
-                conflict.source_from_host.display()
-            ));
-        }
-        if dependency_file_staging
-            .iter()
-            .any(|spec| spec.destination_path == destination && spec.source_from_host == source)
-        {
-            continue;
-        }
-        dependency_file_staging.push(DependencyFileStagingSpec {
-            source_from_host: source,
-            destination_path: destination,
-            required: true,
-            read_only: true,
-        });
-    }
-    let bindings_to_args = parse_bindings_to_args(agent.pointer("/arg_map"))?;
-    let workspace_patches = parse_workspace_patches(agent.pointer("/workspace_patches"), exp_dir)?;
-    let input_arg = agent
-        .pointer("/io/input_arg")
-        .and_then(|v| v.as_str())
-        .unwrap_or("--input")
-        .trim()
-        .to_string();
-    if input_arg.is_empty() {
-        return Err(anyhow!("runtime.agent.io.input_arg must not be empty"));
-    }
-    let output_arg = agent
-        .pointer("/io/output_arg")
-        .and_then(|v| v.as_str())
-        .unwrap_or("--output")
-        .trim()
-        .to_string();
-    if output_arg.is_empty() {
-        return Err(anyhow!("runtime.agent.io.output_arg must not be empty"));
-    }
-
-    let container_image = runtime_agent_image;
-    let force_container = force_container || container_image.is_some();
+    let bindings_to_args = parse_bindings_to_args(agent.pointer("/binding_args"))?;
 
     Ok(AgentRuntimeConfig {
         adapter_ref,
         command_raw: command,
-        container_image,
-        image_source,
+        image: execution_image,
+        network: execution_network,
+        root_read_only: execution_root_read_only,
+        user: execution_user,
         agent_artifact,
         agent_artifact_digest,
         agent_artifact_resolved_path,
-        io: AgentRuntimeIoConfig {
-            input_arg,
-            output_arg,
-        },
         integration_level,
-        launch_mode,
         env,
         env_from_host,
         bindings_to_args,
-        workspace_patches,
         trajectory_path,
         causal_extraction,
-        default_timeout_ms,
-        tracing_mode,
-        force_container,
-        dependency_file_staging,
-        dependency_services,
+        #[cfg(test)]
+        sandbox_image: None,
+        #[cfg(test)]
+        image_source: ImageSource::PerTask,
+        #[cfg(test)]
+        execution: AgentExecutionConfig {
+            executor: Some(AgentExecutionExecutor::Docker),
+            image: Some(agent.pointer("/image").and_then(|v| v.as_str()).unwrap_or("").to_string()),
+            network: execution_network_for_test,
+            root_read_only: execution_root_read_only,
+            user: execution_user_for_test,
+        },
+        #[cfg(test)]
+        io: AgentRuntimeIoConfig {
+            input_arg: "--input".to_string(),
+            output_arg: "--output".to_string(),
+        },
+        #[cfg(test)]
+        launch_mode: AgentLaunchMode::File,
+        #[cfg(test)]
+        workspace_patches: Vec::new(),
+        #[cfg(test)]
+        default_timeout_ms: None,
+        #[cfg(test)]
+        tracing_mode: None,
+        #[cfg(test)]
+        force_container: true,
+        #[cfg(test)]
+        dependency_file_staging: Vec::new(),
+        #[cfg(test)]
+        dependency_services: Vec::new(),
     })
 }
 
@@ -1420,7 +1288,7 @@ fn ensure_required_runtime_env_present(
     for key in &runtime_agent.env_from_host {
         if !resolved_env.contains_key(key) {
             return Err(anyhow!(
-                "missing required runtime env var for runtime.agent.env_from_host: {} (provide via --env or --env-file)",
+                "missing required runtime env var for runtime.agent_runtime.env_from_host: {} (provide via --env or --env-file)",
                 key
             ));
         }
@@ -1429,15 +1297,13 @@ fn ensure_required_runtime_env_present(
 }
 
 fn validate_agent_artifact_pin(runtime_agent: &AgentRuntimeConfig) -> Result<()> {
-    let Some(artifact) = runtime_agent.agent_artifact.as_ref() else {
-        return Ok(());
-    };
+    let artifact = &runtime_agent.agent_artifact;
     if let Some(expected_path) = runtime_agent.agent_artifact_resolved_path.as_ref() {
         let normalized = normalize_path(artifact);
         let expected = normalize_path(expected_path);
         if normalized != expected {
             return Err(anyhow!(
-                "runtime.agent.bundle path mismatch: expected {}, got {}",
+                "runtime.agent_runtime.artifact path mismatch: expected {}, got {}",
                 expected.display(),
                 normalized.display()
             ));
@@ -1455,7 +1321,7 @@ fn validate_agent_artifact_pin(runtime_agent: &AgentRuntimeConfig) -> Result<()>
             .unwrap_or(actual_full.as_str());
         if !expected.eq_ignore_ascii_case(actual) {
             return Err(anyhow!(
-                "runtime.agent.bundle digest mismatch: expected sha256:{}, got sha256:{}",
+                "runtime.agent_runtime.artifact digest mismatch: expected sha256:{}, got sha256:{}",
                 expected,
                 actual
             ));
@@ -1471,18 +1337,70 @@ struct VariantRuntimeProfile {
     agent_runtime: AgentRuntimeConfig,
     agent_runtime_env: BTreeMap<String, String>,
     invocation_source: String,
-    invocation_default_timeout_ms: Option<u64>,
-    executor_kind: ExecutorKind,
-    container_mode: bool,
     configured_network_mode: String,
     effective_network_mode: String,
+}
+
+fn command_contains_scientific_bypass(command: &[String]) -> Option<String> {
+    for token in command {
+        let trimmed = token.trim();
+        if trimmed == "--dangerous" || trimmed.contains("dangerous_mode") {
+            return Some(trimmed.to_string());
+        }
+        for fragment in trimmed.split_whitespace() {
+            if fragment == "--dangerous" || fragment.contains("dangerous_mode") {
+                return Some(fragment.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn preview_agent_command(profile: &VariantRuntimeProfile) -> Vec<String> {
+    let mut command = profile.agent_runtime.command_raw.clone();
+    command.extend(profile.variant_args.iter().cloned());
+    command
+}
+
+fn value_contains_host_scratch_path(value: &str) -> bool {
+    let trimmed = value.trim();
+    trimmed.contains("/.lab/runs/") || trimmed.contains("/.scratch/")
+}
+
+fn profile_is_hermetic(profile: &VariantRuntimeProfile) -> bool {
+    let command = preview_agent_command(profile);
+    profile
+        .agent_runtime
+        .image
+        .trim()
+        .is_empty()
+        == false
+        && command_contains_scientific_bypass(&command).is_none()
+        && !command
+            .iter()
+            .any(|value| value_contains_host_scratch_path(value))
+        && !profile
+            .agent_runtime_env
+            .values()
+            .any(|value| value_contains_host_scratch_path(value))
+}
+
+fn resolve_run_isolation_grade(
+    variant_runtime_profiles: &[VariantRuntimeProfile],
+    _behavior: &RunBehavior,
+) -> &'static str {
+    if !variant_runtime_profiles.is_empty()
+        && variant_runtime_profiles.iter().all(profile_is_hermetic)
+    {
+        return "hermetic";
+    }
+    "invalid"
 }
 
 fn resolve_variant_runtime_profile(
     experiment: &Value,
     variant: &Variant,
     project_root: &Path,
-    use_container: bool,
     behavior: &RunBehavior,
     execution: &RunExecutionOptions,
 ) -> Result<VariantRuntimeProfile> {
@@ -1505,25 +1423,8 @@ fn resolve_variant_runtime_profile(
         ));
     }
 
-    let executor_kind = execution.executor.unwrap_or({
-        if use_container || agent_runtime.force_container {
-            ExecutorKind::LocalDocker
-        } else {
-            ExecutorKind::LocalProcess
-        }
-    });
-    if agent_runtime.image_source == ImageSource::PerTask
-        && !matches!(executor_kind, ExecutorKind::LocalDocker)
-    {
-        return Err(anyhow!(
-            "runtime.sandbox.image_source='per_task' requires container execution"
-        ));
-    }
-    let container_mode = matches!(executor_kind, ExecutorKind::LocalDocker);
-    agent_runtime.command_raw =
-        resolve_agent_runtime_command(&agent_runtime.command_raw, project_root, container_mode);
-    validate_agent_runtime_command(&agent_runtime.command_raw, project_root, container_mode)?;
-    let invocation_default_timeout_ms = agent_runtime.default_timeout_ms;
+    agent_runtime.command_raw = resolve_agent_runtime_command(&agent_runtime.command_raw);
+    validate_agent_runtime_command(&agent_runtime.command_raw, project_root)?;
     let runtime_env_inputs = resolve_runtime_env_inputs(execution)?;
     let mut agent_runtime_env = resolve_agent_runtime_env(&agent_runtime, &runtime_env_inputs)?;
     for (key, value) in &variant.env {
@@ -1541,9 +1442,6 @@ fn resolve_variant_runtime_profile(
         agent_runtime,
         agent_runtime_env,
         invocation_source: "runtime_agent".to_string(),
-        invocation_default_timeout_ms,
-        executor_kind,
-        container_mode,
         configured_network_mode,
         effective_network_mode,
     })
@@ -1650,11 +1548,10 @@ fn build_agent_task(
     task_idx: usize,
     repl: usize,
     task_boundary: &TaskBoundaryMaterialization,
-    runtime_agent: &AgentRuntimeConfig,
 ) -> Value {
     let normalized_task_payload = normalize_task_prompt_aliases(&task_boundary.task_payload);
     let mut policy = json_value
-        .pointer("/runtime/policy")
+        .pointer("/policy")
         .cloned()
         .unwrap_or_else(|| json!({}));
     if policy.pointer("/timeout_ms").is_none() {
@@ -1675,16 +1572,14 @@ fn build_agent_task(
         },
         "task": normalized_task_payload,
         "bindings": variant.bindings.clone(),
-        "dependencies": {
-            "services": runtime_agent.dependency_services.clone()
-        },
+        "dependencies": task_boundary.dependencies.clone(),
         "policy": policy,
     });
     let task_boundary_ext = task_boundary_ext_value(task_boundary);
     if let Some(obj) = input.as_object_mut() {
         obj.insert(
             "ext".to_string(),
-            json!({ "task_boundary_v3": task_boundary_ext }),
+            json!({ "task_spec_v1": task_boundary_ext }),
         );
     }
     input
@@ -2170,14 +2065,8 @@ fn rel_to_run_dir(path: &Path, run_dir: &Path) -> String {
         .to_string()
 }
 
-fn resolve_trial_timeout_ms(
-    input: &Value,
-    invocation_default_timeout_ms: Option<u64>,
-) -> Option<u64> {
-    input
-        .pointer("/policy/timeout_ms")
-        .and_then(|v| v.as_u64())
-        .or(invocation_default_timeout_ms)
+fn resolve_trial_timeout_ms(input: &Value) -> Option<u64> {
+    input.pointer("/policy/timeout_ms").and_then(|v| v.as_u64())
 }
 
 fn output_peer_path(output_path: &str, file_name: &str) -> String {
@@ -2207,7 +2096,7 @@ fn build_runtime_contract_env(
         .and_then(|v| v.as_str())
         .unwrap_or("");
     let task_image = input
-        .pointer("/ext/task_boundary_v3/environment/image")
+        .pointer("/ext/task_spec_v1/environment/image")
         .or_else(|| input.pointer("/environment/image"))
         .and_then(|v| v.as_str())
         .map(str::trim)
@@ -2291,11 +2180,6 @@ fn command_contract_capabilities() -> AgentAdapterCapabilities {
 
 fn run_command_contract_trial(request: &AdapterRunRequest<'_>) -> Result<ProcessRunResult> {
     write_adapter_continue_control(&request.trial_paths.runtime.control)?;
-    if !request.container_mode && request.setup_command.is_some() {
-        return Err(anyhow!(
-            "setup command is only supported for container runs"
-        ));
-    }
     run_external_agent_runtime_trial(request)
 }
 
@@ -2376,13 +2260,11 @@ impl AgentAdapter for PrebuiltCommandAdapter {
             variant_args: request.variant_args,
             runtime_env: request.runtime_env,
             runtime_overrides_env: &adapter_overrides,
-            container_mode: request.container_mode,
             trial_paths: request.trial_paths,
             dynamic_mounts: request.dynamic_mounts,
             io_paths: request.io_paths,
             network_mode: request.network_mode,
-            setup_command: request.setup_command,
-            benchmark_adapter: request.benchmark_adapter,
+            benchmark_grader: request.benchmark_grader,
             benchmark_grading_enabled: request.benchmark_grading_enabled,
             run_id: request.run_id,
             task_image: request.task_image,
@@ -2394,20 +2276,6 @@ impl AgentAdapter for PrebuiltCommandAdapter {
     fn pause_trial(&self, request: &AdapterPauseRequest<'_>) -> Result<AdapterPauseAck> {
         pause_command_contract_trial(request)
     }
-}
-
-fn run_builtin_adapter_local(request: &AdapterRunRequest<'_>) -> Result<ProcessRunResult> {
-    let command = resolve_runtime_agent_command(request)?;
-    let cmd = build_builtin_adapter_local_command(request, &command)?;
-    let stdout_log_path = request.trial_paths.trial_dir.join("harness_stdout.log");
-    let stderr_log_path = request.trial_paths.trial_dir.join("harness_stderr.log");
-    run_adapter_process(
-        cmd,
-        &request.io_paths.output_host,
-        None,
-        &stdout_log_path,
-        &stderr_log_path,
-    )
 }
 
 fn run_container_sidecar_command(
@@ -2424,19 +2292,24 @@ fn run_container_sidecar_command(
         variant_args: &[],
         runtime_env: request.runtime_env,
         runtime_overrides_env,
-        container_mode: request.container_mode,
         trial_paths: request.trial_paths,
         dynamic_mounts: request.dynamic_mounts,
         io_paths: request.io_paths,
         network_mode: request.network_mode,
-        setup_command: None,
-        benchmark_adapter: None,
+        benchmark_grader: None,
         benchmark_grading_enabled: false,
         run_id: request.run_id,
         task_image: request.task_image,
         agent_artifact: None,
     };
-    let mut cmd = build_baked_container_command(&sidecar_request, image, workspace, command, None);
+    let mut cmd = build_baked_container_command(
+        &sidecar_request,
+        ContainerPlane::TaskSandbox,
+        image,
+        workspace,
+        command,
+        None,
+    );
     let output = cmd.output()?;
     if output.status.success() {
         return Ok(output);
@@ -2454,45 +2327,55 @@ fn run_external_agent_runtime_trial(request: &AdapterRunRequest<'_>) -> Result<P
         validate_agent_artifact_pin(request.runtime)?;
         if !bundle.exists() {
             return Err(anyhow!(
-                "runtime.agent.bundle not found: {}",
+                "runtime.agent_runtime.artifact not found: {}",
                 bundle.display()
             ));
         }
-        let bundle_context = format!("runtime.agent.bundle {}", bundle.display());
+        let bundle_context = format!("runtime.agent_runtime.artifact {}", bundle.display());
         validate_agent_artifact_path(bundle, &command, bundle_context.as_str())?;
     }
 
-    let container_image = if request.container_mode {
-        let image = resolve_container_image(request)?;
-        ensure_container_image_ready(&image)?;
-        Some(image)
-    } else {
-        None
+    let task_sandbox_image = resolve_task_sandbox_image(request)?;
+    ensure_container_image_ready(&task_sandbox_image)?;
+    let workspace = resolve_container_workspace(request);
+
+    let image = resolve_agent_execution_image(request)?;
+    ensure_container_image_ready(&image)?;
+    let agent_request = AdapterRunRequest {
+        runtime_experiment: request.runtime_experiment,
+        runtime: request.runtime,
+        variant_args: request.variant_args,
+        runtime_env: request.runtime_env,
+        runtime_overrides_env: request.runtime_overrides_env,
+        trial_paths: request.trial_paths,
+        dynamic_mounts: request.dynamic_mounts,
+        io_paths: request.io_paths,
+        network_mode: request.network_mode,
+        benchmark_grader: request.benchmark_grader,
+        benchmark_grading_enabled: request.benchmark_grading_enabled,
+        run_id: request.run_id,
+        task_image: request.task_image,
+        agent_artifact: request.agent_artifact,
     };
-    let workspace = if request.container_mode {
-        resolve_container_workspace(request)
-    } else {
-        None
-    };
+    let cmd = build_baked_container_command(
+        &agent_request,
+        ContainerPlane::AgentRuntime,
+        &image,
+        workspace,
+        &command,
+        None,
+    );
+    let stdout_log_path = request.trial_paths.trial_dir.join("harness_stdout.log");
+    let stderr_log_path = request.trial_paths.trial_dir.join("harness_stderr.log");
+    let agent_result = run_adapter_process(
+        cmd,
+        &request.io_paths.output_host,
+        None,
+        &stdout_log_path,
+        &stderr_log_path,
+    )?;
 
-    if let (Some(image), Some(setup)) = (container_image.as_deref(), request.setup_command) {
-        let setup_command = vec!["/bin/sh".to_string(), "-lc".to_string(), setup.to_string()];
-        run_container_sidecar_command(
-            request,
-            image,
-            workspace,
-            &setup_command,
-            request.runtime_overrides_env,
-            "task sandbox setup",
-        )?;
-    }
-
-    let agent_result = run_builtin_adapter_local(request)?;
-
-    if let (Some(image), Some(grader_command)) = (
-        container_image.as_deref(),
-        resolve_benchmark_grader_command(request)?,
-    ) {
+    if let Some(grader_command) = resolve_benchmark_grader_command(request)? {
         let grade_error_marker_path = request.trial_paths.out.join(BENCHMARK_GRADE_ERROR_FILENAME);
         let result_path = &request.io_paths.output_host;
         if !result_path.exists() || result_path.metadata().map(|meta| meta.len()).unwrap_or(0) == 0
@@ -2513,7 +2396,7 @@ fn run_external_agent_runtime_trial(request: &AdapterRunRequest<'_>) -> Result<P
         );
         if let Err(err) = run_container_sidecar_command(
             request,
-            image,
+            &task_sandbox_image,
             workspace,
             &grader_command,
             &overrides,
@@ -2543,124 +2426,23 @@ fn run_external_agent_runtime_trial(request: &AdapterRunRequest<'_>) -> Result<P
     Ok(agent_result)
 }
 
-fn rewrite_local_bundle_command(command: &[String], bundle_root: &Path) -> Vec<String> {
-    command
-        .iter()
-        .enumerate()
-        .map(|(idx, token)| {
-            if let Some(relative) = token.trim().strip_prefix("/opt/agent/") {
-                bundle_root.join(relative).to_string_lossy().to_string()
-            } else if idx == 0 && !token.contains('/') {
-                let candidate = bundle_root.join("bin").join(token);
-                if candidate.exists() {
-                    candidate.to_string_lossy().to_string()
-                } else {
-                    token.clone()
-                }
-            } else {
-                token.clone()
-            }
-        })
-        .collect()
-}
-
-fn build_builtin_adapter_local_command(
-    request: &AdapterRunRequest<'_>,
-    command: &[String],
-) -> Result<Command> {
-    let mut resolved_command = command.to_vec();
-    let mut env_vars = request.runtime_overrides_env.clone();
-    for (key, value) in request.runtime_env {
-        env_vars.insert(key.clone(), value.clone());
-    }
-    if let Some(bundle) = request.agent_artifact {
-        let bundle_root = resolve_agent_artifact_mount_dir(bundle)?;
-        resolved_command = rewrite_local_bundle_command(command, &bundle_root);
-        let bundle_bin = bundle_root.join("bin");
-        let existing_path = env_vars
-            .get("PATH")
-            .cloned()
-            .or_else(|| std::env::var("PATH").ok())
-            .unwrap_or_default();
-        let bundle_bin_text = bundle_bin.to_string_lossy().to_string();
-        let merged_path = if existing_path.is_empty() {
-            bundle_bin_text
-        } else {
-            format!("{}:{}", bundle_bin_text, existing_path)
-        };
-        env_vars.insert("PATH".to_string(), merged_path);
-    }
-    resolved_command = resolved_command
-        .into_iter()
-        .map(|token| {
-            if token.starts_with("/agentlab/") {
-                map_contract_path_to_host(
-                    &token,
-                    &ContractPathHostRoots::from_trial_paths(request.trial_paths),
-                    ContractPathMode::ContainerMount,
-                )
-                .map(|path| path.to_string_lossy().to_string())
-                .unwrap_or(token)
-            } else {
-                token
-            }
-        })
-        .collect();
-
-    let env_keys = env_vars.keys().cloned().collect::<Vec<_>>();
-    for env_key in env_keys {
-        let Some(raw) = env_vars.get(&env_key).cloned() else {
-            continue;
-        };
-        if raw.starts_with("/agentlab/") || raw.starts_with("/harness/") {
-            let host_path =
-                resolve_trial_io_host_path(&raw, request.trial_paths, request.container_mode)?;
-            env_vars.insert(env_key, host_path.to_string_lossy().to_string());
-        }
-    }
-    env_vars.insert(
-        "WORKSPACE".to_string(),
-        request.trial_paths.workspace.to_string_lossy().to_string(),
-    );
-
-    let mut cmd = Command::new(&resolved_command[0]);
-    cmd.args(&resolved_command[1..]);
-    cmd.current_dir(&request.trial_paths.workspace);
-    for (key, value) in &env_vars {
-        cmd.env(key, value);
-    }
-    Ok(cmd)
-}
-
 fn resolve_benchmark_grader_command(
     request: &AdapterRunRequest<'_>,
 ) -> Result<Option<Vec<String>>> {
     if !request.benchmark_grading_enabled {
         return Ok(None);
     }
-    let Some(adapter) = request.benchmark_adapter else {
+    let Some(grader) = request.benchmark_grader else {
         return Ok(None);
     };
-    if adapter.command.is_empty() {
+    if grader.command.is_empty() {
         return Ok(None);
     }
-    let mut render_env = request.runtime_overrides_env.clone();
-    for (key, value) in request.runtime_env {
-        render_env.insert(key.clone(), value.clone());
-    }
-    let workspace = if request.container_mode {
-        resolve_container_workspace(request)
-            .unwrap_or(AGENTLAB_CONTRACT_WORKSPACE_DIR)
-            .to_string()
-    } else {
-        request.trial_paths.workspace.to_string_lossy().to_string()
-    };
-    render_env.insert("WORKSPACE".to_string(), workspace);
-    let rendered = apply_agentlab_template_to_command(&adapter.command, &render_env);
+    let rendered = grader.command.clone();
     if let Some(script_path) = rendered.get(1).map(|value| value.trim()) {
         if Path::new(script_path).is_absolute() && !is_runner_staged_script_path(script_path) {
             return Err(anyhow!(
-                "forbidden benchmark adapter script path '{}': script must be under {} or {}",
+                "forbidden benchmark grader script path '{}': script must be under {} or {}",
                 script_path,
                 AGENTLAB_CONTRACT_DEPS_DIR,
                 AGENTLAB_CONTRACT_STATE_DIR
@@ -2670,21 +2452,17 @@ fn resolve_benchmark_grader_command(
     Ok(Some(rendered))
 }
 
-fn resolve_container_image(request: &AdapterRunRequest<'_>) -> Result<String> {
-    let task_image = request
+fn resolve_agent_execution_image(request: &AdapterRunRequest<'_>) -> Result<String> {
+    Ok(request.runtime.image.clone())
+}
+
+fn resolve_task_sandbox_image(request: &AdapterRunRequest<'_>) -> Result<String> {
+    request
         .task_image
         .map(str::trim)
-        .filter(|value| !value.is_empty());
-    match request.runtime.image_source {
-        ImageSource::PerTask => task_image.map(ToString::to_string).ok_or_else(|| {
-            anyhow!("environment.image is required when runtime.sandbox.image_source='per_task'")
-        }),
-        ImageSource::Global => request
-            .runtime
-            .container_image
-            .clone()
-            .ok_or_else(|| anyhow!("container image required for container mode")),
-    }
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+        .ok_or_else(|| anyhow!("task_spec_v1.environment.image is required for task sandbox"))
 }
 
 fn resolve_container_workspace<'a>(request: &'a AdapterRunRequest<'_>) -> Option<&'a str> {
@@ -2692,35 +2470,45 @@ fn resolve_container_workspace<'a>(request: &'a AdapterRunRequest<'_>) -> Option
     Some(AGENTLAB_CONTRACT_WORKSPACE_DIR)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ContainerPlane {
+    AgentRuntime,
+    TaskSandbox,
+}
+
 fn append_container_sandbox_args(
     cmd: &mut Command,
     request: &AdapterRunRequest<'_>,
+    plane: ContainerPlane,
     workspace: Option<&str>,
 ) {
-    let root_read_only = request
-        .runtime_experiment
-        .pointer("/runtime/policy/sandbox/root_read_only")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(true);
+    let root_read_only = match plane {
+        ContainerPlane::AgentRuntime => request.runtime.root_read_only,
+        ContainerPlane::TaskSandbox => true,
+    };
     if root_read_only {
         cmd.arg("--read-only");
     }
 
-    let run_as_user = request
-        .runtime_experiment
-        .pointer("/runtime/policy/sandbox/run_as_user")
-        .and_then(|v| v.as_str());
+    let run_as_user = match plane {
+        ContainerPlane::AgentRuntime => request.runtime.user.as_deref(),
+        ContainerPlane::TaskSandbox => None,
+    };
     if let Some(user) = run_as_user {
         cmd.args(["-u", user]);
     }
 
-    if request.network_mode == "none" {
+    let network_mode = match plane {
+        ContainerPlane::AgentRuntime => request.runtime.network.as_str(),
+        ContainerPlane::TaskSandbox => request.network_mode,
+    };
+    if network_mode == "none" {
         cmd.arg("--network=none");
     }
 
     let no_new_privileges = request
         .runtime_experiment
-        .pointer("/runtime/policy/sandbox/hardening/no_new_privileges")
+        .pointer("/policy/task_sandbox/hardening/no_new_privileges")
         .and_then(|v| v.as_bool())
         .unwrap_or(true);
     if no_new_privileges {
@@ -2729,7 +2517,7 @@ fn append_container_sandbox_args(
 
     let drop_all_caps = request
         .runtime_experiment
-        .pointer("/runtime/policy/sandbox/hardening/drop_all_caps")
+        .pointer("/policy/task_sandbox/hardening/drop_all_caps")
         .and_then(|v| v.as_bool())
         .unwrap_or(true);
     if drop_all_caps {
@@ -2738,14 +2526,14 @@ fn append_container_sandbox_args(
 
     let cpu_limit = request
         .runtime_experiment
-        .pointer("/runtime/policy/sandbox/resources/cpu_count")
+        .pointer("/policy/task_sandbox/resources/cpu_count")
         .and_then(|v| v.as_u64());
     if let Some(cpu) = cpu_limit {
         cmd.arg("--cpus").arg(cpu.to_string());
     }
     let memory_limit_mb = request
         .runtime_experiment
-        .pointer("/runtime/policy/sandbox/resources/memory_mb")
+        .pointer("/policy/task_sandbox/resources/memory_mb")
         .and_then(|v| v.as_u64());
     if let Some(mem) = memory_limit_mb {
         cmd.arg("--memory").arg(format!("{}m", mem));
@@ -2793,7 +2581,7 @@ fn append_container_sandbox_args(
     ]);
     let sandbox_profile = request
         .runtime_experiment
-        .pointer("/runtime/sandbox/profile")
+        .pointer("/policy/task_sandbox/profile")
         .and_then(|v| v.as_str())
         .unwrap_or("default");
     if sandbox_profile == "swebench_testbed" {
@@ -2808,11 +2596,23 @@ fn append_container_sandbox_args(
             &format!("{}:{}:ro", mount.host_path.display(), mount.mount_path),
         ]);
     }
+    if matches!(plane, ContainerPlane::AgentRuntime) {
+        if let Some(bundle) = request.agent_artifact {
+            if let Ok(bundle_root) = resolve_agent_artifact_mount_dir(bundle) {
+                cmd.args([
+                    "-v",
+                    &format!("{}:/opt/agent:ro", bundle_root.display()),
+                ]);
+            }
+        }
+    }
     cmd.args(["--tmpfs", "/tmp:rw"]);
     // Mask legacy image-level /workspace so agent cannot read image internals.
     cmd.args(["--tmpfs", "/workspace:rw"]);
     // Mask benchmark internals bundled in task images from agent runtime view.
-    cmd.args(["--tmpfs", "/opt/bench:rw"]);
+    if matches!(plane, ContainerPlane::AgentRuntime) {
+        cmd.args(["--tmpfs", "/opt/bench:rw"]);
+    }
     if let Some(workspace) = workspace {
         cmd.args(["-w", workspace]);
     }
@@ -2850,16 +2650,11 @@ fn append_container_entrypoint(
     command: &[String],
     grader_command: Option<Vec<String>>,
 ) {
-    let artifact_path_export = if request.agent_artifact.is_some() {
-        format!("export {}\n", AGENT_ARTIFACT_PATH_ENV_VALUE)
-    } else {
-        String::new()
-    };
     if let Some(grader_command) = grader_command {
-        let setup_block = if let Some(setup) = request.setup_command {
-            format!("{}\nsetup_status=$?", setup)
+        let artifact_path_export = if request.agent_artifact.is_some() {
+            format!("export {}\n", AGENT_ARTIFACT_PATH_ENV_VALUE)
         } else {
-            "setup_status=0".to_string()
+            String::new()
         };
         let grade_error_marker_path = output_peer_path(
             &request.io_paths.result_path,
@@ -2869,10 +2664,6 @@ fn append_container_entrypoint(
             "set +e\n\
              rm -f {marker}\n\
              {artifact_path_export}\
-             {setup}\n\
-             if [ \"$setup_status\" -ne 0 ]; then\n\
-               exit \"$setup_status\"\n\
-             fi\n\
              {agent}\n\
              agent_status=$?\n\
              export {agent_exit_env}=\"$agent_status\"\n\
@@ -2900,23 +2691,12 @@ fn append_container_entrypoint(
              exit 0",
             marker = shell_quote(&grade_error_marker_path),
             artifact_path_export = artifact_path_export,
-            setup = setup_block,
             agent = shell_join(command),
             agent_exit_env = AGENTLAB_ENV_AGENT_EXIT_STATUS,
             result_path = shell_quote(&request.io_paths.result_path),
             grader = shell_join(&grader_command),
             score_env = AGENTLAB_ENV_BENCHMARK_SCORE_PATH,
             grade_error_code = BENCHMARK_GRADING_POLICY_EXIT_CODE,
-        );
-        cmd.arg("/bin/sh");
-        cmd.arg("-lc");
-        cmd.arg(wrapped);
-    } else if let Some(setup) = request.setup_command {
-        let wrapped = format!(
-            "{}{} && exec {}",
-            artifact_path_export,
-            setup,
-            shell_join(command)
         );
         cmd.arg("/bin/sh");
         cmd.arg("-lc");
@@ -2928,6 +2708,7 @@ fn append_container_entrypoint(
 
 fn build_baked_container_command(
     request: &AdapterRunRequest<'_>,
+    plane: ContainerPlane,
     image: &str,
     workspace: Option<&str>,
     command: &[String],
@@ -2936,7 +2717,7 @@ fn build_baked_container_command(
     let mut cmd = Command::new("docker");
     cmd.arg("run").arg("--rm").args(["--pull", "never"]);
     append_container_platform_arg(&mut cmd, image);
-    append_container_sandbox_args(&mut cmd, request, workspace);
+    append_container_sandbox_args(&mut cmd, request, plane, workspace);
     append_container_env_args(&mut cmd, request, workspace);
     cmd.arg(image);
     append_container_entrypoint(&mut cmd, request, command, grader_command);
@@ -3051,6 +2832,44 @@ fn ensure_container_image_ready(image: &str) -> Result<()> {
     ))
 }
 
+fn resolve_container_image_digest(image: &str) -> Option<String> {
+    let inspect_output = Command::new("docker")
+        .args([
+            "image",
+            "inspect",
+            image,
+            "--format",
+            "{{index .RepoDigests 0}}",
+        ])
+        .output()
+        .ok()?;
+    if !inspect_output.status.success() {
+        return None;
+    }
+    let raw = String::from_utf8_lossy(&inspect_output.stdout)
+        .trim()
+        .to_string();
+    if let Some((_, digest)) = raw.rsplit_once('@') {
+        if digest.starts_with("sha256:") {
+            return Some(digest.to_string());
+        }
+    }
+
+    let id_output = Command::new("docker")
+        .args(["image", "inspect", image, "--format", "{{.Id}}"])
+        .output()
+        .ok()?;
+    if !id_output.status.success() {
+        return None;
+    }
+    let raw = String::from_utf8_lossy(&id_output.stdout).trim().to_string();
+    if raw.starts_with("sha256:") {
+        Some(raw)
+    } else {
+        None
+    }
+}
+
 fn agent_artifact_cache_lock() -> &'static Mutex<()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| Mutex::new(()))
@@ -3093,13 +2912,13 @@ pub(crate) fn resolve_agent_artifact_mount_dir(artifact: &Path) -> Result<PathBu
     }
     if !artifact.exists() {
         return Err(anyhow!(
-            "runtime.agent.bundle not found: {}",
+            "runtime.agent_runtime.artifact not found: {}",
             artifact.display()
         ));
     }
     if !artifact.is_file() {
         return Err(anyhow!(
-            "runtime.agent.bundle must be a file or directory: {}",
+            "runtime.agent_runtime.artifact must be a file or directory: {}",
             artifact.display()
         ));
     }
@@ -3114,7 +2933,7 @@ pub(crate) fn resolve_agent_artifact_mount_dir(artifact: &Path) -> Result<PathBu
         "-xf"
     } else {
         return Err(anyhow!(
-            "runtime.agent.bundle '{}' must be a directory or .tar/.tar.gz archive",
+            "runtime.agent_runtime.artifact '{}' must be a directory or .tar/.tar.gz archive",
             artifact_path.display()
         ));
     };
@@ -3167,7 +2986,7 @@ pub(crate) fn resolve_agent_artifact_mount_dir(artifact: &Path) -> Result<PathBu
     if !unpack_out.status.success() {
         let _ = fs::remove_dir_all(&staging_dir);
         return Err(anyhow!(
-            "failed to unpack runtime.agent.bundle {}: {}",
+            "failed to unpack runtime.agent_runtime.artifact {}: {}",
             artifact_path.display(),
             output_error_detail(&unpack_out),
         ));
@@ -3175,7 +2994,7 @@ pub(crate) fn resolve_agent_artifact_mount_dir(artifact: &Path) -> Result<PathBu
     if let Err(err) = fs::rename(&staging_dir, &unpacked_dir) {
         let _ = fs::remove_dir_all(&staging_dir);
         return Err(anyhow!(
-            "failed to finalize unpacked runtime.agent.bundle {} into {}: {}",
+            "failed to finalize unpacked runtime.agent_runtime.artifact {} into {}: {}",
             artifact_path.display(),
             unpacked_dir.display(),
             err
@@ -3186,48 +3005,12 @@ pub(crate) fn resolve_agent_artifact_mount_dir(artifact: &Path) -> Result<PathBu
     Ok(unpacked_dir)
 }
 
-fn append_runtime_io_arg(command: &mut Vec<String>, arg_spec: &str, path: &str) -> Result<()> {
-    let trimmed = arg_spec.trim();
-    if trimmed.is_empty() {
-        return Err(anyhow!("runtime.agent.io argument spec must not be empty"));
-    }
-    if trimmed.contains("{path}") {
-        command.push(trimmed.replace("{path}", path));
-    } else if trimmed.ends_with('=') {
-        command.push(format!("{}{}", trimmed, path));
-    } else {
-        command.push(trimmed.to_string());
-        command.push(path.to_string());
-    }
-    Ok(())
-}
-
 fn resolve_runtime_agent_command(request: &AdapterRunRequest<'_>) -> Result<Vec<String>> {
-    let mut render_env = request.runtime_env.clone();
-    let workspace = if request.container_mode {
-        resolve_container_workspace(request)
-            .unwrap_or(AGENTLAB_CONTRACT_WORKSPACE_DIR)
-            .to_string()
-    } else {
-        request.trial_paths.workspace.to_string_lossy().to_string()
-    };
-    render_env.insert("WORKSPACE".to_string(), workspace);
-    let rendered = apply_agentlab_template_to_command(&request.runtime.command_raw, &render_env);
-    if rendered.is_empty() {
-        return Err(anyhow!("resolved runtime.agent command is empty"));
+    if request.runtime.command_raw.is_empty() {
+        return Err(anyhow!("resolved runtime.agent_runtime.command is empty"));
     }
-    let mut command = rendered;
+    let mut command = request.runtime.command_raw.clone();
     command.extend(request.variant_args.iter().cloned());
-    append_runtime_io_arg(
-        &mut command,
-        &request.runtime.io.input_arg,
-        &request.io_paths.task_path,
-    )?;
-    append_runtime_io_arg(
-        &mut command,
-        &request.runtime.io.output_arg,
-        &request.io_paths.result_path,
-    )?;
     Ok(command)
 }
 
@@ -3263,7 +3046,6 @@ fn create_preflight_probe_root(label: &str) -> Result<PreflightProbeRoot> {
 
 fn select_preflight_probe_task(
     tasks: &[Value],
-    image_source: ImageSource,
     image: &str,
 ) -> Result<(usize, TaskBoundaryMaterialization)> {
     let mut parse_errors = Vec::new();
@@ -3275,7 +3057,7 @@ fn select_preflight_probe_task(
                 continue;
             }
         };
-        if image_source == ImageSource::Global || boundary.task_image.as_str() == image {
+        if boundary.task_image.as_str() == image {
             return Ok((idx, boundary));
         }
     }
@@ -3285,33 +3067,9 @@ fn select_preflight_probe_task(
             format_preview(&parse_errors, 3)
         ));
     }
-    if image_source == ImageSource::PerTask {
-        return Err(anyhow!(
-            "no representative task boundary row found for image '{}'",
-            image
-        ));
-    }
-    Ok((
-        0,
-        TaskBoundaryMaterialization {
-            task_payload: json!({ "id": "preflight_probe" }),
-            environment: TaskEnvironmentSpec {
-                image: image.to_string(),
-            },
-            workspace: WorkspaceSpec {
-                mode: WorkspaceMode::Scratch,
-                base: WorkspaceBaseSpec {
-                    kind: WorkspaceBaseKind::Empty,
-                    dataset_pack_ref: None,
-                    repo: None,
-                    commit: None,
-                },
-                overlays: Vec::new(),
-                aux_mounts: Vec::new(),
-            },
-            limits: TaskBoundaryLimits::default(),
-            task_image: image.to_string(),
-        },
+    Err(anyhow!(
+        "no representative task spec row found for image '{}'",
+        image
     ))
 }
 
@@ -3322,19 +3080,18 @@ fn build_preflight_probe_context(
     image: &str,
     project_root: &Path,
 ) -> Result<PreflightProbeContext> {
-    let (task_idx, task_boundary) =
-        select_preflight_probe_task(tasks, runtime_profile.agent_runtime.image_source, image)?;
+    let (task_idx, task_boundary) = select_preflight_probe_task(tasks, image)?;
     let probe_root = create_preflight_probe_root(&format!("{}_{}", variant.id, image))?;
     let trial_dir = probe_root.path.join("trial_1");
     ensure_dir(&trial_dir)?;
     let trial_paths = TrialPaths::new(&trial_dir, project_root)?;
     trial_paths.prepare(false)?;
-    stage_dependencies_for_trial(&runtime_profile.agent_runtime, &trial_paths)?;
+    materialize_task_dependencies_for_trial(&task_boundary, &trial_paths)?;
     materialize_workspace_base(project_root, &trial_paths, &task_boundary.workspace.base)?;
     materialize_workspace_overlays(&trial_paths, &task_boundary.workspace.overlays)?;
-    stage_workspace_patches_for_trial(&runtime_profile.agent_runtime, &trial_paths)?;
+    stage_workspace_inputs_for_trial(&task_boundary, &trial_paths)?;
     let dynamic_mounts =
-        resolve_workspace_aux_mounts(project_root, &task_boundary.workspace.aux_mounts, true)?;
+        resolve_workspace_aux_mounts(project_root, &task_boundary.workspace.aux_mounts)?;
     let mut input = build_agent_task(
         &runtime_profile.experiment,
         "preflight_probe",
@@ -3343,7 +3100,6 @@ fn build_preflight_probe_context(
         task_idx,
         0,
         &task_boundary,
-        &runtime_profile.agent_runtime,
     );
     set_json_pointer_value(
         &mut input,
@@ -3352,9 +3108,9 @@ fn build_preflight_probe_context(
     )?;
     set_json_pointer_value(&mut input, "/runtime/control_plane/mode", json!("file"))?;
     let input_bytes = serde_json::to_vec_pretty(&input)?;
-    let io_paths = prepare_io_paths(&trial_paths, runtime_profile.container_mode, &input_bytes)?;
+    let io_paths = prepare_io_paths(&trial_paths, &input_bytes)?;
     let smoke_timeout_ms =
-        resolve_trial_timeout_ms(&input, runtime_profile.invocation_default_timeout_ms)
+        resolve_trial_timeout_ms(&input)
             .map(|value| value.min(DEFAULT_PREFLIGHT_CONTRACT_SMOKE_TIMEOUT_MS));
     let mut runtime_env =
         build_runtime_contract_env("preflight_probe", &input, &io_paths, smoke_timeout_ms);
@@ -3372,7 +3128,7 @@ fn build_preflight_probe_context(
 fn build_preflight_probe_request<'a>(
     context: &'a PreflightProbeContext,
     runtime_profile: &'a VariantRuntimeProfile,
-    benchmark_adapter: Option<&'a BenchmarkAdapterConfig>,
+    benchmark_grader: Option<&'a BenchmarkGraderConfig>,
     benchmark_grading_enabled: bool,
 ) -> AdapterRunRequest<'a> {
     AdapterRunRequest {
@@ -3381,17 +3137,15 @@ fn build_preflight_probe_request<'a>(
         variant_args: &runtime_profile.variant_args,
         runtime_env: &context.runtime_env,
         runtime_overrides_env: &runtime_profile.agent_runtime_env,
-        container_mode: runtime_profile.container_mode,
         trial_paths: &context.trial_paths,
         dynamic_mounts: &context.dynamic_mounts,
         io_paths: &context.io_paths,
         network_mode: runtime_profile.effective_network_mode.as_str(),
-        setup_command: None,
-        benchmark_adapter,
+        benchmark_grader,
         benchmark_grading_enabled,
         run_id: "preflight_probe",
         task_image: context.task_image.as_deref(),
-        agent_artifact: runtime_profile.agent_runtime.agent_artifact.as_deref(),
+        agent_artifact: Some(runtime_profile.agent_runtime.agent_artifact.as_path()),
     }
 }
 
@@ -3619,30 +3373,8 @@ fn collect_preflight_contract_smoke_failures(
         .collect()
 }
 
-fn resolve_agent_runtime_command(
-    command: &[String],
-    exp_dir: &Path,
-    container_mode: bool,
-) -> Vec<String> {
-    if container_mode {
-        // Keep runtime.command tokens literal in containers so users can run "./agent.py"
-        // from /agentlab/workspace without leaking host absolute paths into experiment YAML.
-        return command.to_vec();
-    }
-    let mut resolved = Vec::new();
-    for part in command {
-        let p = Path::new(part);
-        if p.is_relative() && command_part_looks_like_path(part) {
-            resolved.push(
-                normalize_path(&exp_dir.join(p))
-                    .to_string_lossy()
-                    .to_string(),
-            );
-        } else {
-            resolved.push(part.clone());
-        }
-    }
-    resolved
+fn resolve_agent_runtime_command(command: &[String]) -> Vec<String> {
+    command.to_vec()
 }
 
 fn resolve_command_script_path(command: &[String], project_root: &Path) -> Option<PathBuf> {
@@ -3665,55 +3397,9 @@ fn resolve_command_script_path(command: &[String], project_root: &Path) -> Optio
     }
     Some(normalize_path(&project_root.join(candidate)))
 }
-fn validate_agent_runtime_command(
-    command: &[String],
-    project_root: &Path,
-    container_mode: bool,
-) -> Result<()> {
+fn validate_agent_runtime_command(command: &[String], _project_root: &Path) -> Result<()> {
     if command.is_empty() {
-        return Ok(());
-    }
-    // In container mode, absolute script paths can legitimately point to image paths
-    // such as /opt/... that are not expected on host.
-    if container_mode {
-        let first = Path::new(&command[0]);
-        if first.is_absolute() {
-            return Ok(());
-        }
-        if command.len() >= 2 {
-            let second = Path::new(&command[1]);
-            if second.is_absolute() {
-                return Ok(());
-            }
-        }
-    }
-    let path = resolve_command_script_path(command, project_root);
-    if let Some(p) = path {
-        if !p.exists() {
-            let mut candidates: Vec<String> = Vec::new();
-            for c in [
-                "harness.js",
-                "agentlab_demo_harness.js",
-                "agentlab/harness.js",
-                "harness.py",
-                "main.py",
-            ] {
-                let cp = project_root.join(c);
-                if cp.exists() {
-                    candidates.push(cp.display().to_string());
-                }
-            }
-            let hint = if candidates.is_empty() {
-                "no common harness entrypoints found".to_string()
-            } else {
-                format!("candidates: {}", candidates.join(", "))
-            };
-            return Err(anyhow!(
-                "agent entrypoint file not found on host: {} (update runtime.agent command). {}",
-                p.display(),
-                hint
-            ));
-        }
+        return Err(anyhow!("runtime.agent_runtime.command must not be empty"));
     }
     Ok(())
 }
@@ -3920,88 +3606,26 @@ fn load_trial_output_resilient(path: &Path) -> Result<(Value, Option<String>)> {
     }
 }
 
-fn resolve_trial_io_host_path(
-    path: &str,
-    paths: &TrialPaths,
-    container_mode: bool,
-) -> Result<PathBuf> {
-    if container_mode {
-        return map_container_path_to_host(path, paths);
-    }
-    map_contract_path_to_host(
-        path,
-        &ContractPathHostRoots::from_trial_paths(paths),
-        ContractPathMode::RuntimeIo,
-    )
+fn resolve_trial_io_host_path(path: &str, paths: &TrialPaths) -> Result<PathBuf> {
+    map_container_path_to_host(path, paths)
 }
 
-fn prepare_io_paths(
-    paths: &TrialPaths,
-    container_mode: bool,
-    input_bytes: &[u8],
-) -> Result<PreparedTrialIo> {
-    let (
-        task_path,
-        bindings_path,
-        dependencies_path,
-        policy_path,
-        result_path,
-        trajectory_path,
-        task_host,
-        bindings_host,
-        dependencies_host,
-        policy_host,
-        result_host,
-        trajectory_host,
-        input_host,
-        output_host,
-        events_host,
-    ) = if container_mode {
-        (
-            DEFAULT_CONTAINER_TASK_PATH.to_string(),
-            DEFAULT_CONTAINER_BINDINGS_PATH.to_string(),
-            DEFAULT_CONTAINER_DEPENDENCIES_PATH.to_string(),
-            DEFAULT_CONTAINER_POLICY_PATH.to_string(),
-            DEFAULT_CONTAINER_RESULT_PATH.to_string(),
-            DEFAULT_CONTAINER_TRAJECTORY_PATH.to_string(),
-            resolve_trial_io_host_path(DEFAULT_CONTAINER_TASK_PATH, paths, true)?,
-            resolve_trial_io_host_path(DEFAULT_CONTAINER_BINDINGS_PATH, paths, true)?,
-            resolve_trial_io_host_path(DEFAULT_CONTAINER_DEPENDENCIES_PATH, paths, true)?,
-            resolve_trial_io_host_path(DEFAULT_CONTAINER_POLICY_PATH, paths, true)?,
-            resolve_trial_io_host_path(DEFAULT_CONTAINER_RESULT_PATH, paths, true)?,
-            resolve_trial_io_host_path(DEFAULT_CONTAINER_TRAJECTORY_PATH, paths, true)?,
-            resolve_trial_io_host_path(DEFAULT_CONTAINER_TRIAL_INPUT_PATH, paths, true)?,
-            resolve_trial_io_host_path(DEFAULT_CONTAINER_RESULT_PATH, paths, true)?,
-            resolve_trial_io_host_path(DEFAULT_CONTAINER_TRAJECTORY_PATH, paths, true)?,
-        )
-    } else {
-        let task_host = paths.runtime.task.clone();
-        let bindings_host = paths.runtime.bindings.clone();
-        let dependencies_host = paths.runtime.dependencies.clone();
-        let policy_host = paths.runtime.policy.clone();
-        let result_host = paths.runtime.result.clone();
-        let trajectory_host = paths.runtime.trajectory.clone();
-        let input_host = paths.runtime.trial_input.clone();
-        let output_host = result_host.clone();
-        let events_host = trajectory_host.clone();
-        (
-            task_host.to_string_lossy().to_string(),
-            bindings_host.to_string_lossy().to_string(),
-            dependencies_host.to_string_lossy().to_string(),
-            policy_host.to_string_lossy().to_string(),
-            result_host.to_string_lossy().to_string(),
-            trajectory_host.to_string_lossy().to_string(),
-            task_host,
-            bindings_host,
-            dependencies_host,
-            policy_host,
-            result_host,
-            trajectory_host,
-            input_host,
-            output_host,
-            events_host,
-        )
-    };
+fn prepare_io_paths(paths: &TrialPaths, input_bytes: &[u8]) -> Result<PreparedTrialIo> {
+    let task_path = DEFAULT_CONTAINER_TASK_PATH.to_string();
+    let bindings_path = DEFAULT_CONTAINER_BINDINGS_PATH.to_string();
+    let dependencies_path = DEFAULT_CONTAINER_DEPENDENCIES_PATH.to_string();
+    let policy_path = DEFAULT_CONTAINER_POLICY_PATH.to_string();
+    let result_path = DEFAULT_CONTAINER_RESULT_PATH.to_string();
+    let trajectory_path = DEFAULT_CONTAINER_TRAJECTORY_PATH.to_string();
+    let task_host = resolve_trial_io_host_path(DEFAULT_CONTAINER_TASK_PATH, paths)?;
+    let bindings_host = resolve_trial_io_host_path(DEFAULT_CONTAINER_BINDINGS_PATH, paths)?;
+    let dependencies_host = resolve_trial_io_host_path(DEFAULT_CONTAINER_DEPENDENCIES_PATH, paths)?;
+    let policy_host = resolve_trial_io_host_path(DEFAULT_CONTAINER_POLICY_PATH, paths)?;
+    let result_host = resolve_trial_io_host_path(DEFAULT_CONTAINER_RESULT_PATH, paths)?;
+    let trajectory_host = resolve_trial_io_host_path(DEFAULT_CONTAINER_TRAJECTORY_PATH, paths)?;
+    let input_host = resolve_trial_io_host_path(DEFAULT_CONTAINER_TRIAL_INPUT_PATH, paths)?;
+    let output_host = resolve_trial_io_host_path(DEFAULT_CONTAINER_RESULT_PATH, paths)?;
+    let events_host = resolve_trial_io_host_path(DEFAULT_CONTAINER_TRAJECTORY_PATH, paths)?;
 
     for host_path in [
         &task_host,
@@ -4078,6 +3702,92 @@ fn materialize_trial_result(trial_dir: &Path, output_path: &Path) -> Result<Path
     Ok(canonical_output)
 }
 
+fn copy_file_if_exists(src: &Path, dst: &Path) -> Result<()> {
+    if !src.exists() {
+        return Ok(());
+    }
+    if let Some(parent) = dst.parent() {
+        ensure_dir(parent)?;
+    }
+    if dst.exists() {
+        remove_path_if_exists(dst)?;
+    }
+    fs::copy(src, dst)?;
+    Ok(())
+}
+
+fn copy_dir_preserve_contents(src: &Path, dst: &Path) -> Result<()> {
+    if !src.exists() {
+        return Ok(());
+    }
+    remove_path_if_exists(dst)?;
+    ensure_dir(dst)?;
+    let walker = walkdir::WalkDir::new(src).into_iter();
+    for entry in walker {
+        let entry = entry?;
+        let path = entry.path();
+        let rel = path.strip_prefix(src).unwrap_or(path);
+        if rel.as_os_str().is_empty() {
+            continue;
+        }
+        let target = dst.join(rel);
+        if entry.file_type().is_dir() {
+            ensure_dir(&target)?;
+        } else if entry.file_type().is_symlink() {
+            if let Some(parent) = target.parent() {
+                ensure_dir(parent)?;
+            }
+            match fs::canonicalize(path) {
+                Ok(real) if real.is_dir() => preserve_symlink(path, &target)?,
+                Ok(real) if real.is_file() => {
+                    fs::copy(real, &target)?;
+                }
+                Ok(_) => preserve_symlink(path, &target)?,
+                Err(_) => preserve_symlink(path, &target)?,
+            }
+        } else if entry.file_type().is_file() {
+            if let Some(parent) = target.parent() {
+                ensure_dir(parent)?;
+            }
+            fs::copy(path, &target)?;
+        }
+    }
+    Ok(())
+}
+
+fn materialize_trial_runtime_layout(
+    trial_dir: &Path,
+    paths: &TrialPaths,
+    mode: MaterializationMode,
+) -> Result<()> {
+    match mode {
+        MaterializationMode::Full => {
+            copy_dir_preserve_contents(&paths.in_dir, &trial_dir.join("in"))?;
+            copy_dir_preserve_contents(&paths.out, &trial_dir.join("out"))?;
+            copy_dir_preserve_contents(&paths.state, &trial_dir.join("state"))?;
+            copy_dir_preserve_contents(&paths.deps, &trial_dir.join("deps"))?;
+            copy_dir_preserve_contents(&paths.workspace, &trial_dir.join("workspace"))?;
+            copy_dir_preserve_contents(&paths.tmp, &trial_dir.join("tmp"))?;
+            copy_file_if_exists(&paths.runtime.trial_input, &trial_dir.join("trial_input.json"))?;
+            copy_file_if_exists(
+                &paths.out.join("harness_manifest.json"),
+                &trial_dir.join("harness_manifest.json"),
+            )?;
+            let _ = materialize_trial_result(trial_dir, &paths.runtime.result)?;
+        }
+        MaterializationMode::OutputsOnly => {
+            copy_dir_preserve_contents(&paths.out, &trial_dir.join("out"))?;
+            copy_file_if_exists(
+                &paths.out.join("harness_manifest.json"),
+                &trial_dir.join("harness_manifest.json"),
+            )?;
+            let _ = materialize_trial_result(trial_dir, &paths.runtime.result)?;
+        }
+        MaterializationMode::MetadataOnly | MaterializationMode::None => {}
+    }
+    apply_materialization_policy(trial_dir, mode)
+}
+
 fn write_adapter_continue_control(path: &Path) -> Result<()> {
     let _ = write_adapter_control_action(path, 0, "continue", None, "run_loop")?;
     Ok(())
@@ -4104,18 +3814,11 @@ fn write_adapter_control_action(
     Ok(version)
 }
 
-fn resolve_agent_runtime_manifest_path(
-    paths: &TrialPaths,
-    container_mode: bool,
-) -> Result<PathBuf> {
-    if container_mode {
-        map_container_path_to_host(
-            &format!("{}/harness_manifest.json", AGENTLAB_CONTRACT_OUT_DIR),
-            paths,
-        )
-    } else {
-        Ok(paths.out.join("harness_manifest.json"))
-    }
+fn resolve_agent_runtime_manifest_path(paths: &TrialPaths) -> Result<PathBuf> {
+    map_container_path_to_host(
+        &format!("{}/harness_manifest.json", AGENTLAB_CONTRACT_OUT_DIR),
+        paths,
+    )
 }
 
 fn resolve_exec_digest(command: &[String], exp_dir: &Path) -> Result<String> {
@@ -4137,11 +3840,11 @@ fn write_state_inventory(
     trial_dir: &Path,
     json_value: &Value,
     agent_runtime: &AgentRuntimeConfig,
-    container_mode: bool,
     paths: &TrialPaths,
     exec_digest: &str,
     effective_network_mode: &str,
     invocation_source: &str,
+    task_sandbox_image: Option<&str>,
 ) -> Result<()> {
     let sanitization_profile = json_value
         .pointer("/design/sanitization_profile")
@@ -4149,39 +3852,59 @@ fn write_state_inventory(
         .unwrap_or("hermetic_functional");
     let integration_level = agent_runtime.integration_level.as_str();
     let mode_requested = json_value
-        .pointer("/runtime/sandbox/network")
+        .pointer("/policy/task_sandbox/network")
         .and_then(|v| v.as_str())
         .unwrap_or("none");
-    let mode_effective = if container_mode {
-        effective_network_mode
-    } else {
-        "full"
-    };
-    let enforcement_effective = if container_mode && mode_requested == "none" {
+    let mode_effective = effective_network_mode;
+    let enforcement_effective = if mode_requested == "none" {
         "docker_none"
     } else {
         "unknown"
     };
 
-    let mounts = if container_mode {
-        vec![
-            json!({"name": "in", "path": AGENTLAB_CONTRACT_IN_DIR, "writable": false}),
-            json!({"name": "workspace", "path": AGENTLAB_CONTRACT_WORKSPACE_DIR, "writable": true}),
-            json!({"name": "state", "path": AGENTLAB_CONTRACT_STATE_DIR, "writable": true}),
-            json!({"name": "deps", "path": AGENTLAB_CONTRACT_DEPS_DIR, "writable": true}),
-            json!({"name": "out", "path": AGENTLAB_CONTRACT_OUT_DIR, "writable": true}),
-            json!({"name": "tmp", "path": "/tmp", "writable": true}),
-        ]
-    } else {
-        vec![
-            json!({"name": "in", "path": paths.in_dir.to_string_lossy(), "writable": false}),
-            json!({"name": "workspace", "path": paths.workspace.to_string_lossy(), "writable": true}),
-            json!({"name": "state", "path": paths.state.to_string_lossy(), "writable": true}),
-            json!({"name": "deps", "path": paths.deps.to_string_lossy(), "writable": true}),
-            json!({"name": "out", "path": paths.out.to_string_lossy(), "writable": true}),
-            json!({"name": "tmp", "path": paths.tmp.to_string_lossy(), "writable": true}),
-        ]
-    };
+    let mounts = vec![
+        json!({"name": "in", "path": AGENTLAB_CONTRACT_IN_DIR, "writable": false}),
+        json!({"name": "workspace", "path": AGENTLAB_CONTRACT_WORKSPACE_DIR, "writable": true}),
+        json!({"name": "state", "path": AGENTLAB_CONTRACT_STATE_DIR, "writable": true}),
+        json!({"name": "deps", "path": AGENTLAB_CONTRACT_DEPS_DIR, "writable": true}),
+        json!({"name": "out", "path": AGENTLAB_CONTRACT_OUT_DIR, "writable": true}),
+        json!({"name": "tmp", "path": "/tmp", "writable": true}),
+    ];
+    let mut agent_runtime_mounts = vec![
+        json!({"name": "in", "path": AGENTLAB_CONTRACT_IN_DIR, "writable": false}),
+        json!({"name": "workspace", "path": AGENTLAB_CONTRACT_WORKSPACE_DIR, "writable": true}),
+        json!({"name": "state", "path": AGENTLAB_CONTRACT_STATE_DIR, "writable": true}),
+        json!({"name": "deps", "path": AGENTLAB_CONTRACT_DEPS_DIR, "writable": true}),
+        json!({"name": "out", "path": AGENTLAB_CONTRACT_OUT_DIR, "writable": true}),
+        json!({"name": "tmp", "path": "/tmp", "writable": true}),
+    ];
+    agent_runtime_mounts.push(json!({
+        "name": "agent_bundle",
+        "path": "/opt/agent",
+        "writable": false
+    }));
+    let mut task_sandbox_mounts = vec![
+        json!({"name": "in", "path": AGENTLAB_CONTRACT_IN_DIR, "writable": false}),
+        json!({"name": "workspace", "path": AGENTLAB_CONTRACT_WORKSPACE_DIR, "writable": true}),
+        json!({"name": "state", "path": AGENTLAB_CONTRACT_STATE_DIR, "writable": true}),
+        json!({"name": "deps", "path": AGENTLAB_CONTRACT_DEPS_DIR, "writable": true}),
+        json!({"name": "out", "path": AGENTLAB_CONTRACT_OUT_DIR, "writable": true}),
+        json!({"name": "tmp", "path": "/tmp", "writable": true}),
+    ];
+    let sandbox_profile = json_value
+        .pointer("/policy/task_sandbox/profile")
+        .and_then(|v| v.as_str())
+        .unwrap_or("default");
+    if sandbox_profile == "swebench_testbed" {
+        task_sandbox_mounts.push(json!({
+            "name": "testbed",
+            "path": "/testbed",
+            "writable": true
+        }));
+    }
+    let agent_runtime_image = Some(agent_runtime.image.as_str());
+    let agent_runtime_image_digest = agent_runtime_image.and_then(resolve_container_image_digest);
+    let task_sandbox_image_digest = task_sandbox_image.and_then(resolve_container_image_digest);
 
     let state = json!({
         "schema_version": "state_inventory_v1",
@@ -4192,7 +3915,7 @@ fn write_state_inventory(
             "mode_requested": mode_requested,
             "mode_effective": mode_effective,
             "allowed_hosts": json_value
-                .pointer("/runtime/policy/network/allowed_hosts")
+                .pointer("/policy/task_sandbox/allowed_hosts")
                 .cloned()
                 .unwrap_or(json!([])),
             "enforcement_effective": enforcement_effective,
@@ -4206,10 +3929,27 @@ fn write_state_inventory(
             "exec_digest": exec_digest,
             "entry_command": agent_runtime.command_raw.clone()
         },
+        "planes": {
+            "agent_runtime": {
+                "executor": "docker",
+                "image": agent_runtime_image,
+                "image_digest": agent_runtime_image_digest,
+                "workspace": AGENTLAB_CONTRACT_WORKSPACE_DIR,
+                "mounts": agent_runtime_mounts,
+                "network_mode": agent_runtime.network
+            },
+            "task_sandbox": {
+                "executor": "docker",
+                "image": task_sandbox_image,
+                "image_digest": task_sandbox_image_digest,
+                "workspace": AGENTLAB_CONTRACT_WORKSPACE_DIR,
+                "mounts": task_sandbox_mounts,
+                "network_mode": mode_effective
+            }
+        },
         "ext": {
             "agent_runtime_identity": {
-                "invocation_source": invocation_source,
-                "launch_mode": agent_runtime.launch_mode.as_str()
+                "invocation_source": invocation_source
             }
         },
         "violations": {
@@ -4223,13 +3963,22 @@ fn write_state_inventory(
 }
 
 fn remove_path_if_exists(path: &Path) -> Result<()> {
-    if !path.exists() {
-        return Ok(());
+    match fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() || meta.is_file() => fs::remove_file(path)?,
+        Ok(meta) if meta.is_dir() => fs::remove_dir_all(path)?,
+        Ok(_) => fs::remove_file(path)?,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => return Err(err.into()),
     }
-    if path.is_dir() {
-        fs::remove_dir_all(path)?;
-    } else {
-        fs::remove_file(path)?;
+    Ok(())
+}
+
+fn preserve_symlink(path: &Path, target: &Path) -> Result<()> {
+    let link_target = fs::read_link(path)?;
+    remove_path_if_exists(target)?;
+    #[cfg(unix)]
+    {
+        symlink(&link_target, target)?;
     }
     Ok(())
 }
@@ -4450,24 +4199,12 @@ fn copy_dir_filtered(src: &Path, dst: &Path, exclude: &[&str]) -> Result<()> {
                 ensure_dir(parent)?;
             }
             match fs::canonicalize(path) {
-                Ok(real) if real.is_dir() => {
-                    copy_dir_filtered(&real, &target, &[])?;
-                }
+                Ok(real) if real.is_dir() => preserve_symlink(path, &target)?,
                 Ok(real) if real.is_file() => {
                     fs::copy(real, &target)?;
                 }
-                Ok(_) => {}
-                Err(_) => {
-                    // Preserve broken links instead of aborting trial setup.
-                    let link_target = fs::read_link(path)?;
-                    if target.exists() {
-                        let _ = fs::remove_file(&target);
-                    }
-                    #[cfg(unix)]
-                    {
-                        symlink(&link_target, &target)?;
-                    }
-                }
+                Ok(_) => preserve_symlink(path, &target)?,
+                Err(_) => preserve_symlink(path, &target)?,
             }
         } else if entry.file_type().is_file() {
             if let Some(parent) = target.parent() {

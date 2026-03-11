@@ -137,11 +137,12 @@ export interface WorkspaceSpecV3 {
   aux_mounts: WorkspaceAuxMountV3[];
 }
 
-export interface TaskBoundaryV3 {
-  schema_version: 'task_boundary_v3';
+export interface TaskSpecV1 {
+  schema_version: 'task_spec_v1';
   task: Record<string, JsonValue>;
   environment: TaskEnvironmentV3;
   workspace: WorkspaceSpecV3;
+  dependencies?: Record<string, JsonValue>;
   limits: TaskLimitsV1;
 }
 
@@ -150,7 +151,7 @@ export interface InputMapperContext {
 }
 
 export interface InputMapper<TInput> {
-  map(input: TInput, context: InputMapperContext): TaskBoundaryV3;
+  map(input: TInput, context: InputMapperContext): TaskSpecV1;
 }
 
 const TASK_BOUNDARY_KEYS = new Set([
@@ -158,6 +159,7 @@ const TASK_BOUNDARY_KEYS = new Set([
   'task',
   'environment',
   'workspace',
+  'dependencies',
   'limits',
 ]);
 
@@ -273,7 +275,7 @@ function assertWorkspaceBase(base: unknown): void {
   }
 }
 
-export function assertTaskBoundaryV3(boundary: unknown): asserts boundary is TaskBoundaryV3 {
+export function assertTaskSpecV1(boundary: unknown): asserts boundary is TaskSpecV1 {
   if (!isPlainObject(boundary)) {
     throw new Error('task boundary must be an object');
   }
@@ -288,8 +290,8 @@ export function assertTaskBoundaryV3(boundary: unknown): asserts boundary is Tas
     }
   }
 
-  if (boundary.schema_version !== 'task_boundary_v3') {
-    throw new Error('task boundary schema_version must be "task_boundary_v3"');
+  if (boundary.schema_version !== 'task_spec_v1') {
+    throw new Error('task spec schema_version must be "task_spec_v1"');
   }
 
   if (!isPlainObject(boundary.task)) {
@@ -399,20 +401,20 @@ export function assertTaskBoundaryV3(boundary: unknown): asserts boundary is Tas
   assertPositiveInt(readOptionalNumber(limits, 'trial_seconds'), 'trial_seconds');
 }
 
-export function compileTaskBoundaries<TInput>(
+export function compileTaskSpecs<TInput>(
   inputs: readonly TInput[],
   mapper: InputMapper<TInput>,
-): TaskBoundaryV3[] {
+: TaskSpecV1[] {
   return inputs.map((input, index) => {
     const boundary = mapper.map(input, { index });
-    assertTaskBoundaryV3(boundary);
+    assertTaskSpecV1(boundary);
     return boundary;
   });
 }
 
-export function taskBoundariesToJsonl(boundaries: readonly TaskBoundaryV3[]): string {
+export function taskSpecsToJsonl(boundaries: readonly TaskSpecV1[]): string {
   const lines = boundaries.map((boundary) => {
-    assertTaskBoundaryV3(boundary);
+    assertTaskSpecV1(boundary);
     return JSON.stringify(boundary);
   });
   if (lines.length === 0) {
