@@ -1,0 +1,35 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agent-lab.local/schemas/runtime_path_staging_manifest_v1.json",
+  "title": "Runtime Path Staging Manifest v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "variants"],
+  "properties": {
+    "schema_version": { "const": "runtime_path_staging_manifest_v1" },
+    "variants": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "array",
+        "items": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": [
+            "original_relative_path",
+            "packaged_path",
+            "runtime_path",
+            "required",
+            "read_only"
+          ],
+          "properties": {
+            "original_relative_path": { "type": "string", "minLength": 1 },
+            "packaged_path": { "type": "string", "minLength": 1 },
+            "runtime_path": { "type": "string", "minLength": 1 },
+            "required": { "type": "boolean" },
+            "read_only": { "type": "boolean" }
+          }
+        }
+      }
+    }
+  }
+}

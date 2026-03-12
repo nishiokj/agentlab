@@ -2496,10 +2496,19 @@ fn reject_removed_dx_agent_fields(root: &Value, root_name: &str) -> Result<()> {
             "bindings_to_args",
             "put public argv directly in agent.command using $binding placeholders",
         ),
-        ("default_config", "put --config <relative-path> directly in agent.command"),
-        ("config_files", "reference relative files directly from agent.command or agent.env"),
+        (
+            "default_config",
+            "package agent config inside the agent artifact; authored override file wiring is not supported",
+        ),
+        (
+            "config_files",
+            "package agent config inside the agent artifact; authored host-path staging is not supported",
+        ),
         ("provider_env", "bind runtime values directly with $NAME in agent.command or agent.env"),
-        ("support_files", "reference relative files directly from agent.command or agent.env"),
+        (
+            "support_files",
+            "package support files inside the agent artifact; authored host-path staging is not supported",
+        ),
         ("env_from_host", "bind runtime values directly with $NAME in agent.command or agent.env"),
     ];
     for (field, guidance) in removed {
@@ -2535,17 +2544,28 @@ fn resolve_existing_public_path_reference(
     }
     let rel = validate_dx_support_file_relpath(trimmed, field_name)?;
     let resolved = normalize_path(&exp_dir.join(&rel));
-    if resolved.exists() {
-        return Ok(Some(PathBuf::from(rel)));
+    match fs::metadata(&resolved) {
+        Ok(_) => Ok(Some(PathBuf::from(rel))),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            if trimmed.starts_with("./") || trimmed.contains('/') {
+                return Err(anyhow!(
+                    "{} public path '{}' resolved to missing source '{}'",
+                    field_name,
+                    trimmed,
+                    resolved.display()
+                ));
+            }
+            Ok(None)
+        }
+        Err(err) => Err(err).with_context(|| {
+            format!(
+                "failed to read {} public path reference '{}' resolved to '{}'",
+                field_name,
+                trimmed,
+                resolved.display()
+            )
+        }),
     }
-    if trimmed.starts_with("./") || trimmed.contains('/') {
-        return Err(anyhow!(
-            "{} resolved path does not exist: {}",
-            field_name,
-            resolved.display()
-        ));
-    }
-    Ok(None)
 }
 
 fn validate_dx_command_and_env_surface(
@@ -2619,78 +2639,13 @@ fn validate_dx_support_file_relpath(raw: &str, field_name: &str) -> Result<Strin
     Ok(normalized.to_string_lossy().replace('\\', "/"))
 }
 
-fn resolve_dx_support_source_path(
-    raw: &str,
-    exp_dir: &Path,
-    _project_root: &Path,
-    field_name: &str,
-) -> Result<PathBuf> {
-    let candidate = PathBuf::from(raw);
-    let resolved = if candidate.is_absolute() {
-        normalize_path(&candidate)
-    } else {
-        normalize_path(&exp_dir.join(candidate))
-    };
-    if !resolved.exists() {
-        return Err(anyhow!(
-            "{} resolved path does not exist: {}",
-            field_name,
-            resolved.display()
-        ));
-    }
-    Ok(resolved)
-}
-
-fn dx_support_file_value(source: &Path, destination_path: &str) -> Value {
+fn dx_runtime_asset_value(build_source_path: &Path, runtime_path: &str) -> Value {
     json!({
-        "source_from_host": source.to_string_lossy().to_string(),
-        "destination_path": destination_path,
+        "build_source_path": build_source_path.to_string_lossy().to_string(),
+        "runtime_path": runtime_path,
         "required": true,
         "read_only": true
     })
-}
-
-fn parse_dx_support_files_field(
-    value: Option<&Value>,
-    field_name: &str,
-    exp_dir: &Path,
-    project_root: &Path,
-) -> Result<Vec<Value>> {
-    let Some(value) = value else {
-        return Ok(Vec::new());
-    };
-    let items = value
-        .as_array()
-        .ok_or_else(|| anyhow!("{} must be an array", field_name))?;
-    let mut support_files = Vec::with_capacity(items.len());
-    for (idx, item) in items.iter().enumerate() {
-        let obj = item
-            .as_object()
-            .ok_or_else(|| anyhow!("{}[{}] must be an object", field_name, idx))?;
-        let source = obj
-            .get("source_from_host")
-            .and_then(Value::as_str)
-            .ok_or_else(|| anyhow!("{}[{}].source_from_host is required", field_name, idx))?;
-        let destination_path = obj
-            .get("destination_path")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .ok_or_else(|| anyhow!("{}[{}].destination_path is required", field_name, idx))?;
-        let source_path = resolve_dx_support_source_path(
-            source,
-            exp_dir,
-            project_root,
-            &format!("{}[{}].source_from_host", field_name, idx),
-        )?;
-        support_files.push(json!({
-            "source_from_host": source_path.to_string_lossy().to_string(),
-            "destination_path": destination_path,
-            "required": obj.get("required").and_then(Value::as_bool).unwrap_or(true),
-            "read_only": obj.get("read_only").and_then(Value::as_bool).unwrap_or(true),
-        }));
-    }
-    Ok(support_files)
 }
 
 fn parse_dx_provider_env_field(
@@ -2791,13 +2746,14 @@ fn parse_dx_agent_build(
         .ok_or_else(|| anyhow!("{}.artifact is required", root_name))?
         .to_string();
     let artifact_path = resolve_dx_artifact_path(&artifact_raw, exp_dir, project_root);
-    if !artifact_path.exists() {
-        return Err(anyhow!(
-            "{}.artifact resolved path does not exist: {}",
+    fs::metadata(&artifact_path).with_context(|| {
+        format!(
+            "failed to read {}.artifact source path '{}' (artifact value '{}')",
             root_name,
-            artifact_path.display()
-        ));
-    }
+            artifact_path.display(),
+            artifact_raw
+        )
+    })?;
     let artifact_digest = compute_artifact_content_digest(&artifact_path)?;
     let command_base =
         parse_dx_command_field_named(root.get("command"), &format!("{}.command", root_name))?;
@@ -3043,6 +2999,35 @@ fn rewrite_new_variant_agent_model(
     Ok(rewritten)
 }
 
+fn resolve_builtin_benchmark_dataset_path(
+    json_value: &Value,
+    builtin_benchmark: &str,
+    project_root: &Path,
+) -> Result<String> {
+    if let Some(dataset) = json_value.pointer("/dataset") {
+        require_exact_object_keys(dataset, &["path"], "dataset")?;
+        let path = dataset
+            .pointer("/path")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| anyhow!("dataset.path must be a non-empty string"))?;
+        return Ok(path.to_string());
+    }
+    let default_name = match builtin_benchmark {
+        "bench_v0" => "bench_v0.task_spec.jsonl",
+        "swebench_lite_curated" => "swebench_lite_curated.task_spec.jsonl",
+        _ => unreachable!(),
+    };
+    Ok(project_root
+        .join(".lab")
+        .join("experiments")
+        .join("data")
+        .join(default_name)
+        .to_string_lossy()
+        .to_string())
+}
+
 fn normalize_experiment_authoring(
     json_value: Value,
     exp_dir: &Path,
@@ -3165,26 +3150,22 @@ fn normalize_experiment_authoring(
         "variant_sequential"
     };
     let builtin_assets_root = builtin_benchmark_assets_root()?;
+    let dataset_path =
+        resolve_builtin_benchmark_dataset_path(&json_value, builtin_benchmark, project_root)?;
 
     let agent_root = json_value
         .pointer("/agent")
         .ok_or_else(|| anyhow!("agent section is required"))?;
     let agent_build = parse_dx_agent_build(agent_root, "agent", exp_dir, project_root)?;
     let (
-        dataset_path,
         dataset_suite_id,
         dataset_split_id,
         metrics,
         benchmark_policy,
         benchmark_grader_command,
-        benchmark_grader_support_files,
+        benchmark_grader_runtime_assets,
     ) = match builtin_benchmark {
         "bench_v0" => (
-            project_root
-                .join(".lab")
-                .join("experiments")
-                .join("data")
-                .join("bench_v0.task_spec.jsonl"),
             "bench_v0",
             "test",
             json!([
@@ -3205,18 +3186,13 @@ fn normalize_experiment_authoring(
                 "/agentlab/deps/bench/integration/agentlab/bench_benchmark_adapter.py"
             ]),
             json!([
-                dx_support_file_value(
+                dx_runtime_asset_value(
                     &builtin_assets_root.join("bench"),
                     "/agentlab/deps/bench"
                 )
             ]),
         ),
         "swebench_lite_curated" => (
-            project_root
-                .join(".lab")
-                .join("experiments")
-                .join("data")
-                .join("swebench_lite_curated.task_spec.jsonl"),
             "swebench_lite_curated",
             "test",
             json!([
@@ -3235,7 +3211,7 @@ fn normalize_experiment_authoring(
                 "/agentlab/deps/swebench/swebench_task_container_grader.py"
             ]),
             json!([
-                dx_support_file_value(
+                dx_runtime_asset_value(
                     &builtin_assets_root.join("adapters").join("swebench"),
                     "/agentlab/deps/swebench"
                 )
@@ -3293,7 +3269,7 @@ fn normalize_experiment_authoring(
         },
         "dataset": {
             "provider": "local_jsonl",
-            "path": dataset_path.to_string_lossy().to_string(),
+            "path": dataset_path,
             "suite_id": dataset_suite_id,
             "split_id": dataset_split_id
         },
@@ -3320,7 +3296,7 @@ fn normalize_experiment_authoring(
             "policy": benchmark_policy,
             "grader": {
                 "command": benchmark_grader_command,
-                "support_files": benchmark_grader_support_files
+                "_runtime_assets": benchmark_grader_runtime_assets
             }
         },
         "runtime": {

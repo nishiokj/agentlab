@@ -1,4 +1,4 @@
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use chrono::Utc;
 use lab_core::{canonical_json_digest, ensure_dir, sha256_bytes, sha256_file};
 use lab_schemas::compile_schema;
@@ -147,32 +147,81 @@ pub(crate) fn validate_required_fields(json_value: &Value) -> Result<()> {
     {
         return Err(anyhow!("legacy experiment version '1.0' is not supported"));
     }
-    for pointer in [
-        "/runtime/agent",
-        "/runtime/sandbox",
-        "/runtime/policy",
-        "/runtime/agent_runtime/io",
-        "/runtime/agent_runtime/workspace_patches",
-        "/runtime/agent_runtime/launch",
-        "/runtime/agent_runtime/env_from_host",
-        "/runtime/agent_runtime/binding_args",
-        "/runtime/agent_runtime/support_files",
-        "/runtime/agent_runtime/secret_env",
+    for (pointer, message) in [
+        (
+            "/runtime/agent",
+            "use runtime.agent_runtime plus policy.task_sandbox only",
+        ),
+        (
+            "/runtime/sandbox",
+            "use runtime.agent_runtime plus policy.task_sandbox only",
+        ),
+        (
+            "/runtime/policy",
+            "use runtime.agent_runtime plus policy.task_sandbox only",
+        ),
+        (
+            "/runtime/agent_runtime/io",
+            "commands consume the trial contract directly; no runner IO remapping is supported",
+        ),
+        (
+            "/runtime/agent_runtime/workspace_patches",
+            "workspace patches were removed; task-owned inputs must come from task rows or packaged artifacts",
+        ),
+        (
+            "/runtime/agent_runtime/launch",
+            "launch indirection was removed; use runtime.agent_runtime.{artifact,image,command,env}",
+        ),
+        (
+            "/runtime/agent_runtime/env_from_host",
+            "use $NAME runtime bindings resolved from variant bindings or lab run --env/--env-file",
+        ),
+        (
+            "/runtime/agent_runtime/binding_args",
+            "commands are literal argv; project bindings directly in runtime.agent_runtime.command",
+        ),
+        (
+            "/runtime/agent_runtime/support_files",
+            "runtime support file staging was removed; package files in the agent artifact or benchmark-owned sealed assets",
+        ),
+        (
+            "/runtime/agent_runtime/secret_env",
+            "use $NAME runtime bindings resolved from variant bindings or lab run --env/--env-file",
+        ),
+        (
+            "/runtime/dependencies/file_staging",
+            "host-path file staging was removed; package files in the agent artifact or task rows",
+        ),
+        (
+            "/runtime/dependencies/assets",
+            "dependency asset staging was removed; task-owned inputs must be embedded in task rows",
+        ),
+        (
+            "/runtime/dependencies/secret_files",
+            "secret file staging was removed; inject secrets at launch time, not through authored host paths",
+        ),
+        (
+            "/benchmark/grader/support_files",
+            "benchmark grader support_files was removed; reference grader files directly in grader.command or use runner-owned built-ins",
+        ),
+        (
+            "/benchmark/adapter/support_files",
+            "benchmark adapter support_files was removed; benchmark assets must be runner-owned sealed assets",
+        ),
     ] {
         if json_value.pointer(pointer).is_some() {
             return Err(anyhow!(
-                "{} was removed in the hard cutover; use runtime.agent_runtime plus policy.task_sandbox only",
-                pointer
+                "{} was removed in the hard cutover; {}",
+                pointer,
+                message
             ));
         }
     }
     let required: &[&str] = &[
         "/experiment/workload_type",
-        "/design/sanitization_profile",
         "/design/replications",
         "/policy/timeout_ms",
         "/policy/task_sandbox/network",
-        "/policy/task_sandbox/profile",
         "/baseline/variant_id",
     ];
     let mut missing = Vec::new();
@@ -222,14 +271,6 @@ pub(crate) fn validate_required_fields(json_value: &Value) -> Result<()> {
         .unwrap_or("");
     if image.is_empty() {
         missing.push("/runtime/agent_runtime/image");
-    }
-    let sandbox_profile = json_value
-        .pointer("/policy/task_sandbox/profile")
-        .and_then(|v| v.as_str())
-        .map(str::trim)
-        .unwrap_or("");
-    if sandbox_profile.is_empty() {
-        missing.push("/policy/task_sandbox/profile");
     }
     let sandbox_network = json_value
         .pointer("/policy/task_sandbox/network")
@@ -448,6 +489,12 @@ pub(crate) fn verify_sealed_package_integrity(
             "preflight_failed: checksums must include 'resolved_experiment.json'"
         ));
     }
+    if !files.contains_key(STAGING_MANIFEST_FILE) {
+        return Err(anyhow!(
+            "preflight_failed: checksums must include '{}'",
+            STAGING_MANIFEST_FILE
+        ));
+    }
     let computed_digest = canonical_json_digest(
         checksums
             .pointer("/files")
@@ -482,13 +529,24 @@ pub(crate) fn verify_sealed_package_integrity(
         "resolved_experiment.json",
         "checksums.files",
     )?;
-    load_json_file(&resolved_path).map_err(|err| {
+    let resolved_experiment = load_json_file(&resolved_path).map_err(|err| {
         anyhow!(
             "preflight_failed: resolved_experiment.json missing or unreadable at {}: {}",
             resolved_path.display(),
             err
         )
-    })
+    })?;
+    let staging_manifest_path =
+        resolve_package_path_under_root(package_dir, STAGING_MANIFEST_FILE, "checksums.files")?;
+    load_json_file(&staging_manifest_path).map_err(|err| {
+        anyhow!(
+            "preflight_failed: {} missing or unreadable at {}: {}",
+            STAGING_MANIFEST_FILE,
+            staging_manifest_path.display(),
+            err
+        )
+    })?;
+    Ok(resolved_experiment)
 }
 
 pub(crate) fn load_sealed_package_for_run(path: &Path) -> Result<LoadedExperimentInput> {
@@ -1553,7 +1611,22 @@ pub(crate) fn load_task_specs_for_build(
     if limit == Some(0) {
         return Ok(Vec::new());
     }
-    let file = fs::File::open(path)?;
+    let dataset_ref = json_value
+        .pointer("/dataset/path")
+        .and_then(Value::as_str)
+        .unwrap_or("<missing>");
+    let dataset_suite = json_value
+        .pointer("/dataset/suite_id")
+        .and_then(Value::as_str)
+        .unwrap_or("<unknown>");
+    let file = fs::File::open(path).with_context(|| {
+        format!(
+            "failed to open dataset file '{}' (resolved from dataset.path='{}', dataset.suite_id='{}')",
+            path.display(),
+            dataset_ref,
+            dataset_suite
+        )
+    })?;
     let reader = BufReader::new(file);
     let mut tasks = Vec::new();
     for (idx, line) in reader.lines().enumerate() {
@@ -1600,7 +1673,12 @@ pub(crate) fn load_tasks(path: &Path, json_value: &Value) -> Result<Vec<Value>> 
     if limit == Some(0) {
         return Ok(Vec::new());
     }
-    let file = fs::File::open(path)?;
+    let file = fs::File::open(path).with_context(|| {
+        format!(
+            "failed to open dataset file '{}' referenced by dataset.path during build",
+            path.display()
+        )
+    })?;
     let reader = BufReader::new(file);
     let mut tasks = Vec::new();
     for (idx, line) in reader.lines().enumerate() {

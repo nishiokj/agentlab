@@ -872,6 +872,32 @@ struct DependencyFileStagingSpec {
     read_only: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct RuntimePathStagingManifestEntry {
+    original_relative_path: String,
+    packaged_path: String,
+    runtime_path: String,
+    required: bool,
+    read_only: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+struct RuntimePathStagingManifest {
+    schema_version: String,
+    variants: BTreeMap<String, Vec<RuntimePathStagingManifestEntry>>,
+}
+
+enum PathResolutionContext<'a> {
+    Build {
+        exp_dir: &'a Path,
+        project_root: &'a Path,
+    },
+    Run {
+        package_dir: &'a Path,
+        variant_id: &'a str,
+    },
+}
+
 #[derive(Clone)]
 struct AgentRuntimeConfig {
     adapter_ref: AgentAdapterRef,
@@ -978,10 +1004,114 @@ fn parse_bindings_to_args(value: Option<&Value>) -> Result<Vec<BindingArgProject
     Ok(parsed)
 }
 
-fn derive_public_path_staging_specs(
+fn contract_deps_destination_path(rel_path: &str) -> String {
+    format!("{}/{}", AGENTLAB_CONTRACT_DEPS_DIR, rel_path)
+}
+
+fn reject_packaged_public_path_references(
     command: &[String],
     env: &BTreeMap<String, String>,
+    package_dir: &Path,
+) -> Result<()> {
+    for (idx, token) in command.iter().enumerate() {
+        if idx == 0 {
+            continue;
+        }
+        let field = format!("runtime.agent_runtime.command[{}]", idx);
+        if let Some(rel) = resolve_existing_public_path_reference(token, package_dir, &field)? {
+            return Err(anyhow!(
+                "{} still contains unresolved package-relative path '{}'; rebuild the sealed package with the build-time runtime path cutover (resolved path: {})",
+                field,
+                token,
+                rel.display()
+            ));
+        }
+    }
+    for (key, value) in env {
+        let field = format!("runtime.agent_runtime.env.{}", key);
+        if let Some(rel) = resolve_existing_public_path_reference(value, package_dir, &field)? {
+            return Err(anyhow!(
+                "{} still contains unresolved package-relative path '{}'; rebuild the sealed package with the build-time runtime path cutover (resolved path: {})",
+                field,
+                value,
+                rel.display()
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn load_staging_specs_from_package(
+    package_dir: &Path,
+    variant_id: &str,
+) -> Result<Vec<DependencyFileStagingSpec>> {
+    let manifest_path =
+        resolve_package_path_under_root(package_dir, STAGING_MANIFEST_FILE, STAGING_MANIFEST_FILE)?;
+    let manifest_bytes = fs::read(&manifest_path).with_context(|| {
+        format!(
+            "failed to read runtime staging manifest at {}",
+            manifest_path.display()
+        )
+    })?;
+    let manifest: RuntimePathStagingManifest =
+        serde_json::from_slice(&manifest_bytes).with_context(|| {
+            format!(
+                "failed to parse runtime staging manifest JSON at {}",
+                manifest_path.display()
+            )
+        })?;
+    if manifest.schema_version != STAGING_MANIFEST_SCHEMA_VERSION {
+        return Err(anyhow!(
+            "runtime staging manifest schema_version must be '{}' (found '{}')",
+            STAGING_MANIFEST_SCHEMA_VERSION,
+            manifest.schema_version
+        ));
+    }
+    let entries = manifest.variants.get(variant_id).ok_or_else(|| {
+        anyhow!(
+            "runtime staging manifest missing entries for variant '{}' in {}",
+            variant_id,
+            manifest_path.display()
+        )
+    })?;
+    let mut specs = Vec::with_capacity(entries.len());
+    for (idx, entry) in entries.iter().enumerate() {
+        let source_from_host = resolve_package_path_under_root(
+            package_dir,
+            &entry.packaged_path,
+            &format!(
+                "staging_manifest.variants.{}[{}].packaged_path",
+                variant_id, idx
+            ),
+        )?;
+        fs::metadata(&source_from_host).with_context(|| {
+            format!(
+                "failed to read packaged runtime staging source '{}' for staging_manifest.variants.{}[{}]",
+                source_from_host.display(),
+                variant_id,
+                idx
+            )
+        })?;
+        specs.push(DependencyFileStagingSpec {
+            source_from_host,
+            destination_path: validate_runtime_contract_path(
+                &entry.runtime_path,
+                &format!(
+                    "staging_manifest.variants.{}[{}].runtime_path",
+                    variant_id, idx
+                ),
+            )?,
+            required: entry.required,
+            read_only: entry.read_only,
+        });
+    }
+    Ok(specs)
+}
+
+fn derive_public_command_path_staging_specs(
+    command: &[String],
     exp_dir: &Path,
+    field_name: &str,
 ) -> Result<Vec<DependencyFileStagingSpec>> {
     let mut specs = Vec::new();
     let mut seen = HashSet::new();
@@ -992,7 +1122,7 @@ fn derive_public_path_staging_specs(
         let Some(rel) = resolve_existing_public_path_reference(
             token,
             exp_dir,
-            &format!("runtime.agent_runtime.command[{}]", idx),
+            &format!("{}[{}]", field_name, idx),
         )? else {
             continue;
         };
@@ -1001,23 +1131,43 @@ fn derive_public_path_staging_specs(
             continue;
         }
         let source = normalize_path(&exp_dir.join(&rel));
-        if !source.exists() {
-            return Err(anyhow!(
-                "runtime.agent_runtime.command[{}] resolved path does not exist: {}",
+        fs::metadata(&source).with_context(|| {
+            format!(
+                "failed to read {}[{}] public path reference '{}' resolved to '{}'",
+                field_name,
                 idx,
+                token,
                 source.display()
-            ));
-        }
+            )
+        })?;
         specs.push(DependencyFileStagingSpec {
             source_from_host: source,
-            destination_path: format!(
-                "{}/{}",
-                AGENTLAB_CONTRACT_WORKSPACE_DIR,
-                key.replace('\\', "/")
-            ),
+            destination_path: contract_deps_destination_path(&key.replace('\\', "/")),
             required: true,
             read_only: true,
         });
+    }
+    Ok(specs)
+}
+
+fn derive_public_path_staging_specs(
+    command: &[String],
+    env: &BTreeMap<String, String>,
+    exp_dir: &Path,
+) -> Result<Vec<DependencyFileStagingSpec>> {
+    let mut specs = derive_public_command_path_staging_specs(
+        command,
+        exp_dir,
+        "runtime.agent_runtime.command",
+    )?;
+    let mut seen = HashSet::new();
+    for spec in &specs {
+        if let Some(rel) = spec
+            .destination_path
+            .strip_prefix(&format!("{}/", AGENTLAB_CONTRACT_DEPS_DIR))
+        {
+            seen.insert(rel.to_string());
+        }
     }
     for (key_name, value) in env {
         let Some(rel) = resolve_existing_public_path_reference(
@@ -1032,20 +1182,17 @@ fn derive_public_path_staging_specs(
             continue;
         }
         let source = normalize_path(&exp_dir.join(&rel));
-        if !source.exists() {
-            return Err(anyhow!(
-                "runtime.agent_runtime.env.{} resolved path does not exist: {}",
+        fs::metadata(&source).with_context(|| {
+            format!(
+                "failed to read runtime.agent_runtime.env.{} public path reference '{}' resolved to '{}'",
                 key_name,
+                value,
                 source.display()
-            ));
-        }
+            )
+        })?;
         specs.push(DependencyFileStagingSpec {
             source_from_host: source,
-            destination_path: format!(
-                "{}/{}",
-                AGENTLAB_CONTRACT_WORKSPACE_DIR,
-                key.replace('\\', "/")
-            ),
+            destination_path: contract_deps_destination_path(&key.replace('\\', "/")),
             required: true,
             read_only: true,
         });
@@ -1078,17 +1225,17 @@ fn normalize_staged_support_source_path(
             resolved.display()
         ));
     }
-    if !resolved.exists() {
-        return Err(anyhow!(
-            "{} resolved path does not exist: {}",
+    fs::metadata(&resolved).with_context(|| {
+        format!(
+            "failed to read {} source path '{}'",
             field_name,
             resolved.display()
-        ));
-    }
+        )
+    })?;
     Ok(resolved)
 }
 
-fn validate_support_destination_path(raw: &str, field_name: &str) -> Result<String> {
+pub(crate) fn validate_runtime_contract_path(raw: &str, field_name: &str) -> Result<String> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         return Err(anyhow!("{} must not be empty", field_name));
@@ -1117,7 +1264,7 @@ fn validate_support_destination_path(raw: &str, field_name: &str) -> Result<Stri
     Ok(trimmed.to_string())
 }
 
-fn parse_support_file_staging_specs(
+fn parse_build_runtime_asset_specs(
     value: Option<&Value>,
     field_name: &str,
     exp_dir: &Path,
@@ -1135,13 +1282,13 @@ fn parse_support_file_staging_specs(
             .as_object()
             .ok_or_else(|| anyhow!("{}[{}] must be an object", field_name, idx))?;
         let source_from_host = obj
-            .get("source_from_host")
+            .get("build_source_path")
             .and_then(Value::as_str)
-            .ok_or_else(|| anyhow!("{}[{}].source_from_host is required", field_name, idx))?;
+            .ok_or_else(|| anyhow!("{}[{}].build_source_path is required", field_name, idx))?;
         let destination_path = obj
-            .get("destination_path")
+            .get("runtime_path")
             .and_then(Value::as_str)
-            .ok_or_else(|| anyhow!("{}[{}].destination_path is required", field_name, idx))?;
+            .ok_or_else(|| anyhow!("{}[{}].runtime_path is required", field_name, idx))?;
         let required = obj.get("required").and_then(Value::as_bool).unwrap_or(true);
         let read_only = obj.get("read_only").and_then(Value::as_bool).unwrap_or(true);
         specs.push(DependencyFileStagingSpec {
@@ -1149,11 +1296,11 @@ fn parse_support_file_staging_specs(
                 source_from_host,
                 exp_dir,
                 project_root,
-                &format!("{}[{}].source_from_host", field_name, idx),
+                &format!("{}[{}].build_source_path", field_name, idx),
             )?,
-            destination_path: validate_support_destination_path(
+            destination_path: validate_runtime_contract_path(
                 destination_path,
-                &format!("{}[{}].destination_path", field_name, idx),
+                &format!("{}[{}].runtime_path", field_name, idx),
             )?,
             required,
             read_only,
@@ -1361,6 +1508,83 @@ fn resolve_agent_runtime(
     exp_dir: &Path,
     project_root: &Path,
 ) -> Result<AgentRuntimeConfig> {
+    resolve_agent_runtime_with_context(
+        json_value,
+        PathResolutionContext::Build {
+            exp_dir,
+            project_root,
+        },
+    )
+}
+
+fn resolve_packaged_agent_runtime(
+    json_value: &Value,
+    package_dir: &Path,
+    variant_id: &str,
+) -> Result<AgentRuntimeConfig> {
+    resolve_agent_runtime_with_context(
+        json_value,
+        PathResolutionContext::Run {
+            package_dir,
+            variant_id,
+        },
+    )
+}
+
+fn resolve_agent_artifact_path_for_context(
+    raw: &str,
+    field_name: &str,
+    context: &PathResolutionContext<'_>,
+) -> Result<PathBuf> {
+    match context {
+        PathResolutionContext::Build {
+            exp_dir,
+            project_root,
+        } => {
+            let trimmed = raw.trim();
+            if trimmed.starts_with("./") || trimmed.starts_with("../") || trimmed.contains('/') {
+                Ok(normalize_path(&exp_dir.join(trimmed)))
+            } else {
+                Ok(resolve_dx_artifact_path(trimmed, exp_dir, project_root))
+            }
+        }
+        PathResolutionContext::Run { package_dir, .. } => {
+            let candidate = PathBuf::from(raw);
+            if candidate.is_absolute() {
+                Ok(normalize_path(&candidate))
+            } else {
+                resolve_package_path_under_root(package_dir, raw, field_name)
+            }
+        }
+    }
+}
+
+fn resolve_runtime_source_path_for_context(
+    raw: &str,
+    field_name: &str,
+    context: &PathResolutionContext<'_>,
+) -> Result<PathBuf> {
+    let candidate = PathBuf::from(raw);
+    match context {
+        PathResolutionContext::Build { exp_dir, .. } => Ok(if candidate.is_absolute() {
+            normalize_path(&candidate)
+        } else {
+            normalize_path(&exp_dir.join(candidate))
+        }),
+        PathResolutionContext::Run { package_dir, .. } => {
+            if candidate.is_absolute() {
+                Ok(normalize_path(&candidate))
+            } else {
+                resolve_package_path_under_root(package_dir, raw, field_name)
+            }
+        }
+    }
+}
+
+fn resolve_agent_runtime_with_context(
+    json_value: &Value,
+    context: PathResolutionContext<'_>,
+) -> Result<AgentRuntimeConfig> {
     if json_value.pointer("/runtime/harness").is_some() {
         return Err(anyhow!(
             "runtime.harness is not supported; use runtime.agent_runtime"
@@ -1380,6 +1604,32 @@ fn resolve_agent_runtime(
         return Err(anyhow!(
             "runtime.agent_runtime hard cut: use runtime.agent_runtime.{{artifact,image,command,env,network,root_read_only,user}}"
         ));
+    }
+    for (pointer, message) in [
+        (
+            "/runtime/dependencies/file_staging",
+            "runtime.dependencies.file_staging is not supported; package files in the agent artifact or task rows",
+        ),
+        (
+            "/runtime/dependencies/assets",
+            "runtime.dependencies.assets is not supported; task-owned inputs must be embedded in task rows",
+        ),
+        (
+            "/runtime/dependencies/secret_files",
+            "runtime.dependencies.secret_files is not supported; inject secrets at launch time instead of authored host paths",
+        ),
+        (
+            "/benchmark/grader/support_files",
+            "benchmark.grader.support_files is not supported; reference grader files directly in benchmark.grader.command or use runner-owned built-ins",
+        ),
+        (
+            "/benchmark/adapter/support_files",
+            "benchmark.adapter.support_files is not supported; benchmark assets must be runner-owned sealed assets",
+        ),
+    ] {
+        if json_value.pointer(pointer).is_some() {
+            return Err(anyhow!("{}", message));
+        }
     }
 
     let trajectory_path = json_value
@@ -1417,14 +1667,11 @@ fn resolve_agent_runtime(
         "runtime.agent_runtime.artifact",
     )?
     .ok_or_else(|| anyhow!("runtime.agent_runtime.artifact is required"))?;
-    let agent_artifact = {
-        let raw = artifact_raw.trim();
-        if raw.starts_with("./") || raw.starts_with("../") || raw.contains('/') {
-            normalize_path(&exp_dir.join(raw))
-        } else {
-            resolve_dx_artifact_path(raw, exp_dir, project_root)
-        }
-    };
+    let agent_artifact = resolve_agent_artifact_path_for_context(
+        &artifact_raw,
+        "runtime.agent_runtime.artifact",
+        &context,
+    )?;
     let agent_artifact_digest = parse_optional_nonempty_string(
         agent.pointer("/artifact_digest"),
         "runtime.agent_runtime.artifact_digest",
@@ -1434,13 +1681,13 @@ fn resolve_agent_runtime(
         "runtime.agent_runtime.artifact_resolved_path",
     )?
     .map(|raw| {
-        let path = PathBuf::from(raw);
-        if path.is_absolute() {
-            normalize_path(&path)
-        } else {
-            normalize_path(&exp_dir.join(path))
-        }
-    });
+        resolve_runtime_source_path_for_context(
+            &raw,
+            "runtime.agent_runtime.artifact_resolved_path",
+            &context,
+        )
+    })
+    .transpose()?;
 
     let command = parse_command_field(agent.pointer("/command"), "runtime.agent_runtime.command")?
         .ok_or_else(|| anyhow!("runtime.agent_runtime.command is required"))?;
@@ -1451,6 +1698,7 @@ fn resolve_agent_runtime(
         .to_string();
     let adapter_ref = AgentAdapterRef::default();
     let env = parse_string_map_field(agent.pointer("/env"), "runtime.agent_runtime.env")?;
+    let allow_internal_contract_paths = matches!(context, PathResolutionContext::Run { .. });
     for (key, value) in &env {
         if contains_removed_runtime_template(value) {
             return Err(anyhow!(
@@ -1458,7 +1706,7 @@ fn resolve_agent_runtime(
                 key
             ));
         }
-        if value.trim().starts_with("/agentlab/") {
+        if !allow_internal_contract_paths && value.trim().starts_with("/agentlab/") {
             return Err(anyhow!(
                 "runtime.agent_runtime.env.{} leaks runner topology; remove internal /agentlab paths from public authoring",
                 key
@@ -1472,7 +1720,7 @@ fn resolve_agent_runtime(
                 idx
             ));
         }
-        if token.trim().starts_with("/agentlab/") {
+        if !allow_internal_contract_paths && token.trim().starts_with("/agentlab/") {
             return Err(anyhow!(
                 "runtime.agent_runtime.command[{}] leaks runner topology; remove internal /agentlab paths from public authoring",
                 idx
@@ -1490,16 +1738,18 @@ fn resolve_agent_runtime(
     }
     let bindings_to_args = Vec::new();
     let env_from_host = Vec::new();
-    let mut dependency_file_staging = derive_public_path_staging_specs(&command, &env, exp_dir)?;
-    merge_dependency_file_staging(
-        &mut dependency_file_staging,
-        parse_support_file_staging_specs(
-            json_value.pointer("/runtime/dependencies/file_staging"),
-            "runtime.dependencies.file_staging",
-            exp_dir,
-            project_root,
-        )?,
-    );
+    let dependency_file_staging = match &context {
+        PathResolutionContext::Build { exp_dir, .. } => {
+            derive_public_path_staging_specs(&command, &env, exp_dir)?
+        }
+        PathResolutionContext::Run {
+            package_dir,
+            variant_id,
+        } => {
+            reject_packaged_public_path_references(&command, &env, package_dir)?;
+            load_staging_specs_from_package(package_dir, variant_id)?
+        }
+    };
 
     Ok(AgentRuntimeConfig {
         adapter_ref,
@@ -1675,22 +1925,44 @@ fn validate_agent_artifact_pin(runtime_agent: &AgentRuntimeConfig) -> Result<()>
     Ok(())
 }
 
-fn resolve_benchmark_support_files(
+fn resolve_benchmark_runtime_assets(
     experiment: &Value,
     exp_dir: &Path,
     project_root: &Path,
 ) -> Result<Vec<DependencyFileStagingSpec>> {
-    let mut support_files = parse_support_file_staging_specs(
-        experiment.pointer("/benchmark/grader/support_files"),
-        "benchmark.grader.support_files",
+    let mut support_files = derive_public_command_path_staging_specs(
+        &parse_string_array_field(
+            experiment.pointer("/benchmark/grader/command"),
+            "benchmark.grader.command",
+        )?,
         exp_dir,
-        project_root,
+        "benchmark.grader.command",
     )?;
     merge_dependency_file_staging(
         &mut support_files,
-        parse_support_file_staging_specs(
-            experiment.pointer("/benchmark/adapter/support_files"),
-            "benchmark.adapter.support_files",
+        derive_public_command_path_staging_specs(
+            &parse_string_array_field(
+                experiment.pointer("/benchmark/adapter/command"),
+                "benchmark.adapter.command",
+            )?,
+            exp_dir,
+            "benchmark.adapter.command",
+        )?,
+    );
+    merge_dependency_file_staging(
+        &mut support_files,
+        parse_build_runtime_asset_specs(
+        experiment.pointer("/benchmark/grader/_runtime_assets"),
+        "benchmark.grader._runtime_assets",
+        exp_dir,
+        project_root,
+    )?,
+    );
+    merge_dependency_file_staging(
+        &mut support_files,
+        parse_build_runtime_asset_specs(
+            experiment.pointer("/benchmark/adapter/_runtime_assets"),
+            "benchmark.adapter._runtime_assets",
             exp_dir,
             project_root,
         )?,
@@ -1760,21 +2032,39 @@ fn resolve_run_isolation_grade(
     "invalid"
 }
 
-fn resolve_variant_runtime_profile(
+fn resolve_variant_runtime_profile_with_context(
     experiment: &Value,
     variant: &Variant,
-    project_root: &Path,
+    context: PathResolutionContext<'_>,
     behavior: &RunBehavior,
     execution: &RunExecutionOptions,
 ) -> Result<VariantRuntimeProfile> {
     let variant_experiment = resolve_runtime_for_variant(experiment, variant)?;
     validate_required_fields(&variant_experiment)?;
 
-    let mut agent_runtime = resolve_agent_runtime(&variant_experiment, project_root, project_root)?;
-    merge_dependency_file_staging(
-        &mut agent_runtime.dependency_file_staging,
-        resolve_benchmark_support_files(&variant_experiment, project_root, project_root)?,
-    );
+    let mut agent_runtime = match context {
+        PathResolutionContext::Build {
+            exp_dir,
+            project_root,
+        } => resolve_agent_runtime(&variant_experiment, exp_dir, project_root)?,
+        PathResolutionContext::Run { package_dir, .. } => {
+            resolve_packaged_agent_runtime(&variant_experiment, package_dir, &variant.id)?
+        }
+    };
+    let validate_root = match context {
+        PathResolutionContext::Build { exp_dir, .. } => exp_dir,
+        PathResolutionContext::Run { package_dir, .. } => package_dir,
+    };
+    if let PathResolutionContext::Build {
+        exp_dir,
+        project_root,
+    } = context
+    {
+        merge_dependency_file_staging(
+            &mut agent_runtime.dependency_file_staging,
+            resolve_benchmark_runtime_assets(&variant_experiment, exp_dir, project_root)?,
+        );
+    }
     validate_agent_artifact_pin(&agent_runtime)?;
     let configured_network_mode = configured_network_mode(&variant_experiment)?;
     let effective_network_mode = behavior
@@ -1796,7 +2086,7 @@ fn resolve_variant_runtime_profile(
         &variant.bindings,
         &runtime_env_inputs,
     )?;
-    validate_agent_runtime_command(&agent_runtime.command_raw, project_root)?;
+    validate_agent_runtime_command(&agent_runtime.command_raw, validate_root)?;
     let mut agent_runtime_env =
         resolve_agent_runtime_env(&agent_runtime, &variant.bindings, &runtime_env_inputs)?;
     let resolved_variant_env =
@@ -1804,7 +2094,8 @@ fn resolve_variant_runtime_profile(
     for (key, value) in resolved_variant_env {
         agent_runtime_env.insert(key, value);
     }
-    let variant_args = resolve_command_templates(&variant.args, &variant.bindings, &runtime_env_inputs)?;
+    let variant_args =
+        resolve_command_templates(&variant.args, &variant.bindings, &runtime_env_inputs)?;
 
     Ok(VariantRuntimeProfile {
         experiment: variant_experiment,
@@ -1815,6 +2106,27 @@ fn resolve_variant_runtime_profile(
         configured_network_mode,
         effective_network_mode,
     })
+}
+
+fn resolve_variant_runtime_profile(
+    experiment: &Value,
+    variant: &Variant,
+    root_dir: &Path,
+    behavior: &RunBehavior,
+    execution: &RunExecutionOptions,
+) -> Result<VariantRuntimeProfile> {
+    let context = if root_dir.join(STAGING_MANIFEST_FILE).is_file() {
+        PathResolutionContext::Run {
+            package_dir: root_dir,
+            variant_id: &variant.id,
+        }
+    } else {
+        PathResolutionContext::Build {
+            exp_dir: root_dir,
+            project_root: root_dir,
+        }
+    };
+    resolve_variant_runtime_profile_with_context(experiment, variant, context, behavior, execution)
 }
 
 struct TrialPaths {

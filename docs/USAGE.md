@@ -99,7 +99,7 @@ Hard-cut runtime rules:
 - `runtime.agent_runtime.artifact`, `runtime.agent_runtime.image`, and `runtime.agent_runtime.command` are required for scientific `run` and `build-run`
 - put public argv directly in `runtime.agent_runtime.command`; DX authoring uses `agent.command`
 - put public env directly in `runtime.agent_runtime.env`; DX authoring uses `agent.env`
-- plain relative paths in argv/env are build-time file or data refs
+- if a command token names a relative executable or data file, build resolves and seals it once; do not rely on ad hoc override directories or runtime host layout
 - use `$NAME` for runtime bindings from variant bindings or launch-time env; do not use removed `${...}` templating
 - do not use `env_from_host`, `binding_args`, `support_files`, `provider_env`, `default_config`, or `config_files`
 - task sandbox images come only from `task.environment.image`

@@ -85,12 +85,23 @@ def _run_json(
     env: dict[str, str] | None = None,
     expected_exit: int = 0,
 ) -> dict[str, Any]:
+    payload, _ = _run_json_with_process(args, cwd=cwd, env=env, expected_exit=expected_exit)
+    return payload
+
+
+def _run_json_with_process(
+    args: list[str],
+    *,
+    cwd: Path,
+    env: dict[str, str] | None = None,
+    expected_exit: int = 0,
+) -> tuple[dict[str, Any], subprocess.CompletedProcess[str]]:
     proc = _run(args, cwd=cwd, env=env, expected_exit=expected_exit)
     stdout = proc.stdout.strip()
     if not stdout:
         raise AssertionError(f"expected JSON output from {args}, got empty stdout")
     try:
-        return json.loads(stdout)
+        return json.loads(stdout), proc
     except json.JSONDecodeError as exc:  # pragma: no cover
         raise AssertionError(f"invalid JSON output from {args}: {stdout}") from exc
 
@@ -106,6 +117,17 @@ def _run_lab(
     return _run_json(rendered, cwd=cwd, env=env, expected_exit=expected_exit)
 
 
+def _run_lab_with_process(
+    lab_cli_bin: Path,
+    *args: str | Path,
+    cwd: Path,
+    env: dict[str, str] | None = None,
+    expected_exit: int = 0,
+) -> tuple[dict[str, Any], subprocess.CompletedProcess[str]]:
+    rendered = [str(lab_cli_bin), *(str(arg) for arg in args)]
+    return _run_json_with_process(rendered, cwd=cwd, env=env, expected_exit=expected_exit)
+
+
 def _run_python(*args: str | Path, cwd: Path, expected_exit: int = 0) -> subprocess.CompletedProcess[str]:
     rendered = [sys.executable, *(str(arg) for arg in args)]
     return _run(rendered, cwd=cwd, expected_exit=expected_exit)
@@ -113,6 +135,14 @@ def _run_python(*args: str | Path, cwd: Path, expected_exit: int = 0) -> subproc
 
 def _read_json(path: Path) -> dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+def _write_json(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(
+        json.dumps(payload, indent=2, sort_keys=True) + "\n",
+        encoding="utf-8",
+    )
 
 
 def _read_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -381,8 +411,73 @@ def _run_package(
     return payload
 
 
+def _run_package_with_process(
+    lab_cli_bin: Path,
+    project: ProjectLayout,
+    package_dir: Path,
+    *,
+    run_args: tuple[str | Path, ...] = (),
+    env: dict[str, str] | None = None,
+    cwd: Path | None = None,
+    expected_exit: int = 0,
+) -> tuple[dict[str, Any], subprocess.CompletedProcess[str]]:
+    payload, proc = _run_lab_with_process(
+        lab_cli_bin,
+        "run",
+        package_dir,
+        *run_args,
+        "--materialize",
+        "full",
+        "--json",
+        cwd=cwd or project.root,
+        env=env,
+        expected_exit=expected_exit,
+    )
+    if expected_exit == 0:
+        assert payload["ok"] is True
+    return payload, proc
+
+
 def _load_agent_report(trial_dir: Path) -> dict[str, Any]:
     return _read_json(trial_dir / "out" / "agent_report.json")
+
+
+def _sha256_bytes(value: bytes) -> str:
+    return f"sha256:{hashlib.sha256(value).hexdigest()}"
+
+
+def _canonical_json(value: Any) -> str:
+    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+
+
+def _reseal_package_dir(package_dir: Path) -> None:
+    checksums: dict[str, str] = {}
+    for path in sorted(package_dir.rglob("*")):
+        if not path.is_file():
+            continue
+        if path.name in {"manifest.json", "checksums.json", "package.lock"}:
+            continue
+        rel = path.relative_to(package_dir).as_posix()
+        checksums[rel] = _sha256_bytes(path.read_bytes())
+
+    _write_json(
+        package_dir / "checksums.json",
+        {
+            "schema_version": "sealed_package_checksums_v2",
+            "files": checksums,
+        },
+    )
+    package_digest = _sha256_bytes(_canonical_json(checksums).encode("utf-8"))
+    _write_json(
+        package_dir / "package.lock",
+        {
+            "schema_version": "sealed_package_lock_v1",
+            "package_digest": package_digest,
+        },
+    )
+    manifest = _read_json(package_dir / "manifest.json")
+    manifest["package_digest"] = package_digest
+    _write_json(package_dir / "manifest.json", manifest)
 
 
 def _assert_text_tree_excludes_host_paths(root: Path, disallowed_paths: list[Path]) -> None:
@@ -403,6 +498,61 @@ def _assert_text_tree_excludes_host_paths(root: Path, disallowed_paths: list[Pat
                 matches.append(f"{path}: {needle}")
                 break
     assert not matches, "run outputs leaked source-tree host paths:\n" + "\n".join(matches)
+
+
+def _assert_command_output_excludes_host_paths(
+    proc: subprocess.CompletedProcess[str],
+    disallowed_paths: list[Path],
+) -> None:
+    needles = [str(path) for path in disallowed_paths]
+    matches: list[str] = []
+    for label, text in [("stdout", proc.stdout), ("stderr", proc.stderr)]:
+        for needle in needles:
+            if needle and needle in text:
+                matches.append(f"{label}: {needle}")
+    assert not matches, "command output leaked source-tree host paths:\n" + "\n".join(matches)
+
+
+def _assert_message_excludes_host_paths(payload: dict[str, Any], disallowed_paths: list[Path]) -> None:
+    message = payload["error"]["message"]
+    for path in disallowed_paths:
+        assert str(path) not in message, message
+
+
+def _prepare_runtime_file_ref_project(
+    tmp_path: Path,
+    artifact_bundle: Path,
+    fixture_image: str,
+    *,
+    exp_id: str,
+) -> tuple[ProjectLayout, Path, Path, str]:
+    source_root = tmp_path / exp_id
+    support_file = source_root / "overrides" / "defaults.json"
+    support_file.parent.mkdir(parents=True, exist_ok=True)
+    support_file.write_text('{"profile":"portable-run"}\n', encoding="utf-8")
+    runtime_config_path = "/agentlab/deps/overrides/defaults.json"
+    rows = [
+        _task_row(
+            task_id="TASK_MOVED_PACKAGE",
+            task_image=fixture_image,
+            observe={
+                "runtime_support_file": {
+                    "path": runtime_config_path,
+                    "expect_text": '"profile":"portable-run"',
+                }
+            },
+        ),
+    ]
+    project, experiment_path = _create_simple_project(
+        source_root,
+        artifact_bundle,
+        fixture_image,
+        exp_id=exp_id,
+        rows=rows,
+        agent_command=["e2e-agent", "--config", "overrides/defaults.json"],
+        agent_env={"E2E_CONFIG_PATH": "overrides/defaults.json"},
+    )
+    return project, experiment_path, source_root, runtime_config_path
 
 
 def _assert_trial_hermetic(run_dir: Path, trial_dir: Path) -> None:
@@ -524,13 +674,7 @@ def _create_custom_benchmark_project(
         "grader": {
             "command": [
                 "python3",
-                "/agentlab/deps/custom_benchmark_grader.py",
-            ],
-            "support_files": [
-                {
-                    "source_from_host": _relpath(grader_path, project.root),
-                    "destination_path": "/agentlab/deps/custom_benchmark_grader.py",
-                }
+                _relpath(grader_path, project.root),
             ],
         },
     }
@@ -856,36 +1000,106 @@ def test_preflight_and_run_accept_env_file_for_required_runtime_env(
 
 
 @pytest.mark.e2e_build_preflight
-def test_run_from_moved_package_uses_packaged_runtime_path_refs_without_source_tree(
+def test_build_rewrites_runtime_file_refs_to_runner_owned_deps_paths(
     tmp_path: Path,
     lab_cli_bin: Path,
     artifact_bundle: Path,
     fixture_image: str,
 ) -> None:
-    source_root = tmp_path / "source_project"
-    support_file = source_root / "overrides" / "defaults.json"
-    support_file.parent.mkdir(parents=True, exist_ok=True)
-    support_file.write_text('{"profile":"portable-run"}\n', encoding="utf-8")
-
-    rows = [
-        _task_row(
-            task_id="TASK_MOVED_PACKAGE",
-            task_image=fixture_image,
-            observe={
-                "runtime_support_file": {
-                    "path": "overrides/defaults.json",
-                    "expect_text": '"profile":"portable-run"',
-                }
-            },
-        ),
-    ]
-    project, experiment_path = _create_simple_project(
+    (
+        project,
+        experiment_path,
         source_root,
+        runtime_config_path,
+    ) = _prepare_runtime_file_ref_project(
+        tmp_path,
         artifact_bundle,
         fixture_image,
-        exp_id="run_from_moved_package_uses_packaged_runtime_path_refs_without_source_tree",
-        rows=rows,
-        agent_env={"E2E_CONFIG_PATH": "overrides/defaults.json"},
+        exp_id="build_rewrites_runtime_file_refs_to_runner_owned_deps_paths",
+    )
+    package_dir = _build_package(
+        lab_cli_bin,
+        project,
+        experiment_path,
+        "rewrite_runtime_file_refs_pkg",
+    )
+    resolved_experiment = _read_json(package_dir / "resolved_experiment.json")
+    runtime = resolved_experiment["runtime"]["agent_runtime"]
+    assert runtime["command"] == ["e2e-agent", "--config", runtime_config_path]
+    assert runtime["env"]["E2E_CONFIG_PATH"] == runtime_config_path
+    _assert_text_tree_excludes_host_paths(package_dir, [source_root])
+
+
+@pytest.mark.e2e_build_preflight
+def test_preflight_rejects_stale_package_with_legacy_runtime_relative_paths(
+    tmp_path: Path,
+    lab_cli_bin: Path,
+    artifact_bundle: Path,
+    fixture_image: str,
+) -> None:
+    (
+        project,
+        experiment_path,
+        source_root,
+        _runtime_config_path,
+    ) = _prepare_runtime_file_ref_project(
+        tmp_path,
+        artifact_bundle,
+        fixture_image,
+        exp_id="preflight_rejects_stale_package_with_legacy_runtime_relative_paths",
+    )
+    package_dir = _build_package(
+        lab_cli_bin,
+        project,
+        experiment_path,
+        "stale_runtime_relative_paths_pkg",
+    )
+
+    legacy_rel = "overrides/defaults.json"
+    legacy_runtime_copy = package_dir / legacy_rel
+    legacy_runtime_copy.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(package_dir / "deps" / legacy_rel, legacy_runtime_copy)
+
+    resolved_experiment = _read_json(package_dir / "resolved_experiment.json")
+    runtime = resolved_experiment["runtime"]["agent_runtime"]
+    runtime["command"][2] = legacy_rel
+    runtime["env"]["E2E_CONFIG_PATH"] = legacy_rel
+    _write_json(package_dir / "resolved_experiment.json", resolved_experiment)
+
+    manifest = _read_json(package_dir / "manifest.json")
+    manifest["resolved_experiment"] = resolved_experiment
+    _write_json(package_dir / "manifest.json", manifest)
+    _reseal_package_dir(package_dir)
+
+    preflight = _run_lab(
+        lab_cli_bin,
+        "preflight",
+        package_dir,
+        "--json",
+        cwd=project.root,
+        expected_exit=1,
+    )
+    _assert_command_failed(preflight, "unresolved package-relative path")
+    _assert_message_excludes_host_paths(preflight, [source_root, package_dir])
+
+
+@pytest.mark.e2e_build_preflight
+def test_run_from_moved_package_uses_sealed_runtime_paths_without_host_path_leakage(
+    tmp_path: Path,
+    lab_cli_bin: Path,
+    artifact_bundle: Path,
+    fixture_image: str,
+) -> None:
+    (
+        project,
+        experiment_path,
+        source_root,
+        runtime_config_path,
+    ) = _prepare_runtime_file_ref_project(
+        tmp_path,
+        artifact_bundle,
+        fixture_image,
+        exp_id="run_from_moved_package_uses_sealed_runtime_paths_without_host_path_leakage",
     )
     package_dir = _build_package(
         lab_cli_bin,
@@ -900,7 +1114,7 @@ def test_run_from_moved_package_uses_packaged_runtime_path_refs_without_source_t
     shutil.copytree(package_dir, moved_package_dir)
     shutil.rmtree(source_root)
 
-    run_payload = _run_package(
+    run_payload, run_proc = _run_package_with_process(
         lab_cli_bin,
         project,
         moved_package_dir,
@@ -910,9 +1124,13 @@ def test_run_from_moved_package_uses_packaged_runtime_path_refs_without_source_t
     trial_dir = _only_trial_dir(run_dir)
     agent_report = _load_agent_report(trial_dir)
     support_observation = agent_report["observations"]["runtime_support_file"]
+    runtime_inputs = agent_report["runtime_inputs"]
+    assert runtime_inputs["config_arg"] == runtime_config_path
+    assert runtime_inputs["e2e_config_path"] == runtime_config_path
     assert support_observation["exists"] is True
     assert support_observation["kind"] == "file"
     assert support_observation["matches_expected_text"] is True
+    _assert_command_output_excludes_host_paths(run_proc, [source_root, package_dir])
     _assert_text_tree_excludes_host_paths(run_dir, [source_root, package_dir])
 
 
@@ -2152,10 +2370,9 @@ def test_custom_benchmark_build_preflight_run_writes_prediction_and_score(
     )
     resolved_experiment = _read_json(package_dir / "resolved_experiment.json")
     assert resolved_experiment["dataset"]["suite_id"] == "custom_benchmark_e2e"
-    assert (
-        resolved_experiment["benchmark"]["grader"]["command"][1]
-        == "/agentlab/deps/custom_benchmark_grader.py"
-    )
+    grader_command_path = resolved_experiment["benchmark"]["grader"]["command"][1]
+    assert grader_command_path.endswith("custom_benchmark_grader.py")
+    assert str(project.root) not in grader_command_path
     describe = _run_lab(
         lab_cli_bin,
         "describe",

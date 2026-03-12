@@ -10,20 +10,6 @@ export interface DatasetJsonlOptions {
   limit: number;
 }
 
-export interface DependencyFileStagingEntry {
-  source_from_host: string;
-  destination_path: string;
-  required?: boolean;
-}
-
-export interface DependencyAssetEntry {
-  id?: string;
-  source_from_host: string;
-  mount_path: string;
-  read_only?: boolean;
-  required?: boolean;
-}
-
 // ---------------------------------------------------------------------------
 // Metrics
 // ---------------------------------------------------------------------------
@@ -535,38 +521,6 @@ export class ExperimentBuilder {
     throw new Error(
       `ExperimentBuilder.agentIo(${inputArg}, ${outputArg}) was removed; commands are literal argv and must consume the trial contract directly.`,
     );
-  }
-
-  dependencyAssets(entries: DependencyAssetEntry[]): this {
-    throw new Error(
-      `ExperimentBuilder.dependencyAssets(${entries.length}) was removed; task-owned dependencies must be embedded in task_spec_v1 rows.`,
-    );
-  }
-
-  dependencyFileStaging(entries: DependencyFileStagingEntry[]): this {
-    throw new Error(
-      `ExperimentBuilder.dependencyFileStaging(${entries.length}) was removed; task-owned dependencies must be embedded in task_spec_v1 rows.`,
-    );
-  }
-
-  stageDependencyAsset(
-    sourceFromHost: string,
-    mountPath: string,
-    options?: { id?: string; readOnly?: boolean; required?: boolean },
-  ): this {
-    throw new Error(
-      `ExperimentBuilder.stageDependencyAsset(${sourceFromHost}, ${mountPath}) was removed; task-owned dependencies must be embedded in task_spec_v1 rows.`,
-    );
-  }
-
-  stageDependencyFile(
-    sourceFromHost: string,
-    destinationPath: string,
-    options?: { required?: boolean },
-  ): this {
-    return this.stageDependencyAsset(sourceFromHost, destinationPath, {
-      required: options?.required ?? true,
-    });
   }
 
   baseline(variantId: string, bindings: Bindings): this {

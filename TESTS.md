@@ -119,6 +119,8 @@ Removed inputs are hard errors and must only appear in tests that explicitly ver
 - `runtime.agent`
 - `runtime.sandbox`
 - `runtime.dependencies.file_staging`
+- `benchmark.grader.support_files`
+- `benchmark.adapter.support_files`
 - `benchmark.adapter`
 - `--executor`
 

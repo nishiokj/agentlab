@@ -1802,11 +1802,7 @@ dataset:
   split_id: dev
   limit: 50
 design:
-  sanitization_profile: hermetic_functional
-  comparison: paired
   replications: 3
-  random_seed: 42
-  shuffle_tasks: true
   max_concurrency: 1
 baseline:
   variant_id: control
@@ -1822,11 +1818,7 @@ runtime:
 policy:
   timeout_ms: 300000
   task_sandbox:
-    profile: default
     network: none
-validity:
-  fail_on_state_leak: true
-  fail_on_profile_invariant_violation: true
 "
         }
         InitProfileArg::AbTest => {
@@ -1834,19 +1826,6 @@ validity:
   id: my_ab_test
   name: Paired Variant Comparison
   workload_type: agent_runtime
-dataset:
-  suite_id: local_suite
-  provider: local_jsonl
-  path: tasks.jsonl
-  split_id: dev
-  limit: 100
-design:
-  sanitization_profile: hermetic_functional
-  comparison: paired
-  replications: 5
-  random_seed: 42
-  shuffle_tasks: true
-  max_concurrency: 1
 baseline:
   variant_id: variant_a
   bindings: {}
@@ -1854,6 +1833,15 @@ variant_plan:
   - variant_id: variant_b
     bindings:
       model: claude-4
+dataset:
+  suite_id: local_suite
+  provider: local_jsonl
+  path: tasks.jsonl
+  split_id: dev
+  limit: 100
+design:
+  replications: 5
+  max_concurrency: 1
 runtime:
   agent_runtime:
     command: [python, harness.py]
@@ -1864,11 +1852,7 @@ runtime:
 policy:
   timeout_ms: 300000
   task_sandbox:
-    profile: default
     network: none
-validity:
-  fail_on_state_leak: true
-  fail_on_profile_invariant_violation: true
 "
         }
         InitProfileArg::Sweep => {
@@ -1876,19 +1860,6 @@ validity:
   id: my_sweep
   name: Parameter Sweep
   workload_type: agent_runtime
-dataset:
-  suite_id: local_suite
-  provider: local_jsonl
-  path: tasks.jsonl
-  split_id: dev
-  limit: 100
-design:
-  sanitization_profile: hermetic_functional
-  comparison: unpaired
-  replications: 1
-  random_seed: 42
-  shuffle_tasks: true
-  max_concurrency: 1
 baseline:
   variant_id: control
   bindings: {}
@@ -1899,6 +1870,16 @@ variant_plan:
   - variant_id: t09
     bindings:
       temperature: 0.9
+dataset:
+  suite_id: local_suite
+  provider: local_jsonl
+  path: tasks.jsonl
+  split_id: dev
+  limit: 100
+design:
+  comparison: unpaired
+  replications: 1
+  max_concurrency: 1
 runtime:
   agent_runtime:
     command: [python, harness.py]
@@ -1909,11 +1890,7 @@ runtime:
 policy:
   timeout_ms: 300000
   task_sandbox:
-    profile: default
     network: none
-validity:
-  fail_on_state_leak: true
-  fail_on_profile_invariant_violation: true
 "
         }
         InitProfileArg::Regression => {
@@ -1928,11 +1905,7 @@ dataset:
   split_id: dev
   limit: 50
 design:
-  sanitization_profile: hermetic_functional
-  comparison: paired
   replications: 3
-  random_seed: 42
-  shuffle_tasks: true
   max_concurrency: 1
 baseline:
   variant_id: control
@@ -1948,11 +1921,7 @@ runtime:
 policy:
   timeout_ms: 300000
   task_sandbox:
-    profile: default
     network: none
-validity:
-  fail_on_state_leak: true
-  fail_on_profile_invariant_violation: true
 "
         }
     }

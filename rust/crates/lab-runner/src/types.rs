@@ -82,6 +82,9 @@ pub(crate) const RUNTIME_KEY_SCHEDULE_PROGRESS: &str = "schedule_progress_v2";
 pub(crate) const RUNTIME_KEY_ENGINE_LEASE: &str = "engine_lease_v1";
 
 pub(crate) const RUN_CONTROL_UNKNOWN_WORKER_ID: &str = "worker.unknown";
+pub(crate) const PACKAGED_RUNTIME_DEPS_DIR: &str = "deps";
+pub(crate) const STAGING_MANIFEST_FILE: &str = "staging_manifest.json";
+pub(crate) const STAGING_MANIFEST_SCHEMA_VERSION: &str = "runtime_path_staging_manifest_v1";
 
 // ---------------------------------------------------------------------------
 // Type declarations from runner_part1_core.rs

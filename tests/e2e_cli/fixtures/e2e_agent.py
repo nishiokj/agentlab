@@ -172,6 +172,7 @@ def main() -> int:
     parser = argparse.ArgumentParser(description="AgentLab E2E agent fixture")
     parser.add_argument("--input")
     parser.add_argument("--output")
+    parser.add_argument("--config")
     args = parser.parse_args()
 
     task_path = _contract_path("AGENTLAB_TASK_PATH", args.input)
@@ -226,6 +227,10 @@ def main() -> int:
         "bindings": bindings,
         "observations": observations,
         "cwd": str(Path.cwd()),
+        "runtime_inputs": {
+            "config_arg": args.config or "",
+            "e2e_config_path": os.environ.get("E2E_CONFIG_PATH", ""),
+        },
         "env": {
             "run_id": os.environ.get("AGENTLAB_RUN_ID", ""),
             "trial_id": os.environ.get("AGENTLAB_TRIAL_ID", ""),

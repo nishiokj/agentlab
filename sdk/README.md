@@ -4,7 +4,7 @@ TypeScript SDK for authoring AgentLab experiments and invoking the Rust runner.
 
 The SDK is runtime-agent-first:
 
-1. You declare `runtime.agent`, `runtime.dependencies`, and `runtime.policy`.
+1. You declare `runtime.agent_runtime` and `policy.task_sandbox`.
 2. Runner owns container/process execution, isolation, and causal artifact extraction.
 3. Your runtime command is invoked once per trial.
 
@@ -45,20 +45,6 @@ const builder = ExperimentBuilder.create('rex_ab', 'Rex Prompt A/B')
   )
   .agentEnvFromHost(['OPENAI_API_KEY'])
 
-  // Dependency boundary: stage host files into trial paths.
-  .dependencyFileStaging([
-    {
-      source_from_host: './deps/sqlite/main.db',
-      destination_path: '/agentlab/deps/sqlite/main.db',
-      required: true,
-    },
-    {
-      source_from_host: './deps/ast/index.tar.zst',
-      destination_path: '/agentlab/deps/ast/index.tar.zst',
-      required: false,
-    },
-  ])
-
   .baseline('control', { model: 'gpt-4o-mini', prompt: 'v1' })
   .addVariant('treatment', { model: 'gpt-4o-mini', prompt: 'treatment_prompt' })
 
@@ -88,11 +74,10 @@ console.log(run.run.run_id);
 ## What You Need To Bring
 
 1. A dataset JSONL (`dataset.path`) with one JSON object per line.
-2. An agent bundle (`runtime.agent.bundle`) plus a runtime command (`runtime.agent.command`).
-3. A task-sandbox image (`runtime.sandbox.image`) unless your dataset provides per-task `environment.image`.
+2. An agent bundle (`runtime.agent_runtime.artifact`) plus a runtime command (`runtime.agent_runtime.command`).
+3. An agent-runtime image (`runtime.agent_runtime.image`).
 4. At least one baseline variant (`.baseline(...)`).
 5. Optional treatment variants (`.addVariant(...)`) and metrics (`.metric(...)`).
-6. Optional staged dependency files (`.dependencyFileStaging(...)`).
 
 You do not provide a control-plane protocol, runner socket wiring, or runner state handling.
 
@@ -109,9 +94,9 @@ builder
 
 You can set runtime command/env through:
 
-1. `.agentBundle(path)` (sets `runtime.agent.bundle`)
-2. `.agentLoop(command)` (sets `runtime.agent.command`)
-3. `.customAgentImage(image, command)` (sets `runtime.sandbox.image` and `runtime.agent.command`)
+1. `.agentBundle(path)` (sets `runtime.agent_runtime.artifact`)
+2. `.agentLoop(command)` (sets `runtime.agent_runtime.command`)
+3. `.customAgentImage(image, command)` (sets `runtime.agent_runtime.image` and `runtime.agent_runtime.command`)
 4. `.agentArgs(args)`
 5. `.agentEnv(env)`
 6. `.agentEnvFromHost(keys)`
@@ -120,25 +105,16 @@ You can set runtime command/env through:
 ## Command Semantics
 
 1. Runner executes exactly one command per trial.
-2. `runtime.agent.command` launches the external agent runtime, not the task sandbox.
-3. `runtime.sandbox.image` selects the task-sandbox image where shell tools, tests, and graders run.
+2. `runtime.agent_runtime.command` launches the external agent runtime.
+3. `runtime.agent_runtime.image` selects the runtime container image.
 4. In local agent-runtime mode, runner rewrites `/agentlab/...` and `/opt/agent/...` command paths to host paths before launch.
 5. `${AGENTLAB_*}` placeholders in command tokens are expanded by runner before launch.
 
 Practical implication: the command must be valid in the runtime environment you selected (image or local process).
 
-## Dependencies: Intuitive Staging
+## Runtime Files
 
-Preferred API:
-
-1. `.dependencyFileStaging(entries)`
-2. `.stageDependencyFile(sourceFromHost, destinationPath, options?)`
-
-Entry fields:
-
-1. `source_from_host`: host file path (supports `~`; relative paths resolve from the experiment file directory).
-2. `destination_path`: absolute path exposed in trial filesystem (usually under `/agentlab/deps/...`).
-3. `required` (optional, default true): if false, missing source is tolerated.
+If your runtime needs config or support files, package them inside the agent artifact. The SDK no longer exposes authored host-path staging fields.
 
 ## What Goes Into The Trial Container
 
@@ -194,7 +170,6 @@ await client.run({ experiment: '.lab/experiment.yaml' });
 Resolution rules:
 
 1. `dataset.path` is resolved relative to the experiment file directory.
-2. `runtime.dependencies.*.source_from_host` is resolved relative to the experiment file directory when relative.
 
 ## ExperimentBuilder API (Primary)
 
@@ -212,8 +187,7 @@ Common optional setters:
 4. `.guardrail(def)`
 5. `.artifacts({ collect, diff, baseDir? })`
 6. `.networkMode('none' | 'full' | 'allowlist_enforced', hosts?)`
-7. `.sandboxImage(image)`
-8. `.timeoutMs(ms)`
+7. `.timeoutMs(ms)`
 
 ## LabClient API (Primary)
 
@@ -250,4 +224,4 @@ Canonical per-trial result is:
 
 1. `networkMode('allowlist_enforced', ...)` is not yet implemented by the Rust container executor.
 2. Container reproducibility is strongest when image references are pinned by digest (`image@sha256:...`).
-3. `runtime.agent` is the runtime source of truth.
+3. `runtime.agent_runtime` is the runtime source of truth.
