@@ -10,7 +10,6 @@ from typing import Any
 
 from bench.config import BenchConfig
 from bench.taskkit.hidden_runner import run_hidden_suite, HiddenSuiteResult
-from bench.taskkit.loader import load_task, prepare_grader_workspace
 from bench.taskkit.patch_utils import check_patch_escapes_workspace, parse_patch_files
 from bench.taskkit.policy import PatchPolicy
 
@@ -97,15 +96,14 @@ def _apply_patch_text(workspace: Path, patch_text: str) -> bool:
     return result2.returncode == 0
 
 
-def grade_patch_for_task(
+def grade_patch_for_task_data(
     task_dir: Path,
+    task_data: dict[str, Any],
     patch_text: str | None,
     config: BenchConfig,
 ) -> dict[str, Any]:
-    """Grade an agent patch for a task bundle and return score payload."""
-    task_data = load_task(task_dir, config)
-    task_id = task_data["task_id"]
-
+    """Grade an agent patch using already-materialized task data."""
+    task_id = str(task_data["task_id"])
     if not patch_text or not patch_text.strip():
         return _compute_score(task_id=task_id, failure_label="NO_PATCH")
 
@@ -131,6 +129,8 @@ def grade_patch_for_task(
 
     work_root = Path(tempfile.mkdtemp(prefix=f"bench_adapter_grade_{task_id}_"))
     try:
+        from bench.taskkit.loader import prepare_grader_workspace
+
         manifest = prepare_grader_workspace(
             task_dir=task_dir,
             task_data=task_data,
@@ -207,3 +207,14 @@ def grade_patch_for_task(
     finally:
         shutil.rmtree(work_root, ignore_errors=True)
 
+
+def grade_patch_for_task(
+    task_dir: Path,
+    patch_text: str | None,
+    config: BenchConfig,
+) -> dict[str, Any]:
+    """Grade an agent patch for a task bundle and return score payload."""
+    from bench.taskkit.loader import load_task
+
+    task_data = load_task(task_dir, config)
+    return grade_patch_for_task_data(task_dir, task_data, patch_text, config)

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Convert curated SWE-bench Lite task_jsonl_v1 rows into task_boundary_v3 rows."""
+"""Convert curated SWE-bench Lite task_jsonl_v1 rows into public AgentLab task_spec rows."""
 
 from __future__ import annotations
 
@@ -12,7 +12,7 @@ from typing import Any
 DEFAULT_INPUT = (
     ".lab/runs/run_20260223_025729/trials/trial_1/dataset/swebench_lite_curated.jsonl"
 )
-DEFAULT_OUTPUT = ".lab/experiments/data/swebench_lite_curated.task_boundary_v3.jsonl"
+DEFAULT_OUTPUT = ".lab/experiments/data/swebench_lite_curated.task_spec.jsonl"
 DEFAULT_BENCHMARK_NAME = "swebench_lite_curated"
 DEFAULT_SPLIT = "test"
 DEFAULT_ADAPTER_ID = "swebench_task_container_grader"
@@ -84,7 +84,6 @@ def _to_boundary_row(
         task_payload["metadata"] = metadata
 
     return {
-        "schema_version": "task_boundary_v3",
         "task": task_payload,
         "environment": {
             "image": image,
@@ -102,6 +101,7 @@ def _to_boundary_row(
             ],
             "aux_mounts": [],
         },
+        "dependencies": {},
         "limits": {},
     }
 
@@ -112,7 +112,7 @@ def main() -> int:
     parser.add_argument(
         "--output",
         default=DEFAULT_OUTPUT,
-        help="Output task_boundary_v3 JSONL path",
+        help="Output task JSONL path",
     )
     parser.add_argument("--benchmark-name", default=DEFAULT_BENCHMARK_NAME)
     parser.add_argument("--split", default=DEFAULT_SPLIT)

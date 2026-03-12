@@ -124,13 +124,8 @@ pub fn continue_run_with_options(
     // 7. Reconstruct variant runtime profiles
     let mut variant_runtime_profiles = Vec::with_capacity(variants.len());
     for variant in &variants {
-        let profile = resolve_variant_runtime_profile(
-            &json_value,
-            variant,
-            &exp_dir,
-            &behavior,
-            &execution,
-        )?;
+        let profile =
+            resolve_variant_runtime_profile(&json_value, variant, &exp_dir, &behavior, &execution)?;
         ensure_required_runtime_env_present(&profile.agent_runtime, &profile.agent_runtime_env)?;
         variant_runtime_profiles.push(profile);
     }
@@ -202,7 +197,15 @@ pub fn continue_run_with_options(
     )?;
     run_sink.flush()?;
     if schedule_outcome != ScheduleEngineOutcome::Completed {
-        run_guard.disarm();
+        match schedule_outcome {
+            ScheduleEngineOutcome::Interrupted => {
+                run_guard.complete("interrupted")?;
+            }
+            _ => {
+                // Paused/Killed: handler already wrote correct status
+                run_guard.disarm();
+            }
+        }
         return Ok(RunResult {
             run_dir: run_dir.to_path_buf(),
             run_id,
@@ -423,18 +426,10 @@ pub fn replay_trial(run_dir: &Path, trial_id: &str, strict: bool) -> Result<Repl
         ));
     }
     let json_value: Value = serde_json::from_slice(&fs::read(&resolved_path)?)?;
-    let policy_config = parse_policies(&json_value);
-    let mut input = load_trial_input_payload(&run_dir, &run_id, trial_id)?;
+    let parent_trial_dir = run_dir.join("trials").join(trial_id);
+    let prepared_manifest = load_prepared_task_environment_manifest(&parent_trial_dir)?;
     let (variants, _) = load_run_variants(&run_dir, &json_value)?;
-    let variant_id = input
-        .pointer("/ids/variant_id")
-        .and_then(|v| v.as_str())
-        .or_else(|| {
-            json_value
-                .pointer("/baseline/variant_id")
-                .and_then(|v| v.as_str())
-        })
-        .unwrap_or("");
+    let variant_id = prepared_manifest.variant_id.as_str();
     let variant = find_variant_by_id(&variants, variant_id)?;
     let runtime_profile = resolve_variant_runtime_profile(
         &json_value,
@@ -461,12 +456,7 @@ pub fn replay_trial(run_dir: &Path, trial_id: &str, strict: bool) -> Result<Repl
     ensure_dir(&replay_dir)?;
 
     let replay_trial_id = format!("{}_{}", trial_id, replay_id);
-    set_json_pointer_value(
-        &mut input,
-        "/ids/trial_id",
-        Value::String(replay_trial_id.clone()),
-    )?;
-    let task_boundary = parse_task_boundary_from_trial_input(&input)?;
+    let task_boundary = materialize_task_boundary(prepared_manifest.declaration.clone());
     validate_task_boundary_workspace_materialization(&task_boundary)?;
 
     let replay_trial_dir = replay_dir.join("trial_1");
@@ -481,28 +471,33 @@ pub fn replay_trial(run_dir: &Path, trial_id: &str, strict: bool) -> Result<Repl
     )?;
     let mut trial_guard = TrialStateGuard::new(&replay_trial_dir, &replay_trial_id);
 
-    let trial_paths = TrialPaths::new(&replay_trial_dir, &project_root)?;
-    trial_paths.prepare(true)?;
-    let mut has_lineage_workspace = false;
+    let mut lineage_workspace_ref: Option<String> = None;
     {
         let store = BackingSqliteStore::open(&run_dir)?;
         if let Some(version_id) = store.latest_lineage_version_id_for_trial(&run_id, trial_id)? {
-            if let Some(workspace_ref) = store.lineage_workspace_ref_by_version(&version_id)? {
-                let artifact_store = ArtifactStore::new(run_dir.join("artifacts"));
-                restore_workspace_from_object_ref(
-                    &artifact_store,
-                    &workspace_ref,
-                    &trial_paths.workspace,
-                )?;
-                has_lineage_workspace = true;
-            }
+            lineage_workspace_ref = store.lineage_workspace_ref_by_version(&version_id)?;
         }
     }
-    materialize_task_dependencies_for_trial(&task_boundary, &trial_paths)?;
-    if !has_lineage_workspace {
-        materialize_workspace_base(&project_root, &trial_paths, &task_boundary.workspace.base)?;
-    }
-    materialize_workspace_overlays(&trial_paths, &task_boundary.workspace.overlays)?;
+    let prepared = prepare_task_environment(
+        &project_root,
+        &replay_trial_dir,
+        &run_id,
+        &replay_trial_id,
+        &runtime_experiment,
+        variant,
+        prepared_manifest.task_index,
+        prepared_manifest.repl_idx,
+        &task_boundary,
+        &agent_runtime,
+        lineage_workspace_ref.as_deref(),
+    )?;
+    let PreparedTaskEnvironment {
+        manifest: replay_prepared_manifest,
+        trial_paths,
+        io_paths: _,
+        dynamic_mounts,
+        trial_input: mut input,
+    } = prepared;
 
     set_json_pointer_value(
         &mut input,
@@ -517,10 +512,9 @@ pub fn replay_trial(run_dir: &Path, trial_id: &str, strict: bool) -> Result<Repl
         &run_id,
         &input,
         &io_paths,
+        Some(replay_prepared_manifest.task_image.as_str()),
         resolve_trial_timeout_ms(&input),
     );
-    let dynamic_mounts =
-        resolve_workspace_aux_mounts(&project_root, &task_boundary.workspace.aux_mounts)?;
     let adapter = adapter_registry_entry(&agent_runtime.adapter_ref)?;
     let run_request = AdapterRunRequest {
         runtime_experiment: &runtime_experiment,
@@ -535,7 +529,7 @@ pub fn replay_trial(run_dir: &Path, trial_id: &str, strict: bool) -> Result<Repl
         benchmark_grader: None,
         benchmark_grading_enabled: false,
         run_id: &run_id,
-        task_image: Some(task_boundary.task_image.as_str()),
+        task_image: Some(replay_prepared_manifest.task_image.as_str()),
         agent_artifact: Some(agent_runtime.agent_artifact.as_path()),
     };
     let proc_result = adapter.run_trial(&run_request)?;
@@ -651,7 +645,6 @@ fn fork_trial_inner(
         ));
     }
     let json_value: Value = serde_json::from_slice(&fs::read(&resolved_path)?)?;
-    let policy_config = parse_policies(&json_value);
     let parsed_selector = parse_fork_selector(selector)?;
 
     let run_id = run_dir
@@ -660,18 +653,11 @@ fn fork_trial_inner(
         .unwrap_or("run")
         .to_string();
 
-    let mut input = load_trial_input_payload(&run_dir, &run_id, from_trial)?;
+    let parent_trial_dir = run_dir.join("trials").join(from_trial);
+    let prepared_manifest = load_prepared_task_environment_manifest(&parent_trial_dir)?;
     let parent_output = load_trial_output_payload(&run_dir, &run_id, from_trial).ok();
     let (variants, _) = load_run_variants(&run_dir, &json_value)?;
-    let variant_id = input
-        .pointer("/ids/variant_id")
-        .and_then(|v| v.as_str())
-        .or_else(|| {
-            json_value
-                .pointer("/baseline/variant_id")
-                .and_then(|v| v.as_str())
-        })
-        .unwrap_or("");
+    let variant_id = prepared_manifest.variant_id.as_str();
     let variant = find_variant_by_id(&variants, variant_id)?;
     let runtime_profile = resolve_variant_runtime_profile(
         &json_value,
@@ -709,24 +695,7 @@ fn fork_trial_inner(
     let fork_dir = run_dir.join("forks").join(&fork_id);
     ensure_dir(&fork_dir)?;
     let fork_trial_id = format!("{}_{}", from_trial, fork_id);
-    set_json_pointer_value(
-        &mut input,
-        "/ids/trial_id",
-        Value::String(fork_trial_id.clone()),
-    )?;
-    apply_binding_overrides(&mut input, set_bindings)?;
-    set_json_pointer_value(
-        &mut input,
-        "/ext/fork",
-        json!({
-            "parent_run_id": run_id,
-            "parent_trial_id": from_trial,
-            "selector": selector,
-            "source_checkpoint": source_checkpoint.clone(),
-            "strict": strict
-        }),
-    )?;
-    let task_boundary = parse_task_boundary_from_trial_input(&input)?;
+    let task_boundary = materialize_task_boundary(prepared_manifest.declaration.clone());
     validate_task_boundary_workspace_materialization(&task_boundary)?;
 
     let fork_trial_dir = fork_dir.join("trial_1");
@@ -741,28 +710,43 @@ fn fork_trial_inner(
     )?;
     let mut trial_guard = TrialStateGuard::new(&fork_trial_dir, &fork_trial_id);
 
-    let trial_paths = TrialPaths::new(&fork_trial_dir, &project_root)?;
-    trial_paths.prepare(true)?;
-    let mut has_checkpoint_workspace = false;
-    if let Some(ref checkpoint_token) = source_checkpoint {
-        if let Some(workspace_ref) =
-            resolve_workspace_ref_from_checkpoint_token(&run_dir, checkpoint_token)?
-        {
-            let artifact_store = ArtifactStore::new(run_dir.join("artifacts"));
-            restore_workspace_from_object_ref(
-                &artifact_store,
-                &workspace_ref,
-                &trial_paths.workspace,
-            )?;
-            has_checkpoint_workspace = true;
-        }
-    }
-    materialize_task_dependencies_for_trial(&task_boundary, &trial_paths)?;
-    if !has_checkpoint_workspace {
-        materialize_workspace_base(&project_root, &trial_paths, &task_boundary.workspace.base)?;
-    }
-    materialize_workspace_overlays(&trial_paths, &task_boundary.workspace.overlays)?;
-
+    let checkpoint_workspace_ref = if let Some(ref checkpoint_token) = source_checkpoint {
+        resolve_workspace_ref_from_checkpoint_token(&run_dir, checkpoint_token)?
+    } else {
+        None
+    };
+    let prepared = prepare_task_environment(
+        &project_root,
+        &fork_trial_dir,
+        &run_id,
+        &fork_trial_id,
+        &runtime_experiment,
+        variant,
+        prepared_manifest.task_index,
+        prepared_manifest.repl_idx,
+        &task_boundary,
+        &agent_runtime,
+        checkpoint_workspace_ref.as_deref(),
+    )?;
+    let PreparedTaskEnvironment {
+        manifest: fork_prepared_manifest,
+        trial_paths,
+        io_paths: _,
+        dynamic_mounts,
+        trial_input: mut input,
+    } = prepared;
+    apply_binding_overrides(&mut input, set_bindings)?;
+    set_json_pointer_value(
+        &mut input,
+        "/ext/fork",
+        json!({
+            "parent_run_id": run_id,
+            "parent_trial_id": from_trial,
+            "selector": selector,
+            "source_checkpoint": source_checkpoint.clone(),
+            "strict": strict
+        }),
+    )?;
     set_json_pointer_value(
         &mut input,
         "/runtime/control_plane/path",
@@ -776,10 +760,9 @@ fn fork_trial_inner(
         &run_id,
         &input,
         &io_paths,
+        Some(fork_prepared_manifest.task_image.as_str()),
         resolve_trial_timeout_ms(&input),
     );
-    let dynamic_mounts =
-        resolve_workspace_aux_mounts(&project_root, &task_boundary.workspace.aux_mounts)?;
     let adapter = adapter_registry_entry(&agent_runtime.adapter_ref)?;
     let run_request = AdapterRunRequest {
         runtime_experiment: &runtime_experiment,
@@ -794,7 +777,7 @@ fn fork_trial_inner(
         benchmark_grader: None,
         benchmark_grading_enabled: false,
         run_id: &run_id,
-        task_image: Some(task_boundary.task_image.as_str()),
+        task_image: Some(fork_prepared_manifest.task_image.as_str()),
         agent_artifact: Some(agent_runtime.agent_artifact.as_path()),
     };
     let proc_result = adapter.run_trial(&run_request)?;
@@ -816,11 +799,7 @@ fn fork_trial_inner(
     }
 
     let replay_grade = replay_grade_for_integration(&agent_runtime.integration_level).to_string();
-    let fallback_mode = if has_checkpoint_workspace {
-        "checkpoint".to_string()
-    } else {
-        "input_only".to_string()
-    };
+    let fallback_mode = "checkpoint".to_string();
     let artifact_store = ArtifactStore::new(run_dir.join("artifacts"));
     let trial_input_ref = artifact_store.put_bytes(&input_bytes)?;
     let trial_output_ref = artifact_store.put_bytes(&serde_json::to_vec_pretty(&trial_output)?)?;
@@ -1496,7 +1475,6 @@ enum ContractPathRoot {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ContractPathMode {
     ContainerMount,
-    RuntimeIo,
     RuntimeEvents,
 }
 
@@ -1574,7 +1552,7 @@ fn resolve_contract_path_components(path: &str) -> Option<(ContractPathRoot, &st
 
 fn mode_allows_root(mode: ContractPathMode, root: ContractPathRoot) -> bool {
     match mode {
-        ContractPathMode::ContainerMount | ContractPathMode::RuntimeIo => matches!(
+        ContractPathMode::ContainerMount => matches!(
             root,
             ContractPathRoot::In
                 | ContractPathRoot::State
@@ -1599,15 +1577,11 @@ fn map_contract_path_to_host(
 ) -> Result<PathBuf> {
     let raw = match mode {
         ContractPathMode::ContainerMount => path.trim(),
-        ContractPathMode::RuntimeIo | ContractPathMode::RuntimeEvents => path,
+        ContractPathMode::RuntimeEvents => path,
     };
     if raw.is_empty() {
         return Err(match mode {
             ContractPathMode::ContainerMount => anyhow!("container path is empty"),
-            ContractPathMode::RuntimeIo => anyhow!(
-                "runtime io path must be absolute when using container mount contract: {}",
-                raw
-            ),
             ContractPathMode::RuntimeEvents => anyhow!(
                 "runtime event path must be absolute when resolving trial events: {}",
                 raw
@@ -1617,10 +1591,6 @@ fn map_contract_path_to_host(
     if !raw.starts_with('/') {
         return Err(match mode {
             ContractPathMode::ContainerMount => anyhow!("container path must be absolute: {}", raw),
-            ContractPathMode::RuntimeIo => anyhow!(
-                "runtime io path must be absolute when using container mount contract: {}",
-                raw
-            ),
             ContractPathMode::RuntimeEvents => anyhow!(
                 "runtime event path must be absolute when resolving trial events: {}",
                 raw
@@ -1633,12 +1603,6 @@ fn map_contract_path_to_host(
             ContractPathMode::ContainerMount => {
                 anyhow!("unsupported container mount path: {}", raw)
             }
-            ContractPathMode::RuntimeIo => {
-                anyhow!(
-                    "unsupported runtime io path for non-container trials: {}",
-                    raw
-                )
-            }
             ContractPathMode::RuntimeEvents => {
                 anyhow!("unsupported runtime event path for trial: {}", raw)
             }
@@ -1649,12 +1613,6 @@ fn map_contract_path_to_host(
         return Err(match mode {
             ContractPathMode::ContainerMount => {
                 anyhow!("unsupported container mount path: {}", raw)
-            }
-            ContractPathMode::RuntimeIo => {
-                anyhow!(
-                    "unsupported runtime io path for non-container trials: {}",
-                    raw
-                )
             }
             ContractPathMode::RuntimeEvents => {
                 anyhow!("unsupported runtime event path for trial: {}", raw)
@@ -1976,10 +1934,6 @@ fn parse_dx_command_field_named(value: Option<&Value>, field: &str) -> Result<Ve
     }
 }
 
-fn parse_dx_command_field(value: Option<&Value>) -> Result<Vec<String>> {
-    parse_dx_command_field_named(value, "agent.command")
-}
-
 fn parse_dx_arg_map(value: Option<&Value>, field: &str) -> Result<Value> {
     let Some(raw) = value else {
         return Ok(json!([]));
@@ -2155,31 +2109,55 @@ fn validate_agent_artifact_entrypoint_script(entrypoint_path: &Path, context: &s
         return Ok(());
     }
     let text = String::from_utf8_lossy(&head);
-    for raw in text.split_whitespace() {
-        let Some(token) = normalize_shell_token(raw) else {
-            continue;
-        };
-        if token.starts_with("#!") {
+    let Some(_) = text.lines().next() else {
+        return Ok(());
+    };
+    for (line_idx, line) in text.lines().take(8).enumerate() {
+        let trimmed_line = line.trim_start();
+        if line_idx > 0
+            && !(trimmed_line.starts_with("exec ")
+                || trimmed_line == "exec"
+                || trimmed_line.starts_with("exec\t"))
+        {
             continue;
         }
-        if !token.starts_with('/') {
-            continue;
-        }
-        if token.starts_with("/opt/agent/") {
-            if token_looks_like_script_source_path(&token) {
-                return Err(anyhow!(
-                    "{} entrypoint delegates to readable script path '{}'; bundle a binary entrypoint instead",
-                    context,
-                    token
-                ));
+        for raw in line.split_whitespace() {
+            let Some(token) = normalize_shell_token(raw) else {
+                continue;
+            };
+            if token.starts_with("#!") {
+                let shebang_target = token.trim_start_matches("#!");
+                if shebang_target == "/usr/bin/env" {
+                    continue;
+                }
+                if shebang_target.starts_with('/') && !shebang_target.starts_with("/opt/agent/") {
+                    return Err(anyhow!(
+                        "{} entrypoint delegates to image-resident path '{}'; only /opt/agent paths are allowed",
+                        context,
+                        shebang_target
+                    ));
+                }
+                continue;
             }
-            continue;
+            if !token.starts_with('/') {
+                continue;
+            }
+            if token.starts_with("/opt/agent/") {
+                if token_looks_like_script_source_path(&token) {
+                    return Err(anyhow!(
+                        "{} entrypoint delegates to readable script path '{}'; bundle a binary entrypoint instead",
+                        context,
+                        token
+                    ));
+                }
+                continue;
+            }
+            return Err(anyhow!(
+                "{} entrypoint delegates to image-resident path '{}'; only /opt/agent paths are allowed",
+                context,
+                token
+            ));
         }
-        return Err(anyhow!(
-            "{} entrypoint delegates to image-resident path '{}'; only /opt/agent paths are allowed",
-            context,
-            token
-        ));
     }
     Ok(())
 }
@@ -2393,8 +2371,7 @@ fn collect_runtime_artifact_validation_specs(
     experiment: &Value,
 ) -> Result<Vec<RuntimeArtifactValidationSpec>> {
     let root_agent = experiment.pointer("/runtime/agent_runtime");
-    let root_command =
-        command_for_artifact_validation(root_agent, "/runtime/agent_runtime", None)?;
+    let root_command = command_for_artifact_validation(root_agent, "/runtime/agent_runtime", None)?;
     let mut specs = Vec::new();
 
     let mut push_spec =
@@ -2419,7 +2396,11 @@ fn collect_runtime_artifact_validation_specs(
             Ok(())
         };
 
-    push_spec("/runtime/agent_runtime/artifact".to_string(), root_agent, None)?;
+    push_spec(
+        "/runtime/agent_runtime/artifact".to_string(),
+        root_agent,
+        None,
+    )?;
     push_spec(
         "/baseline/runtime_overrides/agent_runtime/artifact".to_string(),
         experiment.pointer("/baseline/runtime_overrides/agent_runtime"),
@@ -2432,7 +2413,10 @@ fn collect_runtime_artifact_validation_specs(
     {
         for (idx, variant) in variant_plan.iter().enumerate() {
             push_spec(
-                format!("/variant_plan/{}/runtime_overrides/agent_runtime/artifact", idx),
+                format!(
+                    "/variant_plan/{}/runtime_overrides/agent_runtime/artifact",
+                    idx
+                ),
                 variant.pointer("/runtime_overrides/agent_runtime"),
                 root_command.as_ref(),
             )?;
@@ -2476,10 +2460,10 @@ struct DxResolvedAgentBuild {
     artifact_path: PathBuf,
     artifact_digest: String,
     image: String,
+    command_base: Vec<String>,
     command: Vec<String>,
+    env_base: BTreeMap<String, String>,
     env: BTreeMap<String, String>,
-    env_from_host: Vec<String>,
-    bindings_to_args: Value,
 }
 
 #[derive(Debug, Clone)]
@@ -2505,12 +2489,300 @@ fn uses_new_variant_agent_model(json_value: &Value) -> bool {
     })
 }
 
+fn reject_removed_dx_agent_fields(root: &Value, root_name: &str) -> Result<()> {
+    let removed = [
+        ("arg_map", "put public argv directly in agent.command using $binding placeholders"),
+        (
+            "bindings_to_args",
+            "put public argv directly in agent.command using $binding placeholders",
+        ),
+        ("default_config", "put --config <relative-path> directly in agent.command"),
+        ("config_files", "reference relative files directly from agent.command or agent.env"),
+        ("provider_env", "bind runtime values directly with $NAME in agent.command or agent.env"),
+        ("support_files", "reference relative files directly from agent.command or agent.env"),
+        ("env_from_host", "bind runtime values directly with $NAME in agent.command or agent.env"),
+    ];
+    for (field, guidance) in removed {
+        if root.get(field).is_some() {
+            return Err(anyhow!(
+                "{}.{} was removed in the hard cutover; {}",
+                root_name,
+                field,
+                guidance
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn contains_removed_runtime_template(raw: &str) -> bool {
+    raw.contains("${")
+}
+
+fn resolve_existing_public_path_reference(
+    raw: &str,
+    exp_dir: &Path,
+    field_name: &str,
+) -> Result<Option<PathBuf>> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty()
+        || trimmed.starts_with('/')
+        || trimmed.starts_with('-')
+        || trimmed.contains('$')
+        || trimmed.contains("://")
+    {
+        return Ok(None);
+    }
+    let rel = validate_dx_support_file_relpath(trimmed, field_name)?;
+    let resolved = normalize_path(&exp_dir.join(&rel));
+    if resolved.exists() {
+        return Ok(Some(PathBuf::from(rel)));
+    }
+    if trimmed.starts_with("./") || trimmed.contains('/') {
+        return Err(anyhow!(
+            "{} resolved path does not exist: {}",
+            field_name,
+            resolved.display()
+        ));
+    }
+    Ok(None)
+}
+
+fn validate_dx_command_and_env_surface(
+    command: &[String],
+    env: &BTreeMap<String, String>,
+    root_name: &str,
+    exp_dir: &Path,
+) -> Result<()> {
+    for (idx, token) in command.iter().enumerate() {
+        let field = format!("{}.command[{}]", root_name, idx);
+        if contains_removed_runtime_template(token) {
+            return Err(anyhow!(
+                "{} uses removed '${{...}}' syntax; use $NAME runtime bindings instead",
+                field
+            ));
+        }
+        if token.trim().starts_with("/agentlab/") {
+            return Err(anyhow!(
+                "{} leaks runner topology; remove internal /agentlab paths from public authoring",
+                field
+            ));
+        }
+        if idx > 0 {
+            let _ = resolve_existing_public_path_reference(token, exp_dir, &field)?;
+        }
+    }
+    for (key, value) in env {
+        let field = format!("{}.env.{}", root_name, key);
+        if contains_removed_runtime_template(value) {
+            return Err(anyhow!(
+                "{} uses removed '${{...}}' syntax; use $NAME runtime bindings instead",
+                field
+            ));
+        }
+        if value.trim().starts_with("/agentlab/") {
+            return Err(anyhow!(
+                "{} leaks runner topology; remove internal /agentlab paths from public authoring",
+                field
+            ));
+        }
+        let _ = resolve_existing_public_path_reference(value, exp_dir, &field)?;
+    }
+    Ok(())
+}
+
+fn validate_dx_support_file_relpath(raw: &str, field_name: &str) -> Result<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(anyhow!("{} must not be empty", field_name));
+    }
+    let path = Path::new(trimmed);
+    if path.is_absolute() {
+        return Err(anyhow!("{} must be relative", field_name));
+    }
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::Normal(seg) => normalized.push(seg),
+            Component::ParentDir => {
+                return Err(anyhow!("{} cannot contain '..'", field_name));
+            }
+            Component::RootDir | Component::Prefix(_) => {
+                return Err(anyhow!("{} must be relative", field_name));
+            }
+        }
+    }
+    if normalized.as_os_str().is_empty() {
+        return Err(anyhow!("{} cannot resolve to empty", field_name));
+    }
+    Ok(normalized.to_string_lossy().replace('\\', "/"))
+}
+
+fn resolve_dx_support_source_path(
+    raw: &str,
+    exp_dir: &Path,
+    _project_root: &Path,
+    field_name: &str,
+) -> Result<PathBuf> {
+    let candidate = PathBuf::from(raw);
+    let resolved = if candidate.is_absolute() {
+        normalize_path(&candidate)
+    } else {
+        normalize_path(&exp_dir.join(candidate))
+    };
+    if !resolved.exists() {
+        return Err(anyhow!(
+            "{} resolved path does not exist: {}",
+            field_name,
+            resolved.display()
+        ));
+    }
+    Ok(resolved)
+}
+
+fn dx_support_file_value(source: &Path, destination_path: &str) -> Value {
+    json!({
+        "source_from_host": source.to_string_lossy().to_string(),
+        "destination_path": destination_path,
+        "required": true,
+        "read_only": true
+    })
+}
+
+fn parse_dx_support_files_field(
+    value: Option<&Value>,
+    field_name: &str,
+    exp_dir: &Path,
+    project_root: &Path,
+) -> Result<Vec<Value>> {
+    let Some(value) = value else {
+        return Ok(Vec::new());
+    };
+    let items = value
+        .as_array()
+        .ok_or_else(|| anyhow!("{} must be an array", field_name))?;
+    let mut support_files = Vec::with_capacity(items.len());
+    for (idx, item) in items.iter().enumerate() {
+        let obj = item
+            .as_object()
+            .ok_or_else(|| anyhow!("{}[{}] must be an object", field_name, idx))?;
+        let source = obj
+            .get("source_from_host")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("{}[{}].source_from_host is required", field_name, idx))?;
+        let destination_path = obj
+            .get("destination_path")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| anyhow!("{}[{}].destination_path is required", field_name, idx))?;
+        let source_path = resolve_dx_support_source_path(
+            source,
+            exp_dir,
+            project_root,
+            &format!("{}[{}].source_from_host", field_name, idx),
+        )?;
+        support_files.push(json!({
+            "source_from_host": source_path.to_string_lossy().to_string(),
+            "destination_path": destination_path,
+            "required": obj.get("required").and_then(Value::as_bool).unwrap_or(true),
+            "read_only": obj.get("read_only").and_then(Value::as_bool).unwrap_or(true),
+        }));
+    }
+    Ok(support_files)
+}
+
+fn parse_dx_provider_env_field(
+    value: Option<&Value>,
+    field_name: &str,
+) -> Result<Vec<(String, String)>> {
+    let Some(value) = value else {
+        return Ok(Vec::new());
+    };
+    let mut pairs = Vec::new();
+    match value {
+        Value::Object(obj) => {
+            for (provider, env_name_raw) in obj {
+                let provider = provider.trim();
+                let env_name = env_name_raw
+                    .as_str()
+                    .ok_or_else(|| anyhow!("{}['{}'] must be a string", field_name, provider))?
+                    .trim();
+                if provider.is_empty() || env_name.is_empty() {
+                    return Err(anyhow!(
+                        "{} entries must use non-empty provider and env values",
+                        field_name
+                    ));
+                }
+                pairs.push((provider.to_string(), env_name.to_string()));
+            }
+        }
+        Value::Array(items) => {
+            for (idx, item) in items.iter().enumerate() {
+                if let Some(token) = item.as_str() {
+                    let trimmed = token.trim();
+                    let (provider, env_name) = trimmed.split_once('=').ok_or_else(|| {
+                        anyhow!(
+                            "{}[{}] must use provider=ENV format (got '{}')",
+                            field_name,
+                            idx,
+                            token
+                        )
+                    })?;
+                    if provider.trim().is_empty() || env_name.trim().is_empty() {
+                        return Err(anyhow!(
+                            "{}[{}] must use non-empty provider and env values",
+                            field_name,
+                            idx
+                        ));
+                    }
+                    pairs.push((provider.trim().to_string(), env_name.trim().to_string()));
+                    continue;
+                }
+                let obj = item
+                    .as_object()
+                    .ok_or_else(|| anyhow!("{}[{}] must be a string or object", field_name, idx))?;
+                let provider = obj
+                    .get("provider")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .ok_or_else(|| anyhow!("{}[{}].provider is required", field_name, idx))?;
+                let env_name = obj
+                    .get("env")
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .ok_or_else(|| anyhow!("{}[{}].env is required", field_name, idx))?;
+                pairs.push((provider.to_string(), env_name.to_string()));
+            }
+        }
+        _ => {
+            return Err(anyhow!(
+                "{} must be an object, string[], or object[]",
+                field_name
+            ))
+        }
+    }
+    Ok(pairs)
+}
+
+fn dx_provider_env_value(provider_env: &[(String, String)]) -> Value {
+    let mut mapping = serde_json::Map::new();
+    for (provider, env_name) in provider_env {
+        mapping.insert(provider.clone(), Value::String(env_name.clone()));
+    }
+    Value::Object(mapping)
+}
+
 fn parse_dx_agent_build(
     root: &Value,
     root_name: &str,
     exp_dir: &Path,
     project_root: &Path,
 ) -> Result<DxResolvedAgentBuild> {
+    reject_removed_dx_agent_fields(root, root_name)?;
     let artifact_raw = root
         .get("artifact")
         .and_then(Value::as_str)
@@ -2527,8 +2799,9 @@ fn parse_dx_agent_build(
         ));
     }
     let artifact_digest = compute_artifact_content_digest(&artifact_path)?;
-    let mut command =
+    let command_base =
         parse_dx_command_field_named(root.get("command"), &format!("{}.command", root_name))?;
+    let command = command_base.clone();
     let image = root
         .get("image")
         .and_then(Value::as_str)
@@ -2536,33 +2809,18 @@ fn parse_dx_agent_build(
         .filter(|v| !v.is_empty())
         .ok_or_else(|| anyhow!("{}.image is required", root_name))?
         .to_string();
-    if root.get("io").is_some()
-        || root.get("config_files").is_some()
-        || root.get("default_config").is_some()
-        || root.get("provider_env").is_some()
-        || root.get("workspace_patches").is_some()
-    {
-        return Err(anyhow!(
-            "{} uses removed fields; only artifact, image, command, env, env_from_host, and arg_map are supported",
-            root_name
-        ));
-    }
-    let mut env = parse_string_map_field(root.get("env"), &format!("{}.env", root_name))?;
-    let mut env_from_host = parse_string_array_field(
-        root.get("env_from_host"),
-        &format!("{}.env_from_host", root_name),
-    )?;
-    let bindings_to_args =
-        parse_dx_arg_map(root.get("arg_map"), &format!("{}.arg_map", root_name))?;
+    let env_base = parse_string_map_field(root.get("env"), &format!("{}.env", root_name))?;
+    let env = env_base.clone();
+    validate_dx_command_and_env_surface(&command_base, &env_base, root_name, exp_dir)?;
     Ok(DxResolvedAgentBuild {
         artifact_raw,
         artifact_path,
         artifact_digest,
         image,
+        command_base,
         command,
+        env_base,
         env,
-        env_from_host,
-        bindings_to_args,
     })
 }
 
@@ -2581,11 +2839,20 @@ fn runtime_override_for_variant_build(
             "artifact_digest": build.artifact_digest.clone(),
             "artifact_resolved_path": build.artifact_path.to_string_lossy().to_string(),
             "image": build.image.clone(),
-            "env": merged_env,
-            "env_from_host": build.env_from_host.clone(),
-            "binding_args": build.bindings_to_args.clone()
+            "env": merged_env
         }
     })
+}
+
+fn builtin_benchmark_assets_root() -> Result<PathBuf> {
+    let candidate = normalize_path(&PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../.."));
+    if candidate.join("bench").exists() && candidate.join("adapters").exists() {
+        return Ok(candidate);
+    }
+    Err(anyhow!(
+        "failed to resolve built-in benchmark assets root from {}",
+        candidate.display()
+    ))
 }
 
 fn rewrite_new_variant_agent_model(
@@ -2723,17 +2990,15 @@ fn rewrite_new_variant_agent_model(
         .get(&baseline_variant.agent_ref)
         .ok_or_else(|| anyhow!("internal error: baseline agent build missing"))?;
 
-    let mut baseline_agent_env = baseline_build.env.clone();
+    let mut baseline_agent_env = baseline_build.env_base.clone();
     for (key, value) in &baseline_variant.env {
         baseline_agent_env.insert(key.clone(), value.clone());
     }
     let baseline_agent = json!({
         "artifact": baseline_build.artifact_raw.clone(),
         "image": baseline_build.image.clone(),
-        "command": baseline_build.command.clone(),
+        "command": baseline_build.command_base.clone(),
         "env": baseline_agent_env,
-        "env_from_host": baseline_build.env_from_host.clone(),
-        "arg_map": baseline_build.bindings_to_args.clone(),
     });
     set_json_pointer_value(&mut rewritten, "/agent", baseline_agent)?;
     set_json_pointer_value(
@@ -2778,71 +3043,6 @@ fn rewrite_new_variant_agent_model(
     Ok(rewritten)
 }
 
-fn reject_legacy_fields_in_dx_authoring(json_value: &Value) -> Result<()> {
-    let mut removed = Vec::new();
-    if !matches!(json_value.pointer("/version"), None | Some(Value::Null)) {
-        removed.push("/version (removed: DX authoring is versionless)".to_string());
-    }
-    let checks = [
-        (
-            "/dataset",
-            "removed: benchmark registry owns dataset/provider/schema wiring",
-        ),
-        (
-            "/design",
-            "removed: use top-level DX fields (limit/concurrency/overrides)",
-        ),
-        ("/runtime", "removed: use top-level agent + overrides"),
-        (
-            "/metrics",
-            "removed: benchmark-owned + runner-owned metrics are resolved automatically",
-        ),
-        (
-            "/variant_plan",
-            "removed: use /variants in DX authoring surface",
-        ),
-        (
-            "/baseline/variant_id",
-            "removed: use /baseline/id in DX authoring surface",
-        ),
-        (
-            "/agent/bundle",
-            "removed: use /agent/artifact in DX authoring surface",
-        ),
-        (
-            "/agent/bindings_to_args",
-            "removed: use /agent/arg_map with { key, flag } entries",
-        ),
-        (
-            "/agent/io/input_arg",
-            "removed: use /agent/io/input in DX authoring surface",
-        ),
-        (
-            "/agent/io/output_arg",
-            "removed: use /agent/io/output in DX authoring surface",
-        ),
-    ];
-    for (pointer, reason) in checks {
-        if !matches!(json_value.pointer(pointer), None | Some(Value::Null)) {
-            removed.push(format!("{} ({})", pointer, reason));
-        }
-    }
-    if matches!(json_value.pointer("/benchmark"), Some(Value::Object(_))) {
-        removed.push("/benchmark object (removed: use benchmark: <name>)".to_string());
-    }
-    if !removed.is_empty() {
-        return Err(anyhow!(
-            "legacy/removed fields are not allowed in DX authoring:\n{}",
-            removed
-                .iter()
-                .map(|line| format!("  - {}", line))
-                .collect::<Vec<_>>()
-                .join("\n")
-        ));
-    }
-    Ok(())
-}
-
 fn normalize_experiment_authoring(
     json_value: Value,
     exp_dir: &Path,
@@ -2855,7 +3055,6 @@ fn normalize_experiment_authoring(
     if uses_new_variant_agent_model(&json_value) {
         json_value = rewrite_new_variant_agent_model(&json_value, exp_dir, project_root)?;
     }
-    reject_legacy_fields_in_dx_authoring(&json_value)?;
 
     let experiment_id = json_value
         .pointer("/experiment/id")
@@ -2965,108 +3164,83 @@ fn normalize_experiment_authoring(
     } else {
         "variant_sequential"
     };
+    let builtin_assets_root = builtin_benchmark_assets_root()?;
 
     let agent_root = json_value
         .pointer("/agent")
         .ok_or_else(|| anyhow!("agent section is required"))?;
-    let agent_artifact_raw = agent_root
-        .pointer("/artifact")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|v| !v.is_empty())
-        .ok_or_else(|| anyhow!("agent.artifact is required"))?;
-    let agent_artifact_path = resolve_dx_artifact_path(agent_artifact_raw, exp_dir, project_root);
-    if !agent_artifact_path.exists() {
-        return Err(anyhow!(
-            "agent.artifact resolved path does not exist: {}",
-            agent_artifact_path.display()
-        ));
-    }
-    let agent_artifact_digest = compute_artifact_content_digest(&agent_artifact_path)?;
-    let agent_command = parse_dx_command_field(agent_root.pointer("/command"))?;
-    let agent_image = agent_root
-        .pointer("/image")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|v| !v.is_empty())
-        .ok_or_else(|| anyhow!("agent.image is required"))?
-        .to_string();
-    if agent_root.pointer("/io").is_some()
-        || agent_root.pointer("/config_files").is_some()
-        || agent_root.pointer("/default_config").is_some()
-        || agent_root.pointer("/provider_env").is_some()
-        || agent_root.pointer("/workspace_patches").is_some()
-    {
-        return Err(anyhow!(
-            "agent uses removed fields; only artifact, image, command, env, env_from_host, and arg_map are supported"
-        ));
-    }
-    let agent_env = parse_string_map_field(agent_root.pointer("/env"), "agent.env")?;
-    let agent_env_from_host =
-        parse_string_array_field(agent_root.pointer("/env_from_host"), "agent.env_from_host")?;
-    let bindings_to_args = parse_dx_arg_map(agent_root.pointer("/arg_map"), "agent.arg_map")?;
+    let agent_build = parse_dx_agent_build(agent_root, "agent", exp_dir, project_root)?;
     let (
         dataset_path,
-        dataset_schema_version,
         dataset_suite_id,
         dataset_split_id,
         metrics,
         benchmark_policy,
         benchmark_grader_command,
+        benchmark_grader_support_files,
     ) = match builtin_benchmark {
-        "bench_v0" => {
-            (
-                project_root
-                    .join(".lab")
-                    .join("experiments")
-                    .join("data")
-                    .join("bench_v0.task_spec_v1.jsonl"),
-                "task_spec_v1",
-                "bench_v0",
-                "test",
-                json!([
-                    { "id": "duration_ms", "source": "runner", "weight": 0, "primary": false },
-                    { "id": "turn_count", "source": "runner", "weight": 0, "primary": false },
-                    { "id": "resolved", "source": "output", "json_pointer": "/metrics/resolved", "weight": 1, "direction": "maximize", "primary": true },
-                    { "id": "hidden_cases_passed", "source": "output", "json_pointer": "/metrics/hidden_cases_passed", "weight": 0, "primary": false },
-                    { "id": "hidden_cases_total", "source": "output", "json_pointer": "/metrics/hidden_cases_total", "weight": 0, "primary": false }
-                ]),
-                json!({
-                    "task_model": "independent",
-                    "evaluator_mode": "custom",
-                    "scoring_lifecycle": "predict_then_score",
-                    "chain_failure_policy": "continue_with_flag"
-                }),
-                json!(["python3", "/agentlab/deps/bench_benchmark_adapter.py"]),
-            )
-        }
-        "swebench_lite_curated" => {
-            (
-                project_root
-                    .join(".lab")
-                    .join("experiments")
-                    .join("data")
-                    .join("swebench_lite_curated.task_spec_v1.jsonl"),
-                "task_spec_v1",
-                "swebench_lite_curated",
-                "test",
-                json!([
-                    { "id": "duration_ms", "source": "runner", "weight": 0, "primary": false },
-                    { "id": "turn_count", "source": "runner", "weight": 0, "primary": false },
-                    { "id": "success", "source": "output", "json_pointer": "/metrics/success", "weight": 1, "direction": "maximize", "primary": true }
-                ]),
-                json!({
-                    "task_model": "independent",
-                    "evaluator_mode": "custom",
-                    "scoring_lifecycle": "integrated_score",
-                    "chain_failure_policy": "continue_with_flag"
-                }),
-                json!([
-                    "python3",
-                    "/agentlab/deps/swebench_task_container_grader.py"
-                ]),
-            )
-        }
+        "bench_v0" => (
+            project_root
+                .join(".lab")
+                .join("experiments")
+                .join("data")
+                .join("bench_v0.task_spec.jsonl"),
+            "bench_v0",
+            "test",
+            json!([
+                { "id": "duration_ms", "source": "runner", "weight": 0, "primary": false },
+                { "id": "turn_count", "source": "runner", "weight": 0, "primary": false },
+                { "id": "resolved", "source": "output", "json_pointer": "/metrics/resolved", "weight": 1, "direction": "maximize", "primary": true },
+                { "id": "hidden_cases_passed", "source": "output", "json_pointer": "/metrics/hidden_cases_passed", "weight": 0, "primary": false },
+                { "id": "hidden_cases_total", "source": "output", "json_pointer": "/metrics/hidden_cases_total", "weight": 0, "primary": false }
+            ]),
+            json!({
+                "task_model": "independent",
+                "evaluator_mode": "custom",
+                "scoring_lifecycle": "predict_then_score",
+                "chain_failure_policy": "continue_with_flag"
+            }),
+            json!([
+                "python3",
+                "/agentlab/deps/bench/integration/agentlab/bench_benchmark_adapter.py"
+            ]),
+            json!([
+                dx_support_file_value(
+                    &builtin_assets_root.join("bench"),
+                    "/agentlab/deps/bench"
+                )
+            ]),
+        ),
+        "swebench_lite_curated" => (
+            project_root
+                .join(".lab")
+                .join("experiments")
+                .join("data")
+                .join("swebench_lite_curated.task_spec.jsonl"),
+            "swebench_lite_curated",
+            "test",
+            json!([
+                { "id": "duration_ms", "source": "runner", "weight": 0, "primary": false },
+                { "id": "turn_count", "source": "runner", "weight": 0, "primary": false },
+                { "id": "success", "source": "output", "json_pointer": "/metrics/success", "weight": 1, "direction": "maximize", "primary": true }
+            ]),
+            json!({
+                "task_model": "independent",
+                "evaluator_mode": "custom",
+                "scoring_lifecycle": "integrated_score",
+                "chain_failure_policy": "continue_with_flag"
+            }),
+            json!([
+                "python3",
+                "/agentlab/deps/swebench/swebench_task_container_grader.py"
+            ]),
+            json!([
+                dx_support_file_value(
+                    &builtin_assets_root.join("adapters").join("swebench"),
+                    "/agentlab/deps/swebench"
+                )
+            ]),
+        ),
         _ => unreachable!(),
     };
 
@@ -3110,7 +3284,6 @@ fn normalize_experiment_authoring(
         .max(1);
 
     let mut resolved = json!({
-        "version": "0.6",
         "experiment": {
             "id": experiment_id,
             "name": experiment_name,
@@ -3121,7 +3294,6 @@ fn normalize_experiment_authoring(
         "dataset": {
             "provider": "local_jsonl",
             "path": dataset_path.to_string_lossy().to_string(),
-            "schema_version": dataset_schema_version,
             "suite_id": dataset_suite_id,
             "split_id": dataset_split_id
         },
@@ -3147,19 +3319,18 @@ fn normalize_experiment_authoring(
         "benchmark": {
             "policy": benchmark_policy,
             "grader": {
-                "command": benchmark_grader_command
+                "command": benchmark_grader_command,
+                "support_files": benchmark_grader_support_files
             }
         },
         "runtime": {
             "agent_runtime": {
-                "command": agent_command,
-                "artifact": agent_artifact_path.to_string_lossy().to_string(),
-                "artifact_digest": agent_artifact_digest,
-                "artifact_resolved_path": agent_artifact_path.to_string_lossy().to_string(),
-                "image": agent_image,
-                "env": agent_env,
-                "env_from_host": agent_env_from_host,
-                "binding_args": bindings_to_args,
+                "command": agent_build.command.clone(),
+                "artifact": agent_build.artifact_path.to_string_lossy().to_string(),
+                "artifact_digest": agent_build.artifact_digest.clone(),
+                "artifact_resolved_path": agent_build.artifact_path.to_string_lossy().to_string(),
+                "image": agent_build.image.clone(),
+                "env": agent_build.env.clone(),
                 "network": network_mode,
                 "root_read_only": root_read_only
             }
@@ -3188,7 +3359,6 @@ fn normalize_experiment_authoring(
     Ok(resolved)
 }
 fn configured_network_mode(json_value: &Value) -> Result<String> {
-    reject_legacy_experiment_version(json_value)?;
     json_value
         .pointer("/policy/task_sandbox/network")
         .and_then(|v| v.as_str())

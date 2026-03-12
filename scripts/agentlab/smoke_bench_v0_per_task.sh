@@ -17,7 +17,7 @@ if [[ -z "${PYTHON_BIN}" ]]; then
 fi
 
 EXPERIMENT_PATH="${BENCH_EXPERIMENT_PATH:-.lab/experiments/bench_v0_per_task.yaml}"
-DATASET_PATH="${BENCH_DATASET_PATH:-.lab/experiments/data/bench_v0.task_boundary_v3.jsonl}"
+DATASET_PATH="${BENCH_DATASET_PATH:-.lab/experiments/data/bench_v0.task_spec.jsonl}"
 SUITE="${BENCH_SUITE:-v0}"
 DATASET_LIMIT="${BENCH_DATASET_LIMIT:-1}"
 DEFAULT_TASK_IMAGE="${BENCH_DEFAULT_TASK_IMAGE:-}"
@@ -47,7 +47,7 @@ if [[ ! -f "${AGENT_ARTIFACT}" ]]; then
   exit 1
 fi
 
-echo "building bench v0 task_boundary_v3 dataset: ${DATASET_PATH}"
+echo "building bench v0 tasks dataset: ${DATASET_PATH}"
 "${PYTHON_BIN}" bench/integration/agentlab/export_bench_suite_to_jsonl.py \
   --suite "${SUITE}" \
   --output "${DATASET_PATH}" \

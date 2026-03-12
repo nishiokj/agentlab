@@ -19,7 +19,7 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 
 from bench.config import BenchConfig
-from bench.taskkit.grading import grade_patch_for_task
+from bench.taskkit.grading import grade_patch_for_task, grade_patch_for_task_data
 
 DEFAULT_ADAPTER_ID = "bench_v0"
 DEFAULT_BENCHMARK_NAME = "bench"
@@ -110,18 +110,28 @@ def _extract_benchmark_spec(task_payload: Any) -> dict[str, str]:
     return default
 
 
+def _task_record(task_payload: Any) -> dict[str, Any] | None:
+    if not isinstance(task_payload, dict):
+        return None
+    nested = task_payload.get("task")
+    if isinstance(nested, dict):
+        return nested
+    return task_payload
+
+
 def _resolve_task_dir(task_payload: Any, task_id: str) -> Path:
     root = _repo_root()
+    record = _task_record(task_payload)
 
-    if isinstance(task_payload, dict):
-        direct = task_payload.get("task_dir")
+    if isinstance(record, dict):
+        direct = record.get("task_dir")
         if isinstance(direct, str) and direct.strip():
             direct_path = Path(direct.strip())
             if not direct_path.is_absolute():
                 direct_path = root / direct_path
             return direct_path
 
-        bench = task_payload.get("bench")
+        bench = record.get("bench")
         if isinstance(bench, dict):
             nested = bench.get("task_dir")
             if isinstance(nested, str) and nested.strip():
@@ -134,6 +144,47 @@ def _resolve_task_dir(task_payload: Any, task_id: str) -> Path:
                 return root / "bench" / "benchmark" / "tasks" / suite.strip() / task_id
 
     return root / "bench" / "benchmark" / "tasks" / "v0" / task_id
+
+
+def _task_data_from_payload(task_payload: Any) -> dict[str, Any] | None:
+    record = _task_record(task_payload)
+    if not isinstance(record, dict):
+        return None
+
+    repo_id = record.get("repo_id")
+    baseline_injection_patch = record.get("baseline_injection_patch")
+    if not isinstance(repo_id, str) or not repo_id.strip():
+        return None
+    if not isinstance(baseline_injection_patch, str) or not baseline_injection_patch.strip():
+        return None
+
+    task_data: dict[str, Any] = {
+        "task_id": _task_id(task_payload),
+        "repo_id": repo_id.strip(),
+        "baseline_injection_patch": baseline_injection_patch.strip(),
+    }
+
+    public_command = record.get("public_command")
+    if isinstance(public_command, str) and public_command.strip():
+        task_data["public_command"] = public_command.strip()
+
+    hidden_command = record.get("hidden_command")
+    if isinstance(hidden_command, str) and hidden_command.strip():
+        task_data["hidden_command"] = hidden_command.strip()
+
+    time_limits = record.get("time_limits")
+    if isinstance(time_limits, dict):
+        task_data["time_limits"] = time_limits
+
+    patch_policy = record.get("patch_policy")
+    if isinstance(patch_policy, dict):
+        task_data["patch_policy"] = patch_policy
+
+    determinism_env = record.get("determinism_env")
+    if isinstance(determinism_env, dict):
+        task_data["determinism_env"] = determinism_env
+
+    return task_data
 
 
 def _extract_patch_text(agent_result: Any) -> str | None:
@@ -297,7 +348,16 @@ def _grade_with_bench(task_payload: Any, patch_text: str | None) -> tuple[dict[s
         return None, f"task directory not found: {task_dir}"
 
     try:
-        score = grade_patch_for_task(task_dir=task_dir, patch_text=patch_text, config=cfg)
+        task_data = _task_data_from_payload(task_payload)
+        if task_data is not None:
+            score = grade_patch_for_task_data(
+                task_dir=task_dir,
+                task_data=task_data,
+                patch_text=patch_text,
+                config=cfg,
+            )
+        else:
+            score = grade_patch_for_task(task_dir=task_dir, patch_text=patch_text, config=cfg)
         return score, None
     except Exception as exc:  # noqa: BLE001
         return None, str(exc)

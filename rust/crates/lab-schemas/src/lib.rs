@@ -33,3 +33,15 @@ pub fn compile_schema(name: &str) -> Result<JSONSchema> {
         .compile(schema)?;
     Ok(compiled)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::compile_schema;
+
+    #[test]
+    fn compile_hard_cutover_schemas() {
+        compile_schema("task_declaration_v1.jsonschema").expect("task declaration schema");
+        compile_schema("prepared_task_environment_v1.jsonschema")
+            .expect("prepared task environment schema");
+    }
+}

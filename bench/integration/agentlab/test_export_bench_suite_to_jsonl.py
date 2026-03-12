@@ -136,7 +136,7 @@ class ExportBenchSuiteToJsonlTests(unittest.TestCase):
                 require_task_image=True,
             )
 
-            self.assertEqual(row["schema_version"], exporter.TASK_BOUNDARY_SCHEMA_VERSION)
+            self.assertNotIn("schema_version", row)
             self.assertEqual(row["task"]["id"], "TASK001")
             self.assertEqual(
                 row["environment"]["image"], "bench-v0-workspace-task001:latest"

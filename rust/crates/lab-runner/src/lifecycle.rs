@@ -1,4 +1,3 @@
-
 impl RunSink for BufferedRunSink {
     fn write_run_manifest(&mut self, _run: &RunManifestRecord) -> Result<()> {
         Ok(())
@@ -87,7 +86,7 @@ struct TrialExecutor;
 impl TrialExecutor {
     #[allow(clippy::too_many_arguments)]
     fn execute_slot(
-        mode: ScheduleEngineMode,
+        _mode: ScheduleEngineMode,
         run_dir: &Path,
         run_id: &str,
         workload_type: &str,
@@ -100,7 +99,7 @@ impl TrialExecutor {
         policy_config: &PolicyConfig,
         benchmark_config: &BenchmarkConfig,
         variant_runtime_profiles: &[VariantRuntimeProfile],
-        behavior: &RunBehavior,
+        _behavior: &RunBehavior,
         materialize_mode: MaterializationMode,
         task_boundary_policy: &TaskBoundaryPolicy,
         trials_dir: &Path,
@@ -123,7 +122,7 @@ impl TrialExecutor {
         let effective_network_mode = variant_runtime.effective_network_mode.as_str();
         let task_idx = slot.task_idx;
         let task = &tasks[task_idx];
-        let task_boundary = parse_task_boundary_from_dataset_task(task)?;
+        let task_boundary = parse_task_boundary_from_packaged_task(task)?;
         let _ = task_boundary_policy;
         validate_task_boundary_workspace_materialization(&task_boundary)?;
         let repl = slot.repl_idx;
@@ -163,39 +162,35 @@ impl TrialExecutor {
         write_trial_state(&trial_dir, &trial_id, "running", None, None, None)?;
         let mut trial_guard = TrialStateGuard::new(&trial_dir, &trial_id);
 
-        let trial_paths = TrialPaths::new(&trial_dir, project_root)?;
-        trial_paths.prepare(false)?;
-        materialize_task_dependencies_for_trial(&task_boundary, &trial_paths)?;
-        if matches!(effective_policy.state_policy, StatePolicy::IsolatePerTrial)
+        let existing_workspace_ref = if matches!(effective_policy.state_policy, StatePolicy::IsolatePerTrial)
             || !has_chain_snapshot
         {
-            materialize_workspace_base(project_root, &trial_paths, &task_boundary.workspace.base)?;
-        }
-        if !matches!(effective_policy.state_policy, StatePolicy::IsolatePerTrial) {
-            if let Some(chain_state) = chain_states.get(&chain_key) {
-                if let Some(workspace_ref) = chain_state.latest_workspace_ref.as_deref() {
-                    restore_workspace_from_object_ref(
-                        artifact_store,
-                        workspace_ref,
-                        &trial_paths.workspace,
-                    )?;
-                }
-            }
-        }
-
-        materialize_workspace_overlays(&trial_paths, &task_boundary.workspace.overlays)?;
-        let dynamic_mounts =
-            resolve_workspace_aux_mounts(project_root, &task_boundary.workspace.aux_mounts)?;
-
-        let input = build_agent_task(
-            trial_experiment,
+            None
+        } else {
+            chain_states
+                .get(&chain_key)
+                .and_then(|chain_state| chain_state.latest_workspace_ref.as_deref())
+        };
+        let prepared = prepare_task_environment(
+            project_root,
+            &trial_dir,
             run_id,
             &trial_id,
+            trial_experiment,
             variant,
             task_idx,
             repl,
             &task_boundary,
-        );
+            agent_runtime,
+            existing_workspace_ref,
+        )?;
+        let PreparedTaskEnvironment {
+            manifest: prepared_manifest,
+            trial_paths,
+            io_paths,
+            dynamic_mounts,
+            trial_input: input,
+        } = prepared;
         let input_bytes = serde_json::to_vec_pretty(&input)?;
         let trial_input_ref = artifact_store.put_bytes(&input_bytes)?;
         let mut bootstrap_store = BackingSqliteStore::open(run_dir)?;
@@ -231,7 +226,7 @@ impl TrialExecutor {
                 },
                 "task_sandbox": {
                     "executor": "docker",
-                    "image": task_boundary.task_image.clone(),
+                    "image": prepared_manifest.task_image.clone(),
                     "workspace": AGENTLAB_CONTRACT_WORKSPACE_DIR
                 }
             },
@@ -274,7 +269,6 @@ impl TrialExecutor {
         });
         atomic_write_json_pretty(&trial_dir.join("trial_metadata.json"), &trial_metadata)?;
 
-        let io_paths = prepare_io_paths(&trial_paths, &input_bytes)?;
         stage_benchmark_trial_preflight(
             benchmark_config,
             &trial_dir,
@@ -283,15 +277,10 @@ impl TrialExecutor {
             schedule_idx,
             &variant.id,
             &task_boundary.task_payload,
-            Some(task_boundary.task_image.as_str()),
+            Some(prepared_manifest.task_image.as_str()),
             &io_paths.input_host,
         )?;
-        let runtime_env = build_runtime_contract_env(
-            run_id,
-            &input,
-            &io_paths,
-            resolve_trial_timeout_ms(&input),
-        );
+        let runtime_env = prepared_manifest.runtime_env.clone();
         let benchmark_prediction_path = trial_paths.out.join(BENCHMARK_PREDICTION_FILENAME);
         let benchmark_score_path = trial_paths.out.join(BENCHMARK_SCORE_FILENAME);
         let benchmark_grade_error_path = trial_paths.out.join(BENCHMARK_GRADE_ERROR_FILENAME);
@@ -337,7 +326,7 @@ impl TrialExecutor {
                 benchmark_grader: benchmark_config.grader.as_ref(),
                 benchmark_grading_enabled,
                 run_id,
-                task_image: Some(task_boundary.task_image.as_str()),
+                task_image: Some(prepared_manifest.task_image.as_str()),
                 agent_artifact: Some(agent_runtime.agent_artifact.as_path()),
             };
             let proc_result = adapter.run_trial(&run_request)?;
@@ -1943,6 +1932,18 @@ fn execute_schedule_engine_parallel(
     )?;
 
     while committer.next_commit_idx < schedule.len() || !in_flight.is_empty() {
+        if INTERRUPTED.load(Ordering::SeqCst) {
+            emit_run_log(run_id, "received interrupt signal, shutting down gracefully");
+            write_run_control_v2(
+                run_dir,
+                run_id,
+                "interrupted",
+                &in_flight_active_trials(&in_flight),
+                None,
+            )?;
+            return Ok(ScheduleEngineOutcome::Interrupted);
+        }
+
         if last_disk_check.elapsed() >= disk_check_interval {
             enforce_runtime_disk_headroom(run_dir, min_free_bytes)?;
             last_disk_check = Instant::now();
@@ -1988,7 +1989,7 @@ fn execute_schedule_engine_parallel(
             let proposed_trial_index = trial_index.saturating_add(1);
             let trial_id = format!("trial_{}", proposed_trial_index);
             let variant = &variants[slot.variant_idx];
-            let task_boundary = parse_task_boundary_from_dataset_task(&tasks[slot.task_idx])?;
+            let task_boundary = parse_task_boundary_from_packaged_task(&tasks[slot.task_idx])?;
             let task_id = task_boundary
                 .task_payload
                 .get("id")
@@ -2268,7 +2269,7 @@ fn as_portable_rel(path: &Path) -> String {
 fn copy_path_into_package(source: &Path, destination: &Path) -> Result<()> {
     if source.is_dir() {
         ensure_dir(destination)?;
-        return copy_dir_filtered(source, destination, &[]);
+        return copy_dir_preserve_all(source, destination, &[]);
     }
     if source.is_file() {
         if let Some(parent) = destination.parent() {
@@ -2281,6 +2282,96 @@ fn copy_path_into_package(source: &Path, destination: &Path) -> Result<()> {
         "package build expected file or directory source, got: {}",
         source.display()
     ))
+}
+
+fn stage_task_workspace_dependencies_for_package(
+    tasks: &[TaskDeclaration],
+    project_root: &Path,
+    package_dir: &Path,
+) -> Result<()> {
+    let mut dataset_pack_refs = HashSet::new();
+    let mut git_checkout_commits: BTreeMap<String, HashSet<String>> = BTreeMap::new();
+
+    for (idx, task) in tasks.iter().enumerate() {
+        if matches!(task.workspace.base.kind, WorkspaceBaseKind::DatasetPack) {
+            let dataset_pack_ref = task
+                .workspace
+                .base
+                .dataset_pack_ref
+                .clone()
+                .ok_or_else(|| {
+                    anyhow!(
+                        "package build missing workspace.base.dataset_pack_ref for packaged task row {}",
+                        idx + 1
+                    )
+                })?;
+            dataset_pack_refs.insert(dataset_pack_ref);
+        }
+
+        if matches!(task.workspace.base.kind, WorkspaceBaseKind::GitCheckout) {
+            let repo = task
+                .workspace
+                .base
+                .repo
+                .clone()
+                .ok_or_else(|| {
+                    anyhow!(
+                        "package build missing workspace.base.repo for packaged task row {}",
+                        idx + 1
+                    )
+                })?;
+            let commit = task
+                .workspace
+                .base
+                .commit
+                .clone()
+                .ok_or_else(|| {
+                    anyhow!(
+                        "package build missing workspace.base.commit for packaged task row {}",
+                        idx + 1
+                    )
+                })?;
+            git_checkout_commits.entry(repo).or_default().insert(commit);
+        }
+
+        for mount in &task.workspace.aux_mounts {
+            dataset_pack_refs.insert(mount.dataset_pack_ref.clone());
+        }
+    }
+
+    for dataset_pack_ref in dataset_pack_refs {
+        let digest = parse_dataset_pack_ref_digest(&dataset_pack_ref)?;
+        let source = resolve_dataset_pack_host_path(project_root, &dataset_pack_ref)?;
+        let destination = package_dir
+            .join(".lab")
+            .join("dataset_packs")
+            .join("sha256")
+            .join(digest);
+        copy_path_into_package(&source, &destination)?;
+    }
+
+    for (repo, commits) in git_checkout_commits {
+        for commit in commits {
+            let _ = hydrate_git_checkout_cache(project_root, &repo, &commit)?;
+        }
+        let source = git_repo_cache_dir(project_root, &repo);
+        let destination = package_dir
+            .join(".lab")
+            .join("git_checkouts")
+            .join(sanitize_for_fs(&repo));
+        copy_path_into_package(&source, &destination)?;
+    }
+
+    Ok(())
+}
+
+fn write_packaged_task_declarations(path: &Path, tasks: &[TaskDeclaration]) -> Result<()> {
+    let mut bytes = Vec::new();
+    for task in tasks {
+        serde_json::to_writer(&mut bytes, task)?;
+        bytes.push(b'\n');
+    }
+    atomic_write_bytes(path, &bytes)
 }
 
 fn stage_source_into_package(
@@ -2322,6 +2413,112 @@ fn stage_source_into_package(
     Ok(rel_portable)
 }
 
+fn stage_public_runtime_path_reference(
+    rel: &Path,
+    exp_dir: &Path,
+    package_dir: &Path,
+    copies: &mut BTreeMap<String, String>,
+    _field_name: &str,
+) -> Result<()> {
+    let resolved = normalize_path(&exp_dir.join(&rel));
+    if !resolved.exists() {
+        return Err(anyhow!(
+            "public path reference resolved path does not exist: {}",
+            resolved.display()
+        ));
+    }
+    let key = resolved.to_string_lossy().to_string();
+    if copies.contains_key(&key) {
+        return Ok(());
+    }
+    let destination = package_dir.join(&rel);
+    copy_path_into_package(&resolved, &destination)?;
+    copies.insert(key, as_portable_rel(&rel));
+    Ok(())
+}
+
+fn stage_runtime_command_env_path_refs_for_package(
+    runtime_root: &Value,
+    exp_dir: &Path,
+    package_dir: &Path,
+    file_copies: &mut BTreeMap<String, String>,
+) -> Result<()> {
+    if let Some(items) = runtime_root
+        .pointer("/agent_runtime/command")
+        .and_then(Value::as_array)
+    {
+        for (idx, item) in items.iter().enumerate() {
+            let token = item
+                .as_str()
+                .ok_or_else(|| anyhow!("runtime.agent_runtime.command[{}] must be a string", idx))?;
+            if contains_removed_runtime_template(token) {
+                return Err(anyhow!(
+                    "runtime.agent_runtime.command[{}] uses removed '${{...}}' syntax; use $NAME runtime bindings instead",
+                    idx
+                ));
+            }
+            if token.trim().starts_with("/agentlab/") {
+                return Err(anyhow!(
+                    "runtime.agent_runtime.command[{}] leaks runner topology; remove internal /agentlab paths from public authoring",
+                    idx
+                ));
+            }
+            if idx > 0 {
+                let Some(rel) = resolve_existing_public_path_reference(
+                    token,
+                    exp_dir,
+                    &format!("runtime.agent_runtime.command[{}]", idx),
+                )? else {
+                    continue;
+                };
+                stage_public_runtime_path_reference(
+                    &rel,
+                    exp_dir,
+                    package_dir,
+                    file_copies,
+                    &format!("runtime.agent_runtime.command[{}]", idx),
+                )?;
+            }
+        }
+    }
+    if let Some(items) = runtime_root
+        .pointer("/agent_runtime/env")
+        .and_then(Value::as_object)
+    {
+        for (key, value) in items {
+            let raw = value
+                .as_str()
+                .ok_or_else(|| anyhow!("runtime.agent_runtime.env.{} must be a string", key))?;
+            if contains_removed_runtime_template(raw) {
+                return Err(anyhow!(
+                    "runtime.agent_runtime.env.{} uses removed '${{...}}' syntax; use $NAME runtime bindings instead",
+                    key
+                ));
+            }
+            if raw.trim().starts_with("/agentlab/") {
+                return Err(anyhow!(
+                    "runtime.agent_runtime.env.{} leaks runner topology; remove internal /agentlab paths from public authoring",
+                    key
+                ));
+            }
+            if let Some(rel) = resolve_existing_public_path_reference(
+                raw,
+                exp_dir,
+                &format!("runtime.agent_runtime.env.{}", key),
+            )? {
+                stage_public_runtime_path_reference(
+                    &rel,
+                    exp_dir,
+                    package_dir,
+                    file_copies,
+                    &format!("runtime.agent_runtime.env.{}", key),
+                )?;
+            }
+        }
+    }
+    Ok(())
+}
+
 fn rewrite_runtime_paths_for_package(
     runtime_root: &mut Value,
     exp_dir: &Path,
@@ -2331,8 +2528,6 @@ fn rewrite_runtime_paths_for_package(
     artifact_counter: &mut usize,
     file_counter: &mut usize,
 ) -> Result<()> {
-    let _ = file_copies;
-    let _ = file_counter;
     if let Some(raw) = runtime_root
         .pointer("/agent_runtime/artifact")
         .and_then(Value::as_str)
@@ -2352,6 +2547,74 @@ fn rewrite_runtime_paths_for_package(
             "/agent_runtime/artifact_resolved_path",
             json!(rel),
         )?;
+    }
+    if let Some(items) = runtime_root
+        .pointer_mut("/agent_runtime/support_files")
+        .and_then(Value::as_array_mut)
+    {
+        for (idx, item) in items.iter_mut().enumerate() {
+            let raw = item
+                .get("source_from_host")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    anyhow!(
+                        "runtime.agent_runtime.support_files[{}].source_from_host is required",
+                        idx
+                    )
+                })?;
+            let rel = stage_source_into_package(
+                raw,
+                exp_dir,
+                package_dir,
+                "files",
+                "support",
+                file_copies,
+                file_counter,
+            )?;
+            set_json_pointer_value(item, "/source_from_host", json!(rel))?;
+        }
+    }
+    stage_runtime_command_env_path_refs_for_package(
+        runtime_root,
+        exp_dir,
+        package_dir,
+        file_copies,
+    )?;
+    Ok(())
+}
+
+fn rewrite_benchmark_paths_for_package(
+    benchmark_root: &mut Value,
+    exp_dir: &Path,
+    package_dir: &Path,
+    file_copies: &mut BTreeMap<String, String>,
+    file_counter: &mut usize,
+) -> Result<()> {
+    if let Some(items) = benchmark_root
+        .pointer_mut("/grader/support_files")
+        .and_then(Value::as_array_mut)
+    {
+        for (idx, item) in items.iter_mut().enumerate() {
+            let raw = item
+                .get("source_from_host")
+                .and_then(Value::as_str)
+                .ok_or_else(|| {
+                    anyhow!(
+                        "benchmark.grader.support_files[{}].source_from_host is required",
+                        idx
+                    )
+                })?;
+            let rel = stage_source_into_package(
+                raw,
+                exp_dir,
+                package_dir,
+                "files",
+                "support",
+                file_copies,
+                file_counter,
+            )?;
+            set_json_pointer_value(item, "/source_from_host", json!(rel))?;
+        }
     }
     Ok(())
 }
@@ -2420,13 +2683,15 @@ pub fn build_experiment_package(
 
     let dataset_path = resolve_dataset_path(&json_value, &loaded.exp_dir)?;
     let dataset_target = package_dir.join("tasks").join("tasks.jsonl");
-    copy_path_into_package(&dataset_path, &dataset_target)?;
+    let packaged_tasks = load_task_specs_for_build(&dataset_path, &json_value)?;
+    write_packaged_task_declarations(&dataset_target, &packaged_tasks)?;
     let dataset_rel = PathBuf::from("tasks").join("tasks.jsonl");
     set_json_pointer_value(
         &mut json_value,
         "/dataset/path",
         json!(as_portable_rel(&dataset_rel)),
     )?;
+    stage_task_workspace_dependencies_for_package(&packaged_tasks, &loaded.project_root, &package_dir)?;
 
     let mut artifact_copies: BTreeMap<String, String> = BTreeMap::new();
     let mut file_copies: BTreeMap<String, String> = BTreeMap::new();
@@ -2490,6 +2755,15 @@ pub fn build_experiment_package(
                 )?;
             }
         }
+    }
+    if let Some(benchmark) = json_value.pointer_mut("/benchmark") {
+        rewrite_benchmark_paths_for_package(
+            benchmark,
+            &loaded.exp_dir,
+            &package_dir,
+            &mut file_copies,
+            &mut file_counter,
+        )?;
     }
 
     validate_packaged_runtime_artifacts(&package_dir, &json_value)?;
@@ -2632,13 +2906,8 @@ fn run_experiment_with_behavior(
     let benchmark_config = parse_benchmark_config(&json_value);
     let mut variant_runtime_profiles = Vec::with_capacity(variants.len());
     for variant in &variants {
-        let profile = resolve_variant_runtime_profile(
-            &json_value,
-            variant,
-            &run_dir,
-            &behavior,
-            &execution,
-        )?;
+        let profile =
+            resolve_variant_runtime_profile(&json_value, variant, &run_dir, &behavior, &execution)?;
         ensure_required_runtime_env_present(&profile.agent_runtime, &profile.agent_runtime_env)?;
         variant_runtime_profiles.push(profile);
     }
@@ -2796,7 +3065,15 @@ fn run_experiment_with_behavior(
             &run_id,
             format!("schedule execution halted with {:?}", schedule_outcome),
         );
-        run_guard.disarm();
+        match schedule_outcome {
+            ScheduleEngineOutcome::Interrupted => {
+                run_guard.complete("interrupted")?;
+            }
+            _ => {
+                // Paused/Killed: handler already wrote correct status
+                run_guard.disarm();
+            }
+        }
         return Ok(RunResult { run_dir, run_id });
     }
     let _ = (
@@ -2840,12 +3117,20 @@ fn run_experiment_with_behavior(
 }
 
 pub fn describe_experiment(path: &Path) -> Result<ExperimentSummary> {
+    describe_experiment_with_options(path, &RunExecutionOptions::default())
+}
+
+pub fn describe_experiment_with_options(
+    path: &Path,
+    execution: &RunExecutionOptions,
+) -> Result<ExperimentSummary> {
     let LoadedExperimentInput {
         json_value,
         exp_dir,
         project_root: _,
     } = load_sealed_package_for_run(path)?;
     validate_required_fields(&json_value)?;
+    let execution = normalize_execution_options(execution);
 
     let dataset_path = resolve_dataset_path_in_package(&json_value, &exp_dir)?;
     let task_count = count_tasks(&dataset_path, &json_value)?;
@@ -2865,7 +3150,7 @@ pub fn describe_experiment(path: &Path) -> Result<ExperimentSummary> {
         baseline_variant,
         &exp_dir,
         &RunBehavior::default(),
-        &RunExecutionOptions::default(),
+        &execution,
     )?;
     let preflight_runtime_profiles = vec![runtime_profile.clone()];
     let VariantRuntimeProfile {
@@ -2910,7 +3195,7 @@ pub fn describe_experiment(path: &Path) -> Result<ExperimentSummary> {
                 baseline_variant,
                 &exp_dir,
                 &RunBehavior::default(),
-                &RunExecutionOptions::default(),
+                &execution,
             )?,
             baseline_variant,
             &tasks_for_preflight,

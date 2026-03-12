@@ -26,8 +26,6 @@ pub(crate) const AGENTLAB_ENV_PREFLIGHT_SMOKE: &str = "AGENTLAB_PREFLIGHT_SMOKE"
 pub(crate) const BENCHMARK_PREDICTION_FILENAME: &str = "benchmark_prediction.json";
 pub(crate) const BENCHMARK_SCORE_FILENAME: &str = "benchmark_score.json";
 pub(crate) const BENCHMARK_GRADE_ERROR_FILENAME: &str = "benchmark_grade_error.txt";
-pub(crate) const AGENT_ARTIFACT_UNPACK_COMMAND: &str =
-    "tar -xzf /opt/agent.tar.gz -C /opt/agent && rm -f /opt/agent.tar.gz";
 pub(crate) const AGENT_ARTIFACT_PATH_ENV_VALUE: &str =
     "PATH=/opt/agent/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 pub(crate) const AGENT_ARTIFACT_SCRIPT_SOURCE_EXTENSIONS: &[&str] =
@@ -832,6 +830,179 @@ pub(crate) struct ResolvedVariant {
     pub(crate) variant_digest: String,
     #[serde(flatten)]
     pub(crate) variant: Variant,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct TaskEnvironmentSpec {
+    pub(crate) image: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum WorkspaceMode {
+    Scratch,
+    Patch,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum WorkspaceBaseKind {
+    Empty,
+    DatasetPack,
+    GitCheckout,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct WorkspaceBaseSpec {
+    pub(crate) kind: WorkspaceBaseKind,
+    #[serde(default)]
+    pub(crate) dataset_pack_ref: Option<String>,
+    #[serde(default)]
+    pub(crate) repo: Option<String>,
+    #[serde(default)]
+    pub(crate) commit: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct WorkspaceOverlaySpec {
+    pub(crate) path: String,
+    pub(crate) content: String,
+    #[serde(default)]
+    pub(crate) encoding: Option<String>,
+    #[serde(default)]
+    pub(crate) executable: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct WorkspaceAuxMountSpec {
+    pub(crate) dataset_pack_ref: String,
+    pub(crate) mount_path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct WorkspaceSpec {
+    pub(crate) mode: WorkspaceMode,
+    pub(crate) base: WorkspaceBaseSpec,
+    #[serde(default)]
+    pub(crate) overlays: Vec<WorkspaceOverlaySpec>,
+    #[serde(default)]
+    pub(crate) aux_mounts: Vec<WorkspaceAuxMountSpec>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct TaskDeclarationLimits {
+    #[serde(default)]
+    pub(crate) max_steps: Option<u64>,
+    #[serde(default)]
+    pub(crate) max_total_tokens: Option<u64>,
+    #[serde(default)]
+    pub(crate) max_tool_calls: Option<u64>,
+    #[serde(default)]
+    pub(crate) trial_seconds: Option<u64>,
+}
+
+pub(crate) type TaskBoundaryLimits = TaskDeclarationLimits;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct TaskSpec {
+    pub(crate) task: Value,
+    pub(crate) environment: TaskEnvironmentSpec,
+    pub(crate) workspace: WorkspaceSpec,
+    pub(crate) dependencies: Value,
+    pub(crate) limits: TaskDeclarationLimits,
+}
+
+impl TaskSpec {
+    pub(crate) fn task_id(&self, task_idx: usize) -> String {
+        self.task
+            .get("id")
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("task_{}", task_idx))
+    }
+
+    pub(crate) fn into_task_declaration(self) -> TaskDeclaration {
+        TaskDeclaration {
+            schema_version: "task_declaration_v1".to_string(),
+            task: self.task,
+            environment: self.environment,
+            workspace: self.workspace,
+            dependencies: self.dependencies,
+            limits: self.limits,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct TaskDeclaration {
+    pub(crate) schema_version: String,
+    pub(crate) task: Value,
+    pub(crate) environment: TaskEnvironmentSpec,
+    pub(crate) workspace: WorkspaceSpec,
+    #[serde(default)]
+    pub(crate) dependencies: Value,
+    #[serde(default)]
+    pub(crate) limits: TaskDeclarationLimits,
+}
+
+impl TaskDeclaration {
+    pub(crate) fn task_id(&self, task_idx: usize) -> String {
+        self.task
+            .get("id")
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("task_{}", task_idx))
+    }
+
+    pub(crate) fn task_image(&self) -> &str {
+        self.environment.image.as_str()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PreparedMountReference {
+    pub(crate) host_path: String,
+    pub(crate) mount_path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PreparedContractFilePaths {
+    pub(crate) trial_input: String,
+    pub(crate) task: String,
+    pub(crate) bindings: String,
+    pub(crate) dependencies: String,
+    pub(crate) policy: String,
+    pub(crate) result: String,
+    pub(crate) trajectory: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PreparedTaskEnvironmentManifest {
+    pub(crate) schema_version: String,
+    pub(crate) declaration: TaskDeclaration,
+    pub(crate) declaration_digest: String,
+    pub(crate) run_id: String,
+    pub(crate) trial_id: String,
+    pub(crate) variant_id: String,
+    pub(crate) task_id: String,
+    pub(crate) task_index: usize,
+    pub(crate) repl_idx: usize,
+    pub(crate) task_image: String,
+    pub(crate) workspace_root: String,
+    pub(crate) aux_mounts: Vec<PreparedMountReference>,
+    pub(crate) contract_files: PreparedContractFilePaths,
+    pub(crate) runtime_env: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

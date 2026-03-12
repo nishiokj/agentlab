@@ -17,3 +17,4 @@ lab-analysis = { path = "../lab-analysis", features = ["duckdb_engine"] }
 ratatui.workspace = true
 crossterm.workspace = true
 libc = "0.2"
+ctrlc.workspace = true

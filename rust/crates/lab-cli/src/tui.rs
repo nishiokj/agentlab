@@ -61,6 +61,8 @@ pub struct ViewBrowserItem {
 pub struct RunBrowserState<'a> {
     pub items: &'a [RunBrowserItem],
     pub refresh_secs: u64,
+    pub chrome_title: &'a str,
+    pub description: &'a str,
 }
 
 pub struct ViewBrowserState<'a> {
@@ -70,6 +72,7 @@ pub struct ViewBrowserState<'a> {
     pub status: &'a str,
     pub items: &'a [ViewBrowserItem],
     pub refresh_secs: u64,
+    pub chrome_title: &'a str,
 }
 
 pub struct ViewState<'a> {
@@ -124,10 +127,9 @@ impl Term {
                             Action::Quit
                         }
                         KeyCode::Char('r') => Action::Refresh,
-                        KeyCode::Esc
-                        | KeyCode::Backspace
-                        | KeyCode::Left
-                        | KeyCode::Char('h') => Action::Back,
+                        KeyCode::Esc | KeyCode::Backspace | KeyCode::Left | KeyCode::Char('h') => {
+                            Action::Back
+                        }
                         KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => Action::Select,
                         KeyCode::Up | KeyCode::Char('k') => Action::ScrollUp,
                         KeyCode::Down | KeyCode::Char('j') => Action::ScrollDown,
@@ -197,7 +199,7 @@ fn render(f: &mut Frame, screen: &Screen, table_state: &mut TableState) {
 
 fn render_run_browser(f: &mut Frame, state: &RunBrowserState, table_state: &mut TableState) {
     paint_app_background(f);
-    let shell = chrome_block("Live View Browser", "Runs");
+    let shell = chrome_block(state.chrome_title, "Runs");
     let inner = shell.inner(f.area());
     f.render_widget(shell, f.area());
 
@@ -212,7 +214,7 @@ fn render_run_browser(f: &mut Frame, state: &RunBrowserState, table_state: &mut 
         f,
         sections[0],
         "Runs",
-        "Active runs are pinned first. Pick one, then choose the exact view you want to inspect.",
+        state.description,
         state.refresh_secs,
         state.items.len(),
     );
@@ -224,13 +226,7 @@ fn render_run_browser(f: &mut Frame, state: &RunBrowserState, table_state: &mut 
             "No active runs right now",
             "This screen keeps polling. Start a run and it will appear here.",
         );
-        render_browser_footer(
-            f,
-            sections[2],
-            "q quit",
-            "Runs refresh automatically",
-            None,
-        );
+        render_browser_footer(f, sections[2], "q quit", "Runs refresh automatically", None);
         return;
     }
 
@@ -251,7 +247,11 @@ fn render_run_browser(f: &mut Frame, state: &RunBrowserState, table_state: &mut 
             Cell::from(item.status.as_str()).style(status_style(item.status.as_str()).bg(bg)),
             Cell::from(item.active_trials.to_string()).style(
                 Style::default()
-                    .fg(if item.active_trials > 0 { ACCENT } else { MUTED })
+                    .fg(if item.active_trials > 0 {
+                        ACCENT
+                    } else {
+                        MUTED
+                    })
                     .bg(bg),
             ),
         ])
@@ -303,7 +303,7 @@ fn render_run_browser(f: &mut Frame, state: &RunBrowserState, table_state: &mut 
 
 fn render_view_browser(f: &mut Frame, state: &ViewBrowserState, table_state: &mut TableState) {
     paint_app_background(f);
-    let shell = chrome_block("Live View Browser", state.run_id);
+    let shell = chrome_block(state.chrome_title, state.run_id);
     let inner = shell.inner(f.area());
     f.render_widget(shell, f.area());
 
@@ -330,13 +330,7 @@ fn render_view_browser(f: &mut Frame, state: &ViewBrowserState, table_state: &mu
             "No standard views available",
             "This run exists, but the standardized view surface could not be resolved.",
         );
-        render_browser_footer(
-            f,
-            sections[2],
-            "Esc back",
-            "q quit",
-            None,
-        );
+        render_browser_footer(f, sections[2], "Esc back", "q quit", None);
         return;
     }
 
@@ -404,7 +398,7 @@ fn render_view_browser(f: &mut Frame, state: &ViewBrowserState, table_state: &mu
 
 fn render_live_view(f: &mut Frame, state: &ViewState, table_state: &mut TableState) {
     paint_app_background(f);
-    let shell = chrome_block("Live View Browser", state.view_name);
+    let shell = chrome_block("AgentLab", state.view_name);
     let inner = shell.inner(f.area());
     f.render_widget(shell, f.area());
 
@@ -449,7 +443,10 @@ fn render_live_view(f: &mut Frame, state: &ViewState, table_state: &mut TableSta
 }
 
 fn paint_app_background(f: &mut Frame) {
-    f.render_widget(Block::default().style(Style::default().bg(APP_BG)), f.area());
+    f.render_widget(
+        Block::default().style(Style::default().bg(APP_BG)),
+        f.area(),
+    );
 }
 
 fn chrome_block<'a>(title: &'a str, subtitle: &'a str) -> Block<'a> {
@@ -491,24 +488,24 @@ fn render_browser_header(
     let block = panel_block(title).style(Style::default().bg(PANEL_ALT_BG));
     let inner = block.inner(area);
     f.render_widget(block, area);
-    let text = Text::from(vec![
-        Line::from(vec![
-            Span::styled(
-                subtitle,
-                Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
-            ),
-            Span::raw("  "),
-            Span::styled(
-                format!("{} item{}", count, if count == 1 { "" } else { "s" }),
-                Style::default().fg(ACCENT),
-            ),
-        ]),
-        Line::from(vec![Span::styled(
-            format!("refresh {}s", refresh_secs.max(1)),
+    let mut lines = vec![Line::from(vec![
+        Span::styled(
+            subtitle,
+            Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("  "),
+        Span::styled(
+            format!("{} item{}", count, if count == 1 { "" } else { "s" }),
+            Style::default().fg(ACCENT),
+        ),
+    ])];
+    if refresh_secs > 0 {
+        lines.push(Line::from(vec![Span::styled(
+            format!("refresh {}s", refresh_secs),
             Style::default().fg(MUTED),
-        )]),
-    ]);
-    f.render_widget(Paragraph::new(text), inner);
+        )]));
+    }
+    f.render_widget(Paragraph::new(Text::from(lines)), inner);
 }
 
 fn render_empty_panel(f: &mut Frame, area: Rect, title: &str, body: &str) {
@@ -517,10 +514,7 @@ fn render_empty_panel(f: &mut Frame, area: Rect, title: &str, body: &str) {
     f.render_widget(block, area);
     let text = Text::from(vec![
         Line::default(),
-        Line::from(vec![Span::styled(
-            body,
-            Style::default().fg(MUTED),
-        )]),
+        Line::from(vec![Span::styled(body, Style::default().fg(MUTED))]),
     ]);
     f.render_widget(
         Paragraph::new(text)
@@ -587,26 +581,31 @@ fn render_live_header(f: &mut Frame, area: Rect, state: &ViewState) {
                 Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
             ),
         ]),
-        Line::from(vec![
-            Span::styled(
-                format!(
-                    "{} row{}",
-                    state.table.rows.len(),
-                    if state.table.rows.len() == 1 { "" } else { "s" }
+        {
+            let mut spans = vec![
+                Span::styled(
+                    format!(
+                        "{} row{}",
+                        state.table.rows.len(),
+                        if state.table.rows.len() == 1 { "" } else { "s" }
+                    ),
+                    Style::default().fg(MUTED),
                 ),
-                Style::default().fg(MUTED),
-            ),
-            Span::raw("  "),
-            Span::styled(
-                format!("started {}", state.started_at),
-                Style::default().fg(MUTED),
-            ),
-            Span::raw("  "),
-            Span::styled(
-                format!("refresh {}s", state.interval_secs),
-                Style::default().fg(MUTED),
-            ),
-        ]),
+                Span::raw("  "),
+                Span::styled(
+                    format!("started {}", state.started_at),
+                    Style::default().fg(MUTED),
+                ),
+            ];
+            if state.interval_secs > 0 {
+                spans.push(Span::raw("  "));
+                spans.push(Span::styled(
+                    format!("refresh {}s", state.interval_secs),
+                    Style::default().fg(MUTED),
+                ));
+            }
+            Line::from(spans)
+        },
     ]);
     f.render_widget(Paragraph::new(text), inner);
 }
@@ -728,10 +727,13 @@ fn render_table(f: &mut Frame, area: Rect, state: &ViewState, table_state: &mut 
         })
         .collect();
 
-    let table = Table::new(rows, compute_column_widths(state.table, inner.width as usize))
-        .header(header)
-        .row_highlight_style(selected_row_style())
-        .column_spacing(1);
+    let table = Table::new(
+        rows,
+        compute_column_widths(state.table, inner.width as usize),
+    )
+    .header(header)
+    .row_highlight_style(selected_row_style())
+    .column_spacing(1);
 
     ensure_selection(table_state, state.table.rows.len());
     f.render_stateful_widget(table, inner, table_state);
@@ -759,7 +761,10 @@ fn ensure_selection(table_state: &mut TableState, len: usize) -> usize {
         table_state.select(None);
         return 0;
     }
-    let idx = table_state.selected().unwrap_or(0).min(len.saturating_sub(1));
+    let idx = table_state
+        .selected()
+        .unwrap_or(0)
+        .min(len.saturating_sub(1));
     table_state.select(Some(idx));
     idx
 }
@@ -795,17 +800,13 @@ fn striped_bg(idx: usize) -> Color {
 
 fn status_style(status: &str) -> Style {
     if status.starts_with("running") {
-        Style::default()
-            .fg(WARNING)
-            .add_modifier(Modifier::BOLD)
+        Style::default().fg(WARNING).add_modifier(Modifier::BOLD)
     } else if status.starts_with("paused") {
-        Style::default()
-            .fg(ACCENT)
-            .add_modifier(Modifier::BOLD)
+        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
     } else if status == "completed" {
-        Style::default()
-            .fg(SUCCESS)
-            .add_modifier(Modifier::BOLD)
+        Style::default().fg(SUCCESS).add_modifier(Modifier::BOLD)
+    } else if status == "interrupted" {
+        Style::default().fg(WARNING).add_modifier(Modifier::BOLD)
     } else if status.contains("fail") || status.contains("error") || status == "killed" {
         Style::default().fg(DANGER).add_modifier(Modifier::BOLD)
     } else {
@@ -833,6 +834,28 @@ fn format_cell_value(value: &Value) -> String {
     }
 }
 
+/// Whether a column name is recognized as a numeric metric for color-coding.
+/// Exposed as pub(crate) so tests can verify that display_column_name mappings
+/// remain consistent with the color-coding rules.
+pub(crate) fn is_metric_column(name: &str) -> bool {
+    name.contains("rate")
+        || name.contains("score")
+        || name.ends_with('%')
+        || name == "primary_metric_mean"
+        || name == "metric"
+        || name == "effect"
+}
+
+/// Whether a column name is recognized as an outcome column for color-coding.
+pub(crate) fn is_outcome_column(name: &str) -> bool {
+    name == "outcome" || name.ends_with("_outcome")
+}
+
+/// Whether a column name is recognized as a status column for color-coding.
+pub(crate) fn is_status_column(name: &str) -> bool {
+    name == "status" || name == "lifecycle"
+}
+
 fn cell_style(columns: &[String], col_idx: usize, value: &Value, bg: Color) -> Style {
     let column = columns.get(col_idx).map(String::as_str).unwrap_or("");
     let base = Style::default().bg(bg).fg(TEXT);
@@ -851,7 +874,7 @@ fn cell_style(columns: &[String], col_idx: usize, value: &Value, bg: Color) -> S
         return base.fg(MUTED);
     }
 
-    if column.contains("rate") || column.contains("score") || column == "primary_metric_mean" {
+    if is_metric_column(column) {
         if let Some(number) = value.as_f64() {
             return if number >= 0.8 {
                 base.fg(SUCCESS)
@@ -863,7 +886,7 @@ fn cell_style(columns: &[String], col_idx: usize, value: &Value, bg: Color) -> S
         }
     }
 
-    if column == "outcome" || column.ends_with("_outcome") {
+    if is_outcome_column(column) {
         if let Some(status) = value.as_str() {
             return match status {
                 "success" => base.fg(SUCCESS),
@@ -873,7 +896,7 @@ fn cell_style(columns: &[String], col_idx: usize, value: &Value, bg: Color) -> S
         }
     }
 
-    if column == "status" || column == "lifecycle" {
+    if is_status_column(column) {
         if let Some(status) = value.as_str() {
             return status_style(status).bg(bg);
         }

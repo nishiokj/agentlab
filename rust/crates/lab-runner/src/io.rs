@@ -1,160 +1,115 @@
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
-struct TaskBoundaryLimits {
-    #[serde(default)]
-    max_steps: Option<u64>,
-    #[serde(default)]
-    max_total_tokens: Option<u64>,
-    #[serde(default)]
-    max_tool_calls: Option<u64>,
-    #[serde(default)]
-    trial_seconds: Option<u64>,
-}
-
-impl TaskBoundaryLimits {
-    fn is_empty(&self) -> bool {
-        self.max_steps.is_none()
-            && self.max_total_tokens.is_none()
-            && self.max_tool_calls.is_none()
-            && self.trial_seconds.is_none()
-    }
+struct PreparedTaskEnvironment {
+    manifest: PreparedTaskEnvironmentManifest,
+    trial_paths: TrialPaths,
+    io_paths: PreparedTrialIo,
+    dynamic_mounts: Vec<ResolvedMountReference>,
+    trial_input: Value,
 }
 
 #[derive(Debug, Clone)]
 struct TaskBoundaryMaterialization {
+    declaration: TaskDeclaration,
     task_payload: Value,
     environment: TaskEnvironmentSpec,
     workspace: WorkspaceSpec,
     dependencies: Value,
-    limits: TaskBoundaryLimits,
+    limits: TaskDeclarationLimits,
     task_image: String,
 }
 
-fn parse_task_boundary_from_dataset_task(task: &Value) -> Result<TaskBoundaryMaterialization> {
+pub(crate) fn parse_task_spec(task: &Value) -> Result<TaskSpec> {
+    let task_spec: TaskSpec =
+        serde_json::from_value(task.clone()).map_err(|e| anyhow!("invalid public task_spec: {}", e))?;
+    validate_task_spec(&task_spec)?;
+    Ok(task_spec)
+}
+
+pub(crate) fn compile_task_spec(task_spec: TaskSpec) -> Result<TaskDeclaration> {
+    let declaration = task_spec.into_task_declaration();
+    validate_task_declaration(&declaration)?;
+    Ok(declaration)
+}
+
+pub(crate) fn parse_task_declaration(task: &Value) -> Result<TaskDeclaration> {
     let obj = task
         .as_object()
-        .ok_or_else(|| anyhow!("task boundary must be an object"))?;
-    let schema_version = obj.get("schema_version").and_then(|v| v.as_str());
-    if schema_version != Some(TASK_SPEC_V1_SCHEMA_VERSION) {
+        .ok_or_else(|| anyhow!("task declaration must be an object"))?;
+    if obj.get("schema_version").and_then(Value::as_str) != Some("task_declaration_v1") {
         return Err(anyhow!(
-            "task spec schema_version must be '{}' (got {:?})",
-            TASK_SPEC_V1_SCHEMA_VERSION,
-            schema_version
+            "task declaration schema_version must be 'task_declaration_v1'"
         ));
     }
-
-    let allowed = [
-        "schema_version",
-        "task",
-        "environment",
-        "workspace",
-        "dependencies",
-        "limits",
-    ];
-    for key in obj.keys() {
-        if !allowed.contains(&key.as_str()) {
-            return Err(anyhow!(
-                "task boundary contains unsupported key '{}'; expected schema_version + task + environment + workspace + limits",
-                key
-            ));
-        }
-    }
-
-    let task_payload = obj
-        .get("task")
-        .cloned()
-        .ok_or_else(|| anyhow!("task boundary missing field: task"))?;
-    if !task_payload.is_object() {
-        return Err(anyhow!("task boundary field 'task' must be an object"));
-    }
-    if task_payload.get("image").is_some() {
-        return Err(anyhow!(
-            "task boundary field 'task.image' was removed; use environment.image"
-        ));
-    }
-    if task_payload.get("workspace").is_some() {
-        return Err(anyhow!(
-            "task boundary field 'task.workspace' was removed; sandbox topology is runner-owned"
-        ));
-    }
-
-    let environment = parse_task_environment(obj.get("environment"))?;
-    Ok(TaskBoundaryMaterialization {
-        task_payload,
-        task_image: environment.image.clone(),
-        environment,
-        workspace: parse_workspace_spec(obj.get("workspace"))?,
-        dependencies: parse_task_dependencies(obj.get("dependencies"))?,
-        limits: parse_task_limits(obj.get("limits"))?,
-    })
+    let declaration: TaskDeclaration =
+        serde_json::from_value(task.clone()).map_err(|e| anyhow!("invalid task declaration: {}", e))?;
+    validate_task_declaration(&declaration)?;
+    Ok(declaration)
 }
 
-fn parse_task_boundary_from_trial_input(input: &Value) -> Result<TaskBoundaryMaterialization> {
-    if let Some(task_payload) = input.pointer("/task").cloned() {
-        if !task_payload.is_object() {
-            return Err(anyhow!("trial_input /task must be an object"));
-        }
-        let ext = input
-            .pointer("/ext/task_spec_v1")
-            .ok_or_else(|| anyhow!("trial_input /ext/task_spec_v1 is required"))?;
-        parse_task_boundary_ext(ext, task_payload)
-    } else if input.is_object() {
-        if input.get("schema_version").and_then(|v| v.as_str()) == Some(TASK_SPEC_V1_SCHEMA_VERSION)
-        {
-            parse_task_boundary_from_dataset_task(input)
-        } else {
-            Err(anyhow!(
-                "trial_input must provide '/task' + '/ext/task_spec_v1' or be a '{}' object",
-                TASK_SPEC_V1_SCHEMA_VERSION
-            ))
-        }
-    } else {
-        Err(anyhow!("trial_input missing required /task"))
+fn materialize_task_boundary(declaration: TaskDeclaration) -> TaskBoundaryMaterialization {
+    TaskBoundaryMaterialization {
+        task_payload: declaration.task.clone(),
+        environment: declaration.environment.clone(),
+        workspace: declaration.workspace.clone(),
+        dependencies: declaration.dependencies.clone(),
+        limits: declaration.limits.clone(),
+        task_image: declaration.environment.image.clone(),
+        declaration,
     }
 }
 
-fn parse_task_boundary_ext(
-    ext: &Value,
-    task_payload: Value,
-) -> Result<TaskBoundaryMaterialization> {
-    let obj = ext
-        .as_object()
-        .ok_or_else(|| anyhow!("trial_input /ext/task_spec_v1 must be an object"))?;
-    let schema_version = obj.get("schema_version").and_then(|v| v.as_str());
-    if schema_version != Some(TASK_SPEC_V1_SCHEMA_VERSION) {
-        return Err(anyhow!(
-            "trial_input /ext/task_spec_v1 schema_version must be '{}'",
-            TASK_SPEC_V1_SCHEMA_VERSION
-        ));
-    }
-    let allowed = ["schema_version", "environment", "workspace", "dependencies", "limits"];
-    for key in obj.keys() {
-        if !allowed.contains(&key.as_str()) {
-            return Err(anyhow!(
-                "trial_input /ext/task_spec_v1 contains unsupported key '{}'",
-                key
-            ));
-        }
-    }
-    if task_payload.get("image").is_some() {
-        return Err(anyhow!(
-            "trial_input /task.image was removed; use /ext/task_spec_v1/environment.image"
-        ));
-    }
-    if task_payload.get("workspace").is_some() {
-        return Err(anyhow!(
-            "trial_input /task.workspace was removed; sandbox topology is runner-owned"
-        ));
-    }
+fn parse_task_boundary_from_packaged_task(task: &Value) -> Result<TaskBoundaryMaterialization> {
+    Ok(materialize_task_boundary(parse_task_declaration(task)?))
+}
 
-    let environment = parse_task_environment(obj.get("environment"))?;
-    Ok(TaskBoundaryMaterialization {
-        task_payload,
-        task_image: environment.image.clone(),
-        environment,
-        workspace: parse_workspace_spec(obj.get("workspace"))?,
-        dependencies: parse_task_dependencies(obj.get("dependencies"))?,
-        limits: parse_task_limits(obj.get("limits"))?,
-    })
+fn validate_task_spec(task_spec: &TaskSpec) -> Result<()> {
+    if !task_spec.task.is_object() {
+        return Err(anyhow!("public task_spec field 'task' must be an object"));
+    }
+    let task_id = task_spec
+        .task
+        .get("id")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow!("public task_spec field 'task.id' must be a non-empty string"))?;
+    if task_spec.task.get("image").is_some() {
+        return Err(anyhow!(
+            "public task_spec field 'task.image' is not allowed for task '{}'; use environment.image",
+            task_id
+        ));
+    }
+    if task_spec.task.get("workspace").is_some() {
+        return Err(anyhow!(
+            "public task_spec field 'task.workspace' is not allowed for task '{}'; use workspace",
+            task_id
+        ));
+    }
+    parse_task_environment(Some(&serde_json::to_value(&task_spec.environment)?))?;
+    parse_workspace_spec(Some(&serde_json::to_value(&task_spec.workspace)?))?;
+    parse_task_dependencies(Some(&task_spec.dependencies))?;
+    parse_task_limits(Some(&serde_json::to_value(&task_spec.limits)?))?;
+    Ok(())
+}
+
+fn validate_task_declaration(declaration: &TaskDeclaration) -> Result<()> {
+    if !declaration.task.is_object() {
+        return Err(anyhow!("task declaration field 'task' must be an object"));
+    }
+    if declaration.task.get("image").is_some() {
+        return Err(anyhow!(
+            "task declaration field 'task.image' was removed; use environment.image"
+        ));
+    }
+    if declaration.task.get("workspace").is_some() {
+        return Err(anyhow!(
+            "task declaration field 'task.workspace' was removed; sandbox topology is runner-owned"
+        ));
+    }
+    parse_task_environment(Some(&serde_json::to_value(&declaration.environment)?))?;
+    parse_workspace_spec(Some(&serde_json::to_value(&declaration.workspace)?))?;
+    parse_task_dependencies(Some(&declaration.dependencies))?;
+    parse_task_limits(Some(&serde_json::to_value(&declaration.limits)?))?;
+    Ok(())
 }
 
 fn validate_task_boundary_workspace_materialization(
@@ -178,7 +133,7 @@ fn validate_task_boundary_workspace_materialization(
 }
 
 fn parse_task_environment(value: Option<&Value>) -> Result<TaskEnvironmentSpec> {
-    let raw = value.ok_or_else(|| anyhow!("task boundary missing field: environment"))?;
+    let raw = value.ok_or_else(|| anyhow!("task declaration missing field: environment"))?;
     let environment: TaskEnvironmentSpec =
         serde_json::from_value(raw.clone()).map_err(|e| anyhow!("invalid environment: {}", e))?;
     if environment.image.trim().is_empty() {
@@ -253,7 +208,7 @@ fn validate_workspace_base(base: &WorkspaceBaseSpec) -> Result<()> {
 }
 
 fn parse_workspace_spec(value: Option<&Value>) -> Result<WorkspaceSpec> {
-    let raw = value.ok_or_else(|| anyhow!("task boundary missing field: workspace"))?;
+    let raw = value.ok_or_else(|| anyhow!("task declaration missing field: workspace"))?;
     let workspace: WorkspaceSpec =
         serde_json::from_value(raw.clone()).map_err(|e| anyhow!("invalid workspace: {}", e))?;
     validate_workspace_base(&workspace.base)?;
@@ -296,11 +251,11 @@ fn parse_workspace_spec(value: Option<&Value>) -> Result<WorkspaceSpec> {
     Ok(workspace)
 }
 
-fn parse_task_limits(value: Option<&Value>) -> Result<TaskBoundaryLimits> {
+fn parse_task_limits(value: Option<&Value>) -> Result<TaskDeclarationLimits> {
     let Some(raw) = value else {
-        return Ok(TaskBoundaryLimits::default());
+        return Ok(TaskDeclarationLimits::default());
     };
-    let limits: TaskBoundaryLimits =
+    let limits: TaskDeclarationLimits =
         serde_json::from_value(raw.clone()).map_err(|e| anyhow!("invalid limits: {}", e))?;
     validate_limit_positive("max_steps", limits.max_steps)?;
     validate_limit_positive("max_total_tokens", limits.max_total_tokens)?;
@@ -478,14 +433,8 @@ fn ensure_git_checkout_cache(project_root: &Path, repo: &str, commit: &str) -> R
     Ok(cache_dir)
 }
 
-fn materialize_workspace_git_checkout(
-    project_root: &Path,
-    paths: &TrialPaths,
-    repo: &str,
-    commit: &str,
-) -> Result<()> {
-    let cache_dir = ensure_git_checkout_cache(project_root, repo, commit)?;
-    let staging_dir = project_root
+fn git_checkout_staging_dir(project_root: &Path, repo: &str, commit: &str) -> PathBuf {
+    project_root
         .join(".lab")
         .join("git_checkout_staging")
         .join(format!(
@@ -493,7 +442,16 @@ fn materialize_workspace_git_checkout(
             sanitize_for_fs(repo),
             sanitize_for_fs(commit),
             Utc::now().timestamp_micros()
-        ));
+        ))
+}
+
+fn prepare_git_checkout_worktree(
+    project_root: &Path,
+    repo: &str,
+    commit: &str,
+) -> Result<(PathBuf, PathBuf)> {
+    let cache_dir = ensure_git_checkout_cache(project_root, repo, commit)?;
+    let staging_dir = git_checkout_staging_dir(project_root, repo, commit);
     if staging_dir.exists() {
         let _ = fs::remove_dir_all(&staging_dir);
     }
@@ -501,48 +459,73 @@ fn materialize_workspace_git_checkout(
         ensure_dir(parent)?;
     }
 
-    let mut clone = Command::new("git");
-    clone.args([
-        "clone",
-        "--shared",
-        "--no-checkout",
-        cache_dir.to_string_lossy().as_ref(),
-        staging_dir.to_string_lossy().as_ref(),
-    ]);
-    run_checked_command(
-        clone,
-        &format!(
-            "failed to stage workspace.base git checkout '{}' at '{}'",
-            repo, commit
-        ),
-    )?;
-
-    let mut checkout = Command::new("git");
-    checkout.args([
+    let mut worktree_add = Command::new("git");
+    worktree_add.args([
         "-C",
+        cache_dir.to_string_lossy().as_ref(),
+        "worktree",
+        "add",
+        "--detach",
         staging_dir.to_string_lossy().as_ref(),
-        "checkout",
-        "--force",
         commit,
     ]);
     if let Err(err) = run_checked_command(
-        checkout,
+        worktree_add,
         &format!(
-            "failed to checkout workspace.base commit '{}' for repo '{}'",
-            commit, repo
+            "failed to stage workspace.base git checkout '{}' at '{}'",
+            repo, commit
         ),
     ) {
         let _ = fs::remove_dir_all(&staging_dir);
         return Err(err);
     }
+    Ok((cache_dir, staging_dir))
+}
 
+fn cleanup_git_checkout_worktree(cache_dir: &Path, staging_dir: &Path) -> Result<()> {
+    let mut remove = Command::new("git");
+    remove.args([
+        "-C",
+        cache_dir.to_string_lossy().as_ref(),
+        "worktree",
+        "remove",
+        "--force",
+        staging_dir.to_string_lossy().as_ref(),
+    ]);
+    if let Err(err) = run_checked_command(
+        remove,
+        &format!(
+            "failed to clean staged workspace.base git checkout '{}'",
+            staging_dir.display()
+        ),
+    ) {
+        let _ = fs::remove_dir_all(staging_dir);
+        return Err(err);
+    }
+    Ok(())
+}
+
+fn hydrate_git_checkout_cache(project_root: &Path, repo: &str, commit: &str) -> Result<PathBuf> {
+    let (cache_dir, staging_dir) = prepare_git_checkout_worktree(project_root, repo, commit)?;
+    cleanup_git_checkout_worktree(&cache_dir, &staging_dir)?;
+    Ok(cache_dir)
+}
+
+fn materialize_workspace_git_checkout(
+    project_root: &Path,
+    paths: &TrialPaths,
+    repo: &str,
+    commit: &str,
+) -> Result<()> {
+    let (cache_dir, staging_dir) = prepare_git_checkout_worktree(project_root, repo, commit)?;
     if paths.workspace.exists() {
         fs::remove_dir_all(&paths.workspace)?;
     }
     ensure_dir(&paths.workspace)?;
     let result = copy_dir_filtered(&staging_dir, &paths.workspace, &[".git"]);
-    let _ = fs::remove_dir_all(&staging_dir);
+    let cleanup_result = cleanup_git_checkout_worktree(&cache_dir, &staging_dir);
     result?;
+    cleanup_result?;
     Ok(())
 }
 
@@ -624,26 +607,39 @@ fn materialize_workspace_overlays(
     Ok(())
 }
 
-fn copy_staged_host_file(src: &Path, dst: &Path, required: bool, label: &str) -> Result<bool> {
+fn copy_staged_host_path(src: &Path, dst: &Path, required: bool, label: &str) -> Result<bool> {
     if !src.exists() {
         if required {
             return Err(anyhow!(
-                "staged host file source missing for {}: {}",
+                "staged host path source missing for {}: {}",
                 label,
                 src.display()
             ));
         }
         return Ok(false);
     }
+    if let Some(parent) = dst.parent() {
+        ensure_dir(parent)?;
+    }
+    if src.is_dir() {
+        ensure_dir(dst)?;
+        copy_dir_filtered(src, dst, &[]).map_err(|e| {
+            anyhow!(
+                "failed to copy staged host directory {} from {} to {}: {}",
+                label,
+                src.display(),
+                dst.display(),
+                e
+            )
+        })?;
+        return Ok(true);
+    }
     if !src.is_file() {
         return Err(anyhow!(
-            "staged host file source is not a file for {}: {}",
+            "staged host path source is not a file or directory for {}: {}",
             label,
             src.display()
         ));
-    }
-    if let Some(parent) = dst.parent() {
-        ensure_dir(parent)?;
     }
     fs::copy(src, dst).map_err(|e| {
         anyhow!(
@@ -655,6 +651,31 @@ fn copy_staged_host_file(src: &Path, dst: &Path, required: bool, label: &str) ->
         )
     })?;
     Ok(true)
+}
+
+#[cfg(unix)]
+fn set_staged_path_read_only(dst: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    if dst.is_dir() {
+        for entry in walkdir::WalkDir::new(dst).into_iter().filter_map(|entry| entry.ok()) {
+            let entry_path = entry.path();
+            let mut perms = fs::metadata(entry_path)?.permissions();
+            perms.set_mode(if entry.file_type().is_dir() { 0o555 } else { 0o444 });
+            fs::set_permissions(entry_path, perms)?;
+        }
+        return Ok(());
+    }
+
+    let mut perms = fs::metadata(dst)?.permissions();
+    perms.set_mode(0o444);
+    fs::set_permissions(dst, perms)?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn set_staged_path_read_only(_dst: &Path) -> Result<()> {
+    Ok(())
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -671,7 +692,9 @@ fn default_task_dependency_encoding() -> String {
     "utf8".to_string()
 }
 
-fn parse_task_dependency_files(task_boundary: &TaskBoundaryMaterialization) -> Result<Vec<TaskDependencyFileSpec>> {
+fn parse_task_dependency_files(
+    task_boundary: &TaskBoundaryMaterialization,
+) -> Result<Vec<TaskDependencyFileSpec>> {
     let Some(files) = task_boundary
         .dependencies
         .get("files")
@@ -687,7 +710,10 @@ fn materialize_task_dependencies_for_trial(
     task_boundary: &TaskBoundaryMaterialization,
     paths: &TrialPaths,
 ) -> Result<()> {
-    for (idx, spec) in parse_task_dependency_files(task_boundary)?.iter().enumerate() {
+    for (idx, spec) in parse_task_dependency_files(task_boundary)?
+        .iter()
+        .enumerate()
+    {
         let rel = validate_workspace_relative_path(&spec.path).map_err(|err| {
             anyhow!(
                 "task dependencies.files[{}].path '{}' invalid: {}",
@@ -700,7 +726,13 @@ fn materialize_task_dependencies_for_trial(
             "utf8" => spec.content.as_bytes().to_vec(),
             "base64" => BASE64_STANDARD
                 .decode(spec.content.as_bytes())
-                .map_err(|err| anyhow!("task dependencies.files[{}] base64 decode failed: {}", idx, err))?,
+                .map_err(|err| {
+                    anyhow!(
+                        "task dependencies.files[{}] base64 decode failed: {}",
+                        idx,
+                        err
+                    )
+                })?,
             other => {
                 return Err(anyhow!(
                     "task dependencies.files[{}].encoding must be 'utf8' or 'base64' (got '{}')",
@@ -721,12 +753,11 @@ fn materialize_task_dependencies_for_trial(
     Ok(())
 }
 
-fn stage_workspace_inputs_for_trial(_task_boundary: &TaskBoundaryMaterialization, _paths: &TrialPaths) -> Result<()> {
-    Ok(())
-}
-
 #[cfg(test)]
-fn parse_workspace_patches(value: Option<&Value>, exp_dir: &Path) -> Result<Vec<WorkspacePatchSpec>> {
+fn parse_workspace_patches(
+    value: Option<&Value>,
+    exp_dir: &Path,
+) -> Result<Vec<WorkspacePatchSpec>> {
     let Some(value) = value else {
         return Ok(Vec::new());
     };
@@ -754,47 +785,33 @@ fn parse_workspace_patches(value: Option<&Value>, exp_dir: &Path) -> Result<Vec<
     Ok(patches)
 }
 
-#[cfg(test)]
 fn stage_dependencies_for_trial(runtime: &AgentRuntimeConfig, paths: &TrialPaths) -> Result<()> {
     for entry in &runtime.dependency_file_staging {
         let dst = map_container_path_to_host(&entry.destination_path, paths)?;
-        let copied = copy_staged_host_file(
+        let copied = copy_staged_host_path(
             &entry.source_from_host,
             &dst,
             entry.required,
             &entry.destination_path,
         )?;
         if copied && entry.read_only {
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let mut perms = fs::metadata(&dst)?.permissions();
-                perms.set_mode(0o444);
-                fs::set_permissions(&dst, perms)?;
-            }
+            set_staged_path_read_only(&dst)?;
         }
     }
     Ok(())
 }
 
 #[cfg(test)]
-fn stage_workspace_patches_for_trial(runtime: &AgentRuntimeConfig, paths: &TrialPaths) -> Result<()> {
+fn stage_workspace_patches_for_trial(
+    runtime: &AgentRuntimeConfig,
+    paths: &TrialPaths,
+) -> Result<()> {
     for patch in &runtime.workspace_patches {
         let rel = validate_workspace_relative_path(&patch.target_path)?;
         let dst = paths.workspace.join(rel);
-        copy_staged_host_file(&patch.source_from_host, &dst, true, &patch.target_path)?;
+        copy_staged_host_path(&patch.source_from_host, &dst, true, &patch.target_path)?;
     }
     Ok(())
-}
-
-fn task_boundary_ext_value(task_boundary: &TaskBoundaryMaterialization) -> Value {
-    json!({
-        "schema_version": TASK_SPEC_V1_SCHEMA_VERSION,
-        "environment": task_boundary.environment,
-        "workspace": task_boundary.workspace,
-        "dependencies": task_boundary.dependencies,
-        "limits": task_boundary.limits,
-    })
 }
 
 #[derive(Debug, Clone)]
@@ -847,7 +864,6 @@ struct WorkspacePatchSpec {
     target_path: String,
 }
 
-#[cfg(test)]
 #[derive(Debug, Clone)]
 struct DependencyFileStagingSpec {
     source_from_host: PathBuf,
@@ -891,63 +907,9 @@ struct AgentRuntimeConfig {
     tracing_mode: Option<String>,
     #[cfg(test)]
     force_container: bool,
-    #[cfg(test)]
     dependency_file_staging: Vec<DependencyFileStagingSpec>,
     #[cfg(test)]
     dependency_services: Vec<Value>,
-}
-
-fn resolve_host_path_from_spec(raw: &str, exp_dir: &Path) -> Result<PathBuf> {
-    let trimmed = raw.trim();
-    if trimmed.is_empty() {
-        return Err(anyhow!("path must not be empty"));
-    }
-    let expanded = if trimmed == "~" || trimmed.starts_with("~/") {
-        let home = std::env::var("HOME")
-            .map_err(|_| anyhow!("HOME env var is required to resolve '{}'", trimmed))?;
-        if trimmed == "~" {
-            PathBuf::from(home)
-        } else {
-            Path::new(&home).join(trimmed.trim_start_matches("~/"))
-        }
-    } else {
-        PathBuf::from(trimmed)
-    };
-    let resolved = if expanded.is_absolute() {
-        normalize_path(&expanded)
-    } else {
-        normalize_path(&exp_dir.join(expanded))
-    };
-    ensure_path_within_project_root(&resolved, exp_dir)?;
-    Ok(resolved)
-}
-fn nearest_existing_ancestor(path: &Path) -> Option<PathBuf> {
-    let mut current = Some(path);
-    while let Some(candidate) = current {
-        if candidate.exists() {
-            return Some(canonicalize_best_effort(candidate));
-        }
-        current = candidate.parent();
-    }
-    None
-}
-
-fn ensure_path_within_project_root(path: &Path, project_root: &Path) -> Result<()> {
-    let root = canonicalize_best_effort(project_root);
-    let candidate = canonicalize_best_effort(path);
-    if candidate.starts_with(&root) {
-        return Ok(());
-    }
-    if let Some(ancestor) = nearest_existing_ancestor(path) {
-        if ancestor.starts_with(&root) {
-            return Ok(());
-        }
-    }
-    Err(anyhow!(
-        "host path '{}' resolves outside project root '{}'; host path leaks are not allowed",
-        path.display(),
-        root.display()
-    ))
 }
 
 fn parse_command_field(value: Option<&Value>, field: &str) -> Result<Option<Vec<String>>> {
@@ -980,9 +942,12 @@ fn parse_bindings_to_args(value: Option<&Value>) -> Result<Vec<BindingArgProject
         .ok_or_else(|| anyhow!("runtime.agent_runtime.binding_args must be an array"))?;
     let mut parsed = Vec::with_capacity(items.len());
     for (idx, item) in items.iter().enumerate() {
-        let obj = item
-            .as_object()
-            .ok_or_else(|| anyhow!("runtime.agent_runtime.binding_args[{}] must be an object", idx))?;
+        let obj = item.as_object().ok_or_else(|| {
+            anyhow!(
+                "runtime.agent_runtime.binding_args[{}] must be an object",
+                idx
+            )
+        })?;
         let binding = obj
             .get("key")
             .and_then(Value::as_str)
@@ -1013,12 +978,349 @@ fn parse_bindings_to_args(value: Option<&Value>) -> Result<Vec<BindingArgProject
     Ok(parsed)
 }
 
+fn derive_public_path_staging_specs(
+    command: &[String],
+    env: &BTreeMap<String, String>,
+    exp_dir: &Path,
+) -> Result<Vec<DependencyFileStagingSpec>> {
+    let mut specs = Vec::new();
+    let mut seen = HashSet::new();
+    for (idx, token) in command.iter().enumerate() {
+        if idx == 0 {
+            continue;
+        }
+        let Some(rel) = resolve_existing_public_path_reference(
+            token,
+            exp_dir,
+            &format!("runtime.agent_runtime.command[{}]", idx),
+        )? else {
+            continue;
+        };
+        let key = rel.to_string_lossy().to_string();
+        if !seen.insert(key.clone()) {
+            continue;
+        }
+        let source = normalize_path(&exp_dir.join(&rel));
+        if !source.exists() {
+            return Err(anyhow!(
+                "runtime.agent_runtime.command[{}] resolved path does not exist: {}",
+                idx,
+                source.display()
+            ));
+        }
+        specs.push(DependencyFileStagingSpec {
+            source_from_host: source,
+            destination_path: format!(
+                "{}/{}",
+                AGENTLAB_CONTRACT_WORKSPACE_DIR,
+                key.replace('\\', "/")
+            ),
+            required: true,
+            read_only: true,
+        });
+    }
+    for (key_name, value) in env {
+        let Some(rel) = resolve_existing_public_path_reference(
+            value,
+            exp_dir,
+            &format!("runtime.agent_runtime.env.{}", key_name),
+        )? else {
+            continue;
+        };
+        let key = rel.to_string_lossy().to_string();
+        if !seen.insert(key.clone()) {
+            continue;
+        }
+        let source = normalize_path(&exp_dir.join(&rel));
+        if !source.exists() {
+            return Err(anyhow!(
+                "runtime.agent_runtime.env.{} resolved path does not exist: {}",
+                key_name,
+                source.display()
+            ));
+        }
+        specs.push(DependencyFileStagingSpec {
+            source_from_host: source,
+            destination_path: format!(
+                "{}/{}",
+                AGENTLAB_CONTRACT_WORKSPACE_DIR,
+                key.replace('\\', "/")
+            ),
+            required: true,
+            read_only: true,
+        });
+    }
+    Ok(specs)
+}
+
+fn normalize_staged_support_source_path(
+    raw: &str,
+    exp_dir: &Path,
+    project_root: &Path,
+    field_name: &str,
+) -> Result<PathBuf> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(anyhow!("{} must not be empty", field_name));
+    }
+    let candidate = PathBuf::from(trimmed);
+    let resolved = if candidate.is_absolute() {
+        normalize_path(&candidate)
+    } else {
+        normalize_path(&exp_dir.join(candidate))
+    };
+    let root_cmp = canonicalize_best_effort(project_root);
+    let resolved_cmp = canonicalize_best_effort(&resolved);
+    if !resolved_cmp.starts_with(&root_cmp) {
+        return Err(anyhow!(
+            "{} resolves outside project root: {}",
+            field_name,
+            resolved.display()
+        ));
+    }
+    if !resolved.exists() {
+        return Err(anyhow!(
+            "{} resolved path does not exist: {}",
+            field_name,
+            resolved.display()
+        ));
+    }
+    Ok(resolved)
+}
+
+fn validate_support_destination_path(raw: &str, field_name: &str) -> Result<String> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(anyhow!("{} must not be empty", field_name));
+    }
+    let path = Path::new(trimmed);
+    if !path.is_absolute() {
+        return Err(anyhow!("{} must be an absolute contract path", field_name));
+    }
+    if !(trimmed == AGENTLAB_CONTRACT_DEPS_DIR
+        || trimmed.starts_with(&format!("{}/", AGENTLAB_CONTRACT_DEPS_DIR))
+        || trimmed == AGENTLAB_CONTRACT_STATE_DIR
+        || trimmed.starts_with(&format!("{}/", AGENTLAB_CONTRACT_STATE_DIR)))
+    {
+        return Err(anyhow!(
+            "{} must be under {} or {}",
+            field_name,
+            AGENTLAB_CONTRACT_DEPS_DIR,
+            AGENTLAB_CONTRACT_STATE_DIR
+        ));
+    }
+    for component in path.components() {
+        if matches!(component, Component::ParentDir) {
+            return Err(anyhow!("{} cannot contain '..'", field_name));
+        }
+    }
+    Ok(trimmed.to_string())
+}
+
+fn parse_support_file_staging_specs(
+    value: Option<&Value>,
+    field_name: &str,
+    exp_dir: &Path,
+    project_root: &Path,
+) -> Result<Vec<DependencyFileStagingSpec>> {
+    let Some(raw) = value else {
+        return Ok(Vec::new());
+    };
+    let items = raw
+        .as_array()
+        .ok_or_else(|| anyhow!("{} must be an array", field_name))?;
+    let mut specs = Vec::with_capacity(items.len());
+    for (idx, item) in items.iter().enumerate() {
+        let obj = item
+            .as_object()
+            .ok_or_else(|| anyhow!("{}[{}] must be an object", field_name, idx))?;
+        let source_from_host = obj
+            .get("source_from_host")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("{}[{}].source_from_host is required", field_name, idx))?;
+        let destination_path = obj
+            .get("destination_path")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("{}[{}].destination_path is required", field_name, idx))?;
+        let required = obj.get("required").and_then(Value::as_bool).unwrap_or(true);
+        let read_only = obj.get("read_only").and_then(Value::as_bool).unwrap_or(true);
+        specs.push(DependencyFileStagingSpec {
+            source_from_host: normalize_staged_support_source_path(
+                source_from_host,
+                exp_dir,
+                project_root,
+                &format!("{}[{}].source_from_host", field_name, idx),
+            )?,
+            destination_path: validate_support_destination_path(
+                destination_path,
+                &format!("{}[{}].destination_path", field_name, idx),
+            )?,
+            required,
+            read_only,
+        });
+    }
+    Ok(specs)
+}
+
+fn merge_dependency_file_staging(
+    base: &mut Vec<DependencyFileStagingSpec>,
+    extra: Vec<DependencyFileStagingSpec>,
+) {
+    for next in extra {
+        if let Some(existing) = base
+            .iter_mut()
+            .find(|entry| entry.destination_path == next.destination_path)
+        {
+            *existing = next;
+        } else {
+            base.push(next);
+        }
+    }
+}
+
 fn binding_lookup<'a>(bindings: &'a Value, key: &str) -> Option<&'a Value> {
     if key.trim().is_empty() {
         return None;
     }
     let pointer = format!("/{}", key.split('.').collect::<Vec<_>>().join("/"));
     bindings.pointer(&pointer)
+}
+
+fn binding_lookup_string(bindings: &Value, key: &str, field_name: &str) -> Result<Option<String>> {
+    let Some(value) = binding_lookup(bindings, key) else {
+        return Ok(None);
+    };
+    let token = match value {
+        Value::String(v) => v.clone(),
+        Value::Number(v) => v.to_string(),
+        Value::Bool(v) => v.to_string(),
+        _ => {
+            return Err(anyhow!(
+                "{} runtime binding '{}' must resolve to string|number|bool (got {})",
+                field_name,
+                key,
+                value_type_name(value)
+            ))
+        }
+    };
+    Ok(Some(token))
+}
+
+fn resolve_runtime_binding_value(
+    name: &str,
+    bindings: &Value,
+    runtime_env_inputs: &BTreeMap<String, String>,
+    field_name: &str,
+) -> Result<String> {
+    if name == "WORKSPACE" {
+        return Ok(AGENTLAB_CONTRACT_WORKSPACE_DIR.to_string());
+    }
+    if let Some(value) = binding_lookup_string(bindings, name, field_name)? {
+        return Ok(value);
+    }
+    if let Some(value) = runtime_env_inputs.get(name) {
+        return Ok(value.clone());
+    }
+    if let Ok(value) = std::env::var(name) {
+        return Ok(value);
+    }
+    Err(anyhow!(
+        "{} references missing runtime binding ${}; provide it in variant bindings or launch-time env",
+        field_name,
+        name
+    ))
+}
+
+fn render_runtime_template(
+    raw: &str,
+    bindings: &Value,
+    runtime_env_inputs: &BTreeMap<String, String>,
+    field_name: &str,
+) -> Result<String> {
+    if contains_removed_runtime_template(raw) {
+        return Err(anyhow!(
+            "{} uses removed '${{...}}' syntax; use $NAME runtime bindings instead",
+            field_name
+        ));
+    }
+    let chars: Vec<char> = raw.chars().collect();
+    let mut idx = 0usize;
+    let mut out = String::new();
+    while idx < chars.len() {
+        let ch = chars[idx];
+        if ch != '$' {
+            out.push(ch);
+            idx += 1;
+            continue;
+        }
+        if idx + 1 >= chars.len() {
+            out.push(ch);
+            idx += 1;
+            continue;
+        }
+        let start = chars[idx + 1];
+        if !(start == '_' || start.is_ascii_alphabetic()) {
+            out.push(ch);
+            idx += 1;
+            continue;
+        }
+        let mut end = idx + 2;
+        while end < chars.len() {
+            let next = chars[end];
+            if next == '_' || next.is_ascii_alphanumeric() {
+                end += 1;
+            } else {
+                break;
+            }
+        }
+        let name: String = chars[idx + 1..end].iter().collect();
+        out.push_str(&resolve_runtime_binding_value(
+            &name,
+            bindings,
+            runtime_env_inputs,
+            field_name,
+        )?);
+        idx = end;
+    }
+    Ok(out)
+}
+
+fn resolve_command_templates(
+    command: &[String],
+    bindings: &Value,
+    runtime_env_inputs: &BTreeMap<String, String>,
+) -> Result<Vec<String>> {
+    let mut resolved = Vec::with_capacity(command.len());
+    for (idx, token) in command.iter().enumerate() {
+        resolved.push(render_runtime_template(
+            token,
+            bindings,
+            runtime_env_inputs,
+            &format!("runtime.agent_runtime.command[{}]", idx),
+        )?);
+    }
+    Ok(resolved)
+}
+
+fn resolve_env_templates(
+    env: &BTreeMap<String, String>,
+    bindings: &Value,
+    runtime_env_inputs: &BTreeMap<String, String>,
+    field_prefix: &str,
+) -> Result<BTreeMap<String, String>> {
+    let mut resolved = BTreeMap::new();
+    for (key, value) in env {
+        resolved.insert(
+            key.clone(),
+            render_runtime_template(
+                value,
+                bindings,
+                runtime_env_inputs,
+                &format!("{}.{}", field_prefix, key),
+            )?,
+        );
+    }
+    Ok(resolved)
 }
 
 fn project_bindings_to_args(
@@ -1054,9 +1356,11 @@ fn project_bindings_to_args(
     Ok(projected)
 }
 
-fn resolve_agent_runtime(json_value: &Value, exp_dir: &Path) -> Result<AgentRuntimeConfig> {
-    reject_legacy_experiment_version(json_value)?;
-
+fn resolve_agent_runtime(
+    json_value: &Value,
+    exp_dir: &Path,
+    project_root: &Path,
+) -> Result<AgentRuntimeConfig> {
     if json_value.pointer("/runtime/harness").is_some() {
         return Err(anyhow!(
             "runtime.harness is not supported; use runtime.agent_runtime"
@@ -1069,9 +1373,12 @@ fn resolve_agent_runtime(json_value: &Value, exp_dir: &Path) -> Result<AgentRunt
         || agent.pointer("/execution").is_some()
         || agent.pointer("/workspace_patches").is_some()
         || agent.pointer("/launch").is_some()
+        || agent.pointer("/env_from_host").is_some()
+        || agent.pointer("/binding_args").is_some()
+        || agent.pointer("/support_files").is_some()
     {
         return Err(anyhow!(
-            "runtime.agent_runtime hard cut: use runtime.agent_runtime.{{artifact,image,command,env,env_from_host,binding_args,network,root_read_only,user}}"
+            "runtime.agent_runtime hard cut: use runtime.agent_runtime.{{artifact,image,command,env,network,root_read_only,user}}"
         ));
     }
 
@@ -1085,11 +1392,9 @@ fn resolve_agent_runtime(json_value: &Value, exp_dir: &Path) -> Result<AgentRunt
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
 
-    let execution_image = parse_optional_nonempty_string(
-        agent.pointer("/image"),
-        "runtime.agent_runtime.image",
-    )?
-    .ok_or_else(|| anyhow!("runtime.agent_runtime.image is required"))?;
+    let execution_image =
+        parse_optional_nonempty_string(agent.pointer("/image"), "runtime.agent_runtime.image")?
+            .ok_or_else(|| anyhow!("runtime.agent_runtime.image is required"))?;
     let execution_network = agent
         .pointer("/network")
         .and_then(|v| v.as_str())
@@ -1101,10 +1406,8 @@ fn resolve_agent_runtime(json_value: &Value, exp_dir: &Path) -> Result<AgentRunt
         .pointer("/root_read_only")
         .and_then(|v| v.as_bool())
         .unwrap_or(true);
-    let execution_user = parse_optional_nonempty_string(
-        agent.pointer("/user"),
-        "runtime.agent_runtime.user",
-    )?;
+    let execution_user =
+        parse_optional_nonempty_string(agent.pointer("/user"), "runtime.agent_runtime.user")?;
     #[cfg(test)]
     let execution_network_for_test = execution_network.clone();
     #[cfg(test)]
@@ -1119,7 +1422,7 @@ fn resolve_agent_runtime(json_value: &Value, exp_dir: &Path) -> Result<AgentRunt
         if raw.starts_with("./") || raw.starts_with("../") || raw.contains('/') {
             normalize_path(&exp_dir.join(raw))
         } else {
-            resolve_dx_artifact_path(raw, exp_dir, exp_dir)
+            resolve_dx_artifact_path(raw, exp_dir, project_root)
         }
     };
     let agent_artifact_digest = parse_optional_nonempty_string(
@@ -1148,20 +1451,55 @@ fn resolve_agent_runtime(json_value: &Value, exp_dir: &Path) -> Result<AgentRunt
         .to_string();
     let adapter_ref = AgentAdapterRef::default();
     let env = parse_string_map_field(agent.pointer("/env"), "runtime.agent_runtime.env")?;
-    let env_from_host = parse_string_array_field(
-        agent.pointer("/env_from_host"),
-        "runtime.agent_runtime.env_from_host",
-    )?;
+    for (key, value) in &env {
+        if contains_removed_runtime_template(value) {
+            return Err(anyhow!(
+                "runtime.agent_runtime.env.{} uses removed '${{...}}' syntax; use $NAME runtime bindings instead",
+                key
+            ));
+        }
+        if value.trim().starts_with("/agentlab/") {
+            return Err(anyhow!(
+                "runtime.agent_runtime.env.{} leaks runner topology; remove internal /agentlab paths from public authoring",
+                key
+            ));
+        }
+    }
+    for (idx, token) in command.iter().enumerate() {
+        if contains_removed_runtime_template(token) {
+            return Err(anyhow!(
+                "runtime.agent_runtime.command[{}] uses removed '${{...}}' syntax; use $NAME runtime bindings instead",
+                idx
+            ));
+        }
+        if token.trim().starts_with("/agentlab/") {
+            return Err(anyhow!(
+                "runtime.agent_runtime.command[{}] leaks runner topology; remove internal /agentlab paths from public authoring",
+                idx
+            ));
+        }
+    }
     if agent
         .pointer("/secret_env")
         .map(|value| !value.is_null())
         .unwrap_or(false)
     {
         return Err(anyhow!(
-            "runtime.agent_runtime.secret_env is not supported; use runtime.agent_runtime.env_from_host and provide values via --env/--env-file"
+            "runtime.agent_runtime.secret_env is not supported; use $NAME runtime bindings in runtime.agent_runtime.command or runtime.agent_runtime.env"
         ));
     }
-    let bindings_to_args = parse_bindings_to_args(agent.pointer("/binding_args"))?;
+    let bindings_to_args = Vec::new();
+    let env_from_host = Vec::new();
+    let mut dependency_file_staging = derive_public_path_staging_specs(&command, &env, exp_dir)?;
+    merge_dependency_file_staging(
+        &mut dependency_file_staging,
+        parse_support_file_staging_specs(
+            json_value.pointer("/runtime/dependencies/file_staging"),
+            "runtime.dependencies.file_staging",
+            exp_dir,
+            project_root,
+        )?,
+    );
 
     Ok(AgentRuntimeConfig {
         adapter_ref,
@@ -1186,7 +1524,13 @@ fn resolve_agent_runtime(json_value: &Value, exp_dir: &Path) -> Result<AgentRunt
         #[cfg(test)]
         execution: AgentExecutionConfig {
             executor: Some(AgentExecutionExecutor::Docker),
-            image: Some(agent.pointer("/image").and_then(|v| v.as_str()).unwrap_or("").to_string()),
+            image: Some(
+                agent
+                    .pointer("/image")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+            ),
             network: execution_network_for_test,
             root_read_only: execution_root_read_only,
             user: execution_user_for_test,
@@ -1206,8 +1550,7 @@ fn resolve_agent_runtime(json_value: &Value, exp_dir: &Path) -> Result<AgentRunt
         tracing_mode: None,
         #[cfg(test)]
         force_container: true,
-        #[cfg(test)]
-        dependency_file_staging: Vec::new(),
+        dependency_file_staging,
         #[cfg(test)]
         dependency_services: Vec::new(),
     })
@@ -1272,13 +1615,15 @@ fn resolve_runtime_env_inputs(execution: &RunExecutionOptions) -> Result<BTreeMa
 
 fn resolve_agent_runtime_env(
     runtime_agent: &AgentRuntimeConfig,
+    bindings: &Value,
     runtime_env_inputs: &BTreeMap<String, String>,
 ) -> Result<BTreeMap<String, String>> {
-    let mut merged = runtime_agent.env.clone();
-    for (key, value) in runtime_env_inputs {
-        merged.insert(key.clone(), value.clone());
-    }
-    Ok(merged)
+    resolve_env_templates(
+        &runtime_agent.env,
+        bindings,
+        runtime_env_inputs,
+        "runtime.agent_runtime.env",
+    )
 }
 
 fn ensure_required_runtime_env_present(
@@ -1288,7 +1633,7 @@ fn ensure_required_runtime_env_present(
     for key in &runtime_agent.env_from_host {
         if !resolved_env.contains_key(key) {
             return Err(anyhow!(
-                "missing required runtime env var for runtime.agent_runtime.env_from_host: {} (provide via --env or --env-file)",
+                "missing required runtime env var for runtime.agent_runtime.env_from_host: {} (provide via host env, --env, or --env-file)",
                 key
             ));
         }
@@ -1330,6 +1675,29 @@ fn validate_agent_artifact_pin(runtime_agent: &AgentRuntimeConfig) -> Result<()>
     Ok(())
 }
 
+fn resolve_benchmark_support_files(
+    experiment: &Value,
+    exp_dir: &Path,
+    project_root: &Path,
+) -> Result<Vec<DependencyFileStagingSpec>> {
+    let mut support_files = parse_support_file_staging_specs(
+        experiment.pointer("/benchmark/grader/support_files"),
+        "benchmark.grader.support_files",
+        exp_dir,
+        project_root,
+    )?;
+    merge_dependency_file_staging(
+        &mut support_files,
+        parse_support_file_staging_specs(
+            experiment.pointer("/benchmark/adapter/support_files"),
+            "benchmark.adapter.support_files",
+            exp_dir,
+            project_root,
+        )?,
+    );
+    Ok(support_files)
+}
+
 #[derive(Clone)]
 struct VariantRuntimeProfile {
     experiment: Value,
@@ -1369,12 +1737,7 @@ fn value_contains_host_scratch_path(value: &str) -> bool {
 
 fn profile_is_hermetic(profile: &VariantRuntimeProfile) -> bool {
     let command = preview_agent_command(profile);
-    profile
-        .agent_runtime
-        .image
-        .trim()
-        .is_empty()
-        == false
+    profile.agent_runtime.image.trim().is_empty() == false
         && command_contains_scientific_bypass(&command).is_none()
         && !command
             .iter()
@@ -1407,7 +1770,11 @@ fn resolve_variant_runtime_profile(
     let variant_experiment = resolve_runtime_for_variant(experiment, variant)?;
     validate_required_fields(&variant_experiment)?;
 
-    let mut agent_runtime = resolve_agent_runtime(&variant_experiment, project_root)?;
+    let mut agent_runtime = resolve_agent_runtime(&variant_experiment, project_root, project_root)?;
+    merge_dependency_file_staging(
+        &mut agent_runtime.dependency_file_staging,
+        resolve_benchmark_support_files(&variant_experiment, project_root, project_root)?,
+    );
     validate_agent_artifact_pin(&agent_runtime)?;
     let configured_network_mode = configured_network_mode(&variant_experiment)?;
     let effective_network_mode = behavior
@@ -1423,18 +1790,21 @@ fn resolve_variant_runtime_profile(
         ));
     }
 
-    agent_runtime.command_raw = resolve_agent_runtime_command(&agent_runtime.command_raw);
-    validate_agent_runtime_command(&agent_runtime.command_raw, project_root)?;
     let runtime_env_inputs = resolve_runtime_env_inputs(execution)?;
-    let mut agent_runtime_env = resolve_agent_runtime_env(&agent_runtime, &runtime_env_inputs)?;
-    for (key, value) in &variant.env {
-        agent_runtime_env.insert(key.clone(), value.clone());
-    }
-    let mut variant_args = variant.args.clone();
-    variant_args.extend(project_bindings_to_args(
+    agent_runtime.command_raw = resolve_agent_runtime_command(
+        &agent_runtime.command_raw,
         &variant.bindings,
-        &agent_runtime.bindings_to_args,
-    )?);
+        &runtime_env_inputs,
+    )?;
+    validate_agent_runtime_command(&agent_runtime.command_raw, project_root)?;
+    let mut agent_runtime_env =
+        resolve_agent_runtime_env(&agent_runtime, &variant.bindings, &runtime_env_inputs)?;
+    let resolved_variant_env =
+        resolve_env_templates(&variant.env, &variant.bindings, &runtime_env_inputs, "variant.env")?;
+    for (key, value) in resolved_variant_env {
+        agent_runtime_env.insert(key, value);
+    }
+    let variant_args = resolve_command_templates(&variant.args, &variant.bindings, &runtime_env_inputs)?;
 
     Ok(VariantRuntimeProfile {
         experiment: variant_experiment,
@@ -1575,14 +1945,147 @@ fn build_agent_task(
         "dependencies": task_boundary.dependencies.clone(),
         "policy": policy,
     });
-    let task_boundary_ext = task_boundary_ext_value(task_boundary);
     if let Some(obj) = input.as_object_mut() {
-        obj.insert(
-            "ext".to_string(),
-            json!({ "task_spec_v1": task_boundary_ext }),
-        );
+        obj.remove("ext");
     }
     input
+}
+
+fn prepared_task_environment_manifest_path(trial_dir: &Path) -> PathBuf {
+    trial_dir
+        .join("runtime")
+        .join("prepared_task_environment.json")
+}
+
+fn write_prepared_task_environment_manifest(
+    trial_dir: &Path,
+    manifest: &PreparedTaskEnvironmentManifest,
+) -> Result<()> {
+    let manifest_path = prepared_task_environment_manifest_path(trial_dir);
+    atomic_write_json_pretty(&manifest_path, &serde_json::to_value(manifest)?)?;
+    Ok(())
+}
+
+fn load_prepared_task_environment_manifest(
+    trial_dir: &Path,
+) -> Result<PreparedTaskEnvironmentManifest> {
+    let manifest_path = prepared_task_environment_manifest_path(trial_dir);
+    if !manifest_path.exists() {
+        return Err(anyhow!(
+            "prepared_task_environment manifest missing for trial '{}': {}",
+            trial_dir
+                .file_name()
+                .and_then(|value| value.to_str())
+                .unwrap_or("unknown"),
+            manifest_path.display()
+        ));
+    }
+    let value = load_json_file(&manifest_path)?;
+    let manifest: PreparedTaskEnvironmentManifest =
+        serde_json::from_value(value).map_err(|err| {
+            anyhow!(
+                "invalid prepared_task_environment manifest at {}: {}",
+                manifest_path.display(),
+                err
+            )
+        })?;
+    Ok(manifest)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prepare_task_environment(
+    project_root: &Path,
+    trial_dir: &Path,
+    run_id: &str,
+    trial_id: &str,
+    trial_experiment: &Value,
+    variant: &Variant,
+    task_idx: usize,
+    repl: usize,
+    task_boundary: &TaskBoundaryMaterialization,
+    agent_runtime: &AgentRuntimeConfig,
+    existing_workspace_ref: Option<&str>,
+) -> Result<PreparedTaskEnvironment> {
+    let trial_paths = TrialPaths::new(trial_dir, project_root)?;
+    trial_paths.prepare(false)?;
+    materialize_task_dependencies_for_trial(task_boundary, &trial_paths)?;
+    stage_dependencies_for_trial(agent_runtime, &trial_paths)?;
+    if let Some(workspace_ref) = existing_workspace_ref {
+        let artifact_store = ArtifactStore::new(
+            infer_run_dir_from_path(trial_dir)
+                .unwrap_or_else(|| trial_dir.to_path_buf())
+                .join("artifacts"),
+        );
+        restore_workspace_from_object_ref(&artifact_store, workspace_ref, &trial_paths.workspace)?;
+    } else {
+        materialize_workspace_base(project_root, &trial_paths, &task_boundary.workspace.base)?;
+    }
+    materialize_workspace_overlays(&trial_paths, &task_boundary.workspace.overlays)?;
+    let dynamic_mounts =
+        resolve_workspace_aux_mounts(project_root, &task_boundary.workspace.aux_mounts)?;
+
+    let input = build_agent_task(
+        trial_experiment,
+        run_id,
+        trial_id,
+        variant,
+        task_idx,
+        repl,
+        task_boundary,
+    );
+    let input_bytes = serde_json::to_vec_pretty(&input)?;
+    let io_paths = prepare_io_paths(&trial_paths, &input_bytes)?;
+    let runtime_env = build_runtime_contract_env(
+        run_id,
+        &input,
+        &io_paths,
+        Some(task_boundary.task_image.as_str()),
+        resolve_trial_timeout_ms(&input),
+    );
+    let manifest = PreparedTaskEnvironmentManifest {
+        schema_version: "prepared_task_environment_v1".to_string(),
+        declaration: task_boundary.declaration.clone(),
+        declaration_digest: canonical_json_digest(&serde_json::to_value(&task_boundary.declaration)?),
+        run_id: run_id.to_string(),
+        trial_id: trial_id.to_string(),
+        variant_id: variant.id.clone(),
+        task_id: task_boundary
+            .task_payload
+            .get("id")
+            .and_then(|v| v.as_str())
+            .unwrap_or(&format!("task_{}", task_idx))
+            .to_string(),
+        task_index: task_idx,
+        repl_idx: repl,
+        task_image: task_boundary.task_image.clone(),
+        workspace_root: trial_paths.workspace.to_string_lossy().to_string(),
+        aux_mounts: dynamic_mounts
+            .iter()
+            .map(|mount| PreparedMountReference {
+                host_path: mount.host_path.to_string_lossy().to_string(),
+                mount_path: mount.mount_path.clone(),
+            })
+            .collect(),
+        contract_files: PreparedContractFilePaths {
+            trial_input: io_paths.input_host.to_string_lossy().to_string(),
+            task: io_paths.task_path.clone(),
+            bindings: io_paths.bindings_path.clone(),
+            dependencies: io_paths.dependencies_path.clone(),
+            policy: io_paths.policy_path.clone(),
+            result: io_paths.result_path.clone(),
+            trajectory: io_paths.trajectory_path.clone(),
+        },
+        runtime_env: runtime_env.clone(),
+    };
+    write_prepared_task_environment_manifest(trial_dir, &manifest)?;
+
+    Ok(PreparedTaskEnvironment {
+        manifest,
+        trial_paths,
+        io_paths,
+        dynamic_mounts,
+        trial_input: input,
+    })
 }
 
 fn normalize_task_prompt_aliases(task_payload: &Value) -> Value {
@@ -2030,15 +2533,6 @@ fn restore_workspace_from_object_ref(
     Ok(())
 }
 
-fn restore_workspace_from_snapshot(snapshot_dir: &Path, workspace_dir: &Path) -> Result<()> {
-    if workspace_dir.exists() {
-        fs::remove_dir_all(workspace_dir)?;
-    }
-    ensure_dir(workspace_dir)?;
-    copy_dir_filtered(snapshot_dir, workspace_dir, &[])?;
-    Ok(())
-}
-
 fn resolve_chain_label(task_payload: &Value, task_id: &str, state_policy: StatePolicy) -> String {
     let explicit = task_payload
         .get("chain_id")
@@ -2052,17 +2546,6 @@ fn resolve_chain_label(task_payload: &Value, task_id: &str, state_policy: StateP
         StatePolicy::Accumulate => "global".to_string(),
         StatePolicy::IsolatePerTrial => task_id.to_string(),
     }
-}
-
-fn chain_root_workspace_dir_name(trial_id: &str) -> String {
-    format!("chain_root_workspace_{}", sanitize_for_fs(trial_id))
-}
-
-fn rel_to_run_dir(path: &Path, run_dir: &Path) -> String {
-    path.strip_prefix(run_dir)
-        .unwrap_or(path)
-        .to_string_lossy()
-        .to_string()
 }
 
 fn resolve_trial_timeout_ms(input: &Value) -> Option<u64> {
@@ -2081,6 +2564,7 @@ fn build_runtime_contract_env(
     run_id: &str,
     input: &Value,
     io: &PreparedTrialIo,
+    task_image: Option<&str>,
     timeout_ms: Option<u64>,
 ) -> BTreeMap<String, String> {
     let trial_id = input
@@ -2095,13 +2579,6 @@ fn build_runtime_contract_env(
         .pointer("/ids/task_id")
         .and_then(|v| v.as_str())
         .unwrap_or("");
-    let task_image = input
-        .pointer("/ext/task_spec_v1/environment/image")
-        .or_else(|| input.pointer("/environment/image"))
-        .and_then(|v| v.as_str())
-        .map(str::trim)
-        .filter(|v| !v.is_empty())
-        .map(ToString::to_string);
     let repl_idx = input
         .pointer("/ids/repl_idx")
         .and_then(|v| v.as_u64())
@@ -2127,8 +2604,8 @@ fn build_runtime_contract_env(
     env.insert(AGENTLAB_ENV_TRIAL_ID.to_string(), trial_id.to_string());
     env.insert(AGENTLAB_ENV_VARIANT_ID.to_string(), variant_id.to_string());
     env.insert(AGENTLAB_ENV_TASK_ID.to_string(), task_id.to_string());
-    if let Some(task_image) = task_image {
-        env.insert(AGENTLAB_ENV_TASK_IMAGE.to_string(), task_image);
+    if let Some(task_image) = task_image.map(str::trim).filter(|v| !v.is_empty()) {
+        env.insert(AGENTLAB_ENV_TASK_IMAGE.to_string(), task_image.to_string());
     }
     env.insert(
         AGENTLAB_ENV_BENCHMARK_PREDICTION_PATH.to_string(),
@@ -2143,30 +2620,6 @@ fn build_runtime_contract_env(
         env.insert(AGENTLAB_ENV_TIMEOUT_MS.to_string(), timeout_ms.to_string());
     }
     env
-}
-
-fn apply_agentlab_template(raw: &str, env: &BTreeMap<String, String>) -> String {
-    let mut rendered = raw.to_string();
-    for (key, value) in env {
-        if !key.starts_with("AGENTLAB_") && key != "WORKSPACE" {
-            continue;
-        }
-        let needle = format!("${{{}}}", key);
-        if rendered.contains(&needle) {
-            rendered = rendered.replace(&needle, value);
-        }
-    }
-    rendered
-}
-
-fn apply_agentlab_template_to_command(
-    command: &[String],
-    env: &BTreeMap<String, String>,
-) -> Vec<String> {
-    command
-        .iter()
-        .map(|part| apply_agentlab_template(part, env))
-        .collect::<Vec<_>>()
 }
 
 fn command_contract_capabilities() -> AgentAdapterCapabilities {
@@ -2462,7 +2915,7 @@ fn resolve_task_sandbox_image(request: &AdapterRunRequest<'_>) -> Result<String>
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(ToString::to_string)
-        .ok_or_else(|| anyhow!("task_spec_v1.environment.image is required for task sandbox"))
+        .ok_or_else(|| anyhow!("task environment.image is required for task sandbox"))
 }
 
 fn resolve_container_workspace<'a>(request: &'a AdapterRunRequest<'_>) -> Option<&'a str> {
@@ -2599,10 +3052,7 @@ fn append_container_sandbox_args(
     if matches!(plane, ContainerPlane::AgentRuntime) {
         if let Some(bundle) = request.agent_artifact {
             if let Ok(bundle_root) = resolve_agent_artifact_mount_dir(bundle) {
-                cmd.args([
-                    "-v",
-                    &format!("{}:/opt/agent:ro", bundle_root.display()),
-                ]);
+                cmd.args(["-v", &format!("{}:/opt/agent:ro", bundle_root.display())]);
             }
         }
     }
@@ -2722,18 +3172,6 @@ fn build_baked_container_command(
     cmd.arg(image);
     append_container_entrypoint(&mut cmd, request, command, grader_command);
     cmd
-}
-
-struct ContainerCleanupGuard {
-    container_id: String,
-}
-
-impl Drop for ContainerCleanupGuard {
-    fn drop(&mut self) {
-        let _ = Command::new("docker")
-            .args(["rm", "-f", &self.container_id])
-            .output();
-    }
 }
 
 fn run_checked_command(mut cmd: Command, step: &str) -> Result<std::process::Output> {
@@ -2862,7 +3300,9 @@ fn resolve_container_image_digest(image: &str) -> Option<String> {
     if !id_output.status.success() {
         return None;
     }
-    let raw = String::from_utf8_lossy(&id_output.stdout).trim().to_string();
+    let raw = String::from_utf8_lossy(&id_output.stdout)
+        .trim()
+        .to_string();
     if raw.starts_with("sha256:") {
         Some(raw)
     } else {
@@ -3050,7 +3490,7 @@ fn select_preflight_probe_task(
 ) -> Result<(usize, TaskBoundaryMaterialization)> {
     let mut parse_errors = Vec::new();
     for (idx, task) in tasks.iter().enumerate() {
-        let boundary = match parse_task_boundary_from_dataset_task(task) {
+        let boundary = match parse_task_boundary_from_packaged_task(task) {
             Ok(boundary) => boundary,
             Err(err) => {
                 parse_errors.push(format!("line {}: {}", idx + 1, err));
@@ -3084,23 +3524,20 @@ fn build_preflight_probe_context(
     let probe_root = create_preflight_probe_root(&format!("{}_{}", variant.id, image))?;
     let trial_dir = probe_root.path.join("trial_1");
     ensure_dir(&trial_dir)?;
-    let trial_paths = TrialPaths::new(&trial_dir, project_root)?;
-    trial_paths.prepare(false)?;
-    materialize_task_dependencies_for_trial(&task_boundary, &trial_paths)?;
-    materialize_workspace_base(project_root, &trial_paths, &task_boundary.workspace.base)?;
-    materialize_workspace_overlays(&trial_paths, &task_boundary.workspace.overlays)?;
-    stage_workspace_inputs_for_trial(&task_boundary, &trial_paths)?;
-    let dynamic_mounts =
-        resolve_workspace_aux_mounts(project_root, &task_boundary.workspace.aux_mounts)?;
-    let mut input = build_agent_task(
-        &runtime_profile.experiment,
+    let prepared = prepare_task_environment(
+        project_root,
+        &trial_dir,
         "preflight_probe",
         "trial_preflight",
+        &runtime_profile.experiment,
         variant,
         task_idx,
         0,
         &task_boundary,
-    );
+        &runtime_profile.agent_runtime,
+        None,
+    )?;
+    let mut input = prepared.trial_input.clone();
     set_json_pointer_value(
         &mut input,
         "/runtime/control_plane/path",
@@ -3108,18 +3545,22 @@ fn build_preflight_probe_context(
     )?;
     set_json_pointer_value(&mut input, "/runtime/control_plane/mode", json!("file"))?;
     let input_bytes = serde_json::to_vec_pretty(&input)?;
-    let io_paths = prepare_io_paths(&trial_paths, &input_bytes)?;
-    let smoke_timeout_ms =
-        resolve_trial_timeout_ms(&input)
-            .map(|value| value.min(DEFAULT_PREFLIGHT_CONTRACT_SMOKE_TIMEOUT_MS));
-    let mut runtime_env =
-        build_runtime_contract_env("preflight_probe", &input, &io_paths, smoke_timeout_ms);
+    let io_paths = prepare_io_paths(&prepared.trial_paths, &input_bytes)?;
+    let smoke_timeout_ms = resolve_trial_timeout_ms(&input)
+        .map(|value| value.min(DEFAULT_PREFLIGHT_CONTRACT_SMOKE_TIMEOUT_MS));
+    let mut runtime_env = build_runtime_contract_env(
+        "preflight_probe",
+        &input,
+        &io_paths,
+        Some(task_boundary.task_image.as_str()),
+        smoke_timeout_ms,
+    );
     runtime_env.insert(AGENTLAB_ENV_PREFLIGHT_SMOKE.to_string(), "1".to_string());
     Ok(PreflightProbeContext {
         _root: probe_root,
-        trial_paths,
+        trial_paths: prepared.trial_paths,
         io_paths,
-        dynamic_mounts,
+        dynamic_mounts: prepared.dynamic_mounts,
         runtime_env,
         task_image: Some(task_boundary.task_image),
     })
@@ -3187,6 +3628,10 @@ fn detect_known_probe_output_blockers(stdout: &str, stderr: &str) -> Vec<String>
         }
         let lower = trimmed.to_ascii_lowercase();
         if lower.contains("cpu lacks avx support") {
+            blockers.push(trimmed.to_string());
+            continue;
+        }
+        if lower.contains("missing env var ") || lower.contains("fatal error: missing env var") {
             blockers.push(trimmed.to_string());
             continue;
         }
@@ -3361,9 +3806,6 @@ fn collect_preflight_contract_smoke_failures(
     if request.benchmark_grading_enabled {
         let benchmark_failures =
             validate_preflight_benchmark_smoke_outputs(request, &execution.status);
-        if !benchmark_failures.is_empty() {
-            contract_failed = true;
-        }
         failures.extend(benchmark_failures);
     }
     let mut seen = HashSet::new();
@@ -3373,30 +3815,14 @@ fn collect_preflight_contract_smoke_failures(
         .collect()
 }
 
-fn resolve_agent_runtime_command(command: &[String]) -> Vec<String> {
-    command.to_vec()
+fn resolve_agent_runtime_command(
+    command: &[String],
+    bindings: &Value,
+    runtime_env_inputs: &BTreeMap<String, String>,
+) -> Result<Vec<String>> {
+    resolve_command_templates(command, bindings, runtime_env_inputs)
 }
 
-fn resolve_command_script_path(command: &[String], project_root: &Path) -> Option<PathBuf> {
-    if command.is_empty() {
-        return None;
-    }
-    let candidate_idx = if command_part_looks_like_path(&command[0]) {
-        0
-    } else if command.len() >= 2 && command_part_looks_like_path(&command[1]) {
-        1
-    } else {
-        return None;
-    };
-    let candidate = Path::new(&command[candidate_idx]);
-    if candidate.is_absolute() {
-        return Some(normalize_path(candidate));
-    }
-    if candidate.as_os_str().is_empty() {
-        return None;
-    }
-    Some(normalize_path(&project_root.join(candidate)))
-}
 fn validate_agent_runtime_command(command: &[String], _project_root: &Path) -> Result<()> {
     if command.is_empty() {
         return Err(anyhow!("runtime.agent_runtime.command must not be empty"));
@@ -3768,7 +4194,10 @@ fn materialize_trial_runtime_layout(
             copy_dir_preserve_contents(&paths.deps, &trial_dir.join("deps"))?;
             copy_dir_preserve_contents(&paths.workspace, &trial_dir.join("workspace"))?;
             copy_dir_preserve_contents(&paths.tmp, &trial_dir.join("tmp"))?;
-            copy_file_if_exists(&paths.runtime.trial_input, &trial_dir.join("trial_input.json"))?;
+            copy_file_if_exists(
+                &paths.runtime.trial_input,
+                &trial_dir.join("trial_input.json"),
+            )?;
             copy_file_if_exists(
                 &paths.out.join("harness_manifest.json"),
                 &trial_dir.join("harness_manifest.json"),
@@ -3840,7 +4269,7 @@ fn write_state_inventory(
     trial_dir: &Path,
     json_value: &Value,
     agent_runtime: &AgentRuntimeConfig,
-    paths: &TrialPaths,
+    _paths: &TrialPaths,
     exec_digest: &str,
     effective_network_mode: &str,
     invocation_source: &str,
@@ -3964,12 +4393,73 @@ fn write_state_inventory(
 
 fn remove_path_if_exists(path: &Path) -> Result<()> {
     match fs::symlink_metadata(path) {
-        Ok(meta) if meta.file_type().is_symlink() || meta.is_file() => fs::remove_file(path)?,
-        Ok(meta) if meta.is_dir() => fs::remove_dir_all(path)?,
-        Ok(_) => fs::remove_file(path)?,
+        Ok(meta) if meta.file_type().is_symlink() || meta.is_file() => {
+            make_path_tree_writable(path)?;
+            fs::remove_file(path)?
+        }
+        Ok(meta) if meta.is_dir() => {
+            make_path_tree_writable(path)?;
+            fs::remove_dir_all(path)?
+        }
+        Ok(_) => {
+            make_path_tree_writable(path)?;
+            fs::remove_file(path)?
+        }
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
         Err(err) => return Err(err.into()),
     }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn make_path_tree_writable(path: &Path) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let meta = match fs::symlink_metadata(path) {
+        Ok(meta) => meta,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(err.into()),
+    };
+    if meta.file_type().is_symlink() {
+        return Ok(());
+    }
+
+    if meta.is_dir() {
+        for entry in walkdir::WalkDir::new(path)
+            .follow_links(false)
+            .contents_first(true)
+        {
+            let entry = entry?;
+            if entry.file_type().is_symlink() {
+                continue;
+            }
+            let entry_path = entry.path();
+            let metadata = fs::metadata(entry_path)?;
+            let mut perms = metadata.permissions();
+            let desired_mode = if entry.file_type().is_dir() {
+                perms.mode() | 0o700
+            } else {
+                perms.mode() | 0o600
+            };
+            if perms.mode() != desired_mode {
+                perms.set_mode(desired_mode);
+                fs::set_permissions(entry_path, perms)?;
+            }
+        }
+        return Ok(());
+    }
+
+    let mut perms = meta.permissions();
+    let desired_mode = perms.mode() | 0o600;
+    if perms.mode() != desired_mode {
+        perms.set_mode(desired_mode);
+        fs::set_permissions(path, perms)?;
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn make_path_tree_writable(_path: &Path) -> Result<()> {
     Ok(())
 }
 
@@ -4170,7 +4660,12 @@ fn binding_value_to_text(value: &Value) -> String {
     }
 }
 
-fn copy_dir_filtered(src: &Path, dst: &Path, exclude: &[&str]) -> Result<()> {
+fn copy_dir_with_policy(
+    src: &Path,
+    dst: &Path,
+    exclude: &[&str],
+    respect_workspace_evidence_exclusions: bool,
+) -> Result<()> {
     let walker = walkdir::WalkDir::new(src).into_iter().filter_entry(|e| {
         let rel = e.path().strip_prefix(src).unwrap_or(e.path());
         if rel.as_os_str().is_empty() {
@@ -4179,7 +4674,7 @@ fn copy_dir_filtered(src: &Path, dst: &Path, exclude: &[&str]) -> Result<()> {
         if exclude.iter().any(|ex| rel.starts_with(ex)) {
             return false;
         }
-        if is_workspace_evidence_excluded(rel) {
+        if respect_workspace_evidence_exclusions && is_workspace_evidence_excluded(rel) {
             return false;
         }
         true
@@ -4214,6 +4709,14 @@ fn copy_dir_filtered(src: &Path, dst: &Path, exclude: &[&str]) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn copy_dir_filtered(src: &Path, dst: &Path, exclude: &[&str]) -> Result<()> {
+    copy_dir_with_policy(src, dst, exclude, true)
+}
+
+fn copy_dir_preserve_all(src: &Path, dst: &Path, exclude: &[&str]) -> Result<()> {
+    copy_dir_with_policy(src, dst, exclude, false)
 }
 
 fn command_part_looks_like_path(part: &str) -> bool {

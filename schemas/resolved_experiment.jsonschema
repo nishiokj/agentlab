@@ -1,12 +1,11 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "https://agent-lab.local/schemas/resolved_experiment_v0_6.json",
-  "title": "Resolved Experiment v0.6",
+  "$id": "https://agent-lab.local/schemas/resolved_experiment.json",
+  "title": "Resolved Experiment",
   "type": "object",
   "additionalProperties": true,
-  "required": ["version", "experiment", "dataset", "design", "baseline", "runtime", "policy"],
+  "required": ["experiment", "dataset", "design", "baseline", "runtime", "policy"],
   "properties": {
-    "version": { "const": "0.6" },
     "experiment": {
       "type": "object",
       "additionalProperties": true,
@@ -22,12 +21,11 @@
     "dataset": {
       "type": "object",
       "additionalProperties": true,
-      "required": ["path", "provider", "suite_id", "schema_version", "split_id"],
+      "required": ["path", "provider", "suite_id", "split_id"],
       "properties": {
         "path": { "type": "string", "minLength": 1 },
         "provider": { "type": "string", "minLength": 1 },
         "suite_id": { "type": "string", "minLength": 1 },
-        "schema_version": { "const": "task_spec_v1" },
         "split_id": { "type": "string", "minLength": 1 },
         "limit": { "type": "integer", "minimum": 1 }
       }
@@ -168,22 +166,6 @@
             "env": {
               "type": "object",
               "additionalProperties": { "type": "string" }
-            },
-            "env_from_host": {
-              "type": "array",
-              "items": { "type": "string", "minLength": 1 }
-            },
-            "binding_args": {
-              "type": "array",
-              "items": {
-                "type": "object",
-                "additionalProperties": false,
-                "required": ["key", "flag"],
-                "properties": {
-                  "key": { "type": "string", "minLength": 1 },
-                  "flag": { "type": "string", "minLength": 1 }
-                }
-              }
             }
           }
         },

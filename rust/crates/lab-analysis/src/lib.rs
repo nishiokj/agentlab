@@ -37,8 +37,6 @@ const SCHEDULE_PROGRESS_FILE: &str = "schedule_progress.json";
 
 #[cfg(feature = "duckdb_engine")]
 const ANALYSIS_DB_FILE: &str = "agentlab.duckdb";
-#[cfg(feature = "duckdb_engine")]
-const LOAD_SQL_FILE: &str = "load_duckdb.sql";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ViewSet {
@@ -95,8 +93,6 @@ struct RunAnalysisContext {
     run_id: String,
     #[cfg(feature = "duckdb_engine")]
     run_dir: PathBuf,
-    #[cfg(feature = "duckdb_engine")]
-    analysis_dir: PathBuf,
     #[cfg(feature = "duckdb_engine")]
     facts_dir: PathBuf,
     #[cfg(feature = "duckdb_engine")]
@@ -264,8 +260,6 @@ fn load_run_context(run_dir: &Path) -> Result<RunAnalysisContext> {
     let canonical = run_dir
         .canonicalize()
         .map_err(|_| anyhow!("run directory not found: {}", run_dir.display()))?;
-    #[cfg(feature = "duckdb_engine")]
-    let analysis_dir = canonical.join("analysis");
     let facts_dir = canonical.join(FACTS_DIR);
     #[cfg(feature = "duckdb_engine")]
     let sqlite_path = canonical.join("run.sqlite");
@@ -295,8 +289,6 @@ fn load_run_context(run_dir: &Path) -> Result<RunAnalysisContext> {
             .to_string(),
         #[cfg(feature = "duckdb_engine")]
         run_dir: canonical,
-        #[cfg(feature = "duckdb_engine")]
-        analysis_dir,
         #[cfg(feature = "duckdb_engine")]
         facts_dir,
         #[cfg(feature = "duckdb_engine")]
@@ -416,36 +408,6 @@ fn load_view_bundle_sql(view_set: ViewSet) -> Result<Option<String>> {
         .contents_utf8()
         .ok_or_else(|| anyhow!("view bundle is not valid UTF-8: {}", file_name))?;
     Ok(Some(content.to_string()))
-}
-
-#[cfg(feature = "duckdb_engine")]
-fn build_load_sql_relative(context: &RunAnalysisContext, bundle_sql: Option<&str>) -> String {
-    let mut sql = String::from(
-        "-- Run from analysis directory:
--- duckdb .lab/runs/<run_id>/analysis/agentlab.duckdb < load_duckdb.sql
-
-LOAD json;
-",
-    );
-    sql.push_str(&build_fact_views_sql(
-        &sql_literal("../facts/trials.jsonl"),
-        &sql_literal("../facts/metrics_long.jsonl"),
-        &sql_literal("../facts/events.jsonl"),
-        &sql_literal("../facts/variant_snapshots.jsonl"),
-        &sql_literal("../runtime/slot_commit_journal.jsonl"),
-        &sql_literal("../runtime/schedule_progress.json"),
-    ));
-    let metadata_sql = build_metadata_view_sql(context);
-    sql.push_str(&metadata_sql);
-    sql.push('\n');
-    if let Some(bundle) = bundle_sql {
-        sql.push_str("-- Opinionated view bundle\n");
-        sql.push_str(bundle);
-        if !bundle.ends_with('\n') {
-            sql.push('\n');
-        }
-    }
-    sql
 }
 
 #[cfg(feature = "duckdb_engine")]
@@ -902,7 +864,6 @@ fn prepare_sqlite_compat_context(
         RunAnalysisContext {
             run_id: context.run_id.clone(),
             run_dir: root.clone(),
-            analysis_dir: root.join("analysis"),
             facts_dir,
             sqlite_path: context.sqlite_path.clone(),
             comparison_policy: context.comparison_policy.clone(),

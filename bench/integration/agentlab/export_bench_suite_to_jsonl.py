@@ -1,8 +1,9 @@
 #!/usr/bin/env python3
-"""Export bench task bundles as strict AgentLab task_boundary_v3 JSONL.
+"""Export bench task bundles as the current AgentLab task JSONL.
 
-Hard cut:
-- task boundaries emit `environment.image`
+Single-head contract:
+- tasks are unversioned
+- task rows emit `environment.image`
 - workspace state emits `workspace.{mode,base,overlays,aux_mounts}`
 - sandbox topology remains runner-owned
 """
@@ -24,7 +25,6 @@ import yaml
 DEFAULT_SUITE = "v0"
 DEFAULT_SPLIT = "test"
 DEFAULT_BENCHMARK_NAME = "bench"
-TASK_BOUNDARY_SCHEMA_VERSION = "task_boundary_v3"
 PACK_FORMAT_VERSION = "bench_workspace_base_pack_v1"
 DEFAULT_DATASET_PACK_ROOT = ".lab/dataset_packs/sha256"
 
@@ -374,6 +374,22 @@ def _build_task_row(
         },
     }
 
+    baseline_injection_patch = task_yaml.get("baseline_injection_patch")
+    if isinstance(baseline_injection_patch, str) and baseline_injection_patch.strip():
+        task_payload["baseline_injection_patch"] = baseline_injection_patch.strip()
+
+    time_limits = task_yaml.get("time_limits")
+    if isinstance(time_limits, dict):
+        task_payload["time_limits"] = time_limits
+
+    determinism_env = task_yaml.get("determinism_env")
+    if isinstance(determinism_env, dict):
+        task_payload["determinism_env"] = determinism_env
+
+    patch_policy = task_yaml.get("patch_policy")
+    if isinstance(patch_policy, dict):
+        task_payload["patch_policy"] = patch_policy
+
     public_command = task_yaml.get("public_command")
     if isinstance(public_command, str) and public_command.strip():
         task_payload["public_command"] = public_command.strip()
@@ -383,7 +399,6 @@ def _build_task_row(
         task_payload["hidden_command"] = hidden_command.strip()
 
     row: dict[str, Any] = {
-        "schema_version": TASK_BOUNDARY_SCHEMA_VERSION,
         "task": task_payload,
         "environment": {
             "image": task_image,
@@ -397,6 +412,7 @@ def _build_task_row(
             "overlays": _workspace_overlay_files(task_dir),
             "aux_mounts": [],
         },
+        "dependencies": {},
         "limits": {},
     }
     return row
@@ -433,7 +449,7 @@ def main() -> int:
     parser.add_argument(
         "--output",
         default=None,
-        help="Output JSONL path (default: data/bench_<suite>.task_boundary_v3.jsonl)",
+        help="Output JSONL path (default: data/bench_<suite>.task_spec.jsonl)",
     )
     parser.add_argument(
         "--image",
@@ -482,7 +498,6 @@ def main() -> int:
     if not suite_dir.exists():
         raise FileNotFoundError(f"suite directory not found: {suite_dir}")
 
-    schema_tag = TASK_BOUNDARY_SCHEMA_VERSION
     default_task_image = _candidate_string(args.default_task_image) or _candidate_string(args.image)
 
     if args.output:
@@ -490,7 +505,7 @@ def main() -> int:
         if not out_path.is_absolute():
             out_path = root / out_path
     else:
-        out_path = root / "data" / f"bench_{args.suite}.{schema_tag}.jsonl"
+        out_path = root / "data" / f"bench_{args.suite}.task_spec.jsonl"
 
     task_dirs = _iter_task_dirs(suite_dir)
     if args.limit and args.limit > 0:
@@ -524,7 +539,6 @@ def main() -> int:
                 "split": args.split,
                 "benchmark_name": args.benchmark_name,
                 "adapter_id": args.adapter_id,
-                "schema_version": schema_tag,
                 "default_task_image": default_task_image,
                 "dataset_pack_root": str(_dataset_pack_root(root, args.dataset_pack_root)),
                 "require_task_image": args.require_task_image,

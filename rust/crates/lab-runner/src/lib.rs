@@ -1,6 +1,12 @@
 mod types;
 pub use types::*;
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// Global flag set by the ctrlc handler to request graceful shutdown.
+/// Checked by the schedule engine between trials.
+pub static INTERRUPTED: AtomicBool = AtomicBool::new(false);
+
 mod config;
 pub use config::validate_knob_overrides;
 use config::*;

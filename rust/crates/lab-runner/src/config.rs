@@ -105,30 +105,6 @@ pub(crate) fn load_json_file(path: &Path) -> Result<Value> {
 }
 
 // ---------------------------------------------------------------------------
-// Experiment version helpers
-// ---------------------------------------------------------------------------
-
-pub(crate) fn experiment_version_string(json_value: &Value) -> Option<String> {
-    match json_value.pointer("/version") {
-        Some(Value::String(raw)) => Some(raw.trim().to_string()),
-        Some(Value::Number(raw)) => Some(raw.to_string()),
-        _ => None,
-    }
-}
-
-pub(crate) fn reject_legacy_experiment_version(json_value: &Value) -> Result<()> {
-    let version = experiment_version_string(json_value)
-        .ok_or_else(|| anyhow!("missing /version; resolved experiments must use version '0.6'"))?;
-    if version == "0.6" {
-        return Ok(());
-    }
-    Err(anyhow!(
-        "unsupported resolved experiment version '{}' ; rebuild the package with version '0.6' task_spec_v1 + runtime.agent_runtime + policy.task_sandbox",
-        version
-    ))
-}
-
-// ---------------------------------------------------------------------------
 // Experiment field helpers
 // ---------------------------------------------------------------------------
 
@@ -141,7 +117,6 @@ pub(crate) fn experiment_workload_type(json_value: &Value) -> Result<String> {
     {
         return Ok(value.to_string());
     }
-    reject_legacy_experiment_version(json_value)?;
     Err(anyhow!("missing /experiment/workload_type"))
 }
 
@@ -165,8 +140,32 @@ pub(crate) fn experiment_max_concurrency(json_value: &Value) -> usize {
 // ---------------------------------------------------------------------------
 
 pub(crate) fn validate_required_fields(json_value: &Value) -> Result<()> {
-    reject_legacy_experiment_version(json_value)?;
-
+    if json_value
+        .pointer("/version")
+        .and_then(|value| value.as_str())
+        .is_some_and(|value| value.trim() == "1.0")
+    {
+        return Err(anyhow!("legacy experiment version '1.0' is not supported"));
+    }
+    for pointer in [
+        "/runtime/agent",
+        "/runtime/sandbox",
+        "/runtime/policy",
+        "/runtime/agent_runtime/io",
+        "/runtime/agent_runtime/workspace_patches",
+        "/runtime/agent_runtime/launch",
+        "/runtime/agent_runtime/env_from_host",
+        "/runtime/agent_runtime/binding_args",
+        "/runtime/agent_runtime/support_files",
+        "/runtime/agent_runtime/secret_env",
+    ] {
+        if json_value.pointer(pointer).is_some() {
+            return Err(anyhow!(
+                "{} was removed in the hard cutover; use runtime.agent_runtime plus policy.task_sandbox only",
+                pointer
+            ));
+        }
+    }
     let required: &[&str] = &[
         "/experiment/workload_type",
         "/design/sanitization_profile",
@@ -184,8 +183,7 @@ pub(crate) fn validate_required_fields(json_value: &Value) -> Result<()> {
             Some(Value::String(s)) => s.is_empty(),
             Some(Value::Number(n)) => {
                 n.as_u64() == Some(0)
-                    && (*pointer == "/design/replications"
-                        || *pointer == "/policy/timeout_ms")
+                    && (*pointer == "/design/replications" || *pointer == "/policy/timeout_ms")
             }
             _ => false,
         };
@@ -225,47 +223,6 @@ pub(crate) fn validate_required_fields(json_value: &Value) -> Result<()> {
     if image.is_empty() {
         missing.push("/runtime/agent_runtime/image");
     }
-
-    let mut invalid = Vec::new();
-    if json_value.pointer("/runtime/agent").is_some() {
-        invalid.push("/runtime/agent (removed; use runtime.agent_runtime)");
-    }
-    if json_value.pointer("/runtime/sandbox").is_some() {
-        invalid.push("/runtime/sandbox (removed; use policy.task_sandbox)");
-    }
-    if json_value.pointer("/runtime/dependencies").is_some() {
-        invalid.push("/runtime/dependencies (removed; task dependencies are task-owned)");
-    }
-    if json_value.pointer("/runtime/agent_runtime/io").is_some() {
-        invalid.push("/runtime/agent_runtime/io (removed; contract env is the ABI)");
-    }
-    if json_value.pointer("/runtime/agent_runtime/launch_mode").is_some() {
-        invalid.push("/runtime/agent_runtime/launch_mode (removed)");
-    }
-    if json_value
-        .pointer("/runtime/agent_runtime/workspace_patches")
-        .is_some()
-    {
-        invalid.push("/runtime/agent_runtime/workspace_patches (removed; workspace seed is task-owned)");
-    }
-    if json_value.pointer("/runtime/agent_runtime/execution").is_some() {
-        invalid.push("/runtime/agent_runtime/execution (removed; execution shape is fixed)");
-    }
-    if json_value.pointer("/runtime/sandbox/image_source").is_some() {
-        invalid.push("/runtime/sandbox/image_source (removed; task sandbox image comes from task_spec_v1 environment.image)");
-    }
-    if json_value.pointer("/runtime/sandbox/image").is_some() {
-        invalid.push("/runtime/sandbox/image (removed; task sandbox image comes from task_spec_v1 environment.image)");
-    }
-    if json_value.pointer("/policy/network").is_some() {
-        invalid.push("/policy/network (removed; use policy.task_sandbox.network)");
-    }
-    if json_value
-        .pointer("/design/policies/task_boundary/require_workspace_materialization")
-        .is_some()
-    {
-        invalid.push("/design/policies/task_boundary/require_workspace_materialization (removed)");
-    }
     let sandbox_profile = json_value
         .pointer("/policy/task_sandbox/profile")
         .and_then(|v| v.as_str())
@@ -283,9 +240,6 @@ pub(crate) fn validate_required_fields(json_value: &Value) -> Result<()> {
         missing.push("/policy/task_sandbox/network");
     }
     if json_value.pointer("/benchmark").is_some() {
-        if json_value.pointer("/benchmark/adapter").is_some() {
-            invalid.push("/benchmark/adapter (removed; use benchmark.grader)");
-        }
         let has_grader_command = match json_value.pointer("/benchmark/grader/command") {
             Some(Value::Array(parts)) if !parts.is_empty() => parts
                 .iter()
@@ -296,14 +250,13 @@ pub(crate) fn validate_required_fields(json_value: &Value) -> Result<()> {
             missing.push("/benchmark/grader/command");
         }
     }
-    if missing.is_empty() && invalid.is_empty() {
+    if missing.is_empty() {
         Ok(())
     } else {
-        let mut lines = missing
+        let lines = missing
             .iter()
             .map(|p| format!("  - {}", p))
             .collect::<Vec<_>>();
-        lines.extend(invalid.iter().map(|p| format!("  - {}", p)));
         Err(anyhow!(
             "experiment.yaml missing required fields:\n{}",
             lines.join("\n")
@@ -565,7 +518,6 @@ pub(crate) fn load_sealed_package_for_run(path: &Path) -> Result<LoadedExperimen
     };
     let manifest = load_json_file(&manifest_path)?;
     let json_value = verify_sealed_package_integrity(&exp_dir, &manifest)?;
-    reject_legacy_experiment_version(&json_value)?;
     let project_root = find_project_root(&exp_dir)
         .canonicalize()
         .unwrap_or_else(|_| find_project_root(&exp_dir));
@@ -1083,9 +1035,14 @@ pub(crate) fn resolved_variant_behavior_surface(
     experiment: &Value,
     variant: &Variant,
 ) -> Result<Value> {
-    let mut runtime = experiment.pointer("/runtime").cloned().unwrap_or_else(|| json!({}));
+    let mut runtime = experiment
+        .pointer("/runtime")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
     if !runtime.is_object() {
-        return Err(anyhow!("invalid /runtime in resolved experiment: expected object"));
+        return Err(anyhow!(
+            "invalid /runtime in resolved experiment: expected object"
+        ));
     }
     if let Some(runtime_overrides) = variant.runtime_overrides.as_ref() {
         if !runtime_overrides.is_object() {
@@ -1114,7 +1071,10 @@ pub(crate) fn resolved_variant_behavior_digest(
     )?))
 }
 
-fn resolved_variant_manifest_entry(experiment: &Value, variant: &Variant) -> Result<ResolvedVariant> {
+fn resolved_variant_manifest_entry(
+    experiment: &Value,
+    variant: &Variant,
+) -> Result<ResolvedVariant> {
     Ok(ResolvedVariant {
         variant_digest: resolved_variant_behavior_digest(experiment, variant)?,
         variant: variant.clone(),
@@ -1122,29 +1082,17 @@ fn resolved_variant_manifest_entry(experiment: &Value, variant: &Variant) -> Res
 }
 
 pub(crate) fn resolve_variant_plan(json_value: &Value) -> Result<(Vec<Variant>, String)> {
-    reject_legacy_experiment_version(json_value)?;
-    if !matches!(json_value.pointer("/variants"), None | Some(Value::Null)) {
-        return Err(anyhow!(
-            "legacy alias '/variants' is not allowed; use '/variant_plan'"
-        ));
-    }
-    if !matches!(
-        json_value.pointer("/baseline/config"),
-        None | Some(Value::Null)
-    ) {
-        return Err(anyhow!(
-            "legacy alias '/baseline/config' is not allowed; use '/baseline/bindings'"
-        ));
-    }
     let baseline = json_value
         .pointer("/baseline/variant_id")
+        .or_else(|| json_value.pointer("/baseline/id"))
         .and_then(|v| v.as_str())
-        .ok_or_else(|| anyhow!("missing /baseline/variant_id"))?
+        .ok_or_else(|| anyhow!("missing /baseline/variant_id or /baseline/id"))?
         .to_string();
 
     let mut variants = Vec::new();
     let baseline_bindings = json_value
         .pointer("/baseline/bindings")
+        .or_else(|| json_value.pointer("/baseline/config"))
         .cloned()
         .unwrap_or(json!({}));
     if !baseline_bindings.is_object() {
@@ -1171,48 +1119,60 @@ pub(crate) fn resolve_variant_plan(json_value: &Value) -> Result<(Vec<Variant>, 
         runtime_overrides: baseline_runtime_overrides,
     });
 
-    let variant_list: &[Value] = match json_value.pointer("/variant_plan") {
-        Some(value) => value
-            .as_array()
-            .map(|v| v.as_slice())
-            .ok_or_else(|| anyhow!("/variant_plan must be an array of variant objects"))?,
-        None => &[],
-    };
+    let (variant_list, variant_path): (&[Value], &str) =
+        if let Some(value) = json_value.pointer("/variant_plan") {
+            (
+                value
+                    .as_array()
+                    .map(|v| v.as_slice())
+                    .ok_or_else(|| anyhow!("/variant_plan must be an array of variant objects"))?,
+                "/variant_plan",
+            )
+        } else if let Some(value) = json_value.pointer("/variants") {
+            (
+                value
+                    .as_array()
+                    .map(|v| v.as_slice())
+                    .ok_or_else(|| anyhow!("/variants must be an array of variant objects"))?,
+                "/variants",
+            )
+        } else {
+            (&[], "/variant_plan")
+        };
     for (idx, item) in variant_list.iter().enumerate() {
-        if !matches!(item.get("id"), None | Some(Value::Null)) {
-            return Err(anyhow!(
-                "legacy alias '/variant_plan[{}].id' is not allowed; use '.variant_id'",
-                idx
-            ));
-        }
-        if !matches!(item.get("config"), None | Some(Value::Null)) {
-            return Err(anyhow!(
-                "legacy alias '/variant_plan[{}].config' is not allowed; use '.bindings'",
-                idx
-            ));
-        }
         let id = item
             .get("variant_id")
+            .or_else(|| item.get("id"))
             .and_then(|v| v.as_str())
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .ok_or_else(|| {
                 anyhow!(
-                    "/variant_plan[{}] must include non-empty string variant_id",
+                    "{}[{}] must include non-empty string variant_id",
+                    variant_path,
                     idx
                 )
             })?
             .to_string();
-        let bindings = item.get("bindings").cloned().unwrap_or(json!({}));
+        let bindings = item
+            .get("bindings")
+            .or_else(|| item.get("config"))
+            .cloned()
+            .unwrap_or(json!({}));
         if !bindings.is_object() {
-            return Err(anyhow!("/variant_plan[{}].bindings must be an object", idx));
+            return Err(anyhow!(
+                "{}[{}].bindings must be an object",
+                variant_path,
+                idx
+            ));
         }
         let mut runtime_overrides = match item.get("runtime_overrides") {
             None | Some(Value::Null) => None,
             Some(Value::Object(_)) => item.get("runtime_overrides").cloned(),
             Some(_) => {
                 return Err(anyhow!(
-                    "/variant_plan[{}].runtime_overrides must be an object",
+                    "{}[{}].runtime_overrides must be an object",
+                    variant_path,
                     idx
                 ))
             }
@@ -1383,7 +1343,6 @@ pub(crate) fn set_json_pointer_value(
 // ---------------------------------------------------------------------------
 
 pub(crate) fn resolve_runtime_for_variant(experiment: &Value, variant: &Variant) -> Result<Value> {
-    reject_legacy_experiment_version(experiment)?;
     let mut resolved = experiment.clone();
     let Some(runtime_overrides) = variant.runtime_overrides.as_ref() else {
         return Ok(resolved);
@@ -1583,6 +1542,56 @@ pub(crate) fn resolve_dataset_path_in_package(
     resolve_package_path_under_root(package_dir, rel, "dataset.path")
 }
 
+pub(crate) fn load_task_specs_for_build(
+    path: &Path,
+    json_value: &Value,
+) -> Result<Vec<TaskDeclaration>> {
+    let limit = json_value
+        .pointer("/dataset/limit")
+        .and_then(|v| v.as_u64())
+        .map(|v| v as usize);
+    if limit == Some(0) {
+        return Ok(Vec::new());
+    }
+    let file = fs::File::open(path)?;
+    let reader = BufReader::new(file);
+    let mut tasks = Vec::new();
+    for (idx, line) in reader.lines().enumerate() {
+        let line = line?;
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if limit.is_some_and(|max| tasks.len() >= max) {
+            break;
+        }
+        let task: Value = serde_json::from_str(trimmed)?;
+        let task_id = task
+            .pointer("/task/id")
+            .or_else(|| task.pointer("/id"))
+            .and_then(Value::as_str)
+            .unwrap_or("<unknown_task>");
+        let task_spec = crate::parse_task_spec(&task).map_err(|err| {
+            anyhow!(
+                "dataset row {} task '{}' is not a valid public task_spec: {}",
+                idx + 1,
+                task_id,
+                err
+            )
+        })?;
+        let declaration = crate::compile_task_spec(task_spec).map_err(|err| {
+            anyhow!(
+                "dataset row {} task '{}' could not compile from public task_spec to task declaration: {}",
+                idx + 1,
+                task_id,
+                err
+            )
+        })?;
+        tasks.push(declaration);
+    }
+    Ok(tasks)
+}
+
 pub(crate) fn load_tasks(path: &Path, json_value: &Value) -> Result<Vec<Value>> {
     let limit = json_value
         .pointer("/dataset/limit")
@@ -1594,7 +1603,7 @@ pub(crate) fn load_tasks(path: &Path, json_value: &Value) -> Result<Vec<Value>> 
     let file = fs::File::open(path)?;
     let reader = BufReader::new(file);
     let mut tasks = Vec::new();
-    for line in reader.lines() {
+    for (idx, line) in reader.lines().enumerate() {
         let line = line?;
         let trimmed = line.trim();
         if trimmed.is_empty() {
@@ -1604,6 +1613,19 @@ pub(crate) fn load_tasks(path: &Path, json_value: &Value) -> Result<Vec<Value>> 
             break;
         }
         let task: Value = serde_json::from_str(trimmed)?;
+        if let Err(err) = crate::parse_task_declaration(&task) {
+            let task_id = task
+                .pointer("/task/id")
+                .or_else(|| task.pointer("/id"))
+                .and_then(Value::as_str)
+                .unwrap_or("<unknown_task>");
+            return Err(anyhow!(
+                "dataset row {} task '{}' is not a packaged task declaration: {}",
+                idx + 1,
+                task_id,
+                err
+            ));
+        }
         tasks.push(task);
     }
     Ok(tasks)

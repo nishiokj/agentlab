@@ -2,7 +2,7 @@
 
 This repository should be hostile to fake confidence.
 
-Tests exist to catch behavioral regressions, contract regressions, and integration breakage with the least ambiguity possible. If a test can be made green by tweaking a private literal that the product does not expose, that test was probably not asserting the right thing.
+Tests exist to catch behavioral regressions, contract regressions, and integration breakage with the least ambiguity possible. If a test can be made green by tweaking a private literal that the product does not expose, that test is asserting the wrong thing.
 
 ## Priorities
 
@@ -14,11 +14,39 @@ In order:
 4. Keep one canonical way to construct current inputs.
 5. Delete dead paths instead of preserving them in tests.
 
+## Hard Boundary Rule
+
+For happy-path behavioral and E2E tests, the test owns only boundary inputs and public assertions.
+
+Boundary inputs are the files, CLI args, env files, images, and artifacts a real operator can provide
+before invoking the product.
+
+Once the public command or API under test is invoked, the test must not help the product in any way.
+
+This is a hard rule with no exceptions:
+
+- no mocking
+- no stubbing
+- no monkeypatching
+- no manual support-file staging to rescue the product
+- no manual dataset/export/materialization work that the product is supposed to perform
+- no hand-authoring resolved or semi-resolved internals when the workflow starts from public authoring
+- no fake runtime/image/artifact substitution when the real path exists
+- no post-boundary file edits, env injection, or package mutation to make a happy-path test pass
+
+If the real path cannot be exercised, stop and report a blocker. Do not silently substitute an easier
+fixture or a partially pre-solved setup.
+
+A test is not end to end if it can still pass while the real operator path is broken.
+
+Do not report an end-to-end test as completed unless it exercises the actual public boundary from
+boundary input to public output. If the real path is blocked, report the blocker immediately.
+
 ## Non-Negotiable Rules
 
 1. Behavioral tests must exercise public product surfaces, not handwritten private representations.
 2. Compatibility tests may pin old contracts on purpose. Behavioral tests may not.
-3. E2E CLI tests must prefer `lab-cli init`, `lab-cli build`, `lab-cli preflight`, `lab-cli run`, and `lab-cli build-run` over handwritten resolved experiment payloads.
+3. E2E CLI happy-path tests must use the real public workflow under test. If the workflow includes scaffold generation, use `lab-cli init`. If no init profile exists, author only the minimal public input file. Do not hand-author resolved or semi-resolved experiment payloads.
 4. Current contract literals must come from one canonical helper or template, not be duplicated across tests.
 5. If a hard cut changes the contract, update the one canonical helper and keep a small explicit set of legacy-rejection tests.
 6. If a test suite fails broadly because a shared helper hardcoded an obsolete schema version, that is a test architecture bug.
@@ -40,14 +68,15 @@ The E2E CLI layer is for user-visible workflow coverage:
 - run querying and views
 - benchmark grading record flow
 
-It is not the place to hand-author internal runner payloads unless the point of the test is validating that those payloads are rejected.
+It is not the place to hand-author internal runner payloads. The only exception is an explicit
+rejection test that proves those payloads are rejected.
 
 ## Current Runtime Model
 
 The current runtime model has two execution planes and one shared contract:
 
 - `agent_runtime`: the external agent executable, launched from `runtime.agent_runtime.{artifact,image,command,...}`
-- `task_sandbox`: the task/grader plane, driven by `task_spec_v1.environment.image` plus `policy.task_sandbox`
+- `task_sandbox`: the task/grader plane, driven by `task.environment.image` plus `policy.task_sandbox`
 - `TrialContract`: the stable filesystem ABI shared across both planes
 
 Stable contract paths:
@@ -74,7 +103,7 @@ Behavioral E2E assertions should target those stable surfaces, plus stable opera
 
 ## Current Input Contract
 
-Current task rows must use `task_spec_v1`.
+Current task rows are unversioned.
 
 Current experiment/runtime config must use:
 
@@ -84,8 +113,9 @@ Current experiment/runtime config must use:
 
 Removed inputs are hard errors and must only appear in tests that explicitly verify rejection:
 
-- `version: "0.5"`
-- `task_boundary_v3`
+- `version`
+- `dataset.schema_version`
+- `task.schema_version`
 - `runtime.agent`
 - `runtime.sandbox`
 - `runtime.dependencies.file_staging`
@@ -98,8 +128,6 @@ Bad behavioral test pattern:
 
 ```python
 experiment = {
-    "version": "0.5",
-    "dataset": {"schema_version": "task_boundary_v3"},
     "runtime": {
         "agent": {"bundle": "./agent.tar.gz", "io": {"input_arg": "--input"}},
         "sandbox": {"image_source": "global", "image": "task-image"},
@@ -132,7 +160,6 @@ _run([str(lab_cli_bin), "init", "--profile", "agent-eval", "--in-place"], cwd=pr
 experiment_path = project.root / ".lab" / "experiments" / "my_eval.yaml"
 
 task_row = {
-    "schema_version": "task_spec_v1",
     "task": {"id": "TASK001"},
     "environment": {"image": fixture_image},
     "workspace": {
@@ -212,15 +239,16 @@ If a hard cut requires touching dozens of behavioral tests individually, the hel
 
 ## E2E CLI Usage Model
 
-The intended E2E CLI workflow is:
+The required happy-path E2E CLI workflow is:
 
 1. Create a temp project root.
 2. Initialize a current experiment scaffold with `lab-cli init --profile ... --in-place`.
-3. Write `task_spec_v1` dataset rows.
+3. Write current boundary input files only.
 4. Point the experiment at a real agent runtime artifact and image.
 5. `lab-cli build`
 6. `lab-cli preflight`
 7. `lab-cli run` or `lab-cli build-run`
 8. Assert against stable run outputs and query surfaces.
 
-That is the path we want hardened. Anything else should be justified as a deliberate compatibility or rejection test.
+That is the required path for happy-path CLI E2E coverage. Anything else is not end to end and must
+be labeled as a compatibility or rejection test.

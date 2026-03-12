@@ -40,11 +40,10 @@ python -m bench.cli admit-task bench/benchmark/tasks/v0/TASK001
 
 ## Runner Contract After Hard Cutover
 
-Task datasets consumed by the runner must now use `task_spec_v1`. The accepted top-level shape is:
+Task datasets consumed by the runner use a single-head unversioned task contract. The accepted top-level shape is:
 
 ```json
 {
-  "schema_version": "task_spec_v1",
   "task": { "id": "TASK001" },
   "environment": { "image": "ghcr.io/example/task-image:latest" },
   "workspace": {
@@ -81,7 +80,10 @@ Runtime configuration is split between the external agent runtime and runner-own
 runtime:
   agent_runtime:
     artifact: .lab/agents/rex-current.tar.gz
-    command: [rex, run]
+    command: [rex, run, --config, configs/rex.yaml, --model, $MODEL]
+    env:
+      OPENAI_API_KEY: $OPENAI_API_KEY
+      PROMPT_FILE: prompts/system.txt
     image: ghcr.io/example/agent-runtime:sha256-...
     network: none
     root_read_only: true
@@ -94,12 +96,14 @@ policy:
 
 Hard-cut runtime rules:
 
-- `runtime.agent_runtime.artifact` and `runtime.agent_runtime.image` are required for scientific `run` and `build-run`
-- commands are literal argv; there is no `runtime.agent.io` command synthesis
-- task sandbox images come only from `task_spec_v1.environment.image`
-- `policy.task_sandbox.profile` is runner-owned topology selection
-- scientific `run` and `build-run` launch the agent inside the hermetic `agent_runtime` container, never as a host process
+- `runtime.agent_runtime.artifact`, `runtime.agent_runtime.image`, and `runtime.agent_runtime.command` are required for scientific `run` and `build-run`
+- put public argv directly in `runtime.agent_runtime.command`; DX authoring uses `agent.command`
+- put public env directly in `runtime.agent_runtime.env`; DX authoring uses `agent.env`
+- plain relative paths in argv/env are build-time file or data refs
+- use `$NAME` for runtime bindings from variant bindings or launch-time env; do not use removed `${...}` templating
+- do not use `env_from_host`, `binding_args`, `support_files`, `provider_env`, `default_config`, or `config_files`
+- task sandbox images come only from `task.environment.image`
+- scientific `run` and `build-run` launch the agent inside the hermetic `agent_runtime` container
 - `--dangerous` and similar bypass flags are rejected in scientific runs
-- the task sandbox owns task-image execution, graders, and bash-plane work
-
-The logical writable workspace root inside both the `agent_runtime` and `task_sandbox` planes is always `/agentlab/workspace`. Profiles may add compatibility aliases such as `/testbed`, but tasks must not author those paths directly.
+- runner topology is private; do not author `/agentlab/...` paths or rely on `AGENTLAB_*` names
+- `policy.task_sandbox.profile` is runner-owned topology selection
