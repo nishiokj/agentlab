@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Convert curated SWE-bench Lite task_jsonl_v1 rows into task_boundary_v2 rows."""
+"""Convert curated SWE-bench Lite task_jsonl_v1 rows into public AgentLab task_spec rows."""
 
 from __future__ import annotations
 
@@ -12,11 +12,10 @@ from typing import Any
 DEFAULT_INPUT = (
     ".lab/runs/run_20260223_025729/trials/trial_1/dataset/swebench_lite_curated.jsonl"
 )
-DEFAULT_OUTPUT = ".lab/experiments/data/swebench_lite_curated.task_boundary_v2.jsonl"
+DEFAULT_OUTPUT = ".lab/experiments/data/swebench_lite_curated.task_spec.jsonl"
 DEFAULT_BENCHMARK_NAME = "swebench_lite_curated"
 DEFAULT_SPLIT = "test"
 DEFAULT_ADAPTER_ID = "swebench_task_container_grader"
-DEFAULT_WORKSPACE = "/testbed"
 
 
 def _load_rows(path: Path) -> list[dict[str, Any]]:
@@ -45,7 +44,6 @@ def _to_boundary_row(
     benchmark_name: str,
     split: str,
     adapter_id: str,
-    workspace: str,
 ) -> dict[str, Any]:
     task_id = _require_string(row, "task_id", label="task row")
     input_obj = row.get("input")
@@ -60,8 +58,6 @@ def _to_boundary_row(
 
     task_payload: dict[str, Any] = {
         "id": task_id,
-        "image": image,
-        "workspace": workspace,
         "benchmark": {
             "adapter_id": adapter_id,
             "name": benchmark_name,
@@ -88,17 +84,25 @@ def _to_boundary_row(
         task_payload["metadata"] = metadata
 
     return {
-        "schema_version": "task_boundary_v2",
         "task": task_payload,
-        "workspace_files": [
-            {
-                "path": "ISSUE.md",
-                "content": prompt,
-                "encoding": "utf8",
-                "executable": False,
-            }
-        ],
-        "mount_references": [],
+        "environment": {
+            "image": image,
+        },
+        "workspace": {
+            "mode": "scratch",
+            "base": {"kind": "empty"},
+            "overlays": [
+                {
+                    "path": "ISSUE.md",
+                    "content": prompt,
+                    "encoding": "utf8",
+                    "executable": False,
+                }
+            ],
+            "aux_mounts": [],
+        },
+        "dependencies": {},
+        "limits": {},
     }
 
 
@@ -108,12 +112,11 @@ def main() -> int:
     parser.add_argument(
         "--output",
         default=DEFAULT_OUTPUT,
-        help="Output task_boundary_v2 JSONL path",
+        help="Output task JSONL path",
     )
     parser.add_argument("--benchmark-name", default=DEFAULT_BENCHMARK_NAME)
     parser.add_argument("--split", default=DEFAULT_SPLIT)
     parser.add_argument("--adapter-id", default=DEFAULT_ADAPTER_ID)
-    parser.add_argument("--workspace", default=DEFAULT_WORKSPACE)
     args = parser.parse_args()
 
     input_path = Path(args.input).resolve()
@@ -125,7 +128,6 @@ def main() -> int:
             benchmark_name=args.benchmark_name,
             split=args.split,
             adapter_id=args.adapter_id,
-            workspace=args.workspace,
         )
         for row in rows
     ]

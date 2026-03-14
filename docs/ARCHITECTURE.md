@@ -1,5 +1,9 @@
 # System Architecture
 
+> Obsolete note
+>
+> Older references here to `experiment_v1_0` and `experiment_overrides_v1` are stale. The live authoring contract is versionless; use [README.md](/Users/jevinnishioka/Desktop/Experiments/README.md) as the current contract summary.
+
 Reference architecture for the AgentLab experiment runner.
 All diagrams reflect the current codebase as of 2026-02-23.
 
@@ -85,8 +89,8 @@ Five boundaries define the contract surfaces between components.
 ```
                   User
                    │
-                   │  experiment.yaml (experiment_v1_0 schema)
-                   │  + overrides (experiment_overrides_v1)
+                   │  experiment.yaml (current authoring contract)
+                   │  + optional overrides
                    ▼
               ┌──────────┐
               │  Runner   │
@@ -94,7 +98,7 @@ Five boundaries define the contract surfaces between components.
 
   Direction: User → Runner (one-shot)
 
-  Contract (experiment_v1_0):
+  Contract (current authoring):
     ├── experiment: { id, name }
     ├── dataset:    { path, limit? }
     ├── design:     { comparison, replications, seed? }
@@ -389,44 +393,36 @@ The container image used for a trial is resolved through a priority cascade:
 
 ```
   experiment.yaml
-  ├── runtime.agent.image_source = "global" (default)
+  ├── runtime.sandbox.image_source = "global" (default)
   │   │
-  │   └──▶ Use runtime.agent.image (or runtime.image for clean contract)
-  │        │
-  │        │  Variant-level override?
-  │        │  baseline.image / variant_plan[].image
-  │        │  (variant image overrides global when specified)
+  │   └──▶ Use runtime.sandbox.image
   │        │
   │        └──▶ Final image for this variant
   │
-  └── runtime.agent.image_source = "per_task"
+  └── runtime.sandbox.image_source = "per_task"
       │
       └──▶ Each task in the dataset provides its own image:
-           task.image (from JSONL row)
+           environment.image (from task_boundary_v3 row)
            │
            │  Requirements:
-           │  ├── runtime.agent.artifact is REQUIRED
-           │  │   (agent code injected into per-task image)
+           │  ├── runtime.agent.bundle is REQUIRED
            │  ├── Container mode only (local mode rejected)
            │  └── Preflight scans all tasks for valid images
-           │
-           └──▶ task.workspace? (optional per-task workspace path)
 
   Resolution at execution time (resolve_container_image):
 
-    ┌──────────────────────────────────────────┐
-    │  image_source == PerTask?                 │
-    │     YES → use task.image from dataset row │
-    │     NO  → use runtime.agent.image         │
-    └──────────────────────────────────────────┘
+    ┌──────────────────────────────────────────────┐
+    │  image_source == per_task?                   │
+    │     YES → use environment.image              │
+    │     NO  → use runtime.sandbox.image          │
+    └──────────────────────────────────────────────┘
 
   Workspace resolution (resolve_container_workspace):
 
     ┌──────────────────────────────────────────────────────┐
-    │  image_source == PerTask && task.workspace present?   │
-    │     YES → use task.workspace                         │
-    │     NO  → default /agentlab/contract/workspace/      │
-    │           (or none for clean_contract_v1)            │
+    │  writable task root is always /agentlab/workspace    │
+    │  optional aliases such as /testbed are runner-owned  │
+    │  task rows never author sandbox cwd or mount paths   │
     └──────────────────────────────────────────────────────┘
 ```
 

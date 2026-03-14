@@ -1,144 +1,404 @@
 # AgentLab
 
-AgentLab runs controlled agent-runtime experiments.
-It executes one runtime command per trial, enforces policy, and writes append-only facts.
+AgentLab is a build-first system for running controlled agent evaluations.
 
-## Public API (What Is Stable)
+The product is this sequence:
 
-Treat only these as stable:
+`author -> build -> verify -> run -> inspect`
 
-1. Schemas in `schemas/*.jsonschema`.
-2. CLI behavior exposed by `lab-cli --help`.
-3. Run directory contracts under `.lab/runs/<run_id>/`.
+Everything else hangs off those five boundaries.
 
-Everything else is internal implementation detail and may change without notice.
+## The Five Stages
 
-## Canonical Primitives
+1. `Author`
+   You write `experiment.yaml` and `tasks.jsonl`.
+2. `Build`
+   AgentLab resolves paths, bundles files, seals artifacts, and emits a portable package.
+3. `Verify`
+   `preflight` checks that the package can actually run.
+4. `Run`
+   The runner executes trials from the sealed package boundary.
+5. `Inspect`
+   You read the run outputs, facts, and resolved state without guessing.
 
-Use these names consistently in docs, code comments, and UX.
+Do not skip boundaries. Do not hand-author package internals. Do not treat run directories as inputs.
 
-| Primitive | Definition | Owner |
-| --- | --- | --- |
-| `Experiment` | Declarative config: DX authoring (`benchmark + agent + baseline + variants + overrides`) normalized to internal dataset/design/runtime/policy. | User |
-| `Task` | One dataset row (`task_jsonl_v1`). | Dataset provider |
-| `Variant` | Bindings/image override applied across tasks. | Experiment design |
-| `Trial` | `Task x Variant x Replication` execution unit. | Runner |
-| `Runtime` | The single command invocation contract (`runtime.agent`). | Runtime author |
-| `Policy` | Timeout/network/sandbox limits enforced by runner. | Runner config |
-| `Result` | Agent-written `agent_result_v1` output for one trial. | Runtime |
-| `Facts` | Runner-written immutable JSONL records. | Runner |
-| `Views` | Analysis-derived query surfaces over facts. | Analysis layer |
+## 1. Author
 
-## Boundary Rules (Hard)
+Start by choosing the experiment shape you want:
 
-1. Runner executes exactly one runtime command per trial.
-2. Runtime does not own scheduler state, dispatch, or run control.
-3. Runner enforces policy; runtime cannot override policy at execution time.
-4. Runner appends immutable facts; analysis computes aggregates and live views.
-5. Benchmark-specific logic stays in adapters, not runner core.
+- `agent-eval`: one variant, no comparison
+- `ab-test`: paired baseline vs treatments
+- `sweep`: many variants over a parameter surface
+- `regression`: repeated tracking over time
 
-## Phase 2 Isolation Contract (Strict)
-
-`task_boundary_v2` is now a strict boundary type. The runner owns runtime topology.
-
-1. Allowed task-boundary keys are fixed: `schema_version`, `task`, `workspace_seed`, `workspace_files`, `mount_references`, `limits`.
-2. `task.workspace` is not a boundary field and has no runtime meaning.
-3. Runner never seeds workspace by reading paths from inside a task image.
-4. Per-task image mode requires materialization via `workspace_seed` or `workspace_files` or `mount_references`; preflight fails otherwise.
-5. Agent-visible filesystem remains runner-owned workspace only (`/agentlab/workspace`) plus runner-managed deps/io mounts.
-
-### Rebuild Bench v0 Dataset For `/jesus`
-
-Run from `Experiments` root:
+Scaffold one:
 
 ```bash
-python3 bench/integration/agentlab/export_bench_suite_to_jsonl.py \
-  --suite v0 \
-  --output /Users/jevinnishioka/Desktop/jesus/.lab/experiments/data/bench_v0.task_boundary_v2.jsonl \
-  --default-task-image bench-v0-workspace \
-  --require-task-image \
-  --dataset-pack-root /Users/jevinnishioka/Desktop/jesus/.lab/dataset_packs/sha256
+cargo build --manifest-path rust/Cargo.toml -p lab-cli --release
+LAB="$(pwd)/rust/target/release/lab-cli"
+
+mkdir -p /tmp/agentlab-demo
+cd /tmp/agentlab-demo
+
+"$LAB" init --profile ab-test --in-place
 ```
 
-Then run from `/Users/jevinnishioka/Desktop/jesus`:
+### What You Actually Edit
 
-```bash
-/Users/jevinnishioka/Desktop/Experiments/rust/target/release/lab-cli preflight \
-  .lab/experiments/bench_v0_glm5_vs_codex_spark_tarbell_latest_v0.yaml
+Small project, explicit boundary:
 
-/Users/jevinnishioka/Desktop/Experiments/rust/target/release/lab-cli run \
-  .lab/experiments/bench_v0_glm5_vs_codex_spark_tarbell_latest_v0.yaml \
-  --executor local_docker
+```text
+agentlab-demo/
+├── experiment.yaml
+├── tasks.jsonl
+├── agents/
+│   └── rex-current.linux-x64.tar.gz
+└── bench/
+    └── integration/
+        └── agentlab/
+            └── my_benchmark_grader.py
 ```
 
-### Not Public
+`experiment.yaml` is the control plane. `tasks.jsonl` is the workload. Variants are first-class: the baseline is one variant, each entry in `variant_plan` is another.
 
-The following are intentionally not public primitives:
+### Example `experiment.yaml`
 
-- Internal Rust symbols/functions.
-- Worker/coordinator internals.
-- In-memory state machine structure.
-- Patch-spec and migration doc internals.
+This example is intentionally realistic. It shows:
 
-## Minimal DX Experiment Shape
+- experiment type: paired A/B
+- the control and treatment variants first
+- model choice through variant bindings
+- API keys supplied at launch time
+- benchmark grading through a custom grader
+- concurrency and timeout
 
 ```yaml
 experiment:
-  id: bench_v0_qwen35b_a3b_only
-  name: "Bench v0: Qwen3.5 35B A3B (LM Studio)"
-  tags: [bench-v0, single-variant, lmstudio, qwen3.5-35b-a3b]
-
-benchmark: bench_v0
-limit: 20
-
-agent:
-  artifact: rex-minimal-linux-dir
-  command: [rex, run, --dangerous]
-  default_config: overrides/defaults.bench-lmstudio-headless.json
-  provider_env:
-    - provider: z.ai-coder
-      env: ZAI_CODER_API_KEY
-  io: { input: --input-file, output: --output }
-  env:
-    MEMORY_DAEMON_URL: ""
-  config_files:
-    - overrides/defaults.bench-lmstudio-headless.json
-    - overrides/providers.lmstudio-docker.ts
-    - overrides/providers.lmstudio-docker.js
-  workspace_patches:
-    overrides/providers.lmstudio-docker.ts: packages/core/types/src/providers.ts
-    overrides/providers.lmstudio-docker.js: packages/core/types/dist/providers.js
-  arg_map:
-    - key: model_provider
-      flag: --provider
-    - key: model
-      flag: --model
+  id: bench_demo_glm5_vs_codex_low
+  name: Bench Demo: GLM-5 vs Codex Low
+  workload_type: agent_runtime
+  tags: [bench-demo, ab-test]
 
 baseline:
-  id: qwen_35b_a3b
+  variant_id: glm_5
   bindings:
-    model_provider: lmstudio
-    model: qwen3.5-35b-a3b
+    model_provider: z.ai-coder
+    model: glm-5
+    reasoning: off
 
-overrides:
-  network: full
-  root_read_only: false
+variant_plan:
+  - variant_id: codex_low
+    bindings:
+      model_provider: codex
+      model: gpt-5.3-codex
+      reasoning: low
+
+dataset:
+  suite_id: bench_demo
+  provider: local_jsonl
+  path: tasks.jsonl
+  split_id: test
+  limit: 20
+
+runtime:
+  agent_runtime:
+    artifact: agents/rex-current.linux-x64.tar.gz
+    image: ghcr.io/acme/rex-agent:latest
+    command:
+      - rex
+      - run
+      - --provider
+      - $model_provider
+      - --model
+      - $model
+      - --reasoning
+      - $reasoning
+    env:
+      OPENAI_API_KEY: $OPENAI_API_KEY
+      ZAI_CODER_API_KEY: $ZAI_CODER_API_KEY
+    network: full
+    root_read_only: false
+
+benchmark:
+  grader:
+    command: [python3, bench/integration/agentlab/my_benchmark_grader.py]
+  policy:
+    evaluator_mode: custom
+    scoring_lifecycle: predict_then_score
+    task_model: independent
+    chain_failure_policy: continue_with_flag
+
+metrics:
+  - id: duration_ms
+    source: runner
+    primary: false
+    weight: 0
+  - id: resolved
+    source: output
+    json_pointer: /metrics/resolved
+    direction: maximize
+    primary: true
+    weight: 1
+
+design:
+  replications: 1
+  max_concurrency: 2
+
+policy:
+  timeout_ms: 600000
+  task_sandbox:
+    network: full
 ```
 
-DX authoring notes:
+### Variant Boundary
 
-1. Built-in benchmark registry currently supports `benchmark: bench_v0`.
-2. `agent.artifact` resolves short names from `.lab/agents/`.
-3. `agent.default_config` stages the file (if needed) and appends `--config /agentlab/deps/<file>` when command does not already set `--config`.
-4. `agent.provider_env` appends `--provider-env provider=ENV` and auto-adds those env vars to `agent.env_from_host`.
-5. If staged config files include `.config/...` and `agent.env.HOME` is unset, HOME defaults to `/agentlab/deps` for runtime auth lookup.
-6. In DX mode, legacy fields (`dataset`, `design`, `runtime`, `variant_plan`, `baseline.variant_id`) are rejected.
-7. `arg_map` is the canonical authoring name. `bindings_to_args` with `binding:` is accepted as a compatibility alias during the transition.
-8. Persistent workspace carry-forward stores full workspace file contents. By default the runner fails fast above `AGENTLAB_MAX_WORKSPACE_BUNDLE_BYTES=268435456` bytes to avoid unbounded memory growth during bundle capture.
+Variant bindings are the experiment surface for behavior differences.
+
+- `baseline` is not special runtime machinery. It is the control variant.
+- `variant_plan[*]` are treatment variants.
+- `$NAME` in command/env resolves from variant bindings first.
+- If a binding is not provided by the variant, `lab run --env`, `lab run --env-file`, then host env are consulted.
+
+That means:
+
+- choose the model in bindings
+- choose reasoning mode in bindings
+- keep runtime command stable
+- compare variants without rewriting the runtime itself
+
+### Example `tasks.jsonl`
+
+Each line is one task declaration. The benchmark can carry benchmark-specific meaning inside `task.*`, but it must still map into the runner contract.
+
+```json
+{
+  "task": {
+    "id": "TASK001",
+    "prompt": "Fix the failing scorer regression.",
+    "benchmark": {
+      "adapter_id": "bench_demo",
+      "name": "bench",
+      "split": "test"
+    },
+    "input": {
+      "prompt": "The public smoke test fails. Fix the bug without breaking existing behavior."
+    },
+    "public_command": "bash .bench_public/run_public.sh",
+    "hidden_command": "python hidden/runner.py /workspace hidden/cases.jsonl"
+  },
+  "environment": {
+    "image": "ghcr.io/acme/task-image:latest"
+  },
+  "workspace": {
+    "mode": "patch",
+    "base": {
+      "kind": "dataset_pack",
+      "dataset_pack_ref": "sha256:..."
+    },
+    "overlays": [],
+    "aux_mounts": []
+  },
+  "dependencies": {
+    "files": []
+  },
+  "limits": {}
+}
+```
+
+### Benchmark Boundary
+
+Any benchmark works if it can emit valid task rows and grade the agent result.
+
+The benchmark owns:
+
+- task semantics
+- prompt/input payload
+- public and hidden commands
+- benchmark-specific metadata inside `task.*`
+
+The runner owns:
+
+- task sandbox image
+- workspace mounting and materialization
+- per-trial lifecycle
+- scheduling and retries
+
+Rule of thumb: benchmark meaning goes in `task.*`; execution topology goes in `environment`, `workspace`, `dependencies`, and `limits`.
+
+### Grader Boundary
+
+The grader is just another boundary contract. It reads the prepared task and agent result, then writes prediction and score records.
+
+The grader sees these env vars:
+
+- `AGENTLAB_TASK_PATH`
+- `AGENTLAB_RESULT_PATH`
+- `AGENTLAB_BENCHMARK_PREDICTION_PATH`
+- `AGENTLAB_BENCHMARK_SCORE_PATH`
+
+Minimal grader shape:
+
+```python
+import json
+import os
+
+task = json.load(open(os.environ["AGENTLAB_TASK_PATH"]))
+result = json.load(open(os.environ["AGENTLAB_RESULT_PATH"]))
+
+prediction = {
+    "schema_version": "benchmark_prediction_record_v1",
+    "ids": {
+        "run_id": "run_placeholder",
+        "trial_id": "trial_placeholder",
+        "variant_id": "variant_placeholder",
+        "task_id": task["task"]["id"],
+        "repl_idx": 0,
+    },
+    "prediction": {"kind": "text", "value": ""},
+}
+
+score = {
+    "schema_version": "benchmark_score_record_v1",
+    "ids": prediction["ids"],
+    "verdict": "pass",
+    "primary_metric_name": "resolved",
+    "primary_metric_value": 1.0,
+    "metrics": {"resolved": 1.0},
+    "evaluator": {"name": "custom_grader", "mode": "custom"},
+}
+
+json.dump(prediction, open(os.environ["AGENTLAB_BENCHMARK_PREDICTION_PATH"], "w"))
+json.dump(score, open(os.environ["AGENTLAB_BENCHMARK_SCORE_PATH"], "w"))
+```
+
+## 2. Build
+
+Build takes authored inputs and produces a sealed package:
+
+```bash
+"$LAB" build experiment.yaml --out .lab/builds/bench-demo
+```
+
+Typical package shape:
+
+```text
+.lab/builds/bench-demo/
+├── manifest.json
+├── resolved_experiment.json
+├── checksums.json
+├── package.lock
+├── tasks/
+│   └── tasks.jsonl
+├── agent_builds/
+│   └── 000_rex-current.linux-x64.tar.gz
+└── files/
+    ├── 000_defaults.json
+    └── 001_bench/
+```
+
+What build does:
+
+- rewrites `dataset.path` to the packaged task file
+- stages relative file refs under package-controlled paths
+- copies agent artifacts into `agent_builds/`
+- seals the package with manifests and checksums
+
+### What Resolution Looks Like
+
+Your authored experiment is not the runtime object. The package contains the resolved form.
+
+Excerpt from `resolved_experiment.json`:
+
+```json
+{
+  "benchmark": {
+    "grader": {
+      "command": [
+        "python3",
+        "/agentlab/deps/bench/integration/agentlab/my_benchmark_grader.py"
+      ]
+    }
+  },
+  "dataset": {
+    "path": "tasks/tasks.jsonl",
+    "provider": "local_jsonl",
+    "suite_id": "bench_demo",
+    "split_id": "test",
+    "limit": 20
+  },
+  "runtime": {
+    "agent_runtime": {
+      "artifact": "agent_builds/000_rex-current.linux-x64.tar.gz"
+    }
+  }
+}
+```
+
+That is the build boundary in one glance:
+
+- authored relative paths become package-owned runtime paths
+- the package becomes portable
+- the resolved object is the thing the runner actually executes
+
+## 3. Verify
+
+Verify the package before you waste time on a run:
+
+```bash
+"$LAB" describe .lab/builds/bench-demo
+"$LAB" preflight .lab/builds/bench-demo --env-file .env
+```
+
+Use `preflight` to catch:
+
+- missing artifacts
+- missing packaged runtime assets
+- bad image references
+- missing launch-time secrets
+- broken grader reachability
+
+## 4. Run
+
+Run the sealed package, not the authored YAML:
+
+```bash
+"$LAB" run .lab/builds/bench-demo \
+  --env OPENAI_API_KEY=... \
+  --env ZAI_CODER_API_KEY=... \
+  --env-file .env \
+  --materialize full
+```
+
+Tighter loop:
+
+```bash
+"$LAB" build-run experiment.yaml --out .lab/builds/bench-demo --materialize full
+```
+
+Common knobs:
+
+- choose experiment type with `lab init --profile ...`
+- choose models with `baseline.bindings` and `variant_plan[*].bindings`
+- choose concurrency with `design.max_concurrency`
+- choose replications with `design.replications`
+- choose timeout with `policy.timeout_ms`
+- provide API keys with `lab run --env` and `--env-file`
 
 ## Runtime Contract
 
-Runner provides input/output paths via env vars:
+The agent process runs against a stable contract. Consume this contract. Do not infer hidden topology.
+
+Filesystem:
+
+- cwd: `/agentlab/workspace`
+- `/agentlab/in`
+- `/agentlab/out`
+- `/agentlab/state`
+- `/agentlab/workspace`
+- `/agentlab/deps`
+
+Important env vars:
 
 - `AGENTLAB_TASK_PATH`
 - `AGENTLAB_BINDINGS_PATH`
@@ -146,84 +406,90 @@ Runner provides input/output paths via env vars:
 - `AGENTLAB_POLICY_PATH`
 - `AGENTLAB_RESULT_PATH`
 - `AGENTLAB_TRAJECTORY_PATH`
+- `AGENTLAB_RUN_ID`
+- `AGENTLAB_TRIAL_ID`
+- `AGENTLAB_VARIANT_ID`
+- `AGENTLAB_TASK_ID`
+- `AGENTLAB_TIMEOUT_MS`
 
-Runtime requirements per trial:
+Current runtime also exports `WORKSPACE=/agentlab/workspace` as a convenience env. Treat cwd as primary.
 
-1. Read task/bindings/dependencies/policy from provided paths.
-2. Execute autonomously.
-3. Write `agent_result_v1` JSON to `AGENTLAB_RESULT_PATH`.
-4. Optionally append trajectory events to `AGENTLAB_TRAJECTORY_PATH`.
+## 5. Inspect
 
-Container mounts:
-
-- `/agentlab/in` (ro)
-- `/agentlab/out` (rw)
-- `/agentlab/state` (rw)
-- `/agentlab/workspace` (rw)
-- `/agentlab/deps` (ro/rw based on policy and staging)
-
-## 5-Minute Quickstart
-
-From repo root (`/Users/jevinnishioka/Desktop/Experiments`):
-
-```bash
-# build CLI
-cargo build --manifest-path rust/Cargo.toml -p lab-cli --release
-
-# check runner crate
-cargo check --manifest-path rust/Cargo.toml -p lab-runner
-
-# create a DX experiment file using the "Minimal DX Experiment Shape" above
-mkdir -p .lab/experiments
-$EDITOR .lab/experiments/bench_v0_qwen35b_a3b_only.yaml
-
-# validate environment + resolved plan
-rust/target/release/lab-cli preflight .lab/experiments/bench_v0_qwen35b_a3b_only.yaml
-rust/target/release/lab-cli describe .lab/experiments/bench_v0_qwen35b_a3b_only.yaml --json
-
-# run with Docker
-rust/target/release/lab-cli run .lab/experiments/bench_v0_qwen35b_a3b_only.yaml --executor local_docker
-
-# fallback without Docker
-rust/target/release/lab-cli run .lab/experiments/bench_v0_qwen35b_a3b_only.yaml --executor local_process
-```
-
-Notes:
-
-1. If `preflight` reports `container_ready=false`, use `local_process` or start Docker.
-2. If `local_process` fails with command-not-found for `rex`, verify `agent.artifact` resolves under `.lab/agents/` and the artifact contains an executable `bin/rex`.
-3. If `preflight` reports missing config files, place them under `.lab/experiments/overrides/` or use absolute paths.
-
-## Run Outputs (Contract-Level)
-
-Run root:
+Run outputs live under:
 
 ```text
 .lab/runs/<run_id>/
 ```
 
-Key outputs:
+High-signal files:
 
 - `resolved_experiment.json`
 - `runtime/run_control.json`
 - `trials/<trial_id>/trial_state.json`
 - `trials/<trial_id>/out/result.json`
-- `trials/<trial_id>/result.json`
 - `facts/run_manifest.json`
 - `facts/trials.jsonl`
 - `facts/events.jsonl`
 - `facts/metrics_long.jsonl`
 
-## Repository Pointers
+Useful commands:
 
-- `rust/crates/lab-cli/`: CLI surface.
-- `rust/crates/lab-runner/`: execution engine.
-- `schemas/`: contract source of truth.
-- `adapters/`: benchmark adapters.
-- `bench/`: task tooling + integration bridge.
+```bash
+"$LAB" runs
+"$LAB" variants <run_id>
+"$LAB" views <run_id>
+"$LAB" query <run_id> "SELECT * FROM trials LIMIT 20"
+```
 
-## Deep-Dive Docs
+## Public Surfaces
 
-- `docs/AGENTLAB_ONBOARDING.md`: hands-on onboarding flow.
-- `docs/ARCHITECTURE.md`: boundary diagrams and architecture.
-- `docs/USAGE.md`: benchmark task tooling usage.
+If you are building tooling against AgentLab, these are the supported surfaces:
+
+1. `lab` or `lab-cli` subcommands
+2. Scaffolds produced by `lab init`
+3. Schemas in [`schemas/`](schemas/)
+4. Sealed package contents
+5. Run outputs under `.lab/runs/<run_id>/`
+6. The runtime contract documented above
+
+Do not build tooling against undocumented package internals.
+
+## Avoid Legacy Inputs
+
+These are removed from the happy path:
+
+- `version`
+- `dataset.schema_version`
+- `task.schema_version`
+- `runtime.agent`
+- `runtime.sandbox`
+- `runtime.dependencies.file_staging`
+- `benchmark.grader.support_files`
+- `benchmark.adapter.support_files`
+- `benchmark.adapter`
+- `--executor`
+
+## Working On AgentLab
+
+If you are here to work on AgentLab itself, not just use it:
+
+- [`rust/`](rust/) is the CLI, runner, and analysis stack
+- [`schemas/`](schemas/) defines public contracts
+- [`sdk/`](sdk/) is the TypeScript SDK surface
+- [`tests/`](tests/) covers CLI and boundary behavior
+- [`docs/`](docs/) holds design records, migrations, and invariants
+- [`bench/`](bench/) and [`adapters/`](adapters/) hold benchmark-side tooling
+
+Common development commands:
+
+```bash
+make bootstrap
+make test
+make validate-schemas
+
+cargo test --manifest-path rust/Cargo.toml -p lab-runner
+pytest tests/e2e_cli -q
+```
+
+For repo-wide rules, read [`TESTS.md`](TESTS.md).

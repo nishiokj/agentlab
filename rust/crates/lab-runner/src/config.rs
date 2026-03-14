@@ -1,4 +1,4 @@
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use chrono::Utc;
 use lab_core::{canonical_json_digest, ensure_dir, sha256_bytes, sha256_file};
 use lab_schemas::compile_schema;
@@ -105,22 +105,6 @@ pub(crate) fn load_json_file(path: &Path) -> Result<Value> {
 }
 
 // ---------------------------------------------------------------------------
-// Experiment version helpers
-// ---------------------------------------------------------------------------
-
-pub(crate) fn experiment_version_string(json_value: &Value) -> Option<String> {
-    match json_value.pointer("/version") {
-        Some(Value::String(raw)) => Some(raw.trim().to_string()),
-        Some(Value::Number(raw)) => Some(raw.to_string()),
-        _ => None,
-    }
-}
-
-pub(crate) fn is_clean_contract_experiment(json_value: &Value) -> bool {
-    experiment_version_string(json_value).as_deref() == Some("1.0")
-}
-
-// ---------------------------------------------------------------------------
 // Experiment field helpers
 // ---------------------------------------------------------------------------
 
@@ -133,19 +117,10 @@ pub(crate) fn experiment_workload_type(json_value: &Value) -> Result<String> {
     {
         return Ok(value.to_string());
     }
-    if is_clean_contract_experiment(json_value) {
-        return Ok("agent_runtime".to_string());
-    }
     Err(anyhow!("missing /experiment/workload_type"))
 }
 
 pub(crate) fn experiment_random_seed(json_value: &Value) -> u64 {
-    if is_clean_contract_experiment(json_value) {
-        return json_value
-            .pointer("/design/seed")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(1);
-    }
     json_value
         .pointer("/design/random_seed")
         .and_then(|v| v.as_u64())
@@ -165,62 +140,88 @@ pub(crate) fn experiment_max_concurrency(json_value: &Value) -> usize {
 // ---------------------------------------------------------------------------
 
 pub(crate) fn validate_required_fields(json_value: &Value) -> Result<()> {
-    if is_clean_contract_experiment(json_value) {
-        let required_v1: &[&str] = &[
-            "/experiment/id",
-            "/experiment/name",
-            "/dataset/path",
-            "/design/replications",
-            "/baseline/variant_id",
-            "/runtime/image",
-            "/runtime/command",
-        ];
-        let mut missing = Vec::new();
-        for pointer in required_v1 {
-            let value = json_value.pointer(pointer);
-            let is_missing = match value {
-                None => true,
-                Some(Value::String(s)) => s.trim().is_empty(),
-                Some(Value::Array(items)) if *pointer == "/runtime/command" => items.is_empty(),
-                Some(Value::Number(n)) if *pointer == "/design/replications" => {
-                    n.as_u64() == Some(0)
-                }
-                _ => false,
-            };
-            if is_missing {
-                missing.push(*pointer);
-            }
-        }
-
-        let has_command = match json_value.pointer("/runtime/command") {
-            Some(Value::String(s)) => !s.trim().is_empty(),
-            Some(Value::Array(parts)) if !parts.is_empty() => parts
-                .iter()
-                .all(|part| part.as_str().map(|s| !s.trim().is_empty()).unwrap_or(false)),
-            _ => false,
-        };
-        if !has_command {
-            missing.push("/runtime/command");
-        }
-        if missing.is_empty() {
-            return Ok(());
-        }
-        let lines = missing
-            .iter()
-            .map(|p| format!("  - {}", p))
-            .collect::<Vec<_>>();
-        return Err(anyhow!(
-            "experiment.yaml missing required fields:\n{}",
-            lines.join("\n")
-        ));
+    if json_value
+        .pointer("/version")
+        .and_then(|value| value.as_str())
+        .is_some_and(|value| value.trim() == "1.0")
+    {
+        return Err(anyhow!("legacy experiment version '1.0' is not supported"));
     }
-
+    for (pointer, message) in [
+        (
+            "/runtime/agent",
+            "use runtime.agent_runtime plus policy.task_sandbox only",
+        ),
+        (
+            "/runtime/sandbox",
+            "use runtime.agent_runtime plus policy.task_sandbox only",
+        ),
+        (
+            "/runtime/policy",
+            "use runtime.agent_runtime plus policy.task_sandbox only",
+        ),
+        (
+            "/runtime/agent_runtime/io",
+            "commands consume the trial contract directly; no runner IO remapping is supported",
+        ),
+        (
+            "/runtime/agent_runtime/workspace_patches",
+            "workspace patches were removed; task-owned inputs must come from task rows or packaged artifacts",
+        ),
+        (
+            "/runtime/agent_runtime/launch",
+            "launch indirection was removed; use runtime.agent_runtime.{artifact,image,command,env}",
+        ),
+        (
+            "/runtime/agent_runtime/env_from_host",
+            "use $NAME runtime bindings resolved from variant bindings or lab run --env/--env-file",
+        ),
+        (
+            "/runtime/agent_runtime/binding_args",
+            "commands are literal argv; project bindings directly in runtime.agent_runtime.command",
+        ),
+        (
+            "/runtime/agent_runtime/support_files",
+            "runtime support file staging was removed; package files in the agent artifact or benchmark-owned sealed assets",
+        ),
+        (
+            "/runtime/agent_runtime/secret_env",
+            "use $NAME runtime bindings resolved from variant bindings or lab run --env/--env-file",
+        ),
+        (
+            "/runtime/dependencies/file_staging",
+            "host-path file staging was removed; package files in the agent artifact or task rows",
+        ),
+        (
+            "/runtime/dependencies/assets",
+            "dependency asset staging was removed; task-owned inputs must be embedded in task rows",
+        ),
+        (
+            "/runtime/dependencies/secret_files",
+            "secret file staging was removed; inject secrets at launch time, not through authored host paths",
+        ),
+        (
+            "/benchmark/grader/support_files",
+            "benchmark grader support_files was removed; reference grader files directly in grader.command or use runner-owned built-ins",
+        ),
+        (
+            "/benchmark/adapter/support_files",
+            "benchmark adapter support_files was removed; benchmark assets must be runner-owned sealed assets",
+        ),
+    ] {
+        if json_value.pointer(pointer).is_some() {
+            return Err(anyhow!(
+                "{} was removed in the hard cutover; {}",
+                pointer,
+                message
+            ));
+        }
+    }
     let required: &[&str] = &[
         "/experiment/workload_type",
-        "/design/sanitization_profile",
         "/design/replications",
-        "/runtime/policy/timeout_ms",
-        "/runtime/policy/network/mode",
+        "/policy/timeout_ms",
+        "/policy/task_sandbox/network",
         "/baseline/variant_id",
     ];
     let mut missing = Vec::new();
@@ -231,8 +232,7 @@ pub(crate) fn validate_required_fields(json_value: &Value) -> Result<()> {
             Some(Value::String(s)) => s.is_empty(),
             Some(Value::Number(n)) => {
                 n.as_u64() == Some(0)
-                    && (*pointer == "/design/replications"
-                        || *pointer == "/runtime/policy/timeout_ms")
+                    && (*pointer == "/design/replications" || *pointer == "/policy/timeout_ms")
             }
             _ => false,
         };
@@ -240,10 +240,13 @@ pub(crate) fn validate_required_fields(json_value: &Value) -> Result<()> {
             missing.push(*pointer);
         }
     }
-    if json_value.pointer("/runtime/agent").is_none() {
-        missing.push("/runtime/agent");
+    if json_value.pointer("/runtime/agent_runtime").is_none() {
+        missing.push("/runtime/agent_runtime");
     }
-    let has_command = match json_value.pointer("/runtime/agent/command") {
+    if json_value.pointer("/policy/task_sandbox").is_none() {
+        missing.push("/policy/task_sandbox");
+    }
+    let has_command = match json_value.pointer("/runtime/agent_runtime/command") {
         Some(Value::String(s)) => !s.trim().is_empty(),
         Some(Value::Array(parts)) if !parts.is_empty() => parts
             .iter()
@@ -251,91 +254,50 @@ pub(crate) fn validate_required_fields(json_value: &Value) -> Result<()> {
         _ => false,
     };
     if !has_command {
-        missing.push("/runtime/agent/command");
+        missing.push("/runtime/agent_runtime/command");
     }
-
-    let mut invalid = Vec::new();
-    if json_value.pointer("/runtime/agent/mode").is_some() {
-        invalid
-            .push("/runtime/agent/mode (removed; use runtime.agent.command + runtime.agent.image)");
-    }
-    if json_value
-        .pointer("/runtime/agent/known_agent_ref")
-        .is_some()
-    {
-        invalid.push(
-            "/runtime/agent/known_agent_ref (removed; ship built runtime in container image)",
-        );
-    }
-    if json_value.pointer("/runtime/agent/custom_image").is_some() {
-        invalid.push("/runtime/agent/custom_image (removed; use runtime.agent.image)");
-    }
-    if json_value.pointer("/runtime/agent/adapter").is_some() {
-        invalid.push("/runtime/agent/adapter (removed from user-facing spec)");
-    }
-    if json_value.pointer("/runtime/agent/aliases").is_some() {
-        invalid.push("/runtime/agent/aliases (removed from user-facing spec)");
-    }
-    if json_value.pointer("/runtime/agent/overrides").is_some() {
-        invalid.push("/runtime/agent/overrides (removed; package runtime concerns in the image)");
-    }
-
-    let sandbox_mode = json_value
-        .pointer("/runtime/policy/sandbox/mode")
+    let artifact = json_value
+        .pointer("/runtime/agent_runtime/artifact")
         .and_then(|v| v.as_str())
-        .unwrap_or("local");
-    let image_source = json_value
-        .pointer("/runtime/agent/image_source")
+        .map(str::trim)
+        .unwrap_or("");
+    if artifact.is_empty() {
+        missing.push("/runtime/agent_runtime/artifact");
+    }
+    let image = json_value
+        .pointer("/runtime/agent_runtime/image")
         .and_then(|v| v.as_str())
-        .unwrap_or("global");
-    if image_source != "global" && image_source != "per_task" {
-        invalid.push("/runtime/agent/image_source (must be 'global' or 'per_task')");
+        .map(str::trim)
+        .unwrap_or("");
+    if image.is_empty() {
+        missing.push("/runtime/agent_runtime/image");
     }
-    if image_source == "per_task" && sandbox_mode != "container" {
-        invalid.push(
-            "/runtime/agent/image_source (value 'per_task' requires /runtime/policy/sandbox/mode='container')",
-        );
-    }
-    if sandbox_mode == "container" {
-        let runtime_agent_image = json_value
-            .pointer("/runtime/agent/image")
-            .and_then(|v| v.as_str())
-            .map(|v| v.trim().to_string())
-            .unwrap_or_default();
-        let has_container_image = !runtime_agent_image.is_empty();
-        if image_source != "per_task" && !has_container_image {
-            missing.push("/runtime/agent/image");
-        }
-        if image_source == "per_task" {
-            let agent_artifact = json_value
-                .pointer("/runtime/agent/artifact")
-                .and_then(|v| v.as_str())
-                .map(str::trim)
-                .unwrap_or("");
-            if agent_artifact.is_empty() {
-                missing.push("/runtime/agent/artifact");
-            }
-        }
+    let sandbox_network = json_value
+        .pointer("/policy/task_sandbox/network")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .unwrap_or("");
+    if sandbox_network.is_empty() {
+        missing.push("/policy/task_sandbox/network");
     }
     if json_value.pointer("/benchmark").is_some() {
-        let has_adapter_command = match json_value.pointer("/benchmark/adapter/command") {
+        let has_grader_command = match json_value.pointer("/benchmark/grader/command") {
             Some(Value::Array(parts)) if !parts.is_empty() => parts
                 .iter()
                 .all(|part| part.as_str().map(|s| !s.trim().is_empty()).unwrap_or(false)),
             _ => false,
         };
-        if !has_adapter_command {
-            missing.push("/benchmark/adapter/command");
+        if !has_grader_command {
+            missing.push("/benchmark/grader/command");
         }
     }
-    if missing.is_empty() && invalid.is_empty() {
+    if missing.is_empty() {
         Ok(())
     } else {
-        let mut lines = missing
+        let lines = missing
             .iter()
             .map(|p| format!("  - {}", p))
             .collect::<Vec<_>>();
-        lines.extend(invalid.iter().map(|p| format!("  - {}", p)));
         Err(anyhow!(
             "experiment.yaml missing required fields:\n{}",
             lines.join("\n")
@@ -527,6 +489,12 @@ pub(crate) fn verify_sealed_package_integrity(
             "preflight_failed: checksums must include 'resolved_experiment.json'"
         ));
     }
+    if !files.contains_key(STAGING_MANIFEST_FILE) {
+        return Err(anyhow!(
+            "preflight_failed: checksums must include '{}'",
+            STAGING_MANIFEST_FILE
+        ));
+    }
     let computed_digest = canonical_json_digest(
         checksums
             .pointer("/files")
@@ -561,13 +529,24 @@ pub(crate) fn verify_sealed_package_integrity(
         "resolved_experiment.json",
         "checksums.files",
     )?;
-    load_json_file(&resolved_path).map_err(|err| {
+    let resolved_experiment = load_json_file(&resolved_path).map_err(|err| {
         anyhow!(
             "preflight_failed: resolved_experiment.json missing or unreadable at {}: {}",
             resolved_path.display(),
             err
         )
-    })
+    })?;
+    let staging_manifest_path =
+        resolve_package_path_under_root(package_dir, STAGING_MANIFEST_FILE, "checksums.files")?;
+    load_json_file(&staging_manifest_path).map_err(|err| {
+        anyhow!(
+            "preflight_failed: {} missing or unreadable at {}: {}",
+            STAGING_MANIFEST_FILE,
+            staging_manifest_path.display(),
+            err
+        )
+    })?;
+    Ok(resolved_experiment)
 }
 
 pub(crate) fn load_sealed_package_for_run(path: &Path) -> Result<LoadedExperimentInput> {
@@ -656,10 +635,6 @@ pub(crate) fn parse_policies(json_value: &Value) -> PolicyConfig {
         .pointer("/pruning/max_consecutive_failures")
         .and_then(|v| v.as_u64())
         .map(|v| v as usize);
-    let require_workspace_materialization = p
-        .pointer("/task_boundary/require_workspace_materialization")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
     let max_in_flight_per_variant = p
         .pointer("/concurrency/max_in_flight_per_variant")
         .and_then(|v| v.as_u64())
@@ -675,9 +650,7 @@ pub(crate) fn parse_policies(json_value: &Value) -> PolicyConfig {
         retry_max_attempts,
         retry_on,
         pruning_max_consecutive_failures,
-        task_boundary: TaskBoundaryPolicy {
-            require_workspace_materialization,
-        },
+        task_boundary: TaskBoundaryPolicy::default(),
         concurrency: ConcurrencyPolicyConfig {
             max_in_flight_per_variant,
             require_chain_lease,
@@ -732,8 +705,8 @@ pub(crate) fn parse_benchmark_config(json_value: &Value) -> BenchmarkConfig {
         }
     }
 
-    let adapter = root.pointer("/adapter").and_then(|a| {
-        let command = a
+    let grader = root.pointer("/grader").and_then(|g| {
+        let command = g
             .pointer("/command")
             .and_then(|v| v.as_array())
             .map(|arr| {
@@ -754,12 +727,15 @@ pub(crate) fn parse_benchmark_config(json_value: &Value) -> BenchmarkConfig {
         if command.is_empty() {
             return None;
         }
-        let manifest = a.pointer("/manifest").cloned();
-        Some(BenchmarkAdapterConfig { command, manifest })
+        Some(BenchmarkGraderConfig { command })
     });
 
+    #[cfg(test)]
+    let adapter = grader.clone();
     BenchmarkConfig {
         policy: policy_config,
+        grader,
+        #[cfg(test)]
         adapter,
     }
 }
@@ -986,14 +962,19 @@ pub(crate) fn resolved_schedule_path(run_dir: &Path) -> PathBuf {
 
 pub(crate) fn write_resolved_variants(
     run_dir: &Path,
+    experiment: &Value,
     baseline_id: &str,
     variants: &[Variant],
 ) -> Result<()> {
+    let variants = variants
+        .iter()
+        .map(|variant| resolved_variant_manifest_entry(experiment, variant))
+        .collect::<Result<Vec<_>>>()?;
     let manifest = ResolvedVariantsManifest {
         schema_version: "resolved_variants_v1".to_string(),
         generated_at: Utc::now().to_rfc3339(),
         baseline_id: baseline_id.to_string(),
-        variants: variants.to_vec(),
+        variants,
     };
     let value = serde_json::to_value(&manifest)?;
     atomic_write_json_pretty(&resolved_variants_path(run_dir), &value)
@@ -1040,7 +1021,7 @@ pub(crate) fn load_run_variants(
     if !manifest
         .variants
         .iter()
-        .any(|variant| variant.id == manifest.baseline_id)
+        .any(|variant| variant.variant.id == manifest.baseline_id)
     {
         return Err(anyhow!(
             "resolved variants manifest baseline '{}' not found in variants: {}",
@@ -1048,7 +1029,14 @@ pub(crate) fn load_run_variants(
             manifest_path.display()
         ));
     }
-    Ok((manifest.variants, manifest.baseline_id))
+    Ok((
+        manifest
+            .variants
+            .into_iter()
+            .map(|variant| variant.variant)
+            .collect(),
+        manifest.baseline_id,
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -1101,161 +1089,168 @@ pub(crate) fn variant_digest(variant: &Variant) -> Result<String> {
     Ok(canonical_json_digest(&value))
 }
 
+pub(crate) fn resolved_variant_behavior_surface(
+    experiment: &Value,
+    variant: &Variant,
+) -> Result<Value> {
+    let mut runtime = experiment
+        .pointer("/runtime")
+        .cloned()
+        .unwrap_or_else(|| json!({}));
+    if !runtime.is_object() {
+        return Err(anyhow!(
+            "invalid /runtime in resolved experiment: expected object"
+        ));
+    }
+    if let Some(runtime_overrides) = variant.runtime_overrides.as_ref() {
+        if !runtime_overrides.is_object() {
+            return Err(anyhow!(
+                "variant '{}' runtime_overrides must be an object",
+                variant.id
+            ));
+        }
+        merge_json_value(&mut runtime, runtime_overrides);
+    }
+    Ok(json!({
+        "bindings": variant.bindings.clone(),
+        "args": variant.args.clone(),
+        "env": variant.env.clone(),
+        "image": variant.image.clone(),
+        "runtime": runtime,
+    }))
+}
+
+pub(crate) fn resolved_variant_behavior_digest(
+    experiment: &Value,
+    variant: &Variant,
+) -> Result<String> {
+    Ok(canonical_json_digest(&resolved_variant_behavior_surface(
+        experiment, variant,
+    )?))
+}
+
+fn resolved_variant_manifest_entry(
+    experiment: &Value,
+    variant: &Variant,
+) -> Result<ResolvedVariant> {
+    Ok(ResolvedVariant {
+        variant_digest: resolved_variant_behavior_digest(experiment, variant)?,
+        variant: variant.clone(),
+    })
+}
+
 pub(crate) fn resolve_variant_plan(json_value: &Value) -> Result<(Vec<Variant>, String)> {
-    if !matches!(json_value.pointer("/variants"), None | Some(Value::Null)) {
-        return Err(anyhow!(
-            "legacy alias '/variants' is not allowed; use '/variant_plan'"
-        ));
-    }
-    if !matches!(
-        json_value.pointer("/baseline/config"),
-        None | Some(Value::Null)
-    ) {
-        return Err(anyhow!(
-            "legacy alias '/baseline/config' is not allowed; use '/baseline/bindings'"
-        ));
-    }
     let baseline = json_value
         .pointer("/baseline/variant_id")
+        .or_else(|| json_value.pointer("/baseline/id"))
         .and_then(|v| v.as_str())
-        .ok_or_else(|| anyhow!("missing /baseline/variant_id"))?
+        .ok_or_else(|| anyhow!("missing /baseline/variant_id or /baseline/id"))?
         .to_string();
 
-    let clean_contract = is_clean_contract_experiment(json_value);
-
     let mut variants = Vec::new();
-    if clean_contract {
-        let baseline_args =
-            parse_string_array_field(json_value.pointer("/baseline/args"), "/baseline/args")?;
-        let baseline_env =
-            parse_string_map_field(json_value.pointer("/baseline/env"), "/baseline/env")?;
-        let baseline_image = parse_optional_nonempty_string(
-            json_value.pointer("/baseline/image"),
-            "/baseline/image",
-        )?;
-        variants.push(Variant {
-            id: baseline.clone(),
-            bindings: json!({}),
-            args: baseline_args,
-            env: baseline_env,
-            image: baseline_image,
-            runtime_overrides: None,
-        });
-    } else {
-        let baseline_bindings = json_value
-            .pointer("/baseline/bindings")
-            .cloned()
-            .unwrap_or(json!({}));
-        if !baseline_bindings.is_object() {
-            return Err(anyhow!("invalid /baseline/bindings: expected object"));
-        }
-        let mut baseline_runtime_overrides = match json_value.pointer("/baseline/runtime_overrides")
-        {
-            None | Some(Value::Null) => None,
-            Some(Value::Object(_)) => json_value.pointer("/baseline/runtime_overrides").cloned(),
-            Some(_) => return Err(anyhow!("/baseline/runtime_overrides must be an object")),
-        };
-        if let Some(image) = parse_optional_nonempty_string(
-            json_value.pointer("/baseline/image"),
-            "/baseline/image",
-        )? {
-            let mut overrides = baseline_runtime_overrides.unwrap_or_else(|| json!({}));
-            set_json_pointer_value(&mut overrides, "/agent/image", json!(image))?;
-            baseline_runtime_overrides = Some(overrides);
-        }
-        variants.push(Variant {
-            id: baseline.clone(),
-            bindings: baseline_bindings,
-            args: Vec::new(),
-            env: BTreeMap::new(),
-            image: None,
-            runtime_overrides: baseline_runtime_overrides,
-        });
+    let baseline_bindings = json_value
+        .pointer("/baseline/bindings")
+        .or_else(|| json_value.pointer("/baseline/config"))
+        .cloned()
+        .unwrap_or(json!({}));
+    if !baseline_bindings.is_object() {
+        return Err(anyhow!("invalid /baseline/bindings: expected object"));
     }
-
-    let variant_list: &[Value] = match json_value.pointer("/variant_plan") {
-        Some(value) => value
-            .as_array()
-            .map(|v| v.as_slice())
-            .ok_or_else(|| anyhow!("/variant_plan must be an array of variant objects"))?,
-        None => &[],
+    let mut baseline_runtime_overrides = match json_value.pointer("/baseline/runtime_overrides") {
+        None | Some(Value::Null) => None,
+        Some(Value::Object(_)) => json_value.pointer("/baseline/runtime_overrides").cloned(),
+        Some(_) => return Err(anyhow!("/baseline/runtime_overrides must be an object")),
     };
+    if let Some(image) =
+        parse_optional_nonempty_string(json_value.pointer("/baseline/image"), "/baseline/image")?
+    {
+        let mut overrides = baseline_runtime_overrides.unwrap_or_else(|| json!({}));
+        set_json_pointer_value(&mut overrides, "/agent/image", json!(image))?;
+        baseline_runtime_overrides = Some(overrides);
+    }
+    variants.push(Variant {
+        id: baseline.clone(),
+        bindings: baseline_bindings,
+        args: Vec::new(),
+        env: BTreeMap::new(),
+        image: None,
+        runtime_overrides: baseline_runtime_overrides,
+    });
+
+    let (variant_list, variant_path): (&[Value], &str) =
+        if let Some(value) = json_value.pointer("/variant_plan") {
+            (
+                value
+                    .as_array()
+                    .map(|v| v.as_slice())
+                    .ok_or_else(|| anyhow!("/variant_plan must be an array of variant objects"))?,
+                "/variant_plan",
+            )
+        } else if let Some(value) = json_value.pointer("/variants") {
+            (
+                value
+                    .as_array()
+                    .map(|v| v.as_slice())
+                    .ok_or_else(|| anyhow!("/variants must be an array of variant objects"))?,
+                "/variants",
+            )
+        } else {
+            (&[], "/variant_plan")
+        };
     for (idx, item) in variant_list.iter().enumerate() {
-        if !matches!(item.get("id"), None | Some(Value::Null)) {
-            return Err(anyhow!(
-                "legacy alias '/variant_plan[{}].id' is not allowed; use '.variant_id'",
-                idx
-            ));
-        }
-        if !matches!(item.get("config"), None | Some(Value::Null)) {
-            return Err(anyhow!(
-                "legacy alias '/variant_plan[{}].config' is not allowed; use '.bindings'",
-                idx
-            ));
-        }
         let id = item
             .get("variant_id")
+            .or_else(|| item.get("id"))
             .and_then(|v| v.as_str())
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .ok_or_else(|| {
                 anyhow!(
-                    "/variant_plan[{}] must include non-empty string variant_id",
+                    "{}[{}] must include non-empty string variant_id",
+                    variant_path,
                     idx
                 )
             })?
             .to_string();
-        if clean_contract {
-            let args = parse_string_array_field(
-                item.get("args"),
-                &format!("/variant_plan[{}].args", idx),
-            )?;
-            let env =
-                parse_string_map_field(item.get("env"), &format!("/variant_plan[{}].env", idx))?;
-            let image = parse_optional_nonempty_string(
-                item.get("image"),
-                &format!("/variant_plan[{}].image", idx),
-            )?;
-            variants.push(Variant {
-                id,
-                bindings: json!({}),
-                args,
-                env,
-                image,
-                runtime_overrides: None,
-            });
-        } else {
-            let bindings = item.get("bindings").cloned().unwrap_or(json!({}));
-            if !bindings.is_object() {
-                return Err(anyhow!("/variant_plan[{}].bindings must be an object", idx));
-            }
-            let mut runtime_overrides = match item.get("runtime_overrides") {
-                None | Some(Value::Null) => None,
-                Some(Value::Object(_)) => item.get("runtime_overrides").cloned(),
-                Some(_) => {
-                    return Err(anyhow!(
-                        "/variant_plan[{}].runtime_overrides must be an object",
-                        idx
-                    ))
-                }
-            };
-            if let Some(image) = parse_optional_nonempty_string(
-                item.get("image"),
-                &format!("/variant_plan[{}].image", idx),
-            )? {
-                let mut overrides = runtime_overrides.unwrap_or_else(|| json!({}));
-                set_json_pointer_value(&mut overrides, "/agent/image", json!(image))?;
-                runtime_overrides = Some(overrides);
-            }
-            variants.push(Variant {
-                id,
-                bindings,
-                args: Vec::new(),
-                env: BTreeMap::new(),
-                image: None,
-                runtime_overrides,
-            });
+        let bindings = item
+            .get("bindings")
+            .or_else(|| item.get("config"))
+            .cloned()
+            .unwrap_or(json!({}));
+        if !bindings.is_object() {
+            return Err(anyhow!(
+                "{}[{}].bindings must be an object",
+                variant_path,
+                idx
+            ));
         }
+        let mut runtime_overrides = match item.get("runtime_overrides") {
+            None | Some(Value::Null) => None,
+            Some(Value::Object(_)) => item.get("runtime_overrides").cloned(),
+            Some(_) => {
+                return Err(anyhow!(
+                    "{}[{}].runtime_overrides must be an object",
+                    variant_path,
+                    idx
+                ))
+            }
+        };
+        if let Some(image) = parse_optional_nonempty_string(
+            item.get("image"),
+            &format!("/variant_plan[{}].image", idx),
+        )? {
+            let mut overrides = runtime_overrides.unwrap_or_else(|| json!({}));
+            set_json_pointer_value(&mut overrides, "/agent/image", json!(image))?;
+            runtime_overrides = Some(overrides);
+        }
+        variants.push(Variant {
+            id,
+            bindings,
+            args: Vec::new(),
+            env: BTreeMap::new(),
+            image: None,
+            runtime_overrides,
+        });
     }
     Ok((variants, baseline))
 }
@@ -1406,14 +1401,6 @@ pub(crate) fn set_json_pointer_value(
 // ---------------------------------------------------------------------------
 
 pub(crate) fn resolve_runtime_for_variant(experiment: &Value, variant: &Variant) -> Result<Value> {
-    if is_clean_contract_experiment(experiment) {
-        let mut resolved = experiment.clone();
-        if let Some(image) = variant.image.as_ref() {
-            set_json_pointer_value(&mut resolved, "/runtime/image", json!(image))?;
-        }
-        return Ok(resolved);
-    }
-
     let mut resolved = experiment.clone();
     let Some(runtime_overrides) = variant.runtime_overrides.as_ref() else {
         return Ok(resolved);
@@ -1426,7 +1413,6 @@ pub(crate) fn resolve_runtime_for_variant(experiment: &Value, variant: &Variant)
     if !runtime.is_object() {
         return Err(anyhow!("invalid /runtime: expected object"));
     }
-
     merge_json_value(&mut runtime, runtime_overrides);
     set_json_pointer_value(&mut resolved, "/runtime", runtime)?;
     Ok(resolved)
@@ -1614,7 +1600,10 @@ pub(crate) fn resolve_dataset_path_in_package(
     resolve_package_path_under_root(package_dir, rel, "dataset.path")
 }
 
-pub(crate) fn load_tasks(path: &Path, json_value: &Value) -> Result<Vec<Value>> {
+pub(crate) fn load_task_specs_for_build(
+    path: &Path,
+    json_value: &Value,
+) -> Result<Vec<TaskDeclaration>> {
     let limit = json_value
         .pointer("/dataset/limit")
         .and_then(|v| v.as_u64())
@@ -1622,10 +1611,25 @@ pub(crate) fn load_tasks(path: &Path, json_value: &Value) -> Result<Vec<Value>> 
     if limit == Some(0) {
         return Ok(Vec::new());
     }
-    let file = fs::File::open(path)?;
+    let dataset_ref = json_value
+        .pointer("/dataset/path")
+        .and_then(Value::as_str)
+        .unwrap_or("<missing>");
+    let dataset_suite = json_value
+        .pointer("/dataset/suite_id")
+        .and_then(Value::as_str)
+        .unwrap_or("<unknown>");
+    let file = fs::File::open(path).with_context(|| {
+        format!(
+            "failed to open dataset file '{}' (resolved from dataset.path='{}', dataset.suite_id='{}')",
+            path.display(),
+            dataset_ref,
+            dataset_suite
+        )
+    })?;
     let reader = BufReader::new(file);
     let mut tasks = Vec::new();
-    for line in reader.lines() {
+    for (idx, line) in reader.lines().enumerate() {
         let line = line?;
         let trimmed = line.trim();
         if trimmed.is_empty() {
@@ -1635,6 +1639,71 @@ pub(crate) fn load_tasks(path: &Path, json_value: &Value) -> Result<Vec<Value>> 
             break;
         }
         let task: Value = serde_json::from_str(trimmed)?;
+        let task_id = task
+            .pointer("/task/id")
+            .or_else(|| task.pointer("/id"))
+            .and_then(Value::as_str)
+            .unwrap_or("<unknown_task>");
+        let task_spec = crate::parse_task_spec(&task).map_err(|err| {
+            anyhow!(
+                "dataset row {} task '{}' is not a valid public task_spec: {}",
+                idx + 1,
+                task_id,
+                err
+            )
+        })?;
+        let declaration = crate::compile_task_spec(task_spec).map_err(|err| {
+            anyhow!(
+                "dataset row {} task '{}' could not compile from public task_spec to task declaration: {}",
+                idx + 1,
+                task_id,
+                err
+            )
+        })?;
+        tasks.push(declaration);
+    }
+    Ok(tasks)
+}
+
+pub(crate) fn load_tasks(path: &Path, json_value: &Value) -> Result<Vec<Value>> {
+    let limit = json_value
+        .pointer("/dataset/limit")
+        .and_then(|v| v.as_u64())
+        .map(|v| v as usize);
+    if limit == Some(0) {
+        return Ok(Vec::new());
+    }
+    let file = fs::File::open(path).with_context(|| {
+        format!(
+            "failed to open dataset file '{}' referenced by dataset.path during build",
+            path.display()
+        )
+    })?;
+    let reader = BufReader::new(file);
+    let mut tasks = Vec::new();
+    for (idx, line) in reader.lines().enumerate() {
+        let line = line?;
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        if limit.is_some_and(|max| tasks.len() >= max) {
+            break;
+        }
+        let task: Value = serde_json::from_str(trimmed)?;
+        if let Err(err) = crate::parse_task_declaration(&task) {
+            let task_id = task
+                .pointer("/task/id")
+                .or_else(|| task.pointer("/id"))
+                .and_then(Value::as_str)
+                .unwrap_or("<unknown_task>");
+            return Err(anyhow!(
+                "dataset row {} task '{}' is not a packaged task declaration: {}",
+                idx + 1,
+                task_id,
+                err
+            ));
+        }
         tasks.push(task);
     }
     Ok(tasks)

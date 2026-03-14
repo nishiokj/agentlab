@@ -7,7 +7,10 @@
         "scheduling": "paired_interleaved",
         "retry": {
           "max_attempts": 2,
-          "retry_on": ["error", "timeout"]
+          "retry_on": [
+            "error",
+            "timeout"
+          ]
         },
         "concurrency": {
           "max_in_flight_per_variant": 2,
@@ -19,11 +22,17 @@
       "policy": {
         "task_model": "dependent",
         "scoring_lifecycle": "predict_then_score",
-        "required_evidence_classes": ["agent_patch", "grader_report"],
+        "required_evidence_classes": [
+          "agent_patch",
+          "grader_report"
+        ],
         "chain_failure_policy": "continue_with_flag"
       },
       "adapter": {
-        "command": ["node", "./adapters/swebench_adapter.js"],
+        "command": [
+          "node",
+          "./adapters/swebench_adapter.js"
+        ],
         "manifest": {
           "schema_version": "benchmark_adapter_manifest_v1",
           "adapter_id": "swebench_adapter",
@@ -33,33 +42,38 @@
     }
   },
   "dataset_task_row": {
-    "schema_version": "task_boundary_v2",
     "task": {
       "id": "swebench__django__12345",
-      "prompt": "Fix failing tests without changing expected behavior.",
+      "prompt": "Fix failing tests without changing expected behavior."
+    },
+    "environment": {
       "image": "ghcr.io/acme/swebench-task:20260222"
     },
-    "workspace_seed": {
-      "dataset_pack_ref": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    "workspace": {
+      "mode": "patch",
+      "base": {
+        "kind": "dataset_pack",
+        "dataset_pack_ref": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+      },
+      "overlays": [
+        {
+          "path": "README.md",
+          "content": "Task-scoped fixture for P0 baseline freeze."
+        }
+      ],
+      "aux_mounts": [
+        {
+          "dataset_pack_ref": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "mount_path": "/agentlab/workspace/deps"
+        }
+      ]
     },
-    "workspace_files": [
-      {
-        "path": "README.md",
-        "content": "Task-scoped fixture for P0 baseline freeze."
-      }
-    ],
-    "mount_references": [
-      {
-        "dataset_pack_ref": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-        "mount_path": "/agentlab/workspace/deps",
-        "read_only": true
-      }
-    ],
     "limits": {
       "max_steps": 12,
       "max_total_tokens": 16000,
       "max_tool_calls": 32,
       "trial_seconds": 1800
-    }
+    },
+    "dependencies": {}
   }
 }

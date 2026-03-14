@@ -9,6 +9,23 @@
     "schema_version": { "const": "resolved_variants_v1" },
     "generated_at": { "type": "string", "minLength": 1 },
     "baseline_id": { "type": "string", "minLength": 1 },
-    "variants": { "type": "array", "items": { "type": "object" } }
+    "variants": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "variant_digest", "bindings", "args", "env"],
+        "additionalProperties": true,
+        "properties": {
+          "id": { "type": "string", "minLength": 1 },
+          "variant_digest": { "type": "string", "pattern": "^sha256:[0-9a-f]{64}$" },
+          "agent_ref": { "type": "string", "minLength": 1 },
+          "bindings": {},
+          "args": { "type": "array" },
+          "env": { "type": "object" },
+          "image": { "type": ["string", "null"] },
+          "runtime_overrides": { "type": ["object", "null"] }
+        }
+      }
+    }
   }
 }

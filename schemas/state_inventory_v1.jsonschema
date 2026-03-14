@@ -10,6 +10,7 @@
     "integration_level",
     "mounts",
     "network",
+    "planes",
     "harness_identity",
     "violations"
   ],
@@ -91,6 +92,63 @@
           "type": "array",
           "items": { "type": "string", "minLength": 1 },
           "minItems": 1
+        }
+      }
+    },
+    "planes": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["agent_runtime", "task_sandbox"],
+      "properties": {
+        "agent_runtime": {
+          "type": "object",
+          "additionalProperties": true,
+          "required": ["executor", "mounts"],
+          "properties": {
+            "executor": { "type": "string", "minLength": 1 },
+            "image": { "type": ["string", "null"] },
+            "image_digest": { "type": ["string", "null"] },
+            "workspace": { "type": ["string", "null"] },
+            "network_mode": { "type": "string" },
+            "mounts": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["name", "path", "writable"],
+                "properties": {
+                  "name": { "type": "string" },
+                  "path": { "type": "string" },
+                  "writable": { "type": "boolean" }
+                }
+              }
+            }
+          }
+        },
+        "task_sandbox": {
+          "type": "object",
+          "additionalProperties": true,
+          "required": ["executor", "mounts"],
+          "properties": {
+            "executor": { "type": "string", "minLength": 1 },
+            "image": { "type": ["string", "null"] },
+            "image_digest": { "type": ["string", "null"] },
+            "workspace": { "type": ["string", "null"] },
+            "network_mode": { "type": "string" },
+            "mounts": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["name", "path", "writable"],
+                "properties": {
+                  "name": { "type": "string" },
+                  "path": { "type": "string" },
+                  "writable": { "type": "boolean" }
+                }
+              }
+            }
+          }
         }
       }
     },

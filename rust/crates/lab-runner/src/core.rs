@@ -1,18 +1,15 @@
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context, Result};
 use base64::engine::general_purpose::STANDARD as BASE64_STANDARD;
 use base64::Engine as _;
 use chrono::Utc;
 use lab_core::{
     canonical_json_digest, ensure_dir, runner_runtime_host_paths, sha256_bytes, sha256_file,
-    ArtifactStore, RunnerRuntimeHostPaths, AGENTLAB_BINDINGS_PATH, AGENTLAB_CONTRACT_DEPS_DIR,
-    AGENTLAB_CONTRACT_IN_DIR, AGENTLAB_CONTRACT_OUT_DIR, AGENTLAB_CONTRACT_STATE_DIR,
-    AGENTLAB_CONTRACT_WORKSPACE_DIR, AGENTLAB_DEPENDENCIES_PATH,
+    ArtifactStore, RunnerRuntimeHostPaths, AGENTLAB_CONTRACT_DEPS_DIR, AGENTLAB_CONTRACT_IN_DIR,
+    AGENTLAB_CONTRACT_OUT_DIR, AGENTLAB_CONTRACT_STATE_DIR, AGENTLAB_CONTRACT_WORKSPACE_DIR,
     AGENTLAB_ENV_BINDINGS_PATH, AGENTLAB_ENV_DEPENDENCIES_PATH, AGENTLAB_ENV_POLICY_PATH,
     AGENTLAB_ENV_REPL_IDX, AGENTLAB_ENV_RESULT_PATH, AGENTLAB_ENV_RUN_ID, AGENTLAB_ENV_TASK_ID,
     AGENTLAB_ENV_TASK_PATH, AGENTLAB_ENV_TIMEOUT_MS, AGENTLAB_ENV_TRAJECTORY_PATH,
-    AGENTLAB_ENV_TRIAL_ID, AGENTLAB_ENV_VARIANT_ID, AGENTLAB_POLICY_PATH, AGENTLAB_RESULT_PATH,
-    AGENTLAB_TASK_PATH, AGENTLAB_TRAJECTORY_PATH, HARNESS_IN_DIR,
-    HARNESS_OUT_DIR, HARNESS_RESULT_PATH, HARNESS_TASK_PATH,
+    AGENTLAB_ENV_TRIAL_ID, AGENTLAB_ENV_VARIANT_ID,
 };
 use lab_hooks::{load_manifest, validate_hooks};
 use lab_provenance::{default_attestation, write_attestation};
@@ -30,11 +27,10 @@ use std::os::unix::fs::symlink;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Component, Path, PathBuf};
 use std::process::{Command, Output, Stdio};
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicU64, AtomicUsize};
 use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
-
 
 fn parse_bool_env(value: &str) -> Option<bool> {
     match value.trim().to_ascii_lowercase().as_str() {
@@ -172,9 +168,6 @@ fn emit_slot_commit_progress(
     );
 }
 
-
-
-
 #[derive(Clone)]
 struct AdapterRunRequest<'a> {
     runtime_experiment: &'a Value,
@@ -182,13 +175,11 @@ struct AdapterRunRequest<'a> {
     variant_args: &'a [String],
     runtime_env: &'a BTreeMap<String, String>,
     runtime_overrides_env: &'a BTreeMap<String, String>,
-    container_mode: bool,
     trial_paths: &'a TrialPaths,
     dynamic_mounts: &'a [ResolvedMountReference],
     io_paths: &'a PreparedTrialIo,
     network_mode: &'a str,
-    setup_command: Option<&'a str>,
-    benchmark_adapter: Option<&'a BenchmarkAdapterConfig>,
+    benchmark_grader: Option<&'a BenchmarkGraderConfig>,
     benchmark_grading_enabled: bool,
     run_id: &'a str,
     task_image: Option<&'a str>,
@@ -201,7 +192,6 @@ struct AdapterPauseRequest<'a> {
     label: &'a str,
     timeout: Duration,
 }
-
 
 // ---------------------------------------------------------------------------
 // Worker execution boundary contracts (P1: contract freeze)
@@ -221,7 +211,6 @@ struct TrialDispatch {
     task_payload: Value,
     effective_policy: Value,
 }
-
 
 #[allow(dead_code)]
 trait WorkerBackend: Send + Sync {
@@ -574,12 +563,12 @@ impl WorkerBackend for LocalThreadWorkerBackend {
                     worker_id
                 )
             })?;
-        Ok(WorkerPauseAck {
-            worker_id: worker_id.to_string(),
-            trial_id: ticket.trial_id.clone(),
-            label: label.to_string(),
-            accepted: true,
-        })
+        Err(anyhow!(
+            "local worker backend does not support pause for active worker {} (trial {} label {})",
+            worker_id,
+            ticket.trial_id,
+            label
+        ))
     }
 
     fn request_stop(&self, worker_id: &str, reason: &str) -> Result<()> {
@@ -599,7 +588,11 @@ impl WorkerBackend for LocalThreadWorkerBackend {
                     reason
                 )
             })?;
-        Ok(())
+        Err(anyhow!(
+            "local worker backend does not support stop for active worker {} (reason: {})",
+            worker_id,
+            reason
+        ))
     }
 }
 
@@ -664,8 +657,6 @@ fn adapter_registry_entry(adapter_ref: &AgentAdapterRef) -> Result<Box<dyn Agent
     }
 }
 
-
-
 #[derive(Debug)]
 struct RunOperationLease {
     path: PathBuf,
@@ -684,8 +675,6 @@ impl Drop for RunOperationLease {
         }
     }
 }
-
-
 
 struct EngineLeaseGuard {
     stop: Arc<AtomicBool>,
@@ -914,7 +903,6 @@ fn adopt_engine_lease_for_recovery(
     Ok(adopted)
 }
 
-
 fn append_slot_commit_record(run_dir: &Path, record: &SlotCommitRecord) -> Result<()> {
     let record_json = serde_json::to_value(record)?;
     validate_schema_contract_value(&record_json, "slot commit record")?;
@@ -1041,6 +1029,7 @@ fn commit_record_by_schedule(records: &[SlotCommitRecord]) -> BTreeMap<usize, Sl
 }
 fn normalize_execution_options(execution: &RunExecutionOptions) -> RunExecutionOptions {
     RunExecutionOptions {
+        #[cfg(test)]
         executor: execution.executor,
         materialize: Some(execution.materialize.unwrap_or(MaterializationMode::Full)),
         runtime_env: execution.runtime_env.clone(),
@@ -1050,6 +1039,7 @@ fn normalize_execution_options(execution: &RunExecutionOptions) -> RunExecutionO
 
 fn execution_options_for_session_state(execution: &RunExecutionOptions) -> RunExecutionOptions {
     RunExecutionOptions {
+        #[cfg(test)]
         executor: execution.executor,
         materialize: Some(execution.materialize.unwrap_or(MaterializationMode::Full)),
         runtime_env: BTreeMap::new(),
@@ -1059,7 +1049,6 @@ fn execution_options_for_session_state(execution: &RunExecutionOptions) -> RunEx
 fn run_control_path(run_dir: &Path) -> PathBuf {
     run_dir.join("runtime").join("run_control.json")
 }
-
 
 fn load_parallel_worker_control_state(
     run_dir: &Path,
@@ -1178,8 +1167,6 @@ fn load_run_session_state(run_dir: &Path) -> Result<RunSessionState> {
         "run_session_state_v1 not found in sqlite runtime_kv — this run predates continue behavior persistence"
     ))
 }
-
-
 
 fn active_adapter_payload_value(active_control: Option<&ActiveAdapterControl>) -> Value {
     match active_control {
@@ -1354,7 +1341,12 @@ impl RunControlGuard {
 impl Drop for RunControlGuard {
     fn drop(&mut self) {
         if !self.done {
-            let _ = write_run_control_v2(&self.run_dir, &self.run_id, "failed", &[], None);
+            let status = if INTERRUPTED.load(Ordering::SeqCst) {
+                "interrupted"
+            } else {
+                "failed"
+            };
+            let _ = write_run_control_v2(&self.run_dir, &self.run_id, status, &[], None);
         }
     }
 }
@@ -1437,39 +1429,12 @@ fn create_unique_run_dir(project_root: &Path) -> Result<(String, PathBuf)> {
     ))
 }
 
-
-pub fn run_experiment(path: &Path, use_container: bool) -> Result<RunResult> {
-    run_experiment_with_behavior(
-        path,
-        use_container,
-        RunBehavior::default(),
-        RunExecutionOptions::default(),
-    )
+pub fn run_experiment(path: &Path) -> Result<RunResult> {
+    run_experiment_with_behavior(path, RunBehavior::default(), RunExecutionOptions::default())
 }
 
-pub fn run_experiment_dev(path: &Path, setup_command: Option<String>) -> Result<RunResult> {
-    run_experiment_dev_with_options(path, setup_command, RunExecutionOptions::default())
-}
-
-pub fn run_experiment_dev_with_options(
-    path: &Path,
-    setup_command: Option<String>,
-    options: RunExecutionOptions,
-) -> Result<RunResult> {
-    let behavior = RunBehavior {
-        setup_command,
-        network_mode_override: Some("full".to_string()),
-        require_network_none: false,
-    };
-    run_experiment_with_behavior(path, true, behavior, options)
-}
-
-pub fn run_experiment_with_options(
-    path: &Path,
-    use_container: bool,
-    options: RunExecutionOptions,
-) -> Result<RunResult> {
-    run_experiment_with_behavior(path, use_container, RunBehavior::default(), options)
+pub fn run_experiment_with_options(path: &Path, options: RunExecutionOptions) -> Result<RunResult> {
+    run_experiment_with_behavior(path, RunBehavior::default(), options)
 }
 
 pub fn run_experiment_strict(path: &Path) -> Result<RunResult> {
@@ -1481,11 +1446,10 @@ pub fn run_experiment_strict_with_options(
     options: RunExecutionOptions,
 ) -> Result<RunResult> {
     let behavior = RunBehavior {
-        setup_command: None,
         network_mode_override: None,
         require_network_none: true,
     };
-    run_experiment_with_behavior(path, true, behavior, options)
+    run_experiment_with_behavior(path, behavior, options)
 }
 
 /// Derive the project root from a run directory path.

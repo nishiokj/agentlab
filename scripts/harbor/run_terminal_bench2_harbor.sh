@@ -17,13 +17,12 @@ if [[ -z "${PYTHON_BIN}" ]]; then
 fi
 
 EXPERIMENT_PATH="${AGENTLAB_EXPERIMENT_PATH:-.lab/experiments/terminal_bench2_harbor.yaml}"
-DATASET_PATH="${HARBOR_AGENTLAB_DATASET_PATH:-.lab/experiments/data/terminal_bench2_harbor.task_boundary_v2.jsonl}"
+DATASET_PATH="${HARBOR_AGENTLAB_DATASET_PATH:-.lab/experiments/data/terminal_bench2_harbor.task_boundary_v3.jsonl}"
 HARBOR_TASKS_ROOT="${HARBOR_TASKS_ROOT:-}"
 HARBOR_DATASET_REGISTRY="${HARBOR_DATASET_REGISTRY:-}"
 HARBOR_DATASET_REGISTRY_ROOT="${HARBOR_DATASET_REGISTRY_ROOT:-}"
-HARBOR_REQUIRE_TASK_IMAGE="${HARBOR_REQUIRE_TASK_IMAGE:-0}"
 HARBOR_DEFAULT_TASK_IMAGE="${HARBOR_DEFAULT_TASK_IMAGE:-}"
-HARBOR_DEFAULT_TASK_WORKSPACE="${HARBOR_DEFAULT_TASK_WORKSPACE:-}"
+HARBOR_AGENT_BUNDLE="${HARBOR_AGENT_BUNDLE:-${HARBOR_AGENT_ARTIFACT:-.lab/agents/agent-runtime.tar.gz}}"
 export HARBOR_EVALUATOR_CMD="${HARBOR_EVALUATOR_CMD:-}"
 export HARBOR_EVALUATOR_CMD_JSON="${HARBOR_EVALUATOR_CMD_JSON:-}"
 
@@ -51,14 +50,8 @@ if [[ "${build_dataset}" -eq 1 ]]; then
   if [[ -n "${AGENTLAB_LIMIT:-}" ]]; then
     EXPORT_CMD+=(--limit "${AGENTLAB_LIMIT}")
   fi
-  if [[ "${HARBOR_REQUIRE_TASK_IMAGE}" == "1" ]]; then
-    EXPORT_CMD+=(--require-task-image)
-  fi
   if [[ -n "${HARBOR_DEFAULT_TASK_IMAGE}" ]]; then
     EXPORT_CMD+=(--default-task-image "${HARBOR_DEFAULT_TASK_IMAGE}")
-  fi
-  if [[ -n "${HARBOR_DEFAULT_TASK_WORKSPACE}" ]]; then
-    EXPORT_CMD+=(--default-task-workspace "${HARBOR_DEFAULT_TASK_WORKSPACE}")
   fi
   echo "building Harbor dataset: ${EXPORT_CMD[*]}"
   "${EXPORT_CMD[@]}"
@@ -70,15 +63,29 @@ if [[ ! -f "${DATASET_PATH}" ]]; then
   exit 1
 fi
 
+if [[ ! -f "${HARBOR_AGENT_BUNDLE}" ]]; then
+  echo "missing agent bundle: ${HARBOR_AGENT_BUNDLE}"
+  exit 1
+fi
+
+TMP_EXP="$(mktemp ".lab/experiments/_tmp_terminal_bench2_harbor.XXXXXX.yaml")"
+trap 'rm -f "${TMP_EXP}"' EXIT
+DATASET_ABS="$(cd "$(dirname "${DATASET_PATH}")" && pwd)/$(basename "${DATASET_PATH}")"
+BUNDLE_ABS="$(cd "$(dirname "${HARBOR_AGENT_BUNDLE}")" && pwd)/$(basename "${HARBOR_AGENT_BUNDLE}")"
+sed \
+  -e "s|^  path: .*|  path: ${DATASET_ABS}|" \
+  -e "s|^    bundle: .*|    bundle: ${BUNDLE_ABS}|" \
+  "${EXPERIMENT_PATH}" > "${TMP_EXP}"
+
 if [[ "$#" -gt 0 ]]; then
   RUN_CMD=("$@")
 else
   if command -v lab-cli >/dev/null 2>&1; then
-    RUN_CMD=(lab-cli run "${EXPERIMENT_PATH}" --executor "${AGENTLAB_EXECUTOR:-local_docker}")
+    RUN_CMD=(lab-cli run "${TMP_EXP}" --executor "${AGENTLAB_EXECUTOR:-local_docker}")
   elif [[ -x rust/target/release/lab-cli ]]; then
-    RUN_CMD=(rust/target/release/lab-cli run "${EXPERIMENT_PATH}" --executor "${AGENTLAB_EXECUTOR:-local_docker}")
+    RUN_CMD=(rust/target/release/lab-cli run "${TMP_EXP}" --executor "${AGENTLAB_EXECUTOR:-local_docker}")
   else
-    RUN_CMD=(cargo run --manifest-path rust/Cargo.toml -p lab-cli -- run "${EXPERIMENT_PATH}" --executor "${AGENTLAB_EXECUTOR:-local_docker}")
+    RUN_CMD=(cargo run --manifest-path rust/Cargo.toml -p lab-cli -- run "${TMP_EXP}" --executor "${AGENTLAB_EXECUTOR:-local_docker}")
   fi
 fi
 

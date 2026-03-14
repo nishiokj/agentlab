@@ -548,7 +548,7 @@ Methods: `describe()`, `run()`, `runDev()`, `runExperiment()`, `publish()`, `val
 Private: `runJson()`, `isErrorEnvelope()`, `spawnCommand()`, `parsePayload()`
 
 **`ExperimentBuilder`** — `experiment-builder.ts:115`
-Methods: `create()` (static), `description()`, `owner()`, `tags()`, `datasetJsonl()`, `harnessCli()`, `baseline()`, `addVariant()`, `replications()`, `maxConcurrency()`, `primaryMetrics()`, `secondaryMetrics()`, `networkMode()`, `sandboxImage()`, `localSandbox()`, `build()`, `toYaml()`
+Methods: `create()` (static), `description()`, `owner()`, `tags()`, `datasetJsonl()`, `agentBundle()`, `agentLoop()`, `baseline()`, `addVariant()`, `replications()`, `maxConcurrency()`, `networkMode()`, `sandboxImage()`, `build()`, `toYaml()`
 
 ---
 

@@ -1,4 +1,3 @@
-use anyhow::{anyhow, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::BTreeMap;
@@ -18,18 +17,15 @@ pub(crate) const DEFAULT_CONTAINER_RESULT_PATH: &str = lab_core::AGENTLAB_RESULT
 pub(crate) const DEFAULT_CONTAINER_TRAJECTORY_PATH: &str = lab_core::AGENTLAB_TRAJECTORY_PATH;
 pub(crate) const DEFAULT_CONTAINER_TRIAL_INPUT_PATH: &str = lab_core::AGENTLAB_TRIAL_INPUT_PATH;
 pub(crate) const DEFAULT_CONTAINER_CONTROL_PATH: &str = lab_core::AGENTLAB_CONTROL_PATH;
-pub(crate) const DEFAULT_CLEAN_TASK_PATH: &str = lab_core::HARNESS_TASK_PATH;
-pub(crate) const DEFAULT_CLEAN_RESULT_PATH: &str = lab_core::HARNESS_RESULT_PATH;
 pub(crate) const AGENTLAB_ENV_TASK_IMAGE: &str = "AGENTLAB_TASK_IMAGE";
 pub(crate) const AGENTLAB_ENV_BENCHMARK_PREDICTION_PATH: &str =
     "AGENTLAB_BENCHMARK_PREDICTION_PATH";
 pub(crate) const AGENTLAB_ENV_BENCHMARK_SCORE_PATH: &str = "AGENTLAB_BENCHMARK_SCORE_PATH";
 pub(crate) const AGENTLAB_ENV_AGENT_EXIT_STATUS: &str = "AGENTLAB_AGENT_EXIT_STATUS";
+pub(crate) const AGENTLAB_ENV_PREFLIGHT_SMOKE: &str = "AGENTLAB_PREFLIGHT_SMOKE";
 pub(crate) const BENCHMARK_PREDICTION_FILENAME: &str = "benchmark_prediction.json";
 pub(crate) const BENCHMARK_SCORE_FILENAME: &str = "benchmark_score.json";
 pub(crate) const BENCHMARK_GRADE_ERROR_FILENAME: &str = "benchmark_grade_error.txt";
-pub(crate) const AGENT_ARTIFACT_UNPACK_COMMAND: &str =
-    "tar -xzf /opt/agent.tar.gz -C /opt/agent && rm -f /opt/agent.tar.gz";
 pub(crate) const AGENT_ARTIFACT_PATH_ENV_VALUE: &str =
     "PATH=/opt/agent/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin";
 pub(crate) const AGENT_ARTIFACT_SCRIPT_SOURCE_EXTENSIONS: &[&str] =
@@ -49,6 +45,7 @@ pub(crate) const DEFAULT_MIN_FREE_BYTES: u64 = 20 * 1024 * 1024 * 1024;
 pub(crate) const DEFAULT_MAX_WORKSPACE_BUNDLE_BYTES: u64 = 256 * 1024 * 1024;
 pub(crate) const DEFAULT_PREFLIGHT_IMAGE_PROBE_PARALLELISM: usize = 2;
 pub(crate) const MAX_PREFLIGHT_IMAGE_PROBE_PARALLELISM: usize = 8;
+pub(crate) const DEFAULT_PREFLIGHT_CONTRACT_SMOKE_TIMEOUT_MS: u64 = 10_000;
 pub(crate) const LOCAL_WORKER_CAPACITY_ERROR_PREFIX: &str = "local worker backend at capacity:";
 pub(crate) const LOCAL_WORKER_MAX_COMPLETIONS_PER_POLL: usize = 256;
 pub(crate) const RUNTIME_DISK_HEADROOM_CHECK_INTERVAL_SECONDS: u64 = 1;
@@ -85,6 +82,9 @@ pub(crate) const RUNTIME_KEY_SCHEDULE_PROGRESS: &str = "schedule_progress_v2";
 pub(crate) const RUNTIME_KEY_ENGINE_LEASE: &str = "engine_lease_v1";
 
 pub(crate) const RUN_CONTROL_UNKNOWN_WORKER_ID: &str = "worker.unknown";
+pub(crate) const PACKAGED_RUNTIME_DEPS_DIR: &str = "deps";
+pub(crate) const STAGING_MANIFEST_FILE: &str = "staging_manifest.json";
+pub(crate) const STAGING_MANIFEST_SCHEMA_VERSION: &str = "runtime_path_staging_manifest_v1";
 
 // ---------------------------------------------------------------------------
 // Type declarations from runner_part1_core.rs
@@ -175,29 +175,6 @@ pub(crate) struct WorkerPauseAck {
     pub(crate) trial_id: String,
     pub(crate) label: String,
     pub(crate) accepted: bool,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum AgentLaunchMode {
-    File,
-    Stdio,
-}
-
-impl AgentLaunchMode {
-    pub(crate) fn as_str(self) -> &'static str {
-        match self {
-            Self::File => "file",
-            Self::Stdio => "stdio",
-        }
-    }
-
-    pub(crate) fn parse(raw: Option<&str>) -> Result<Self> {
-        match raw.unwrap_or("file") {
-            "file" => Ok(Self::File),
-            "stdio" => Ok(Self::Stdio),
-            other => Err(anyhow!("unsupported launch mode: {}", other)),
-        }
-    }
 }
 
 #[derive(Debug)]
@@ -359,23 +336,22 @@ pub(crate) struct PendingTrialCompletionRecord {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RunBehavior {
-    pub setup_command: Option<String>,
     pub network_mode_override: Option<String>,
     pub require_network_none: bool,
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum ExecutorKind {
+pub(crate) enum ExecutorKind {
     LocalDocker,
-    LocalProcess,
 }
 
+#[cfg(test)]
 impl ExecutorKind {
-    pub fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::LocalDocker => "local_docker",
-            Self::LocalProcess => "local_process",
         }
     }
 }
@@ -402,6 +378,7 @@ impl MaterializationMode {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct RunExecutionOptions {
+    #[cfg(test)]
     pub executor: Option<ExecutorKind>,
     pub materialize: Option<MaterializationMode>,
     #[serde(skip, default)]
@@ -507,7 +484,6 @@ pub struct ExperimentSummary {
     pub variant_count: usize,
     pub total_trials: usize,
     pub agent_runtime_command: Vec<String>,
-    pub container_mode: bool,
     pub image: Option<String>,
     pub network_mode: String,
     pub trajectory_path: Option<String>,
@@ -729,15 +705,19 @@ impl Default for BenchmarkPolicyConfig {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct BenchmarkAdapterConfig {
+pub(crate) struct BenchmarkGraderConfig {
     pub(crate) command: Vec<String>,
-    pub(crate) manifest: Option<Value>,
 }
+
+#[cfg(test)]
+type BenchmarkAdapterConfig = BenchmarkGraderConfig;
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct BenchmarkConfig {
     pub(crate) policy: BenchmarkPolicyConfig,
-    pub(crate) adapter: Option<BenchmarkAdapterConfig>,
+    pub(crate) grader: Option<BenchmarkGraderConfig>,
+    #[cfg(test)]
+    pub(crate) adapter: Option<BenchmarkGraderConfig>,
 }
 
 #[derive(Debug, Clone)]
@@ -760,6 +740,7 @@ pub(crate) struct ChainRuntimeState {
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct TaskBoundaryPolicy {
+    #[cfg(test)]
     pub(crate) require_workspace_materialization: bool,
 }
 
@@ -836,7 +817,6 @@ pub(crate) struct ScheduleProgress {
     pub(crate) completed_slots: Vec<SlotCompletion>,
     pub(crate) pruned_variants: Vec<usize>,
     pub(crate) consecutive_failures: BTreeMap<usize, usize>,
-    pub(crate) use_container: bool,
     pub(crate) updated_at: String,
 }
 
@@ -845,7 +825,187 @@ pub(crate) struct ResolvedVariantsManifest {
     pub(crate) schema_version: String,
     pub(crate) generated_at: String,
     pub(crate) baseline_id: String,
-    pub(crate) variants: Vec<Variant>,
+    pub(crate) variants: Vec<ResolvedVariant>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct ResolvedVariant {
+    pub(crate) variant_digest: String,
+    #[serde(flatten)]
+    pub(crate) variant: Variant,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct TaskEnvironmentSpec {
+    pub(crate) image: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum WorkspaceMode {
+    Scratch,
+    Patch,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum WorkspaceBaseKind {
+    Empty,
+    DatasetPack,
+    GitCheckout,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct WorkspaceBaseSpec {
+    pub(crate) kind: WorkspaceBaseKind,
+    #[serde(default)]
+    pub(crate) dataset_pack_ref: Option<String>,
+    #[serde(default)]
+    pub(crate) repo: Option<String>,
+    #[serde(default)]
+    pub(crate) commit: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct WorkspaceOverlaySpec {
+    pub(crate) path: String,
+    pub(crate) content: String,
+    #[serde(default)]
+    pub(crate) encoding: Option<String>,
+    #[serde(default)]
+    pub(crate) executable: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct WorkspaceAuxMountSpec {
+    pub(crate) dataset_pack_ref: String,
+    pub(crate) mount_path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct WorkspaceSpec {
+    pub(crate) mode: WorkspaceMode,
+    pub(crate) base: WorkspaceBaseSpec,
+    #[serde(default)]
+    pub(crate) overlays: Vec<WorkspaceOverlaySpec>,
+    #[serde(default)]
+    pub(crate) aux_mounts: Vec<WorkspaceAuxMountSpec>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct TaskDeclarationLimits {
+    #[serde(default)]
+    pub(crate) max_steps: Option<u64>,
+    #[serde(default)]
+    pub(crate) max_total_tokens: Option<u64>,
+    #[serde(default)]
+    pub(crate) max_tool_calls: Option<u64>,
+    #[serde(default)]
+    pub(crate) trial_seconds: Option<u64>,
+}
+
+pub(crate) type TaskBoundaryLimits = TaskDeclarationLimits;
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct TaskSpec {
+    pub(crate) task: Value,
+    pub(crate) environment: TaskEnvironmentSpec,
+    pub(crate) workspace: WorkspaceSpec,
+    pub(crate) dependencies: Value,
+    pub(crate) limits: TaskDeclarationLimits,
+}
+
+impl TaskSpec {
+    pub(crate) fn task_id(&self, task_idx: usize) -> String {
+        self.task
+            .get("id")
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("task_{}", task_idx))
+    }
+
+    pub(crate) fn into_task_declaration(self) -> TaskDeclaration {
+        TaskDeclaration {
+            schema_version: "task_declaration_v1".to_string(),
+            task: self.task,
+            environment: self.environment,
+            workspace: self.workspace,
+            dependencies: self.dependencies,
+            limits: self.limits,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct TaskDeclaration {
+    pub(crate) schema_version: String,
+    pub(crate) task: Value,
+    pub(crate) environment: TaskEnvironmentSpec,
+    pub(crate) workspace: WorkspaceSpec,
+    #[serde(default)]
+    pub(crate) dependencies: Value,
+    #[serde(default)]
+    pub(crate) limits: TaskDeclarationLimits,
+}
+
+impl TaskDeclaration {
+    pub(crate) fn task_id(&self, task_idx: usize) -> String {
+        self.task
+            .get("id")
+            .and_then(|v| v.as_str())
+            .map(str::to_string)
+            .unwrap_or_else(|| format!("task_{}", task_idx))
+    }
+
+    pub(crate) fn task_image(&self) -> &str {
+        self.environment.image.as_str()
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PreparedMountReference {
+    pub(crate) host_path: String,
+    pub(crate) mount_path: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PreparedContractFilePaths {
+    pub(crate) trial_input: String,
+    pub(crate) task: String,
+    pub(crate) bindings: String,
+    pub(crate) dependencies: String,
+    pub(crate) policy: String,
+    pub(crate) result: String,
+    pub(crate) trajectory: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct PreparedTaskEnvironmentManifest {
+    pub(crate) schema_version: String,
+    pub(crate) declaration: TaskDeclaration,
+    pub(crate) declaration_digest: String,
+    pub(crate) run_id: String,
+    pub(crate) trial_id: String,
+    pub(crate) variant_id: String,
+    pub(crate) task_id: String,
+    pub(crate) task_index: usize,
+    pub(crate) repl_idx: usize,
+    pub(crate) task_image: String,
+    pub(crate) workspace_root: String,
+    pub(crate) aux_mounts: Vec<PreparedMountReference>,
+    pub(crate) contract_files: PreparedContractFilePaths,
+    pub(crate) runtime_env: BTreeMap<String, String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -869,25 +1029,6 @@ pub(crate) struct Variant {
 // ---------------------------------------------------------------------------
 // Type declarations from runner_part5_runtime_io.rs
 // ---------------------------------------------------------------------------
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub(crate) enum ImageSource {
-    Global,
-    PerTask,
-}
-
-impl ImageSource {
-    pub(crate) fn parse(raw: Option<&str>) -> Result<Self> {
-        match raw.unwrap_or("global") {
-            "global" => Ok(Self::Global),
-            "per_task" => Ok(Self::PerTask),
-            other => Err(anyhow!(
-                "runtime.agent.image_source must be 'global' or 'per_task' (got '{}')",
-                other
-            )),
-        }
-    }
-}
 
 #[derive(Debug, Clone)]
 pub(crate) struct ResolvedMountReference {

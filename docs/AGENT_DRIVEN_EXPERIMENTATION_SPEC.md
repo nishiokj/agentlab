@@ -1,5 +1,9 @@
 # Agent-Driven Experimentation Spec
 
+> Obsolete note
+>
+> References in this document to `experiment_v1_0` are stale. Current authoring is versionless; do not add a top-level `version` field or use this document as the source of truth for the live authoring contract.
+
 Status: Draft v0.2
 Date: 2026-03-08
 
@@ -10,7 +14,7 @@ Enable an agent to autonomously drive the experiment lifecycle using AgentLab's 
 The agent should be able to:
 
 1. Form a testable hypothesis.
-2. Edit an `experiment_v1_0` authoring YAML.
+2. Edit the current experiment authoring YAML.
 3. Build an immutable sealed package from that YAML.
 4. Preflight and run the package.
 5. Monitor execution and analyze results.
@@ -23,7 +27,7 @@ No new Rust code. No new CLI commands. One new schema, one file convention, one 
 
 AgentLab already exposes the surfaces an agent needs:
 
-- `experiment_v1_0` YAML for editable intent.
+- current experiment authoring YAML for editable intent.
 - `lab build` to create a sealed package.
 - `lab describe` and `lab preflight` to inspect and validate that package.
 - `lab run-experiment` to execute strict experiment runs.
@@ -42,7 +46,7 @@ The journal solves the memory problem. This spec also hardens the loop around re
 
 ## 3. Design Principles
 
-1. **Use what exists.** The agent edits `experiment_v1_0` YAML, builds a sealed package with `lab build`, runs that package, and queries results via `lab views --json`.
+1. **Use what exists.** The agent edits the current experiment authoring YAML, builds a sealed package with `lab build`, runs that package, and queries results via `lab views --json`.
 2. **Executed reality beats editable intent.** The authoring YAML is what the agent meant to run. The sealed package digest is what actually ran. Any durable claim must point at the package digest, not just the YAML path.
 3. **The agent owns the experiment logic.** Hypothesis formation, comparability judgment, stopping decisions, and journal maintenance stay agent-side. The harness does not read the journal.
 4. **The journal is a scientific ledger, not a scratchpad.** It records terminal attempts and reusable conclusions. It should not contain raw logs or full task tables.
@@ -491,7 +495,7 @@ The skill should include 1-2 minimal authoring YAML examples relevant to the ben
 
 | Concern | Owner | Notes |
 |---|---|---|
-| Authoring YAML construction | Agent | Agent reads, copies, modifies `experiment_v1_0` YAML |
+| Authoring YAML construction | Agent | Agent reads, copies, modifies the current experiment authoring YAML |
 | Package build | Runner via `lab build` | Produces immutable sealed package and digest |
 | Package immutability | Agent + runner contract | Package must not be edited after build |
 | Preflight validation | Runner via `lab preflight` | Agent interprets checks and decides next step |

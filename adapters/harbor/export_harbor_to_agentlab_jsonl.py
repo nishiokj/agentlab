@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Export Harbor task definitions into AgentLab task_boundary_v2 JSONL."""
+"""Export Harbor task definitions into AgentLab task_boundary_v3 JSONL."""
 
 from __future__ import annotations
 
@@ -16,7 +16,7 @@ try:  # Python 3.11+
 except ModuleNotFoundError:  # pragma: no cover
     tomllib = None  # type: ignore[assignment]
 
-TASK_BOUNDARY_SCHEMA = "task_boundary_v2"
+TASK_BOUNDARY_SCHEMA = "task_boundary_v3"
 DEFAULT_BENCHMARK_NAME = "terminal_bench_2"
 DEFAULT_ADAPTER_ID = "harbor_tb2"
 DEFAULT_SPLIT = "test"
@@ -189,16 +189,13 @@ def _extract_limits(doc: dict[str, Any]) -> dict[str, int]:
     out: dict[str, int] = {}
     max_tool_calls = raw.get("max_tool_calls")
     max_runtime_ms = raw.get("max_runtime_ms")
-    max_output_bytes = raw.get("max_output_bytes")
     max_runtime_seconds = raw.get("max_runtime_seconds")
     if isinstance(max_tool_calls, int) and max_tool_calls > 0:
         out["max_tool_calls"] = max_tool_calls
-    if isinstance(max_runtime_ms, int) and max_runtime_ms > 0:
-        out["max_runtime_ms"] = max_runtime_ms
-    elif isinstance(max_runtime_seconds, int) and max_runtime_seconds > 0:
-        out["max_runtime_ms"] = max_runtime_seconds * 1000
-    if isinstance(max_output_bytes, int) and max_output_bytes > 0:
-        out["max_output_bytes"] = max_output_bytes
+    if isinstance(max_runtime_seconds, int) and max_runtime_seconds > 0:
+        out["trial_seconds"] = max_runtime_seconds
+    elif isinstance(max_runtime_ms, int) and max_runtime_ms > 0:
+        out["trial_seconds"] = max(1, (max_runtime_ms + 999) // 1000)
     return out
 
 
@@ -215,12 +212,14 @@ def parse_task_dir(task_dir: Path, config: ExportConfig) -> dict[str, Any]:
     task_workspace = _extract_workspace(doc)
     if task_image is None and config.default_task_image is not None:
         task_image = config.default_task_image
-    if task_workspace is None and config.default_task_workspace is not None:
-        task_workspace = config.default_task_workspace
-    if config.require_task_image and task_image is None:
+    if task_workspace is not None:
         raise ValueError(
-            f"task.image missing for task '{task_id}' in {task_toml}; "
-            "required for runtime.agent.image_source='per_task'"
+            f"task.workspace is not supported for task '{task_id}' in {task_toml}; "
+            "sandbox topology is runner-owned"
+        )
+    if task_image is None:
+        raise ValueError(
+            f"environment.image could not be resolved for task '{task_id}' in {task_toml}"
         )
     limits = _extract_limits(doc)
 
@@ -238,19 +237,24 @@ def parse_task_dir(task_dir: Path, config: ExportConfig) -> dict[str, Any]:
         },
     }
     if prompt is not None:
-        task_payload["prompt"] = prompt
-    if task_image is not None:
-        task_payload["image"] = task_image
-    if task_workspace is not None:
-        task_payload["workspace"] = task_workspace
+        task_payload["input"] = {"prompt": prompt}
     if config.include_raw_toml:
         task_payload["harbor"]["task_toml_raw"] = doc
 
     return {
         "schema_version": TASK_BOUNDARY_SCHEMA,
         "task": task_payload,
-        "workspace_files": [],
-        "mount_references": [],
+        "environment": {
+            "image": task_image,
+        },
+        "workspace": {
+            "mode": "scratch",
+            "base": {
+                "kind": "empty",
+            },
+            "overlays": [],
+            "aux_mounts": [],
+        },
         "limits": limits,
     }
 
@@ -345,7 +349,7 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument(
         "--require-task-image",
         action="store_true",
-        help="Fail if any mapped task lacks task.image (for per_task image mode).",
+        help="Deprecated/ignored: environment.image is always required.",
     )
     parser.add_argument(
         "--default-task-image",
@@ -355,7 +359,7 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument(
         "--default-task-workspace",
         default=None,
-        help="Fallback workspace path for tasks that do not define workspace.",
+        help="Deprecated/ignored: sandbox topology is runner-owned.",
     )
     return parser.parse_args(argv)
 

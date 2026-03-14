@@ -18,7 +18,7 @@ This runbook covers the implemented Phase 1 path in `/Users/jevinnishioka/Deskto
 ```bash
 python3 adapters/harbor/export_harbor_to_agentlab_jsonl.py \
   --tasks-root /path/to/harbor/tasks \
-  --output .lab/experiments/data/terminal_bench2_harbor.task_boundary_v2.jsonl
+  --output .lab/experiments/data/terminal_bench2_harbor.task_boundary_v3.jsonl
 ```
 
 2. Run experiment:
@@ -42,7 +42,7 @@ You can build from a Harbor registry JSON/JSONL:
 python3 adapters/harbor/export_harbor_to_agentlab_jsonl.py \
   --registry-json /path/to/registry.jsonl \
   --registry-root /path/to/tasks/root \
-  --output .lab/experiments/data/terminal_bench2_harbor.task_boundary_v2.jsonl
+  --output .lab/experiments/data/terminal_bench2_harbor.task_boundary_v3.jsonl
 ```
 
 ## Evaluator Wiring

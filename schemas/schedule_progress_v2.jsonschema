@@ -14,7 +14,6 @@
     "completed_slots",
     "pruned_variants",
     "consecutive_failures",
-    "use_container",
     "updated_at"
   ],
   "properties": {
@@ -41,16 +40,14 @@
       "items": {
         "type": "object",
         "additionalProperties": false,
-        "required": ["schedule_index", "trial_id", "status", "slot_commit_id", "attempt"],
+        "required": ["schedule_index", "trial_id", "status"],
         "properties": {
           "schedule_index": { "type": "integer", "minimum": 0 },
-          "trial_id": { "type": "string" },
+          "trial_id": { "type": "string", "minLength": 1 },
           "status": {
             "type": "string",
             "enum": ["completed", "failed", "skipped_pruned"]
-          },
-          "slot_commit_id": { "type": "string", "minLength": 1 },
-          "attempt": { "type": "integer", "minimum": 1 }
+          }
         }
       }
     },
@@ -62,7 +59,6 @@
       "type": "object",
       "additionalProperties": { "type": "integer", "minimum": 0 }
     },
-    "use_container": { "type": "boolean" },
     "updated_at": { "type": "string", "format": "date-time" }
   }
 }

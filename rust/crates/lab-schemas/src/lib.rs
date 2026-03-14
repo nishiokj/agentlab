@@ -2,8 +2,6 @@ use anyhow::{anyhow, Result};
 use include_dir::{include_dir, Dir};
 use jsonschema::{Draft, JSONSchema};
 use serde_json::Value;
-use std::fs;
-use std::path::Path;
 
 static SCHEMAS_DIR: Dir = include_dir!("$CARGO_MANIFEST_DIR/../../../schemas");
 
@@ -24,15 +22,6 @@ pub fn load_schema(name: &str) -> Result<Value> {
         return Ok(serde_json::from_str(data)?);
     }
 
-    // Dev fallback: allow newly added schema files before this crate is rebuilt.
-    let fs_path = Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("../../../schemas")
-        .join(name);
-    if fs_path.exists() {
-        let data = fs::read_to_string(fs_path)?;
-        return Ok(serde_json::from_str(&data)?);
-    }
-
     Err(anyhow!("schema not found: {}", name))
 }
 
@@ -43,4 +32,16 @@ pub fn compile_schema(name: &str) -> Result<JSONSchema> {
         .with_draft(Draft::Draft7)
         .compile(schema)?;
     Ok(compiled)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::compile_schema;
+
+    #[test]
+    fn compile_hard_cutover_schemas() {
+        compile_schema("task_declaration_v1.jsonschema").expect("task declaration schema");
+        compile_schema("prepared_task_environment_v1.jsonschema")
+            .expect("prepared task environment schema");
+    }
 }

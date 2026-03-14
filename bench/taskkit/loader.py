@@ -13,14 +13,13 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
-import yaml
-
 from bench.config import BenchConfig
-from bench.taskkit.schema import load_task_yaml, validate_json, load_schema
 
 
 def load_task(task_dir: Path, config: BenchConfig) -> dict[str, Any]:
     """Load and validate a task from its directory."""
+    from bench.taskkit.schema import load_task_yaml, load_schema, validate_json
+
     task_data = load_task_yaml(task_dir)
     schema = load_schema(config.schemas_dir / "task.schema.json")
     errors = validate_json(task_data, schema)

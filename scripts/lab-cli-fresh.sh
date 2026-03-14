@@ -9,7 +9,29 @@ import sys
 print(os.path.realpath(sys.argv[1]))
 PY
 )"
-ROOT_DIR="$(cd "$(dirname "$SCRIPT_PATH")/.." && pwd)"
+SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)"
+
+resolve_experiments_root() {
+  local candidate
+  for candidate in \
+    "${AGENTLAB_EXPERIMENTS_ROOT:-}" \
+    "$SCRIPT_DIR/.." \
+    "$SCRIPT_DIR/../Experiments" \
+    "$SCRIPT_DIR/Experiments"
+  do
+    if [[ -n "$candidate" && -f "$candidate/rust/Cargo.toml" ]]; then
+      (cd "$candidate" && pwd)
+      return 0
+    fi
+  done
+  return 1
+}
+
+ROOT_DIR="$(resolve_experiments_root)" || {
+  echo "[lab-cli-fresh] unable to locate sibling Experiments repo; set AGENTLAB_EXPERIMENTS_ROOT" >&2
+  exit 1
+}
+
 RUST_DIR="$ROOT_DIR/rust"
 BINARY="$RUST_DIR/target/release/lab-cli"
 

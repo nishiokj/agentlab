@@ -5,14 +5,29 @@ use crossterm::{
 };
 use ratatui::{
     prelude::*,
-    widgets::{Cell, Gauge, Paragraph, Row, Table, TableState},
+    widgets::{Block, BorderType, Borders, Cell, Gauge, Paragraph, Row, Table, TableState, Wrap},
 };
 use serde_json::Value;
 use std::io::{self, Stdout};
 use std::time::Duration;
 
+const APP_BG: Color = Color::Rgb(14, 18, 22);
+const PANEL_BG: Color = Color::Rgb(24, 29, 34);
+const PANEL_ALT_BG: Color = Color::Rgb(30, 36, 42);
+const BORDER: Color = Color::Rgb(63, 74, 82);
+const ACCENT: Color = Color::Rgb(102, 212, 196);
+const ACCENT_SOFT: Color = Color::Rgb(41, 66, 70);
+const TEXT: Color = Color::Rgb(236, 232, 224);
+const MUTED: Color = Color::Rgb(144, 153, 160);
+const SUCCESS: Color = Color::Rgb(122, 229, 130);
+const WARNING: Color = Color::Rgb(255, 194, 82);
+const DANGER: Color = Color::Rgb(255, 120, 112);
+
 pub enum Action {
     Quit,
+    Back,
+    Select,
+    Refresh,
     ScrollUp,
     ScrollDown,
     PageUp,
@@ -20,16 +35,63 @@ pub enum Action {
     Tick,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct KeyHint {
+    pub key: &'static str,
+    pub label: &'static str,
+}
+
+#[derive(Clone, Debug)]
+pub struct RunBrowserItem {
+    pub run_id: String,
+    pub experiment: String,
+    pub started_at: String,
+    pub status: String,
+    pub status_detail: String,
+    pub active_trials: usize,
+}
+
+#[derive(Clone, Debug)]
+pub struct ViewBrowserItem {
+    pub name: String,
+    pub source_view: String,
+    pub purpose: String,
+}
+
+pub struct RunBrowserState<'a> {
+    pub items: &'a [RunBrowserItem],
+    pub refresh_secs: u64,
+    pub chrome_title: &'a str,
+    pub description: &'a str,
+}
+
+pub struct ViewBrowserState<'a> {
+    pub run_id: &'a str,
+    pub experiment: &'a str,
+    pub started_at: &'a str,
+    pub status: &'a str,
+    pub items: &'a [ViewBrowserItem],
+    pub refresh_secs: u64,
+    pub chrome_title: &'a str,
+}
+
 pub struct ViewState<'a> {
     pub run_id: &'a str,
     pub status: &'a str,
+    pub started_at: &'a str,
     pub view_name: &'a str,
     pub interval_secs: u64,
     pub table: &'a lab_analysis::QueryTable,
     pub progress: Option<(usize, usize)>,
     pub legend: &'a [(String, String)],
-    /// When set, renders variant labels centered over each table half.
     pub split_labels: Option<(&'a str, &'a str)>,
+    pub hints: &'a [KeyHint],
+}
+
+pub enum Screen<'a> {
+    RunBrowser(RunBrowserState<'a>),
+    ViewBrowser(ViewBrowserState<'a>),
+    LiveView(ViewState<'a>),
 }
 
 pub struct Term {
@@ -49,9 +111,9 @@ impl Term {
         })
     }
 
-    pub fn draw(&mut self, state: &ViewState) -> anyhow::Result<()> {
+    pub fn draw(&mut self, screen: &Screen) -> anyhow::Result<()> {
         let table_state = &mut self.table_state;
-        self.terminal.draw(|f| render(f, state, table_state))?;
+        self.terminal.draw(|f| render(f, screen, table_state))?;
         Ok(())
     }
 
@@ -60,12 +122,15 @@ impl Term {
             if let Event::Key(key) = event::read()? {
                 if key.kind == KeyEventKind::Press {
                     return Ok(match key.code {
-                        KeyCode::Char('q') | KeyCode::Esc => Action::Quit,
-                        KeyCode::Char('c')
-                            if key.modifiers.contains(KeyModifiers::CONTROL) =>
-                        {
+                        KeyCode::Char('q') => Action::Quit,
+                        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                             Action::Quit
                         }
+                        KeyCode::Char('r') => Action::Refresh,
+                        KeyCode::Esc | KeyCode::Backspace | KeyCode::Left | KeyCode::Char('h') => {
+                            Action::Back
+                        }
+                        KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => Action::Select,
                         KeyCode::Up | KeyCode::Char('k') => Action::ScrollUp,
                         KeyCode::Down | KeyCode::Char('j') => Action::ScrollDown,
                         KeyCode::PageUp => Action::PageUp,
@@ -84,18 +149,36 @@ impl Term {
     }
 
     pub fn scroll_down(&mut self, max: usize) {
+        if max == 0 {
+            self.table_state.select(None);
+            return;
+        }
         let i = self.table_state.selected().unwrap_or(0);
-        self.table_state.select(Some((i + 1).min(max.saturating_sub(1))));
+        self.table_state
+            .select(Some((i + 1).min(max.saturating_sub(1))));
     }
 
     pub fn page_up(&mut self) {
         let i = self.table_state.selected().unwrap_or(0);
-        self.table_state.select(Some(i.saturating_sub(20)));
+        self.table_state.select(Some(i.saturating_sub(12)));
     }
 
     pub fn page_down(&mut self, max: usize) {
+        if max == 0 {
+            self.table_state.select(None);
+            return;
+        }
         let i = self.table_state.selected().unwrap_or(0);
-        self.table_state.select(Some((i + 20).min(max.saturating_sub(1))));
+        self.table_state
+            .select(Some((i + 12).min(max.saturating_sub(1))));
+    }
+
+    pub fn selected(&self) -> Option<usize> {
+        self.table_state.selected()
+    }
+
+    pub fn set_selected(&mut self, idx: Option<usize>) {
+        self.table_state.select(idx);
     }
 }
 
@@ -106,135 +189,463 @@ impl Drop for Term {
     }
 }
 
-fn render(f: &mut Frame, state: &ViewState, table_state: &mut TableState) {
+fn render(f: &mut Frame, screen: &Screen, table_state: &mut TableState) {
+    match screen {
+        Screen::RunBrowser(state) => render_run_browser(f, state, table_state),
+        Screen::ViewBrowser(state) => render_view_browser(f, state, table_state),
+        Screen::LiveView(state) => render_live_view(f, state, table_state),
+    }
+}
+
+fn render_run_browser(f: &mut Frame, state: &RunBrowserState, table_state: &mut TableState) {
+    paint_app_background(f);
+    let shell = chrome_block(state.chrome_title, "Runs");
+    let inner = shell.inner(f.area());
+    f.render_widget(shell, f.area());
+
+    let sections = Layout::vertical([
+        Constraint::Length(4),
+        Constraint::Min(12),
+        Constraint::Length(2),
+    ])
+    .split(inner);
+
+    render_browser_header(
+        f,
+        sections[0],
+        "Runs",
+        state.description,
+        state.refresh_secs,
+        state.items.len(),
+    );
+
+    if state.items.is_empty() {
+        render_empty_panel(
+            f,
+            sections[1],
+            "No active runs right now",
+            "This screen keeps polling. Start a run and it will appear here.",
+        );
+        render_browser_footer(f, sections[2], "q quit", "Runs refresh automatically", None);
+        return;
+    }
+
+    let selected = ensure_selection(table_state, state.items.len());
+    let columns = Layout::horizontal([Constraint::Percentage(63), Constraint::Percentage(37)])
+        .split(sections[1]);
+
+    let header = Row::new(["run", "experiment", "started", "state", "active"])
+        .style(table_header_style())
+        .height(1);
+
+    let rows = state.items.iter().enumerate().map(|(idx, item)| {
+        let bg = striped_bg(idx);
+        Row::new(vec![
+            Cell::from(item.run_id.as_str()).style(Style::default().fg(TEXT).bg(bg)),
+            Cell::from(item.experiment.as_str()).style(Style::default().fg(TEXT).bg(bg)),
+            Cell::from(item.started_at.as_str()).style(Style::default().fg(MUTED).bg(bg)),
+            Cell::from(item.status.as_str()).style(status_style(item.status.as_str()).bg(bg)),
+            Cell::from(item.active_trials.to_string()).style(
+                Style::default()
+                    .fg(if item.active_trials > 0 {
+                        ACCENT
+                    } else {
+                        MUTED
+                    })
+                    .bg(bg),
+            ),
+        ])
+    });
+
+    let table = Table::new(
+        rows,
+        [
+            Constraint::Length(32),
+            Constraint::Min(18),
+            Constraint::Length(24),
+            Constraint::Length(12),
+            Constraint::Length(8),
+        ],
+    )
+    .header(header)
+    .block(panel_block("Runs"))
+    .row_highlight_style(selected_row_style())
+    .column_spacing(1);
+    f.render_stateful_widget(table, columns[0], table_state);
+
+    let selected_item = &state.items[selected];
+    let details = Text::from(vec![
+        key_value_line("Run", selected_item.run_id.as_str()),
+        key_value_line("Experiment", selected_item.experiment.as_str()),
+        key_value_line("Started", selected_item.started_at.as_str()),
+        key_value_line("Status", selected_item.status_detail.as_str()),
+        key_value_line("Active trials", &selected_item.active_trials.to_string()),
+        Line::default(),
+        Line::from(vec![Span::styled(
+            "Enter opens the view menu for this run.",
+            Style::default().fg(MUTED),
+        )]),
+    ]);
+    let detail_card = Paragraph::new(details)
+        .block(panel_block("Selected Run"))
+        .wrap(Wrap { trim: true })
+        .style(Style::default().bg(PANEL_BG));
+    f.render_widget(detail_card, columns[1]);
+
+    render_browser_footer(
+        f,
+        sections[2],
+        "Enter choose run",
+        "Esc/q quit",
+        Some("↑↓ move"),
+    );
+}
+
+fn render_view_browser(f: &mut Frame, state: &ViewBrowserState, table_state: &mut TableState) {
+    paint_app_background(f);
+    let shell = chrome_block(state.chrome_title, state.run_id);
+    let inner = shell.inner(f.area());
+    f.render_widget(shell, f.area());
+
+    let sections = Layout::vertical([
+        Constraint::Length(4),
+        Constraint::Min(12),
+        Constraint::Length(2),
+    ])
+    .split(inner);
+
+    render_browser_header(
+        f,
+        sections[0],
+        "Views",
+        "Choose the lens: progress, scoreboard, task outcomes, trace, or any other standard surface.",
+        state.refresh_secs,
+        state.items.len(),
+    );
+
+    if state.items.is_empty() {
+        render_empty_panel(
+            f,
+            sections[1],
+            "No standard views available",
+            "This run exists, but the standardized view surface could not be resolved.",
+        );
+        render_browser_footer(f, sections[2], "Esc back", "q quit", None);
+        return;
+    }
+
+    let selected = ensure_selection(table_state, state.items.len());
+    let columns = Layout::horizontal([Constraint::Percentage(58), Constraint::Percentage(42)])
+        .split(sections[1]);
+
+    let header = Row::new(["view", "source", "purpose"])
+        .style(table_header_style())
+        .height(1);
+    let rows = state.items.iter().enumerate().map(|(idx, item)| {
+        let bg = striped_bg(idx);
+        Row::new(vec![
+            Cell::from(item.name.as_str()).style(Style::default().fg(TEXT).bg(bg)),
+            Cell::from(item.source_view.as_str()).style(Style::default().fg(MUTED).bg(bg)),
+            Cell::from(item.purpose.as_str()).style(Style::default().fg(TEXT).bg(bg)),
+        ])
+    });
+    let table = Table::new(
+        rows,
+        [
+            Constraint::Length(22),
+            Constraint::Length(28),
+            Constraint::Min(18),
+        ],
+    )
+    .header(header)
+    .block(panel_block("Available Views"))
+    .row_highlight_style(selected_row_style())
+    .column_spacing(1);
+    f.render_stateful_widget(table, columns[0], table_state);
+
+    let selected_item = &state.items[selected];
+    let details = Text::from(vec![
+        key_value_line("Run", state.run_id),
+        key_value_line("Experiment", state.experiment),
+        key_value_line("Started", state.started_at),
+        key_value_line("Status", state.status),
+        Line::default(),
+        key_value_line("View", selected_item.name.as_str()),
+        key_value_line("Source", selected_item.source_view.as_str()),
+        Line::from(vec![Span::styled(
+            "Purpose",
+            Style::default().fg(MUTED).add_modifier(Modifier::BOLD),
+        )]),
+        Line::from(vec![Span::styled(
+            selected_item.purpose.as_str(),
+            Style::default().fg(TEXT),
+        )]),
+    ]);
+    let detail_card = Paragraph::new(details)
+        .block(panel_block("Selection"))
+        .wrap(Wrap { trim: true })
+        .style(Style::default().bg(PANEL_BG));
+    f.render_widget(detail_card, columns[1]);
+
+    render_browser_footer(
+        f,
+        sections[2],
+        "Enter open live view",
+        "Esc back",
+        Some("↑↓ move"),
+    );
+}
+
+fn render_live_view(f: &mut Frame, state: &ViewState, table_state: &mut TableState) {
+    paint_app_background(f);
+    let shell = chrome_block("AgentLab", state.view_name);
+    let inner = shell.inner(f.area());
+    f.render_widget(shell, f.area());
+
     let has_progress = state.progress.is_some();
     let has_legend = !state.legend.is_empty();
     let has_split = state.split_labels.is_some();
 
-    let mut constraints = vec![Constraint::Length(1)]; // header
+    let mut constraints = vec![Constraint::Length(4)];
     if has_progress {
-        constraints.push(Constraint::Length(1)); // gauge
-        constraints.push(Constraint::Length(1)); // spacer after gauge
+        constraints.push(Constraint::Length(3));
     }
     if has_legend {
-        constraints.push(Constraint::Length(1)); // legend
+        constraints.push(Constraint::Length(3));
     }
     if has_split {
-        constraints.push(Constraint::Length(1)); // split panel labels
+        constraints.push(Constraint::Length(2));
     }
-    constraints.push(Constraint::Length(1)); // separator
-    constraints.push(Constraint::Min(3)); // table
-    constraints.push(Constraint::Length(1)); // footer
-
-    let chunks = Layout::vertical(constraints).split(f.area());
+    constraints.push(Constraint::Min(8));
+    constraints.push(Constraint::Length(2));
+    let sections = Layout::vertical(constraints).split(inner);
 
     let mut slot = 0;
-    render_header(f, chunks[slot], state);
+    render_live_header(f, sections[slot], state);
     slot += 1;
 
     if has_progress {
-        render_gauge(f, chunks[slot], state);
-        slot += 1;
-        // spacer (blank row for breathing room)
+        render_gauge(f, sections[slot], state);
         slot += 1;
     }
-
     if has_legend {
-        render_legend(f, chunks[slot], state);
+        render_legend(f, sections[slot], state);
         slot += 1;
     }
-
     if has_split {
-        render_split_labels(f, chunks[slot], state);
+        render_split_labels(f, sections[slot], state);
         slot += 1;
     }
 
-    // separator
-    let sep = Paragraph::new(
-        "─".repeat(chunks[slot].width as usize),
-    )
-    .style(Style::default().fg(Color::DarkGray));
-    f.render_widget(sep, chunks[slot]);
+    render_table(f, sections[slot], state, table_state);
     slot += 1;
-
-    render_table(f, chunks[slot], state, table_state);
-    slot += 1;
-
-    render_footer(f, chunks[slot], state);
+    render_live_footer(f, sections[slot], state);
 }
 
-fn render_header(f: &mut Frame, area: Rect, state: &ViewState) {
-    let status_style = if state.status.starts_with("running") {
-        Style::default()
-            .fg(Color::Yellow)
-            .add_modifier(Modifier::BOLD)
-    } else if state.status == "completed" {
-        Style::default()
-            .fg(Color::Green)
-            .add_modifier(Modifier::BOLD)
-    } else if state.status.contains("fail") || state.status.contains("error") {
-        Style::default()
-            .fg(Color::Red)
-            .add_modifier(Modifier::BOLD)
-    } else {
-        Style::default().fg(Color::White)
-    };
+fn paint_app_background(f: &mut Frame) {
+    f.render_widget(
+        Block::default().style(Style::default().bg(APP_BG)),
+        f.area(),
+    );
+}
 
-    let header = Line::from(vec![
-        Span::styled(" ▸ ", Style::default().fg(Color::Cyan)),
+fn chrome_block<'a>(title: &'a str, subtitle: &'a str) -> Block<'a> {
+    Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(BORDER))
+        .style(Style::default().bg(APP_BG))
+        .title(Span::styled(
+            format!(" {} ", title),
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+        ))
+        .title_bottom(Span::styled(
+            format!(" {} ", subtitle),
+            Style::default().fg(MUTED),
+        ))
+}
+
+fn panel_block<'a>(title: &'a str) -> Block<'a> {
+    Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(Style::default().fg(BORDER))
+        .style(Style::default().bg(PANEL_BG))
+        .title(Span::styled(
+            format!(" {} ", title),
+            Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
+        ))
+}
+
+fn render_browser_header(
+    f: &mut Frame,
+    area: Rect,
+    title: &str,
+    subtitle: &str,
+    refresh_secs: u64,
+    count: usize,
+) {
+    let block = panel_block(title).style(Style::default().bg(PANEL_ALT_BG));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    let mut lines = vec![Line::from(vec![
         Span::styled(
-            state.run_id,
-            Style::default()
-                .fg(Color::White)
-                .add_modifier(Modifier::BOLD),
+            subtitle,
+            Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
         ),
         Span::raw("  "),
-        Span::styled(state.status, status_style),
-        Span::raw("  "),
-        Span::styled(state.view_name, Style::default().fg(Color::Cyan)),
+        Span::styled(
+            format!("{} item{}", count, if count == 1 { "" } else { "s" }),
+            Style::default().fg(ACCENT),
+        ),
+    ])];
+    if refresh_secs > 0 {
+        lines.push(Line::from(vec![Span::styled(
+            format!("refresh {}s", refresh_secs),
+            Style::default().fg(MUTED),
+        )]));
+    }
+    f.render_widget(Paragraph::new(Text::from(lines)), inner);
+}
+
+fn render_empty_panel(f: &mut Frame, area: Rect, title: &str, body: &str) {
+    let block = panel_block(title);
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    let text = Text::from(vec![
+        Line::default(),
+        Line::from(vec![Span::styled(body, Style::default().fg(MUTED))]),
     ]);
-    f.render_widget(Paragraph::new(header), area);
+    f.render_widget(
+        Paragraph::new(text)
+            .style(Style::default().bg(PANEL_BG))
+            .alignment(Alignment::Center)
+            .wrap(Wrap { trim: true }),
+        inner,
+    );
+}
+
+fn render_browser_footer(
+    f: &mut Frame,
+    area: Rect,
+    primary: &str,
+    secondary: &str,
+    tertiary: Option<&str>,
+) {
+    let mut spans = vec![
+        Span::styled(primary, Style::default().fg(WARNING)),
+        Span::raw("  "),
+        Span::styled(secondary, Style::default().fg(MUTED)),
+    ];
+    if let Some(extra) = tertiary {
+        spans.push(Span::raw("  "));
+        spans.push(Span::styled(extra, Style::default().fg(MUTED)));
+    }
+    f.render_widget(
+        Paragraph::new(Line::from(spans)).style(Style::default().bg(APP_BG)),
+        area,
+    );
+}
+
+fn render_hints_footer(f: &mut Frame, area: Rect, hints: &[KeyHint]) {
+    let mut spans = Vec::new();
+    for (idx, hint) in hints.iter().enumerate() {
+        if idx > 0 {
+            spans.push(Span::raw("  "));
+        }
+        spans.push(Span::styled(hint.key, Style::default().fg(WARNING)));
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(hint.label, Style::default().fg(MUTED)));
+    }
+    f.render_widget(
+        Paragraph::new(Line::from(spans)).style(Style::default().bg(APP_BG)),
+        area,
+    );
+}
+
+fn render_live_header(f: &mut Frame, area: Rect, state: &ViewState) {
+    let block = panel_block("Current View").style(Style::default().bg(PANEL_ALT_BG));
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    let text = Text::from(vec![
+        Line::from(vec![
+            Span::styled(
+                state.run_id,
+                Style::default().fg(TEXT).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw("  "),
+            Span::styled(state.status, status_style(state.status)),
+            Span::raw("  "),
+            Span::styled(
+                state.view_name,
+                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        {
+            let mut spans = vec![
+                Span::styled(
+                    format!(
+                        "{} row{}",
+                        state.table.rows.len(),
+                        if state.table.rows.len() == 1 { "" } else { "s" }
+                    ),
+                    Style::default().fg(MUTED),
+                ),
+                Span::raw("  "),
+                Span::styled(
+                    format!("started {}", state.started_at),
+                    Style::default().fg(MUTED),
+                ),
+            ];
+            if state.interval_secs > 0 {
+                spans.push(Span::raw("  "));
+                spans.push(Span::styled(
+                    format!("refresh {}s", state.interval_secs),
+                    Style::default().fg(MUTED),
+                ));
+            }
+            Line::from(spans)
+        },
+    ]);
+    f.render_widget(Paragraph::new(text), inner);
 }
 
 fn render_gauge(f: &mut Frame, area: Rect, state: &ViewState) {
-    if let Some((done, total)) = state.progress {
-        let ratio = if total > 0 {
-            done as f64 / total as f64
-        } else {
-            0.0
-        };
-        let label = format!(" {}/{} ({:.0}%)", done, total, ratio * 100.0);
-        // Constrain gauge to ~40% width
-        let gauge_width = ((area.width as f64 * 0.4) as u16).max(20).min(area.width);
-        let gauge_area = Rect {
-            width: gauge_width,
-            ..area
-        };
-        let gauge = Gauge::default()
-            .ratio(ratio.min(1.0))
-            .label(label)
-            .gauge_style(Style::default().fg(Color::Green).bg(Color::DarkGray));
-        f.render_widget(gauge, gauge_area);
-    }
+    let Some((done, total)) = state.progress else {
+        return;
+    };
+    let ratio = if total > 0 {
+        done as f64 / total as f64
+    } else {
+        0.0
+    };
+    let block = panel_block("Progress");
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    let gauge = Gauge::default()
+        .ratio(ratio.min(1.0))
+        .label(format!(" {}/{} ({:.0}%) ", done, total, ratio * 100.0))
+        .gauge_style(Style::default().fg(ACCENT).bg(ACCENT_SOFT));
+    f.render_widget(gauge, inner);
 }
 
 fn render_legend(f: &mut Frame, area: Rect, state: &ViewState) {
-    let mut spans = vec![Span::styled(" ", Style::default())];
-    for (i, (key, val)) in state.legend.iter().enumerate() {
-        if i > 0 {
+    let block = panel_block("Legend");
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    let mut spans = Vec::new();
+    for (idx, (key, value)) in state.legend.iter().enumerate() {
+        if idx > 0 {
             spans.push(Span::raw("  "));
         }
         spans.push(Span::styled(
             key.as_str(),
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(MUTED).add_modifier(Modifier::BOLD),
         ));
-        spans.push(Span::styled("=", Style::default().fg(Color::DarkGray)));
-        spans.push(Span::styled(
-            val.as_str(),
-            Style::default().fg(Color::White),
-        ));
+        spans.push(Span::styled(": ", Style::default().fg(MUTED)));
+        spans.push(Span::styled(value.as_str(), Style::default().fg(TEXT)));
     }
-    f.render_widget(Paragraph::new(Line::from(spans)), area);
+    f.render_widget(Paragraph::new(Line::from(spans)), inner);
 }
 
 fn render_split_labels(f: &mut Frame, area: Rect, state: &ViewState) {
@@ -242,17 +653,17 @@ fn render_split_labels(f: &mut Frame, area: Rect, state: &ViewState) {
         Some(pair) => pair,
         None => return,
     };
+    let block = panel_block("Panels");
+    let inner = block.inner(area);
+    f.render_widget(block, area);
 
-    // Compute split position from actual table column widths so the label
-    // aligns with the ┃ separator column in the data rows.
     let sep_idx = state
         .table
         .columns
         .iter()
         .position(|c| c == "┃")
         .unwrap_or(state.table.columns.len() / 2);
-    let widths = compute_column_widths(state.table, area.width as usize);
-    // Each column takes its width + 1 char gap (ratatui default column_spacing=1)
+    let widths = compute_column_widths(state.table, inner.width as usize);
     let left_chars: usize = widths[..sep_idx]
         .iter()
         .map(|c| match c {
@@ -266,38 +677,39 @@ fn render_split_labels(f: &mut Frame, area: Rect, state: &ViewState) {
     let line = Line::from(vec![
         Span::styled(
             left_padded,
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
         ),
-        Span::styled("┃ ", Style::default().fg(Color::DarkGray)),
+        Span::styled("┃ ", Style::default().fg(MUTED)),
         Span::styled(
             right.to_string(),
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
+            Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
         ),
     ]);
-    f.render_widget(Paragraph::new(line), area);
+    f.render_widget(Paragraph::new(line), inner);
 }
 
 fn render_table(f: &mut Frame, area: Rect, state: &ViewState, table_state: &mut TableState) {
+    let block = panel_block("Data");
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
     if state.table.columns.is_empty() {
         f.render_widget(
-            Paragraph::new(" (no data)").style(Style::default().fg(Color::DarkGray)),
-            area,
+            Paragraph::new("No rows yet")
+                .style(Style::default().fg(MUTED).bg(PANEL_BG))
+                .alignment(Alignment::Center),
+            inner,
         );
         return;
     }
 
-    let header_style = Style::default()
-        .fg(Color::Cyan)
-        .add_modifier(Modifier::BOLD);
-    let sep_style = Style::default().fg(Color::DarkGray);
-
-    let header = Row::new(state.table.columns.iter().map(|c| {
-        let style = if c == "┃" { sep_style } else { header_style };
-        Cell::from(c.as_str()).style(style)
+    let header = Row::new(state.table.columns.iter().map(|column| {
+        let style = if column == "┃" {
+            Style::default().fg(MUTED).bg(PANEL_BG)
+        } else {
+            table_header_style().bg(PANEL_BG)
+        };
+        Cell::from(column.as_str()).style(style)
     }))
     .height(1);
 
@@ -306,126 +718,187 @@ fn render_table(f: &mut Frame, area: Rect, state: &ViewState, table_state: &mut 
         .rows
         .iter()
         .enumerate()
-        .map(|(i, row)| {
-            let bg = if i % 2 == 0 {
-                Color::Reset
-            } else {
-                Color::Rgb(25, 25, 30)
-            };
-            Row::new(row.iter().enumerate().map(|(col_idx, v)| {
-                let text = format_cell_value(v);
-                let style = cell_style(&state.table.columns, col_idx, v, bg);
-                Cell::from(text).style(style)
+        .map(|(idx, row)| {
+            let bg = striped_bg(idx);
+            Row::new(row.iter().enumerate().map(|(col_idx, value)| {
+                let style = cell_style(&state.table.columns, col_idx, value, bg);
+                Cell::from(format_cell_value(value)).style(style)
             }))
         })
         .collect();
 
-    let widths = compute_column_widths(state.table, area.width as usize);
+    let table = Table::new(
+        rows,
+        compute_column_widths(state.table, inner.width as usize),
+    )
+    .header(header)
+    .row_highlight_style(selected_row_style())
+    .column_spacing(1);
 
-    let table = Table::new(rows, widths)
-        .header(header)
-        .row_highlight_style(Style::default().add_modifier(Modifier::REVERSED));
+    ensure_selection(table_state, state.table.rows.len());
+    f.render_stateful_widget(table, inner, table_state);
+}
 
-    if table_state.selected().is_none() && !state.table.rows.is_empty() {
-        table_state.select(Some(0));
+fn render_live_footer(f: &mut Frame, area: Rect, state: &ViewState) {
+    if state.hints.is_empty() {
+        let line = Line::from(vec![
+            Span::styled("Esc", Style::default().fg(WARNING)),
+            Span::raw(" "),
+            Span::styled("back", Style::default().fg(MUTED)),
+            Span::raw("  "),
+            Span::styled("q", Style::default().fg(WARNING)),
+            Span::raw(" "),
+            Span::styled("quit", Style::default().fg(MUTED)),
+        ]);
+        f.render_widget(Paragraph::new(line), area);
+    } else {
+        render_hints_footer(f, area, state.hints);
     }
-
-    f.render_stateful_widget(table, area, table_state);
 }
 
-fn render_footer(f: &mut Frame, area: Rect, state: &ViewState) {
-    let footer = Line::from(vec![
-        Span::styled(" q", Style::default().fg(Color::Yellow)),
-        Span::styled(" quit  ", Style::default().fg(Color::DarkGray)),
-        Span::styled("↑↓", Style::default().fg(Color::Yellow)),
-        Span::styled(" scroll  ", Style::default().fg(Color::DarkGray)),
-        Span::styled("PgUp/Dn", Style::default().fg(Color::Yellow)),
-        Span::styled(" page  ", Style::default().fg(Color::DarkGray)),
-        Span::raw("  "),
-        Span::styled(
-            format!("refresh {}s", state.interval_secs),
-            Style::default().fg(Color::DarkGray),
-        ),
-        Span::raw("  "),
-        Span::styled(
-            format!("{} rows", state.table.rows.len()),
-            Style::default().fg(Color::DarkGray),
-        ),
-    ]);
-    f.render_widget(Paragraph::new(footer), area);
+fn ensure_selection(table_state: &mut TableState, len: usize) -> usize {
+    if len == 0 {
+        table_state.select(None);
+        return 0;
+    }
+    let idx = table_state
+        .selected()
+        .unwrap_or(0)
+        .min(len.saturating_sub(1));
+    table_state.select(Some(idx));
+    idx
 }
 
-fn format_cell_value(v: &Value) -> String {
-    match v {
+fn key_value_line(label: &str, value: &str) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(
+            format!("{}: ", label),
+            Style::default().fg(MUTED).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(value.to_string(), Style::default().fg(TEXT)),
+    ])
+}
+
+fn table_header_style() -> Style {
+    Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
+}
+
+fn selected_row_style() -> Style {
+    Style::default()
+        .bg(ACCENT_SOFT)
+        .fg(TEXT)
+        .add_modifier(Modifier::BOLD)
+}
+
+fn striped_bg(idx: usize) -> Color {
+    if idx % 2 == 0 {
+        PANEL_BG
+    } else {
+        PANEL_ALT_BG
+    }
+}
+
+fn status_style(status: &str) -> Style {
+    if status.starts_with("running") {
+        Style::default().fg(WARNING).add_modifier(Modifier::BOLD)
+    } else if status.starts_with("paused") {
+        Style::default().fg(ACCENT).add_modifier(Modifier::BOLD)
+    } else if status == "completed" {
+        Style::default().fg(SUCCESS).add_modifier(Modifier::BOLD)
+    } else if status == "interrupted" {
+        Style::default().fg(WARNING).add_modifier(Modifier::BOLD)
+    } else if status.contains("fail") || status.contains("error") || status == "killed" {
+        Style::default().fg(DANGER).add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(TEXT)
+    }
+}
+
+fn format_cell_value(value: &Value) -> String {
+    match value {
         Value::Null => "·".to_string(),
-        Value::String(s) => s.clone(),
-        Value::Number(n) => {
-            if let Some(f) = n.as_f64() {
+        Value::String(text) => text.clone(),
+        Value::Number(number) => {
+            if let Some(f) = number.as_f64() {
                 if f == f.trunc() && f.abs() < 1e15 {
                     format!("{}", f as i64)
                 } else {
                     format!("{:.4}", f)
                 }
             } else {
-                n.to_string()
+                number.to_string()
             }
         }
-        Value::Bool(b) => b.to_string(),
+        Value::Bool(boolean) => boolean.to_string(),
         other => other.to_string(),
     }
 }
 
-fn cell_style(columns: &[String], col_idx: usize, v: &Value, bg: Color) -> Style {
-    let col_name = columns.get(col_idx).map(String::as_str).unwrap_or("");
-    let base = Style::default().bg(bg);
+/// Whether a column name is recognized as a numeric metric for color-coding.
+/// Exposed as pub(crate) so tests can verify that display_column_name mappings
+/// remain consistent with the color-coding rules.
+pub(crate) fn is_metric_column(name: &str) -> bool {
+    name.contains("rate")
+        || name.contains("score")
+        || name.ends_with('%')
+        || name == "primary_metric_mean"
+        || name == "metric"
+        || name == "effect"
+}
 
-    // Status indicator dots (split view)
-    if col_name == "st" {
-        if let Some(s) = v.as_str() {
-            return match s {
-                "●" => base.fg(Color::Green),
-                "✗" => base.fg(Color::Red),
-                _ => base.fg(Color::DarkGray),
+/// Whether a column name is recognized as an outcome column for color-coding.
+pub(crate) fn is_outcome_column(name: &str) -> bool {
+    name == "outcome" || name.ends_with("_outcome")
+}
+
+/// Whether a column name is recognized as a status column for color-coding.
+pub(crate) fn is_status_column(name: &str) -> bool {
+    name == "status" || name == "lifecycle"
+}
+
+fn cell_style(columns: &[String], col_idx: usize, value: &Value, bg: Color) -> Style {
+    let column = columns.get(col_idx).map(String::as_str).unwrap_or("");
+    let base = Style::default().bg(bg).fg(TEXT);
+
+    if column == "st" {
+        if let Some(symbol) = value.as_str() {
+            return match symbol {
+                "●" => base.fg(SUCCESS),
+                "✗" => base.fg(DANGER),
+                _ => base.fg(MUTED),
             };
         }
     }
 
-    // Split view separator
-    if col_name == "┃" {
-        return base.fg(Color::DarkGray);
+    if column == "┃" {
+        return base.fg(MUTED);
     }
 
-    if col_name.contains("rate") || col_name.contains("score") || col_name == "primary_metric_mean"
-    {
-        if let Some(f) = v.as_f64() {
-            return if f >= 0.8 {
-                base.fg(Color::Green)
-            } else if f >= 0.5 {
-                base.fg(Color::Yellow)
+    if is_metric_column(column) {
+        if let Some(number) = value.as_f64() {
+            return if number >= 0.8 {
+                base.fg(SUCCESS)
+            } else if number >= 0.5 {
+                base.fg(WARNING)
             } else {
-                base.fg(Color::Red)
+                base.fg(DANGER)
             };
         }
     }
 
-    if col_name == "outcome" || col_name.ends_with("_outcome") {
-        if let Some(s) = v.as_str() {
-            return match s {
-                "success" => base.fg(Color::Green),
-                "failure" | "error" => base.fg(Color::Red),
+    if is_outcome_column(column) {
+        if let Some(status) = value.as_str() {
+            return match status {
+                "success" => base.fg(SUCCESS),
+                "failure" | "error" => base.fg(DANGER),
                 _ => base,
             };
         }
     }
 
-    if col_name == "status" || col_name == "lifecycle" {
-        if let Some(s) = v.as_str() {
-            return match s {
-                "completed" | "success" => base.fg(Color::Green),
-                "in_flight" | "running" => base.fg(Color::Yellow),
-                "failed" | "error" => base.fg(Color::Red),
-                _ => base,
-            };
+    if is_status_column(column) {
+        if let Some(status) = value.as_str() {
+            return status_style(status).bg(bg);
         }
     }
 
@@ -439,17 +912,16 @@ fn compute_column_widths(table: &lab_analysis::QueryTable, available: usize) -> 
 
     let mut max_widths: Vec<usize> = table.columns.iter().map(|c| c.len()).collect();
     for row in &table.rows {
-        for (i, v) in row.iter().enumerate() {
-            if i < max_widths.len() {
-                let len = format_cell_value(v).len();
-                max_widths[i] = max_widths[i].max(len);
+        for (idx, value) in row.iter().enumerate() {
+            if idx < max_widths.len() {
+                let len = format_cell_value(value).len();
+                max_widths[idx] = max_widths[idx].max(len);
             }
         }
     }
 
-    // Cap each column at 40 chars
-    for w in &mut max_widths {
-        *w = (*w).min(40);
+    for width in &mut max_widths {
+        *width = (*width).min(40);
     }
 
     let total: usize = max_widths.iter().sum();
@@ -459,14 +931,14 @@ fn compute_column_widths(table: &lab_analysis::QueryTable, available: usize) -> 
     if total <= usable {
         max_widths
             .iter()
-            .map(|&w| Constraint::Length(w as u16))
+            .map(|&width| Constraint::Length(width as u16))
             .collect()
     } else {
         let min_col = 4u16;
         max_widths
             .iter()
-            .map(|&w| {
-                let proportional = (w as f64 / total as f64 * usable as f64) as u16;
+            .map(|&width| {
+                let proportional = (width as f64 / total as f64 * usable as f64) as u16;
                 Constraint::Length(proportional.max(min_col))
             })
             .collect()

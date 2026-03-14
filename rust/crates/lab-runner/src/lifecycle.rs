@@ -1,4 +1,3 @@
-
 impl RunSink for BufferedRunSink {
     fn write_run_manifest(&mut self, _run: &RunManifestRecord) -> Result<()> {
         Ok(())
@@ -87,7 +86,7 @@ struct TrialExecutor;
 impl TrialExecutor {
     #[allow(clippy::too_many_arguments)]
     fn execute_slot(
-        mode: ScheduleEngineMode,
+        _mode: ScheduleEngineMode,
         run_dir: &Path,
         run_id: &str,
         workload_type: &str,
@@ -100,7 +99,7 @@ impl TrialExecutor {
         policy_config: &PolicyConfig,
         benchmark_config: &BenchmarkConfig,
         variant_runtime_profiles: &[VariantRuntimeProfile],
-        behavior: &RunBehavior,
+        _behavior: &RunBehavior,
         materialize_mode: MaterializationMode,
         task_boundary_policy: &TaskBoundaryPolicy,
         trials_dir: &Path,
@@ -119,19 +118,13 @@ impl TrialExecutor {
         let agent_runtime_env = &variant_runtime.agent_runtime_env;
         let trial_experiment = &variant_runtime.experiment;
         let invocation_source = variant_runtime.invocation_source.clone();
-        let invocation_default_timeout_ms = variant_runtime.invocation_default_timeout_ms;
-        let executor_kind = variant_runtime.executor_kind;
-        let container_mode = variant_runtime.container_mode;
         let configured_network_mode = variant_runtime.configured_network_mode.as_str();
         let effective_network_mode = variant_runtime.effective_network_mode.as_str();
         let task_idx = slot.task_idx;
         let task = &tasks[task_idx];
-        let task_boundary = parse_task_boundary_from_dataset_task(task)?;
-        validate_task_boundary_workspace_materialization(
-            &task_boundary,
-            task_boundary_policy,
-            agent_runtime.image_source,
-        )?;
+        let task_boundary = parse_task_boundary_from_packaged_task(task)?;
+        let _ = task_boundary_policy;
+        validate_task_boundary_workspace_materialization(&task_boundary)?;
         let repl = slot.repl_idx;
         let task_id = task_boundary
             .task_payload
@@ -139,15 +132,7 @@ impl TrialExecutor {
             .and_then(|v| v.as_str())
             .map(|s| s.to_string())
             .unwrap_or_else(|| format!("task_{}", task_idx));
-        if agent_runtime.image_source == ImageSource::PerTask && task_boundary.task_image.is_none()
-        {
-            return Err(anyhow!(
-                "task.image is required for task '{}' when runtime.agent.image_source='per_task'",
-                task_id
-            ));
-        }
-        let benchmark_grading_enabled = benchmark_config.adapter.is_some()
-            && !is_clean_contract_experiment(trial_experiment)
+        let benchmark_grading_enabled = benchmark_config.grader.is_some()
             && task_boundary
                 .task_payload
                 .pointer("/grading/enabled")
@@ -177,48 +162,35 @@ impl TrialExecutor {
         write_trial_state(&trial_dir, &trial_id, "running", None, None, None)?;
         let mut trial_guard = TrialStateGuard::new(&trial_dir, &trial_id);
 
-        let trial_paths = TrialPaths::new(&trial_dir, project_root)?;
-        trial_paths.prepare(false)?;
-        stage_dependencies_for_trial(agent_runtime, &trial_paths)?;
-        if matches!(effective_policy.state_policy, StatePolicy::IsolatePerTrial)
+        let existing_workspace_ref = if matches!(effective_policy.state_policy, StatePolicy::IsolatePerTrial)
             || !has_chain_snapshot
         {
-            materialize_workspace_seed(
-                project_root,
-                &trial_paths,
-                task_boundary.workspace_seed.as_ref(),
-            )?;
-        }
-        if !matches!(effective_policy.state_policy, StatePolicy::IsolatePerTrial) {
-            if let Some(chain_state) = chain_states.get(&chain_key) {
-                if let Some(workspace_ref) = chain_state.latest_workspace_ref.as_deref() {
-                    restore_workspace_from_object_ref(
-                        artifact_store,
-                        workspace_ref,
-                        &trial_paths.workspace,
-                    )?;
-                }
-            }
-        }
-
-        materialize_workspace_files(&trial_paths, &task_boundary.workspace_files)?;
-        stage_workspace_patches_for_trial(agent_runtime, &trial_paths)?;
-        let dynamic_mounts = resolve_task_mounts(
+            None
+        } else {
+            chain_states
+                .get(&chain_key)
+                .and_then(|chain_state| chain_state.latest_workspace_ref.as_deref())
+        };
+        let prepared = prepare_task_environment(
             project_root,
-            &task_boundary.mount_references,
-            container_mode,
-        )?;
-
-        let input = build_agent_task(
-            trial_experiment,
+            &trial_dir,
             run_id,
             &trial_id,
+            trial_experiment,
             variant,
             task_idx,
             repl,
             &task_boundary,
             agent_runtime,
-        );
+            existing_workspace_ref,
+        )?;
+        let PreparedTaskEnvironment {
+            manifest: prepared_manifest,
+            trial_paths,
+            io_paths,
+            dynamic_mounts,
+            trial_input: input,
+        } = prepared;
         let input_bytes = serde_json::to_vec_pretty(&input)?;
         let trial_input_ref = artifact_store.put_bytes(&input_bytes)?;
         let mut bootstrap_store = BackingSqliteStore::open(run_dir)?;
@@ -245,10 +217,18 @@ impl TrialExecutor {
                 "task_index": task_idx
             },
             "runtime": {
-                "container_mode": container_mode,
                 "integration_level": agent_runtime.integration_level.as_str(),
                 "network_mode_requested": configured_network_mode,
-                "network_mode_effective": effective_network_mode
+                "network_mode_effective": effective_network_mode,
+                "agent_runtime": {
+                    "image": agent_runtime.image.clone(),
+                    "workspace": AGENTLAB_CONTRACT_WORKSPACE_DIR,
+                },
+                "task_sandbox": {
+                    "executor": "docker",
+                    "image": prepared_manifest.task_image.clone(),
+                    "workspace": AGENTLAB_CONTRACT_WORKSPACE_DIR
+                }
             },
             "policy_merge": {
                 "global_defaults": {
@@ -289,12 +269,6 @@ impl TrialExecutor {
         });
         atomic_write_json_pretty(&trial_dir.join("trial_metadata.json"), &trial_metadata)?;
 
-        let io_paths = prepare_io_paths(
-            &trial_paths,
-            container_mode,
-            &input_bytes,
-            is_clean_contract_experiment(trial_experiment),
-        )?;
         stage_benchmark_trial_preflight(
             benchmark_config,
             &trial_dir,
@@ -303,18 +277,10 @@ impl TrialExecutor {
             schedule_idx,
             &variant.id,
             &task_boundary.task_payload,
+            Some(prepared_manifest.task_image.as_str()),
             &io_paths.input_host,
         )?;
-        let runtime_env = build_runtime_contract_env(
-            run_id,
-            &input,
-            &io_paths,
-            resolve_trial_timeout_ms(&input, invocation_default_timeout_ms),
-            trial_experiment
-                .pointer("/version")
-                .and_then(|v| v.as_str())
-                == Some("1.0"),
-        );
+        let runtime_env = prepared_manifest.runtime_env.clone();
         let benchmark_prediction_path = trial_paths.out.join(BENCHMARK_PREDICTION_FILENAME);
         let benchmark_score_path = trial_paths.out.join(BENCHMARK_SCORE_FILENAME);
         let benchmark_grade_error_path = trial_paths.out.join(BENCHMARK_GRADE_ERROR_FILENAME);
@@ -343,39 +309,6 @@ impl TrialExecutor {
         let mut result_parse_error: Option<String> = None;
         let trial_started_at = Instant::now();
         for attempt in 0..policy_config.retry_max_attempts {
-            let mut otel_receiver = None;
-            let mut otel_manifest = None;
-            if agent_runtime.tracing_mode == Some("otlp".to_string()) {
-                if container_mode
-                    && trial_experiment
-                        .pointer("/runtime/policy/network/mode")
-                        .and_then(|v| v.as_str())
-                        == Some("none")
-                {
-                    otel_manifest = Some(json!({
-                        "schema_version": "trace_manifest_v1",
-                        "mode": "none",
-                        "reason": "network_none",
-                    }));
-                } else {
-                    let receiver = lab_otel::OtlpReceiver::start(
-                        4318,
-                        ArtifactStore::new(trial_dir.join("artifacts")),
-                    )?;
-                    let endpoint = receiver.endpoint.clone();
-                    otel_receiver = Some(receiver);
-                    otel_manifest = Some(json!({
-                        "schema_version": "trace_manifest_v1",
-                        "mode": "otlp",
-                        "endpoint": endpoint,
-                    }));
-                }
-            }
-
-            let setup_command = match mode {
-                ScheduleEngineMode::FreshRun => behavior.setup_command.as_deref(),
-                ScheduleEngineMode::ContinueRun => None,
-            };
             let _ = fs::remove_file(&benchmark_prediction_path);
             let _ = fs::remove_file(&benchmark_score_path);
             let _ = fs::remove_file(&benchmark_grade_error_path);
@@ -386,32 +319,18 @@ impl TrialExecutor {
                 variant_args: &variant_runtime.variant_args,
                 runtime_env: &runtime_env,
                 runtime_overrides_env: agent_runtime_env,
-                container_mode: matches!(executor_kind, ExecutorKind::LocalDocker),
                 trial_paths: &trial_paths,
                 dynamic_mounts: &dynamic_mounts,
                 io_paths: &io_paths,
                 network_mode: effective_network_mode,
-                setup_command,
-                benchmark_adapter: benchmark_config.adapter.as_ref(),
+                benchmark_grader: benchmark_config.grader.as_ref(),
                 benchmark_grading_enabled,
                 run_id,
-                task_image: task_boundary.task_image.as_deref(),
-                agent_artifact: agent_runtime.agent_artifact.as_deref(),
+                task_image: Some(prepared_manifest.task_image.as_str()),
+                agent_artifact: Some(agent_runtime.agent_artifact.as_path()),
             };
             let proc_result = adapter.run_trial(&run_request)?;
             status = proc_result.status;
-
-            if let Some(receiver) = otel_receiver {
-                let records = receiver.records();
-                receiver.stop();
-                if let Some(mut manifest) = otel_manifest {
-                    if let Some(obj) = manifest.as_object_mut() {
-                        obj.insert("records".to_string(), serde_json::to_value(records)?);
-                    }
-                    let path = trial_dir.join("trace_manifest.json");
-                    atomic_write_json_pretty(&path, &manifest)?;
-                }
-            }
 
             let (loaded_output, parse_error) = load_trial_output_resilient(&io_paths.output_host)?;
             trial_output = loaded_output;
@@ -570,7 +489,7 @@ impl TrialExecutor {
                 "chain_step_index": chain_step_index
             },
             "runtime": {
-                "executor": executor_kind.as_str(),
+                "executor": "docker",
                 "exit_status": status.as_str(),
                 "duration_ms": trial_duration_ms
             },
@@ -667,14 +586,14 @@ impl TrialExecutor {
             &trial_dir,
             trial_experiment,
             agent_runtime,
-            container_mode,
             &trial_paths,
             &resolve_exec_digest(&agent_runtime.command_raw, project_root)?,
             effective_network_mode,
             invocation_source.as_str(),
+            Some(task_boundary.task_image.as_str()),
         )?;
 
-        let manifest_path = resolve_agent_runtime_manifest_path(&trial_paths, container_mode)?;
+        let manifest_path = resolve_agent_runtime_manifest_path(&trial_paths)?;
         if manifest_path.exists() && io_paths.events_host.exists() {
             let manifest = load_manifest(&manifest_path)?;
             let schema = compile_schema("hook_events_v1.jsonschema")?;
@@ -802,7 +721,6 @@ impl TrialExecutor {
             outcome: outcome.clone(),
             success: outcome == "success" && grade_error_reason.is_none(),
             status_code: status.clone(),
-            container_mode,
             integration_level: agent_runtime.integration_level.clone(),
             network_mode_requested: configured_network_mode.to_string(),
             network_mode_effective: effective_network_mode.to_string(),
@@ -834,7 +752,7 @@ impl TrialExecutor {
             Some("result_error".to_string())
         };
 
-        let _ = materialize_mode;
+        materialize_trial_runtime_layout(&trial_dir, &trial_paths, materialize_mode)?;
         trial_paths.cleanup_scratch()?;
 
         let slot_status = if grade_error_reason.is_none() && status == "0" && outcome != "error" {
@@ -2014,6 +1932,18 @@ fn execute_schedule_engine_parallel(
     )?;
 
     while committer.next_commit_idx < schedule.len() || !in_flight.is_empty() {
+        if INTERRUPTED.load(Ordering::SeqCst) {
+            emit_run_log(run_id, "received interrupt signal, shutting down gracefully");
+            write_run_control_v2(
+                run_dir,
+                run_id,
+                "interrupted",
+                &in_flight_active_trials(&in_flight),
+                None,
+            )?;
+            return Ok(ScheduleEngineOutcome::Interrupted);
+        }
+
         if last_disk_check.elapsed() >= disk_check_interval {
             enforce_runtime_disk_headroom(run_dir, min_free_bytes)?;
             last_disk_check = Instant::now();
@@ -2059,7 +1989,7 @@ fn execute_schedule_engine_parallel(
             let proposed_trial_index = trial_index.saturating_add(1);
             let trial_id = format!("trial_{}", proposed_trial_index);
             let variant = &variants[slot.variant_idx];
-            let task_boundary = parse_task_boundary_from_dataset_task(&tasks[slot.task_idx])?;
+            let task_boundary = parse_task_boundary_from_packaged_task(&tasks[slot.task_idx])?;
             let task_id = task_boundary
                 .task_payload
                 .get("id")
@@ -2339,7 +2269,7 @@ fn as_portable_rel(path: &Path) -> String {
 fn copy_path_into_package(source: &Path, destination: &Path) -> Result<()> {
     if source.is_dir() {
         ensure_dir(destination)?;
-        return copy_dir_filtered(source, destination, &[]);
+        return copy_dir_preserve_all(source, destination, &[]);
     }
     if source.is_file() {
         if let Some(parent) = destination.parent() {
@@ -2352,6 +2282,96 @@ fn copy_path_into_package(source: &Path, destination: &Path) -> Result<()> {
         "package build expected file or directory source, got: {}",
         source.display()
     ))
+}
+
+fn stage_task_workspace_dependencies_for_package(
+    tasks: &[TaskDeclaration],
+    project_root: &Path,
+    package_dir: &Path,
+) -> Result<()> {
+    let mut dataset_pack_refs = HashSet::new();
+    let mut git_checkout_commits: BTreeMap<String, HashSet<String>> = BTreeMap::new();
+
+    for (idx, task) in tasks.iter().enumerate() {
+        if matches!(task.workspace.base.kind, WorkspaceBaseKind::DatasetPack) {
+            let dataset_pack_ref = task
+                .workspace
+                .base
+                .dataset_pack_ref
+                .clone()
+                .ok_or_else(|| {
+                    anyhow!(
+                        "package build missing workspace.base.dataset_pack_ref for packaged task row {}",
+                        idx + 1
+                    )
+                })?;
+            dataset_pack_refs.insert(dataset_pack_ref);
+        }
+
+        if matches!(task.workspace.base.kind, WorkspaceBaseKind::GitCheckout) {
+            let repo = task
+                .workspace
+                .base
+                .repo
+                .clone()
+                .ok_or_else(|| {
+                    anyhow!(
+                        "package build missing workspace.base.repo for packaged task row {}",
+                        idx + 1
+                    )
+                })?;
+            let commit = task
+                .workspace
+                .base
+                .commit
+                .clone()
+                .ok_or_else(|| {
+                    anyhow!(
+                        "package build missing workspace.base.commit for packaged task row {}",
+                        idx + 1
+                    )
+                })?;
+            git_checkout_commits.entry(repo).or_default().insert(commit);
+        }
+
+        for mount in &task.workspace.aux_mounts {
+            dataset_pack_refs.insert(mount.dataset_pack_ref.clone());
+        }
+    }
+
+    for dataset_pack_ref in dataset_pack_refs {
+        let digest = parse_dataset_pack_ref_digest(&dataset_pack_ref)?;
+        let source = resolve_dataset_pack_host_path(project_root, &dataset_pack_ref)?;
+        let destination = package_dir
+            .join(".lab")
+            .join("dataset_packs")
+            .join("sha256")
+            .join(digest);
+        copy_path_into_package(&source, &destination)?;
+    }
+
+    for (repo, commits) in git_checkout_commits {
+        for commit in commits {
+            let _ = hydrate_git_checkout_cache(project_root, &repo, &commit)?;
+        }
+        let source = git_repo_cache_dir(project_root, &repo);
+        let destination = package_dir
+            .join(".lab")
+            .join("git_checkouts")
+            .join(sanitize_for_fs(&repo));
+        copy_path_into_package(&source, &destination)?;
+    }
+
+    Ok(())
+}
+
+fn write_packaged_task_declarations(path: &Path, tasks: &[TaskDeclaration]) -> Result<()> {
+    let mut bytes = Vec::new();
+    for task in tasks {
+        serde_json::to_writer(&mut bytes, task)?;
+        bytes.push(b'\n');
+    }
+    atomic_write_bytes(path, &bytes)
 }
 
 fn stage_source_into_package(
@@ -2373,12 +2393,13 @@ fn stage_source_into_package(
     if let Some(existing) = copies.get(&key) {
         return Ok(existing.clone());
     }
-    if !resolved.exists() {
-        return Err(anyhow!(
-            "package build could not resolve source path: {}",
-            resolved.display()
-        ));
-    }
+    fs::metadata(&resolved).with_context(|| {
+        format!(
+            "package build failed to read staged source '{}' resolved from '{}'",
+            resolved.display(),
+            raw_source
+        )
+    })?;
     let name = resolved
         .file_name()
         .and_then(|n| n.to_str())
@@ -2393,17 +2414,431 @@ fn stage_source_into_package(
     Ok(rel_portable)
 }
 
+fn stage_public_runtime_path_reference(
+    rel: &Path,
+    exp_dir: &Path,
+    package_dir: &Path,
+    copies: &mut BTreeMap<String, String>,
+    manifest_entries: &mut Vec<RuntimePathStagingManifestEntry>,
+    field_name: &str,
+) -> Result<String> {
+    let rel_portable = as_portable_rel(rel);
+    let resolved = normalize_path(&exp_dir.join(&rel));
+    fs::metadata(&resolved).with_context(|| {
+        format!(
+            "package build failed to read {} public path reference '{}' resolved to '{}'",
+            field_name,
+            rel_portable,
+            resolved.display()
+        )
+    })?;
+    if copies.contains_key(&rel_portable) {
+        return Ok(contract_deps_destination_path(&rel_portable));
+    }
+    let packaged_rel = PathBuf::from(PACKAGED_RUNTIME_DEPS_DIR).join(rel);
+    let packaged_rel_portable = as_portable_rel(&packaged_rel);
+    let destination = package_dir.join(&packaged_rel);
+    copy_path_into_package(&resolved, &destination)?;
+    copies.insert(rel_portable.clone(), packaged_rel_portable.clone());
+    manifest_entries.push(RuntimePathStagingManifestEntry {
+        original_relative_path: rel_portable.clone(),
+        packaged_path: packaged_rel_portable,
+        runtime_path: contract_deps_destination_path(&rel_portable),
+        required: true,
+        read_only: true,
+    });
+    Ok(contract_deps_destination_path(&rel_portable))
+}
+
+fn rewrite_packaged_runtime_asset_entries(
+    entries: Option<&mut Value>,
+    field_name: &str,
+    exp_dir: &Path,
+    package_dir: &Path,
+    file_copies: &mut BTreeMap<String, String>,
+    file_counter: &mut usize,
+) -> Result<()> {
+    let Some(items) = entries.and_then(Value::as_array_mut) else {
+        return Ok(());
+    };
+    for (idx, item) in items.iter_mut().enumerate() {
+        let raw = item
+            .get("build_source_path")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("{}[{}].build_source_path is required", field_name, idx))?;
+        let rel = stage_source_into_package(
+            raw,
+            exp_dir,
+            package_dir,
+            PACKAGED_RUNTIME_DEPS_DIR,
+            "dep",
+            file_copies,
+            file_counter,
+        )
+        .with_context(|| {
+            format!(
+                "failed to stage {}[{}].build_source_path '{}' into sealed package",
+                field_name, idx, raw
+            )
+        })?;
+        if let Some(obj) = item.as_object_mut() {
+            obj.remove("build_source_path");
+        }
+        set_json_pointer_value(item, "/packaged_path", json!(rel))?;
+    }
+    Ok(())
+}
+
+fn stage_command_path_refs_for_package(
+    command_root: Option<&mut Value>,
+    field_name: &str,
+    exp_dir: &Path,
+    package_dir: &Path,
+    public_path_copies: &mut BTreeMap<String, String>,
+    staging_manifest_entries: &mut Vec<RuntimePathStagingManifestEntry>,
+) -> Result<()> {
+    let Some(items) = command_root.and_then(Value::as_array_mut) else {
+        return Ok(());
+    };
+    for idx in 0..items.len() {
+        let token = items[idx]
+            .as_str()
+            .ok_or_else(|| anyhow!("{}[{}] must be a string", field_name, idx))?;
+        if contains_removed_runtime_template(token) {
+            return Err(anyhow!(
+                "{}[{}] uses removed '${{...}}' syntax; use $NAME runtime bindings instead",
+                field_name,
+                idx
+            ));
+        }
+        if idx == 0 {
+            continue;
+        }
+        let Some(rel) = resolve_existing_public_path_reference(
+            token,
+            exp_dir,
+            &format!("{}[{}]", field_name, idx),
+        )? else {
+            continue;
+        };
+        let contract_path = stage_public_runtime_path_reference(
+            &rel,
+            exp_dir,
+            package_dir,
+            public_path_copies,
+            staging_manifest_entries,
+            &format!("{}[{}]", field_name, idx),
+        )?;
+        items[idx] = Value::String(contract_path);
+    }
+    Ok(())
+}
+
+fn stage_runtime_command_env_path_refs_for_package(
+    runtime_root: &mut Value,
+    exp_dir: &Path,
+    package_dir: &Path,
+    public_path_copies: &mut BTreeMap<String, String>,
+    staging_manifest_entries: &mut Vec<RuntimePathStagingManifestEntry>,
+) -> Result<()> {
+    stage_command_path_refs_for_package(
+        runtime_root.pointer_mut("/agent_runtime/command"),
+        "runtime.agent_runtime.command",
+        exp_dir,
+        package_dir,
+        public_path_copies,
+        staging_manifest_entries,
+    )?;
+    if let Some(items) = runtime_root
+        .pointer_mut("/agent_runtime/env")
+        .and_then(Value::as_object_mut)
+    {
+        let keys = items.keys().cloned().collect::<Vec<_>>();
+        for key in keys {
+            let raw = items
+                .get(&key)
+                .and_then(Value::as_str)
+                .ok_or_else(|| anyhow!("runtime.agent_runtime.env.{} must be a string", key))?;
+            if contains_removed_runtime_template(raw) {
+                return Err(anyhow!(
+                    "runtime.agent_runtime.env.{} uses removed '${{...}}' syntax; use $NAME runtime bindings instead",
+                    key
+                ));
+            }
+            if raw.trim().starts_with("/agentlab/") {
+                return Err(anyhow!(
+                    "runtime.agent_runtime.env.{} leaks runner topology; remove internal /agentlab paths from public authoring",
+                    key
+                ));
+            }
+            let Some(rel) = resolve_existing_public_path_reference(
+                raw,
+                exp_dir,
+                &format!("runtime.agent_runtime.env.{}", key),
+            )? else {
+                continue;
+            };
+            let contract_path = stage_public_runtime_path_reference(
+                &rel,
+                exp_dir,
+                package_dir,
+                public_path_copies,
+                staging_manifest_entries,
+                &format!("runtime.agent_runtime.env.{}", key),
+            )?;
+            items.insert(key, Value::String(contract_path));
+        }
+    }
+    Ok(())
+}
+
+fn collect_command_staging_entries(
+    command_root: Option<&Value>,
+    field_name: &str,
+    catalog: &BTreeMap<String, RuntimePathStagingManifestEntry>,
+    seen: &mut HashSet<String>,
+    entries: &mut Vec<RuntimePathStagingManifestEntry>,
+) -> Result<()> {
+    let Some(items) = command_root.and_then(Value::as_array) else {
+        return Ok(());
+    };
+    for (idx, item) in items.iter().enumerate() {
+        if idx == 0 {
+            continue;
+        }
+        let Some(runtime_path) = item.as_str().map(str::trim) else {
+            return Err(anyhow!("{}[{}] must be a string", field_name, idx));
+        };
+        if !runtime_path.starts_with(AGENTLAB_CONTRACT_DEPS_DIR) {
+            continue;
+        }
+        if !seen.insert(runtime_path.to_string()) {
+            continue;
+        }
+        let entry = lookup_runtime_staging_entry(catalog, runtime_path).ok_or_else(|| {
+            anyhow!(
+                "{}[{}] references packaged dependency '{}' with no staging manifest entry",
+                field_name,
+                idx,
+                runtime_path
+            )
+        })?;
+        entries.push(entry);
+    }
+    Ok(())
+}
+
+fn collect_runtime_command_env_staging_entries(
+    experiment: &Value,
+    catalog: &BTreeMap<String, RuntimePathStagingManifestEntry>,
+) -> Result<Vec<RuntimePathStagingManifestEntry>> {
+    let mut entries = Vec::new();
+    let mut seen = HashSet::new();
+
+    collect_command_staging_entries(
+        experiment.pointer("/runtime/agent_runtime/command"),
+        "runtime.agent_runtime.command",
+        catalog,
+        &mut seen,
+        &mut entries,
+    )?;
+    collect_command_staging_entries(
+        experiment.pointer("/benchmark/grader/command"),
+        "benchmark.grader.command",
+        catalog,
+        &mut seen,
+        &mut entries,
+    )?;
+    collect_command_staging_entries(
+        experiment.pointer("/benchmark/adapter/command"),
+        "benchmark.adapter.command",
+        catalog,
+        &mut seen,
+        &mut entries,
+    )?;
+
+    if let Some(items) = experiment
+        .pointer("/runtime/agent_runtime/env")
+        .and_then(Value::as_object)
+    {
+        for (key, value) in items {
+            let Some(runtime_path) = value.as_str().map(str::trim) else {
+                return Err(anyhow!("runtime.agent_runtime.env.{} must be a string", key));
+            };
+            if !runtime_path.starts_with(AGENTLAB_CONTRACT_DEPS_DIR) {
+                continue;
+            }
+            if !seen.insert(runtime_path.to_string()) {
+                continue;
+            }
+            let entry = lookup_runtime_staging_entry(catalog, runtime_path).ok_or_else(|| {
+                anyhow!(
+                    "runtime.agent_runtime.env.{} references packaged dependency '{}' with no staging manifest entry",
+                    key,
+                    runtime_path
+                )
+            })?;
+            entries.push(entry);
+        }
+    }
+
+    Ok(entries)
+}
+
+fn lookup_runtime_staging_entry(
+    catalog: &BTreeMap<String, RuntimePathStagingManifestEntry>,
+    runtime_path: &str,
+) -> Option<RuntimePathStagingManifestEntry> {
+    if let Some(entry) = catalog.get(runtime_path) {
+        return Some(entry.clone());
+    }
+    catalog
+        .values()
+        .filter(|entry| matches_contract_runtime_root(runtime_path, &entry.runtime_path))
+        .max_by_key(|entry| entry.runtime_path.len())
+        .cloned()
+}
+
+fn matches_contract_runtime_root(path: &str, root: &str) -> bool {
+    path == root
+        || path
+            .strip_prefix(root)
+            .is_some_and(|suffix| suffix.starts_with('/'))
+}
+
+fn collect_packaged_runtime_asset_entries(
+    value: Option<&Value>,
+    field_name: &str,
+) -> Result<Vec<RuntimePathStagingManifestEntry>> {
+    let Some(items) = value else {
+        return Ok(Vec::new());
+    };
+    let arr = items
+        .as_array()
+        .ok_or_else(|| anyhow!("{} must be an array", field_name))?;
+    let mut entries = Vec::with_capacity(arr.len());
+    for (idx, item) in arr.iter().enumerate() {
+        let obj = item
+            .as_object()
+            .ok_or_else(|| anyhow!("{}[{}] must be an object", field_name, idx))?;
+        let packaged_path = obj
+            .get("packaged_path")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("{}[{}].packaged_path is required", field_name, idx))?;
+        let runtime_path = obj
+            .get("runtime_path")
+            .and_then(Value::as_str)
+            .ok_or_else(|| anyhow!("{}[{}].runtime_path is required", field_name, idx))?;
+        entries.push(RuntimePathStagingManifestEntry {
+            original_relative_path: packaged_path.to_string(),
+            packaged_path: validate_dx_support_file_relpath(
+                packaged_path,
+                &format!("{}[{}].packaged_path", field_name, idx),
+            )?,
+            runtime_path: validate_runtime_contract_path(
+                runtime_path,
+                &format!("{}[{}].runtime_path", field_name, idx),
+            )?,
+            required: obj.get("required").and_then(Value::as_bool).unwrap_or(true),
+            read_only: obj.get("read_only").and_then(Value::as_bool).unwrap_or(true),
+        });
+    }
+    Ok(entries)
+}
+
+fn merge_runtime_path_staging_entries(
+    base: &mut Vec<RuntimePathStagingManifestEntry>,
+    extra: Vec<RuntimePathStagingManifestEntry>,
+) {
+    for next in extra {
+        if let Some(existing) = base
+            .iter_mut()
+            .find(|entry| entry.runtime_path == next.runtime_path)
+        {
+            *existing = next;
+        } else {
+            base.push(next);
+        }
+    }
+}
+
+fn write_runtime_staging_manifest(
+    package_dir: &Path,
+    experiment: &Value,
+    entries: &[RuntimePathStagingManifestEntry],
+) -> Result<()> {
+    let (variants, _) = resolve_variant_plan(experiment)?;
+    let mut variants_manifest: BTreeMap<String, Vec<RuntimePathStagingManifestEntry>> =
+        BTreeMap::new();
+    for variant in &variants {
+        let variant_experiment = resolve_runtime_for_variant(experiment, variant)?;
+        let mut variant_catalog_entries = entries.to_vec();
+        merge_runtime_path_staging_entries(
+            &mut variant_catalog_entries,
+            collect_packaged_runtime_asset_entries(
+                variant_experiment.pointer("/benchmark/grader/_runtime_assets"),
+                "benchmark.grader._runtime_assets",
+            )?,
+        );
+        merge_runtime_path_staging_entries(
+            &mut variant_catalog_entries,
+            collect_packaged_runtime_asset_entries(
+                variant_experiment.pointer("/benchmark/adapter/_runtime_assets"),
+                "benchmark.adapter._runtime_assets",
+            )?,
+        );
+        let variant_catalog = variant_catalog_entries
+            .iter()
+            .cloned()
+            .map(|entry| (entry.runtime_path.clone(), entry))
+            .collect::<BTreeMap<_, _>>();
+        let mut variant_entries =
+            collect_runtime_command_env_staging_entries(&variant_experiment, &variant_catalog)?;
+        merge_runtime_path_staging_entries(&mut variant_entries, variant_catalog_entries);
+        variant_entries.sort_by(|left, right| {
+            left.runtime_path
+                .cmp(&right.runtime_path)
+                .then(left.packaged_path.cmp(&right.packaged_path))
+        });
+        for (idx, entry) in variant_entries.iter().enumerate() {
+            let packaged_source = resolve_package_path_under_root(
+                package_dir,
+                &entry.packaged_path,
+                &format!(
+                    "staging_manifest.variants.{}[{}].packaged_path",
+                    variant.id, idx
+                ),
+            )?;
+            fs::metadata(&packaged_source).with_context(|| {
+                format!(
+                    "failed to read packaged runtime staging source '{}' for variant '{}'",
+                    packaged_source.display(),
+                    variant.id
+                )
+            })?;
+        }
+        variants_manifest.insert(variant.id.clone(), variant_entries);
+    }
+    let manifest_value = serde_json::to_value(RuntimePathStagingManifest {
+        schema_version: STAGING_MANIFEST_SCHEMA_VERSION.to_string(),
+        variants: variants_manifest,
+    })?;
+    atomic_write_json_pretty(&package_dir.join(STAGING_MANIFEST_FILE), &manifest_value)
+}
+
 fn rewrite_runtime_paths_for_package(
     runtime_root: &mut Value,
     exp_dir: &Path,
     package_dir: &Path,
     artifact_copies: &mut BTreeMap<String, String>,
-    file_copies: &mut BTreeMap<String, String>,
+    _file_copies: &mut BTreeMap<String, String>,
+    public_path_copies: &mut BTreeMap<String, String>,
+    staging_manifest_entries: &mut Vec<RuntimePathStagingManifestEntry>,
     artifact_counter: &mut usize,
-    file_counter: &mut usize,
+    _file_counter: &mut usize,
 ) -> Result<()> {
     if let Some(raw) = runtime_root
-        .pointer("/agent/artifact")
+        .pointer("/agent_runtime/artifact")
         .and_then(Value::as_str)
     {
         let rel = stage_source_into_package(
@@ -2415,52 +2850,64 @@ fn rewrite_runtime_paths_for_package(
             artifact_copies,
             artifact_counter,
         )?;
-        set_json_pointer_value(runtime_root, "/agent/artifact", json!(rel.clone()))?;
-        set_json_pointer_value(runtime_root, "/agent/artifact_resolved_path", json!(rel))?;
+        set_json_pointer_value(runtime_root, "/agent_runtime/artifact", json!(rel.clone()))?;
+        set_json_pointer_value(
+            runtime_root,
+            "/agent_runtime/artifact_resolved_path",
+            json!(rel),
+        )?;
     }
+    stage_runtime_command_env_path_refs_for_package(
+        runtime_root,
+        exp_dir,
+        package_dir,
+        public_path_copies,
+        staging_manifest_entries,
+    )?;
+    Ok(())
+}
 
-    if let Some(file_staging) = runtime_root
-        .pointer_mut("/dependencies/file_staging")
-        .and_then(Value::as_array_mut)
-    {
-        for entry in file_staging.iter_mut() {
-            if let Some(raw) = entry.get("source_from_host").and_then(Value::as_str) {
-                let rel = stage_source_into_package(
-                    raw,
-                    exp_dir,
-                    package_dir,
-                    "files",
-                    "dep",
-                    file_copies,
-                    file_counter,
-                )?;
-                if let Some(obj) = entry.as_object_mut() {
-                    obj.insert("source_from_host".to_string(), json!(rel));
-                }
-            }
-        }
-    }
-    if let Some(workspace_patches) = runtime_root
-        .pointer_mut("/agent/workspace_patches")
-        .and_then(Value::as_array_mut)
-    {
-        for entry in workspace_patches.iter_mut() {
-            if let Some(raw) = entry.get("source_from_host").and_then(Value::as_str) {
-                let rel = stage_source_into_package(
-                    raw,
-                    exp_dir,
-                    package_dir,
-                    "files",
-                    "patch",
-                    file_copies,
-                    file_counter,
-                )?;
-                if let Some(obj) = entry.as_object_mut() {
-                    obj.insert("source_from_host".to_string(), json!(rel));
-                }
-            }
-        }
-    }
+fn rewrite_benchmark_paths_for_package(
+    benchmark_root: &mut Value,
+    exp_dir: &Path,
+    package_dir: &Path,
+    file_copies: &mut BTreeMap<String, String>,
+    file_counter: &mut usize,
+    public_path_copies: &mut BTreeMap<String, String>,
+    staging_manifest_entries: &mut Vec<RuntimePathStagingManifestEntry>,
+) -> Result<()> {
+    rewrite_packaged_runtime_asset_entries(
+        benchmark_root.pointer_mut("/grader/_runtime_assets"),
+        "benchmark.grader._runtime_assets",
+        exp_dir,
+        package_dir,
+        file_copies,
+        file_counter,
+    )?;
+    rewrite_packaged_runtime_asset_entries(
+        benchmark_root.pointer_mut("/adapter/_runtime_assets"),
+        "benchmark.adapter._runtime_assets",
+        exp_dir,
+        package_dir,
+        file_copies,
+        file_counter,
+    )?;
+    stage_command_path_refs_for_package(
+        benchmark_root.pointer_mut("/grader/command"),
+        "benchmark.grader.command",
+        exp_dir,
+        package_dir,
+        public_path_copies,
+        staging_manifest_entries,
+    )?;
+    stage_command_path_refs_for_package(
+        benchmark_root.pointer_mut("/adapter/command"),
+        "benchmark.adapter.command",
+        exp_dir,
+        package_dir,
+        public_path_copies,
+        staging_manifest_entries,
+    )?;
     Ok(())
 }
 
@@ -2525,19 +2972,24 @@ pub fn build_experiment_package(
     ensure_dir(&package_dir.join("agent_builds"))?;
     ensure_dir(&package_dir.join("tasks"))?;
     ensure_dir(&package_dir.join("files"))?;
+    ensure_dir(&package_dir.join(PACKAGED_RUNTIME_DEPS_DIR))?;
 
     let dataset_path = resolve_dataset_path(&json_value, &loaded.exp_dir)?;
     let dataset_target = package_dir.join("tasks").join("tasks.jsonl");
-    copy_path_into_package(&dataset_path, &dataset_target)?;
+    let packaged_tasks = load_task_specs_for_build(&dataset_path, &json_value)?;
+    write_packaged_task_declarations(&dataset_target, &packaged_tasks)?;
     let dataset_rel = PathBuf::from("tasks").join("tasks.jsonl");
     set_json_pointer_value(
         &mut json_value,
         "/dataset/path",
         json!(as_portable_rel(&dataset_rel)),
     )?;
+    stage_task_workspace_dependencies_for_package(&packaged_tasks, &loaded.project_root, &package_dir)?;
 
     let mut artifact_copies: BTreeMap<String, String> = BTreeMap::new();
     let mut file_copies: BTreeMap<String, String> = BTreeMap::new();
+    let mut public_path_copies: BTreeMap<String, String> = BTreeMap::new();
+    let mut staging_manifest_entries = Vec::new();
     let mut artifact_counter = 0usize;
     let mut file_counter = 0usize;
 
@@ -2548,6 +3000,8 @@ pub fn build_experiment_package(
             &package_dir,
             &mut artifact_copies,
             &mut file_copies,
+            &mut public_path_copies,
+            &mut staging_manifest_entries,
             &mut artifact_counter,
             &mut file_counter,
         )?;
@@ -2559,6 +3013,8 @@ pub fn build_experiment_package(
             &package_dir,
             &mut artifact_copies,
             &mut file_copies,
+            &mut public_path_copies,
+            &mut staging_manifest_entries,
             &mut artifact_counter,
             &mut file_counter,
         )?;
@@ -2575,6 +3031,8 @@ pub fn build_experiment_package(
                     &package_dir,
                     &mut artifact_copies,
                     &mut file_copies,
+                    &mut public_path_copies,
+                    &mut staging_manifest_entries,
                     &mut artifact_counter,
                     &mut file_counter,
                 )?;
@@ -2593,14 +3051,28 @@ pub fn build_experiment_package(
                     &package_dir,
                     &mut artifact_copies,
                     &mut file_copies,
+                    &mut public_path_copies,
+                    &mut staging_manifest_entries,
                     &mut artifact_counter,
                     &mut file_counter,
                 )?;
             }
         }
     }
+    if let Some(benchmark) = json_value.pointer_mut("/benchmark") {
+        rewrite_benchmark_paths_for_package(
+            benchmark,
+            &loaded.exp_dir,
+            &package_dir,
+            &mut file_copies,
+            &mut file_counter,
+            &mut public_path_copies,
+            &mut staging_manifest_entries,
+        )?;
+    }
 
     validate_packaged_runtime_artifacts(&package_dir, &json_value)?;
+    write_runtime_staging_manifest(&package_dir, &json_value, &staging_manifest_entries)?;
 
     let resolved_for_manifest = json_value.clone();
     atomic_write_json_pretty(
@@ -2664,7 +3136,6 @@ pub fn build_experiment_package(
 
 fn run_experiment_with_behavior(
     path: &Path,
-    use_container: bool,
     behavior: RunBehavior,
     execution: RunExecutionOptions,
 ) -> Result<RunResult> {
@@ -2689,12 +3160,27 @@ fn run_experiment_with_behavior(
     let _engine_lease_guard = start_engine_lease_heartbeat(&run_dir, &run_id)?;
     let mut run_guard = RunControlGuard::new(&run_dir, &run_id);
 
-    for subdir in ["tasks", "files", "agent_builds"] {
+    for subdir in ["tasks", "files", "agent_builds", PACKAGED_RUNTIME_DEPS_DIR] {
         let source = exp_dir.join(subdir);
         if source.exists() {
             copy_path_into_package(&source, &run_dir.join(subdir))?;
         }
     }
+    let staging_manifest_source = exp_dir.join(STAGING_MANIFEST_FILE);
+    if !staging_manifest_source.is_file() {
+        return Err(anyhow!(
+            "sealed package missing runtime staging manifest: {}",
+            staging_manifest_source.display()
+        ));
+    }
+    copy_path_into_package(&staging_manifest_source, &run_dir.join(STAGING_MANIFEST_FILE))
+        .with_context(|| {
+            format!(
+                "failed to copy runtime staging manifest from sealed package {} into run directory {}",
+                staging_manifest_source.display(),
+                run_dir.display()
+            )
+        })?;
 
     let resolved_path = run_dir.join("resolved_experiment.json");
     atomic_write_json_pretty(&resolved_path, &json_value)?;
@@ -2716,7 +3202,7 @@ fn run_experiment_with_behavior(
     let tasks = load_tasks(&dataset_path, &json_value)?;
 
     let (variants, baseline_id) = resolve_variant_plan(&json_value)?;
-    write_resolved_variants(&run_dir, &baseline_id, &variants)?;
+    write_resolved_variants(&run_dir, &json_value, &baseline_id, &variants)?;
     let replications = json_value
         .pointer("/design/replications")
         .and_then(|v| v.as_u64())
@@ -2741,14 +3227,8 @@ fn run_experiment_with_behavior(
     let benchmark_config = parse_benchmark_config(&json_value);
     let mut variant_runtime_profiles = Vec::with_capacity(variants.len());
     for variant in &variants {
-        let profile = resolve_variant_runtime_profile(
-            &json_value,
-            variant,
-            &run_dir,
-            use_container,
-            &behavior,
-            &execution,
-        )?;
+        let profile =
+            resolve_variant_runtime_profile(&json_value, variant, &run_dir, &behavior, &execution)?;
         ensure_required_runtime_env_present(&profile.agent_runtime, &profile.agent_runtime_env)?;
         variant_runtime_profiles.push(profile);
     }
@@ -2756,9 +3236,7 @@ fn run_experiment_with_behavior(
         .first()
         .map(|profile| profile.agent_runtime.integration_level.clone())
         .unwrap_or_else(|| "cli_basic".to_string());
-    let all_container_mode = variant_runtime_profiles
-        .iter()
-        .all(|profile| profile.container_mode);
+    let isolation_grade = resolve_run_isolation_grade(&variant_runtime_profiles, &behavior);
 
     // Preflight checks — abort before trial execution if anything is fatally wrong
     {
@@ -2771,7 +3249,7 @@ fn run_experiment_with_behavior(
             &json_value,
             &run_dir,
             &run_dir,
-            &run_dir,
+            &project_root,
             &tasks,
             &benchmark_config,
             &variants,
@@ -2868,7 +3346,6 @@ fn run_experiment_with_behavior(
         completed_slots: Vec::new(),
         pruned_variants: Vec::new(),
         consecutive_failures: BTreeMap::new(),
-        use_container,
         updated_at: Utc::now().to_rfc3339(),
     };
     write_schedule_progress(&run_dir, &schedule_progress)?;
@@ -2909,7 +3386,15 @@ fn run_experiment_with_behavior(
             &run_id,
             format!("schedule execution halted with {:?}", schedule_outcome),
         );
-        run_guard.disarm();
+        match schedule_outcome {
+            ScheduleEngineOutcome::Interrupted => {
+                run_guard.complete("interrupted")?;
+            }
+            _ => {
+                // Paused/Killed: handler already wrote correct status
+                run_guard.disarm();
+            }
+        }
         return Ok(RunResult { run_dir, run_id });
     }
     let _ = (
@@ -2919,11 +3404,19 @@ fn run_experiment_with_behavior(
         &task_chain_states_path,
     );
 
+    if isolation_grade != "hermetic" {
+        run_guard.complete("invalid_isolation")?;
+        return Err(anyhow!(
+            "scientific run completed without hermetic isolation (got {})",
+            isolation_grade
+        ));
+    }
+
     let grades = json!({
         "schema_version": "grades_v1",
         "integration_level": run_integration_level,
         "replay_grade": "best_effort",
-        "isolation_grade": if all_container_mode {"bounded"} else {"leaky"},
+        "isolation_grade": isolation_grade,
         "comparability_grade": "unknown",
         "provenance_grade": "recorded",
         "privacy_grade": "unknown"
@@ -2945,12 +3438,20 @@ fn run_experiment_with_behavior(
 }
 
 pub fn describe_experiment(path: &Path) -> Result<ExperimentSummary> {
+    describe_experiment_with_options(path, &RunExecutionOptions::default())
+}
+
+pub fn describe_experiment_with_options(
+    path: &Path,
+    execution: &RunExecutionOptions,
+) -> Result<ExperimentSummary> {
     let LoadedExperimentInput {
         json_value,
         exp_dir,
         project_root: _,
     } = load_sealed_package_for_run(path)?;
     validate_required_fields(&json_value)?;
+    let execution = normalize_execution_options(execution);
 
     let dataset_path = resolve_dataset_path_in_package(&json_value, &exp_dir)?;
     let task_count = count_tasks(&dataset_path, &json_value)?;
@@ -2969,24 +3470,16 @@ pub fn describe_experiment(path: &Path) -> Result<ExperimentSummary> {
         &json_value,
         baseline_variant,
         &exp_dir,
-        false,
         &RunBehavior::default(),
-        &RunExecutionOptions::default(),
+        &execution,
     )?;
     let preflight_runtime_profiles = vec![runtime_profile.clone()];
     let VariantRuntimeProfile {
-        experiment: runtime_experiment,
         agent_runtime: runtime_agent,
-        container_mode,
         configured_network_mode: network_mode,
         ..
     } = runtime_profile;
-    let image = runtime_agent.container_image.clone().or_else(|| {
-        runtime_experiment
-            .pointer("/runtime/policy/sandbox/image")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string())
-    });
+    let image = Some(runtime_agent.image.clone());
 
     let exp_id = json_value
         .pointer("/experiment/id")
@@ -3005,7 +3498,6 @@ pub fn describe_experiment(path: &Path) -> Result<ExperimentSummary> {
     // Collect preflight warnings (lightweight: dataset + config checks only, no Docker)
     let benchmark_config = parse_benchmark_config(&json_value);
     let tasks_for_preflight = load_tasks(&dataset_path, &json_value).unwrap_or_default();
-    let is_clean = is_clean_contract_experiment(&json_value);
     let mut preflight_warnings = Vec::new();
     for check in check_dataset_task_ids(
         &tasks_for_preflight,
@@ -3023,13 +3515,11 @@ pub fn describe_experiment(path: &Path) -> Result<ExperimentSummary> {
                 &json_value,
                 baseline_variant,
                 &exp_dir,
-                false,
                 &RunBehavior::default(),
-                &RunExecutionOptions::default(),
+                &execution,
             )?,
             baseline_variant,
             &tasks_for_preflight,
-            is_clean,
             &exp_dir,
         );
         if matches!(grader_check.severity, PreflightSeverity::Warning)
@@ -3053,7 +3543,6 @@ pub fn describe_experiment(path: &Path) -> Result<ExperimentSummary> {
         variant_count,
         total_trials,
         agent_runtime_command: runtime_agent.command_raw,
-        container_mode,
         image,
         network_mode,
         trajectory_path: runtime_agent.trajectory_path,
