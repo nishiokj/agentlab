@@ -7378,6 +7378,39 @@ mod tests {
     }
 
     #[test]
+    fn build_experiment_package_accepts_legacy_bench_builtin_grader_paths() {
+        let root = create_dx_authoring_fixture("agentlab_build_package_legacy_bench_builtin");
+        let spec = minimal_dx_spec();
+        let spec_path = root.path.join("experiment.yaml");
+        fs::write(&spec_path, serde_yaml::to_string(&spec).expect("yaml")).expect("write spec");
+
+        let out_dir = root.path.join("package");
+        let build =
+            build_experiment_package(&spec_path, None, Some(&out_dir)).expect("build package");
+        let manifest = load_json_file(&build.manifest_path).expect("manifest json");
+
+        assert_eq!(
+            manifest
+                .pointer("/resolved_experiment/benchmark/grader/command/1")
+                .and_then(Value::as_str)
+                .unwrap_or(""),
+            "/agentlab/deps/bench/integration/agentlab/bench_benchmark_adapter.py"
+        );
+        let staging_manifest =
+            load_json_file(&build.package_dir.join(STAGING_MANIFEST_FILE)).expect("staging manifest");
+        assert!(
+            staging_manifest
+                .pointer("/variants/qwen_35b_a3b")
+                .and_then(Value::as_array)
+                .is_some_and(|entries| entries.iter().any(|entry| {
+                    entry.pointer("/runtime_path").and_then(Value::as_str)
+                        == Some("/agentlab/deps/bench")
+                })),
+            "benchmark grader support directory should be staged for the legacy baseline variant"
+        );
+    }
+
+    #[test]
     fn build_experiment_package_uses_builtin_dataset_path_override() {
         let root = create_dx_authoring_fixture("agentlab_build_dataset_path_override");
         let custom_dir = root.path.join("custom");

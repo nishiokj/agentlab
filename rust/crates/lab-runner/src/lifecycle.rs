@@ -2511,13 +2511,6 @@ fn stage_command_path_refs_for_package(
                 idx
             ));
         }
-        if token.trim().starts_with("/agentlab/") {
-            return Err(anyhow!(
-                "{}[{}] leaks runner topology; remove internal /agentlab paths from public authoring",
-                field_name,
-                idx
-            ));
-        }
         if idx == 0 {
             continue;
         }
@@ -2622,7 +2615,7 @@ fn collect_command_staging_entries(
         if !seen.insert(runtime_path.to_string()) {
             continue;
         }
-        let entry = catalog.get(runtime_path).ok_or_else(|| {
+        let entry = lookup_runtime_staging_entry(catalog, runtime_path).ok_or_else(|| {
             anyhow!(
                 "{}[{}] references packaged dependency '{}' with no staging manifest entry",
                 field_name,
@@ -2630,7 +2623,7 @@ fn collect_command_staging_entries(
                 runtime_path
             )
         })?;
-        entries.push(entry.clone());
+        entries.push(entry);
     }
     Ok(())
 }
@@ -2678,18 +2671,39 @@ fn collect_runtime_command_env_staging_entries(
             if !seen.insert(runtime_path.to_string()) {
                 continue;
             }
-            let entry = catalog.get(runtime_path).ok_or_else(|| {
+            let entry = lookup_runtime_staging_entry(catalog, runtime_path).ok_or_else(|| {
                 anyhow!(
                     "runtime.agent_runtime.env.{} references packaged dependency '{}' with no staging manifest entry",
                     key,
                     runtime_path
                 )
             })?;
-            entries.push(entry.clone());
+            entries.push(entry);
         }
     }
 
     Ok(entries)
+}
+
+fn lookup_runtime_staging_entry(
+    catalog: &BTreeMap<String, RuntimePathStagingManifestEntry>,
+    runtime_path: &str,
+) -> Option<RuntimePathStagingManifestEntry> {
+    if let Some(entry) = catalog.get(runtime_path) {
+        return Some(entry.clone());
+    }
+    catalog
+        .values()
+        .filter(|entry| matches_contract_runtime_root(runtime_path, &entry.runtime_path))
+        .max_by_key(|entry| entry.runtime_path.len())
+        .cloned()
+}
+
+fn matches_contract_runtime_root(path: &str, root: &str) -> bool {
+    path == root
+        || path
+            .strip_prefix(root)
+            .is_some_and(|suffix| suffix.starts_with('/'))
 }
 
 fn collect_packaged_runtime_asset_entries(
@@ -2753,32 +2767,34 @@ fn write_runtime_staging_manifest(
     experiment: &Value,
     entries: &[RuntimePathStagingManifestEntry],
 ) -> Result<()> {
-    let catalog = entries
-        .iter()
-        .cloned()
-        .map(|entry| (entry.runtime_path.clone(), entry))
-        .collect::<BTreeMap<_, _>>();
     let (variants, _) = resolve_variant_plan(experiment)?;
     let mut variants_manifest: BTreeMap<String, Vec<RuntimePathStagingManifestEntry>> =
         BTreeMap::new();
     for variant in &variants {
         let variant_experiment = resolve_runtime_for_variant(experiment, variant)?;
-        let mut variant_entries =
-            collect_runtime_command_env_staging_entries(&variant_experiment, &catalog)?;
+        let mut variant_catalog_entries = entries.to_vec();
         merge_runtime_path_staging_entries(
-            &mut variant_entries,
+            &mut variant_catalog_entries,
             collect_packaged_runtime_asset_entries(
                 variant_experiment.pointer("/benchmark/grader/_runtime_assets"),
                 "benchmark.grader._runtime_assets",
             )?,
         );
         merge_runtime_path_staging_entries(
-            &mut variant_entries,
+            &mut variant_catalog_entries,
             collect_packaged_runtime_asset_entries(
                 variant_experiment.pointer("/benchmark/adapter/_runtime_assets"),
                 "benchmark.adapter._runtime_assets",
             )?,
         );
+        let variant_catalog = variant_catalog_entries
+            .iter()
+            .cloned()
+            .map(|entry| (entry.runtime_path.clone(), entry))
+            .collect::<BTreeMap<_, _>>();
+        let mut variant_entries =
+            collect_runtime_command_env_staging_entries(&variant_experiment, &variant_catalog)?;
+        merge_runtime_path_staging_entries(&mut variant_entries, variant_catalog_entries);
         variant_entries.sort_by(|left, right| {
             left.runtime_path
                 .cmp(&right.runtime_path)
