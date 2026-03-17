@@ -706,28 +706,87 @@ pub(crate) fn parse_benchmark_config(json_value: &Value) -> BenchmarkConfig {
     }
 
     let grader = root.pointer("/grader").and_then(|g| {
-        let command = g
-            .pointer("/command")
-            .and_then(|v| v.as_array())
-            .map(|arr| {
-                arr.iter()
-                    .filter_map(|v| {
-                        v.as_str().and_then(|s| {
-                            let trimmed = s.trim();
-                            if trimmed.is_empty() {
-                                None
-                            } else {
-                                Some(trimmed.to_string())
-                            }
+        let parse_string_array = |value: Option<&Value>| {
+            value
+                .and_then(|raw| raw.as_array())
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| {
+                            v.as_str().and_then(|s| {
+                                let trimmed = s.trim();
+                                if trimmed.is_empty() {
+                                    None
+                                } else {
+                                    Some(trimmed.to_string())
+                                }
+                            })
                         })
-                    })
-                    .collect::<Vec<_>>()
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default()
+        };
+        let parse_optional_string = |value: Option<&Value>| {
+            value.and_then(Value::as_str).and_then(|raw| {
+                let trimmed = raw.trim();
+                if trimmed.is_empty() {
+                    None
+                } else {
+                    Some(trimmed.to_string())
+                }
             })
-            .unwrap_or_default();
+        };
+
+        let command = parse_string_array(g.pointer("/command"));
         if command.is_empty() {
             return None;
         }
-        Some(BenchmarkGraderConfig { command })
+
+        let strategy = match g.pointer("/strategy").and_then(Value::as_str) {
+            Some("injected") => GradingStrategy::Injected,
+            Some("separate") => GradingStrategy::Separate,
+            _ => GradingStrategy::InTaskImage,
+        };
+        let conclusion = GraderConclusionConfig {
+            mode: match g.pointer("/conclusion/mode").and_then(Value::as_str) {
+                Some("mapper") => GraderConclusionMode::Mapper,
+                _ => GraderConclusionMode::Direct,
+            },
+            mapper: parse_optional_string(g.pointer("/conclusion/mapper")),
+        };
+        let in_task_image = g
+            .pointer("/in_task_image")
+            .map(|value| InTaskImageGradingConfig {
+                hidden_paths: parse_string_array(value.get("hidden_paths")),
+                revealed_paths: parse_string_array(value.get("revealed_paths")),
+            });
+        let injected = match (
+            parse_optional_string(g.pointer("/injected/bundle")),
+            parse_optional_string(g.pointer("/injected/copy_dest")),
+        ) {
+            (Some(bundle), Some(copy_dest)) => Some(InjectedGradingConfig { bundle, copy_dest }),
+            _ => None,
+        };
+        let separate = match (
+            parse_optional_string(g.pointer("/separate/image")),
+            parse_optional_string(g.pointer("/separate/workdir")),
+        ) {
+            (Some(image), Some(workdir)) => Some(SeparateGradingConfig { image, workdir }),
+            _ => None,
+        };
+        let is_in_task_image = matches!(strategy, GradingStrategy::InTaskImage);
+
+        Some(BenchmarkGraderConfig {
+            strategy,
+            command,
+            conclusion,
+            in_task_image: if is_in_task_image {
+                Some(in_task_image.unwrap_or_default())
+            } else {
+                in_task_image
+            },
+            injected,
+            separate,
+        })
     });
 
     #[cfg(test)]
@@ -1066,6 +1125,17 @@ pub(crate) fn benchmark_verdict_to_trial_outcome(verdict: &str) -> Option<&'stat
         "missing" => Some("missing"),
         "error" => Some("error"),
         _ => None,
+    }
+}
+
+pub(crate) fn trial_conclusion_outcome_to_trial_outcome(outcome: &str) -> Option<&'static str> {
+    match outcome {
+        "success" => Some("success"),
+        "failure" => Some("failure"),
+        "missing" => Some("missing"),
+        "error" => Some("error"),
+        "timeout" => Some("timeout"),
+        other => benchmark_verdict_to_trial_outcome(other),
     }
 }
 
@@ -1600,10 +1670,7 @@ pub(crate) fn resolve_dataset_path_in_package(
     resolve_package_path_under_root(package_dir, rel, "dataset.path")
 }
 
-pub(crate) fn load_task_specs_for_build(
-    path: &Path,
-    json_value: &Value,
-) -> Result<Vec<TaskDeclaration>> {
+pub(crate) fn load_task_rows_for_build(path: &Path, json_value: &Value) -> Result<Vec<Value>> {
     let limit = json_value
         .pointer("/dataset/limit")
         .and_then(|v| v.as_u64())
@@ -1644,23 +1711,14 @@ pub(crate) fn load_task_specs_for_build(
             .or_else(|| task.pointer("/id"))
             .and_then(Value::as_str)
             .unwrap_or("<unknown_task>");
-        let task_spec = crate::parse_task_spec(&task).map_err(|err| {
-            anyhow!(
-                "dataset row {} task '{}' is not a valid public task_spec: {}",
+        if crate::parse_task_row(&task).is_err() {
+            return Err(anyhow!(
+                "dataset row {} task '{}' is not a valid task_row_v1",
                 idx + 1,
-                task_id,
-                err
-            )
-        })?;
-        let declaration = crate::compile_task_spec(task_spec).map_err(|err| {
-            anyhow!(
-                "dataset row {} task '{}' could not compile from public task_spec to task declaration: {}",
-                idx + 1,
-                task_id,
-                err
-            )
-        })?;
-        tasks.push(declaration);
+                task_id
+            ));
+        }
+        tasks.push(task);
     }
     Ok(tasks)
 }
@@ -1691,17 +1749,16 @@ pub(crate) fn load_tasks(path: &Path, json_value: &Value) -> Result<Vec<Value>> 
             break;
         }
         let task: Value = serde_json::from_str(trimmed)?;
-        if let Err(err) = crate::parse_task_declaration(&task) {
-            let task_id = task
-                .pointer("/task/id")
-                .or_else(|| task.pointer("/id"))
-                .and_then(Value::as_str)
-                .unwrap_or("<unknown_task>");
+        let task_id = task
+            .pointer("/task/id")
+            .or_else(|| task.pointer("/id"))
+            .and_then(Value::as_str)
+            .unwrap_or("<unknown_task>");
+        if crate::parse_task_row(&task).is_err() {
             return Err(anyhow!(
-                "dataset row {} task '{}' is not a packaged task declaration: {}",
+                "dataset row {} task '{}' is not a valid packaged task_row_v1",
                 idx + 1,
-                task_id,
-                err
+                task_id
             ));
         }
         tasks.push(task);

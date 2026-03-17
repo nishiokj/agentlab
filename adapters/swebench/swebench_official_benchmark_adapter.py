@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""SWE-bench official adapter shim with aligned metadata extraction."""
+"""SWE-bench conclusion mapper/direct grader shim for the cutover contract."""
 
 from __future__ import annotations
 
@@ -13,6 +13,10 @@ try:  # Import as package when available.
     from ._swebench_meta import extract_swebench_meta as _extract_swebench_meta
 except ImportError:  # pragma: no cover - supports direct script execution.
     from _swebench_meta import extract_swebench_meta as _extract_swebench_meta
+
+
+DEFAULT_MAPPED_OUTPUT_PATH = "/agentlab/out/mapped_grader_output.json"
+VALID_GRADING_STRATEGIES = {"in_task_image", "injected", "separate"}
 
 
 def _read_json(path: str | Path) -> Any:
@@ -73,53 +77,6 @@ def _extract_benchmark_spec(task_payload: Any) -> dict[str, str]:
     return default
 
 
-def build_prediction_record(task_payload: Any, evaluation_output: Any) -> dict[str, Any]:
-    patch = ""
-    if isinstance(evaluation_output, dict):
-        patch_value = evaluation_output.get("patch")
-        if isinstance(patch_value, str):
-            patch = patch_value
-    return {
-        "schema_version": "benchmark_prediction_record_v1",
-        "ids": {
-            "run_id": os.environ.get("AGENTLAB_RUN_ID", "run_unknown"),
-            "trial_id": os.environ.get("AGENTLAB_TRIAL_ID", "trial_unknown"),
-            "variant_id": os.environ.get("AGENTLAB_VARIANT_ID", "variant_unknown"),
-            "task_id": os.environ.get("AGENTLAB_TASK_ID", _task_id(task_payload)),
-            "repl_idx": _env_int("AGENTLAB_REPL_IDX", 0),
-        },
-        "benchmark": _extract_benchmark_spec(task_payload),
-        "prediction": {"kind": "patch", "value": patch},
-        "ext": {"swebench": extract_swebench_meta(task_payload)},
-    }
-
-
-def build_score_record(task_payload: Any, evaluation_output: Any) -> dict[str, Any]:
-    verdict = "fail"
-    if isinstance(evaluation_output, dict):
-        raw_verdict = evaluation_output.get("verdict")
-        if isinstance(raw_verdict, str) and raw_verdict in {"pass", "fail", "error"}:
-            verdict = raw_verdict
-    resolved = 1.0 if verdict == "pass" else 0.0
-    return {
-        "schema_version": "benchmark_score_record_v1",
-        "ids": {
-            "run_id": os.environ.get("AGENTLAB_RUN_ID", "run_unknown"),
-            "trial_id": os.environ.get("AGENTLAB_TRIAL_ID", "trial_unknown"),
-            "variant_id": os.environ.get("AGENTLAB_VARIANT_ID", "variant_unknown"),
-            "task_id": os.environ.get("AGENTLAB_TASK_ID", _task_id(task_payload)),
-            "repl_idx": _env_int("AGENTLAB_REPL_IDX", 0),
-        },
-        "benchmark": _extract_benchmark_spec(task_payload),
-        "verdict": verdict,
-        "primary_metric_name": "resolved",
-        "primary_metric_value": resolved,
-        "metrics": {"resolved": resolved},
-        "evaluator": {"name": "swebench_official", "mode": "official"},
-        "ext": {"swebench": extract_swebench_meta(task_payload)},
-    }
-
-
 def _required_env(name: str) -> str:
     value = os.environ.get(name)
     if not value:
@@ -127,17 +84,132 @@ def _required_env(name: str) -> str:
     return value
 
 
+def _load_grader_input() -> dict[str, Any]:
+    payload = _read_json(_required_env("AGENTLAB_GRADER_INPUT_PATH"))
+    if isinstance(payload, dict):
+        return payload
+    raise RuntimeError("grader input must be a JSON object")
+
+
+def _task_payload(grader_input: dict[str, Any]) -> dict[str, Any]:
+    payload = grader_input.get("task")
+    if isinstance(payload, dict):
+        return payload
+    return {}
+
+
+def _candidate_artifact(grader_input: dict[str, Any]) -> dict[str, Any]:
+    payload = grader_input.get("candidate_artifact")
+    if isinstance(payload, dict):
+        return payload
+    return {}
+
+
+def _load_evaluation_output(grader_input: dict[str, Any]) -> Any:
+    raw_path = os.environ.get("AGENTLAB_RAW_GRADER_OUTPUT_PATH", "").strip()
+    if raw_path:
+        candidate = Path(raw_path)
+        if candidate.exists() and candidate.is_file():
+            return _read_json(candidate)
+    candidate_artifact = _candidate_artifact(grader_input)
+    if candidate_artifact.get("state") == "valid":
+        return candidate_artifact.get("payload")
+    return {}
+
+
+def _extract_prediction(evaluation_output: Any) -> dict[str, Any]:
+    if isinstance(evaluation_output, dict):
+        patch_value = evaluation_output.get("patch")
+        if isinstance(patch_value, str) and patch_value.strip():
+            return {"kind": "patch", "value": patch_value}
+        prediction = evaluation_output.get("prediction")
+        if isinstance(prediction, dict):
+            kind = prediction.get("kind")
+            if isinstance(kind, str) and kind.strip():
+                return {
+                    "kind": kind.strip(),
+                    "value": prediction.get("value"),
+                }
+    return {"kind": "text", "value": ""}
+
+
+def _normalize_verdict(evaluation_output: Any, candidate_state: str) -> str:
+    if isinstance(evaluation_output, dict):
+        raw_verdict = evaluation_output.get("verdict")
+        if isinstance(raw_verdict, str) and raw_verdict in {"pass", "fail", "error", "missing"}:
+            return raw_verdict
+    if candidate_state == "missing":
+        return "missing"
+    if candidate_state == "invalid":
+        return "error"
+    return "fail"
+
+
+def _reported_outcome(verdict: str) -> str:
+    return {
+        "pass": "success",
+        "fail": "failure",
+        "missing": "missing",
+        "error": "error",
+    }.get(verdict, "error")
+
+
+def _grader_strategy() -> str:
+    for env_name in ("AGENTLAB_GRADING_STRATEGY", "AGENTLAB_GRADER_STRATEGY"):
+        raw = os.environ.get(env_name, "").strip()
+        if raw in VALID_GRADING_STRATEGIES:
+            return raw
+    return "in_task_image"
+
+
+def _mapped_output_path() -> str:
+    raw = os.environ.get("AGENTLAB_MAPPED_GRADER_OUTPUT_PATH", "").strip()
+    if raw:
+        return raw
+    return DEFAULT_MAPPED_OUTPUT_PATH
+
+
+def build_trial_conclusion(task_payload: Any, grader_input: dict[str, Any], evaluation_output: Any) -> dict[str, Any]:
+    candidate = _candidate_artifact(grader_input)
+    verdict = _normalize_verdict(evaluation_output, str(candidate.get("state", "missing")))
+    resolved = 1.0 if verdict == "pass" else 0.0
+
+    payload = {
+        "benchmark": _extract_benchmark_spec(task_payload),
+        "ids": grader_input.get("ids", {}),
+        "task_id": os.environ.get("AGENTLAB_TASK_ID", _task_id(task_payload)),
+        "repl_idx": _env_int("AGENTLAB_REPL_IDX", 0),
+        "verdict": verdict,
+        "resolved": resolved,
+        "prediction": _extract_prediction(evaluation_output),
+        "candidate_artifact_state": candidate.get("state", "missing"),
+        "swebench": extract_swebench_meta(task_payload),
+    }
+    if isinstance(evaluation_output, dict):
+        payload["evaluation_output"] = evaluation_output
+
+    return {
+        "schema_version": "trial_conclusion_v1",
+        "payload": payload,
+        "reported_outcome": _reported_outcome(verdict),
+        "primary_metric": {
+            "name": "resolved",
+            "value": resolved,
+        },
+        "grader": {
+            "name": "swebench",
+            "strategy": _grader_strategy(),
+            "version": "v1",
+        },
+    }
+
+
 def main() -> int:
-    task_path = _required_env("AGENTLAB_TASK_PATH")
-    result_path = _required_env("AGENTLAB_RESULT_PATH")
-    prediction_path = _required_env("AGENTLAB_BENCHMARK_PREDICTION_PATH")
-    score_path = _required_env("AGENTLAB_BENCHMARK_SCORE_PATH")
-
-    task_payload = _read_json(task_path)
-    evaluation_output = _read_json(result_path)
-
-    _write_json(prediction_path, build_prediction_record(task_payload, evaluation_output))
-    _write_json(score_path, build_score_record(task_payload, evaluation_output))
+    grader_input = _load_grader_input()
+    task_payload = _task_payload(grader_input)
+    evaluation_output = _load_evaluation_output(grader_input)
+    conclusion = build_trial_conclusion(task_payload, grader_input, evaluation_output)
+    _write_json(_mapped_output_path(), conclusion)
     return 0
 
 

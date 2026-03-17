@@ -11,7 +11,7 @@ Everything else hangs off those five boundaries.
 ## The Five Stages
 
 1. `Author`
-   You write `experiment.yaml` and `tasks.jsonl`.
+   You write `experiment.yaml` and `tasks.jsonl` containing `task_row_v1` rows.
 2. `Build`
    AgentLab resolves paths, bundles files, seals artifacts, and emits a portable package.
 3. `Verify`
@@ -60,7 +60,7 @@ agentlab-demo/
             └── my_benchmark_grader.py
 ```
 
-`experiment.yaml` is the control plane. `tasks.jsonl` is the workload. Variants are first-class: the baseline is one variant, each entry in `variant_plan` is another.
+`experiment.yaml` is the control plane. `tasks.jsonl` is the workload, and each line must be a `task_row_v1`. Variants are first-class: the baseline is one variant, each entry in `variant_plan` is another.
 
 ### Example `experiment.yaml`
 
@@ -118,11 +118,16 @@ runtime:
       OPENAI_API_KEY: $OPENAI_API_KEY
       ZAI_CODER_API_KEY: $ZAI_CODER_API_KEY
     network: full
-    root_read_only: false
 
 benchmark:
   grader:
+    strategy: in_task_image
     command: [python3, bench/integration/agentlab/my_benchmark_grader.py]
+    conclusion:
+      mode: direct
+    in_task_image:
+      hidden_paths: []
+      revealed_paths: []
   policy:
     evaluator_mode: custom
     scoring_lifecycle: predict_then_score
@@ -169,10 +174,15 @@ That means:
 
 ### Example `tasks.jsonl`
 
-Each line is one task declaration. The benchmark can carry benchmark-specific meaning inside `task.*`, but it must still map into the runner contract.
+Each line is one `task_row_v1`. Benchmark-specific meaning lives inside `task.*`. Runner-owned execution fields live at the top level of the row.
 
 ```json
 {
+  "schema_version": "task_row_v1",
+  "id": "TASK001",
+  "image": "ghcr.io/acme/task-image:latest",
+  "workdir": "/workspace/task",
+  "time_limit_ms": 600000,
   "task": {
     "id": "TASK001",
     "prompt": "Fix the failing scorer regression.",
@@ -187,22 +197,9 @@ Each line is one task declaration. The benchmark can carry benchmark-specific me
     "public_command": "bash .bench_public/run_public.sh",
     "hidden_command": "python hidden/runner.py /workspace hidden/cases.jsonl"
   },
-  "environment": {
-    "image": "ghcr.io/acme/task-image:latest"
-  },
-  "workspace": {
-    "mode": "patch",
-    "base": {
-      "kind": "dataset_pack",
-      "dataset_pack_ref": "sha256:..."
-    },
-    "overlays": [],
-    "aux_mounts": []
-  },
-  "dependencies": {
-    "files": []
-  },
-  "limits": {}
+  "materialization": {
+    "kind": "task_image"
+  }
 }
 ```
 
@@ -219,57 +216,51 @@ The benchmark owns:
 
 The runner owns:
 
-- task sandbox image
-- workspace mounting and materialization
+- task image selection
+- declared task `workdir`
+- task materialization mode
+- `time_limit_ms`
 - per-trial lifecycle
 - scheduling and retries
 
-Rule of thumb: benchmark meaning goes in `task.*`; execution topology goes in `environment`, `workspace`, `dependencies`, and `limits`.
+Rule of thumb: benchmark meaning goes in `task.*`; execution topology goes in top-level task row fields like `image`, `workdir`, `materialization`, and `time_limit_ms`.
 
 ### Grader Boundary
 
-The grader is just another boundary contract. It reads the prepared task and agent result, then writes prediction and score records.
+The grader reads `grader_input_v1` and writes the canonical mapped conclusion.
 
 The grader sees these env vars:
 
-- `AGENTLAB_TASK_PATH`
-- `AGENTLAB_RESULT_PATH`
-- `AGENTLAB_BENCHMARK_PREDICTION_PATH`
-- `AGENTLAB_BENCHMARK_SCORE_PATH`
+- `AGENTLAB_GRADER_INPUT_PATH`
+- `AGENTLAB_RAW_GRADER_OUTPUT_PATH`
+- `AGENTLAB_MAPPED_GRADER_OUTPUT_PATH`
 
-Minimal grader shape:
+Minimal direct-mode grader shape:
 
 ```python
 import json
 import os
 
-task = json.load(open(os.environ["AGENTLAB_TASK_PATH"]))
-result = json.load(open(os.environ["AGENTLAB_RESULT_PATH"]))
+grader_input = json.load(open(os.environ["AGENTLAB_GRADER_INPUT_PATH"]))
 
-prediction = {
-    "schema_version": "benchmark_prediction_record_v1",
-    "ids": {
-        "run_id": "run_placeholder",
-        "trial_id": "trial_placeholder",
-        "variant_id": "variant_placeholder",
-        "task_id": task["task"]["id"],
-        "repl_idx": 0,
+conclusion = {
+    "schema_version": "trial_conclusion_v1",
+    "payload": {
+        "task_id": grader_input["ids"]["task_id"],
+        "resolved": 1.0,
     },
-    "prediction": {"kind": "text", "value": ""},
+    "reported_outcome": "success",
+    "primary_metric": {
+        "name": "resolved",
+        "value": 1.0,
+    },
+    "grader": {
+        "name": "custom_grader",
+        "strategy": "in_task_image",
+    },
 }
 
-score = {
-    "schema_version": "benchmark_score_record_v1",
-    "ids": prediction["ids"],
-    "verdict": "pass",
-    "primary_metric_name": "resolved",
-    "primary_metric_value": 1.0,
-    "metrics": {"resolved": 1.0},
-    "evaluator": {"name": "custom_grader", "mode": "custom"},
-}
-
-json.dump(prediction, open(os.environ["AGENTLAB_BENCHMARK_PREDICTION_PATH"], "w"))
-json.dump(score, open(os.environ["AGENTLAB_BENCHMARK_SCORE_PATH"], "w"))
+json.dump(conclusion, open(os.environ["AGENTLAB_MAPPED_GRADER_OUTPUT_PATH"], "w"))
 ```
 
 ## 2. Build
@@ -292,15 +283,16 @@ Typical package shape:
 │   └── tasks.jsonl
 ├── agent_builds/
 │   └── 000_rex-current.linux-x64.tar.gz
+├── runtime_assets/
+│   └── ...
 └── files/
-    ├── 000_defaults.json
-    └── 001_bench/
+    └── ...
 ```
 
 What build does:
 
 - rewrites `dataset.path` to the packaged task file
-- stages relative file refs under package-controlled paths
+- stages runtime support files under package-controlled paths
 - copies agent artifacts into `agent_builds/`
 - seals the package with manifests and checksums
 
@@ -316,7 +308,7 @@ Excerpt from `resolved_experiment.json`:
     "grader": {
       "command": [
         "python3",
-        "/agentlab/deps/bench/integration/agentlab/my_benchmark_grader.py"
+        "__AGENTLAB_TASK_WORKDIR__/.agentlab/support/bench/integration/agentlab/my_benchmark_grader.py"
       ]
     }
   },
@@ -338,6 +330,7 @@ Excerpt from `resolved_experiment.json`:
 That is the build boundary in one glance:
 
 - authored relative paths become package-owned runtime paths
+- task support assets are staged under the task workdir support area at runtime
 - the package becomes portable
 - the resolved object is the thing the runner actually executes
 
@@ -376,6 +369,12 @@ Tighter loop:
 "$LAB" build-run experiment.yaml --out .lab/builds/bench-demo --materialize full
 ```
 
+If a run stops mid-schedule, continue the existing run directory:
+
+```bash
+"$LAB" continue .lab/runs/<run_id> --env-file .env
+```
+
 Common knobs:
 
 - choose experiment type with `lab init --profile ...`
@@ -391,20 +390,21 @@ The agent process runs against a stable contract. Consume this contract. Do not 
 
 Filesystem:
 
-- cwd: `/agentlab/workspace`
+- cwd: the task row `workdir`
 - `/agentlab/in`
 - `/agentlab/out`
-- `/agentlab/state`
-- `/agentlab/workspace`
-- `/agentlab/deps`
+- `/agentlab/metrics`
+- `<workdir>/.agentlab/support` for runner-staged support assets when needed
+
+No `bindings.json`, no `/agentlab/deps`, and no fixed `/agentlab/workspace` compatibility root are part of the supported contract.
 
 Important env vars:
 
-- `AGENTLAB_TASK_PATH`
-- `AGENTLAB_BINDINGS_PATH`
-- `AGENTLAB_DEPENDENCIES_PATH`
-- `AGENTLAB_POLICY_PATH`
+- `AGENTLAB_TRIAL_INPUT_PATH`
+- `AGENTLAB_GRADER_INPUT_PATH`
 - `AGENTLAB_RESULT_PATH`
+- `AGENTLAB_RAW_GRADER_OUTPUT_PATH`
+- `AGENTLAB_MAPPED_GRADER_OUTPUT_PATH`
 - `AGENTLAB_TRAJECTORY_PATH`
 - `AGENTLAB_RUN_ID`
 - `AGENTLAB_TRIAL_ID`
@@ -412,7 +412,7 @@ Important env vars:
 - `AGENTLAB_TASK_ID`
 - `AGENTLAB_TIMEOUT_MS`
 
-Current runtime also exports `WORKSPACE=/agentlab/workspace` as a convenience env. Treat cwd as primary.
+Current runtime also exports `WORKSPACE=<workdir>` as a convenience env. Treat `trial_input_v1.runtime.workdir` and cwd as primary.
 
 ## 5. Inspect
 

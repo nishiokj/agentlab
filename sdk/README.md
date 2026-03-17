@@ -118,45 +118,40 @@ If your runtime needs config or support files, package them inside the agent art
 
 ## What Goes Into The Trial Container
 
-For each trial, runner prepares and mounts:
+For each trial, runner prepares:
 
-1. `/agentlab/in` (read-only): `task.json`, `bindings.json`, `dependencies.json`, `policy.json`
-2. `/agentlab/workspace` (read-write): workspace copy seeded from project root
-3. `/agentlab/deps` (read-write): staged dependency files
-4. `/agentlab/out` (read-write): `result.json`, optional `trajectory.jsonl`
-5. `/agentlab/state` (read-write): runner internal state and metadata
+1. `/agentlab/in/trial_input.json`
+2. `/agentlab/in/grader_input.json`
+3. `/agentlab/out/result.json`
+4. `/agentlab/out/raw_grader_output.json`
+5. `/agentlab/out/mapped_grader_output.json`
+6. optional `/agentlab/out/trajectory.jsonl`
+7. the declared task `workdir`, mounted as the runnable workspace root
 
-If task boundaries include `workspace.aux_mounts`, dataset packs are additionally mounted read-only to their declared paths.
-Task datasets must compile into `task_boundary_v3` rows with:
+Task datasets must compile into `task_row_v1` rows with:
 
-1. `task`
-2. `environment.image`
-3. `workspace.mode`
-4. `workspace.base`
-5. optional `workspace.overlays`
-6. optional `workspace.aux_mounts`
-7. `limits`
-
-`workspace.overlays[*].path` is always relative to `/agentlab/workspace`, and `workspace.aux_mounts[*].mount_path` must target `/agentlab/workspace/...`.
+1. `id`
+2. `image`
+3. `workdir`
+4. `task`
+5. `materialization`
+6. optional `time_limit_ms`
 
 ## Agent Env Contract
 
 Runner sets these env vars for your command:
 
-1. `AGENTLAB_TASK_PATH`
-2. `AGENTLAB_BINDINGS_PATH`
-3. `AGENTLAB_DEPENDENCIES_PATH`
-4. `AGENTLAB_POLICY_PATH`
-5. `AGENTLAB_RESULT_PATH`
-6. `AGENTLAB_TRAJECTORY_PATH`
-7. `AGENTLAB_TIMEOUT_MS`
-8. `AGENTLAB_RUN_ID`
-9. `AGENTLAB_TRIAL_ID`
-10. `AGENTLAB_VARIANT_ID`
-11. `AGENTLAB_TASK_ID`
-12. `AGENTLAB_REPL_IDX`
+1. `AGENTLAB_TRIAL_INPUT_PATH`
+2. `AGENTLAB_RESULT_PATH`
+3. `AGENTLAB_TRAJECTORY_PATH`
+4. `AGENTLAB_TIMEOUT_MS`
+5. `AGENTLAB_RUN_ID`
+6. `AGENTLAB_TRIAL_ID`
+7. `AGENTLAB_VARIANT_ID`
+8. `AGENTLAB_TASK_ID`
+9. `AGENTLAB_REPL_IDX`
 
-Your loop should write `agent_result_v1` JSON to `AGENTLAB_RESULT_PATH`.
+Your loop should write `artifact_envelope_v1` JSON to `AGENTLAB_RESULT_PATH`.
 
 ## Running From Another Directory
 

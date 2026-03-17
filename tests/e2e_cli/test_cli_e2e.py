@@ -287,65 +287,37 @@ def _task_row(
         "resolved_if_match": resolved_if_match,
         "resolved_if_miss": resolved_if_miss,
     }
-    if task_image is not None:
-        environment = {"image": task_image}
-    else:
-        environment = None
     if observe is not None:
         task["observe"] = observe
-    workspace_base: dict[str, Any]
-    workspace_mode: str
-    if workspace_base_ref is not None:
-        workspace_mode = "patch"
-        workspace_base = {
-            "kind": "dataset_pack",
-            "dataset_pack_ref": workspace_base_ref,
-        }
-    else:
-        workspace_mode = "scratch"
-        workspace_base = {"kind": "empty"}
+    if workspace_base_ref is not None or workspace_overlays or workspace_aux_mounts or dependency_files:
+        raise AssertionError(
+            "_task_row now models task_row_v1 only; workspace/dependency authoring must use an updated helper"
+        )
     row: dict[str, Any] = {
+        "schema_version": "task_row_v1",
+        "id": task_id,
+        "image": task_image or "ghcr.io/acme/task-image:latest",
+        "workdir": "/workspace/task",
+        "time_limit_ms": 300_000,
         "task": task,
-        "workspace": {
-            "mode": workspace_mode,
-            "base": workspace_base,
-            "overlays": workspace_overlays or [],
-            "aux_mounts": workspace_aux_mounts or [],
+        "materialization": {
+            "kind": "task_image",
         },
-        "dependencies": {
-            "files": dependency_files or [],
-        },
-        "limits": {},
     }
-    if environment is not None:
-        row["environment"] = environment
     return row
 
 
-def _strict_task_declaration(row: dict[str, Any]) -> dict[str, Any]:
-    payload = json.loads(json.dumps(row))
-    payload["schema_version"] = "task_declaration_v1"
-    return payload
-
-
-def _assert_packaged_task_declaration(
+def _assert_packaged_task_row(
     packaged_row: dict[str, Any],
-    public_row: dict[str, Any],
+    source_row: dict[str, Any],
 ) -> None:
-    assert packaged_row["schema_version"] == "task_declaration_v1"
-    assert packaged_row["task"] == public_row["task"]
-    assert packaged_row["environment"] == public_row["environment"]
-    assert packaged_row["dependencies"] == public_row["dependencies"]
-    assert packaged_row["workspace"]["mode"] == public_row["workspace"]["mode"]
-    assert packaged_row["workspace"]["overlays"] == public_row["workspace"]["overlays"]
-    assert packaged_row["workspace"]["aux_mounts"] == public_row["workspace"]["aux_mounts"]
-    assert packaged_row["workspace"]["base"]["kind"] == public_row["workspace"]["base"]["kind"]
-    assert packaged_row["limits"] == {
-        "max_steps": None,
-        "max_total_tokens": None,
-        "max_tool_calls": None,
-        "trial_seconds": None,
-    }
+    assert packaged_row["schema_version"] == "task_row_v1"
+    assert packaged_row["id"] == source_row["id"]
+    assert packaged_row["image"] == source_row["image"]
+    assert packaged_row["workdir"] == source_row["workdir"]
+    assert packaged_row["time_limit_ms"] == source_row["time_limit_ms"]
+    assert packaged_row["task"] == source_row["task"]
+    assert packaged_row["materialization"] == source_row["materialization"]
 
 
 def _init_agent_eval_experiment(project: ProjectLayout) -> Path:
@@ -530,7 +502,7 @@ def _prepare_runtime_file_ref_project(
     support_file = source_root / "overrides" / "defaults.json"
     support_file.parent.mkdir(parents=True, exist_ok=True)
     support_file.write_text('{"profile":"portable-run"}\n', encoding="utf-8")
-    runtime_config_path = "/agentlab/deps/overrides/defaults.json"
+    runtime_config_path = ".agentlab/support/overrides/defaults.json"
     rows = [
         _task_row(
             task_id="TASK_MOVED_PACKAGE",
@@ -579,8 +551,6 @@ def _create_simple_project(
     agent_command: list[str] | None = None,
     agent_env: dict[str, str] | None = None,
     agent_network: str = "none",
-    agent_root_read_only: bool = True,
-    agent_user: str | None = None,
     state_policy: str | None = None,
     project: ProjectLayout | None = None,
 ) -> tuple[ProjectLayout, Path]:
@@ -589,6 +559,20 @@ def _create_simple_project(
     experiment_path = _init_agent_eval_experiment(project)
     dataset_path = project.root / "tasks.jsonl"
     dataset_rows = [json.loads(json.dumps(row)) for row in rows]
+    variant_controls: dict[str, dict[str, Any]] = {}
+    baseline_controls = json.loads(json.dumps(baseline_bindings or {"variant_label": "control"}))
+    if isinstance(baseline_controls, dict) and baseline_controls:
+        variant_controls["control"] = baseline_controls
+    for item in variant_plan or []:
+        variant_id = item.get("variant_id") or item.get("id")
+        bindings = item.get("bindings")
+        if isinstance(variant_id, str) and variant_id.strip() and isinstance(bindings, dict) and bindings:
+            variant_controls[variant_id.strip()] = json.loads(json.dumps(bindings))
+    if variant_controls:
+        for row in dataset_rows:
+            task = row.get("task")
+            if isinstance(task, dict):
+                task["variant_controls"] = json.loads(json.dumps(variant_controls))
     _write_jsonl(dataset_path, dataset_rows)
     experiment = yaml.safe_load(experiment_path.read_text(encoding="utf-8"))
     experiment["experiment"]["id"] = exp_id
@@ -620,12 +604,7 @@ def _create_simple_project(
     runtime_agent_runtime["artifact"] = _relpath(project.agents_dir / "agent-runtime.tar.gz", project.root)
     runtime_agent_runtime["image"] = image_tag
     runtime_agent_runtime["network"] = agent_network
-    runtime_agent_runtime["root_read_only"] = agent_root_read_only
     runtime_agent_runtime["env"] = agent_env or {}
-    if agent_user is None:
-        runtime_agent_runtime.pop("user", None)
-    else:
-        runtime_agent_runtime["user"] = agent_user
     _write_yaml(experiment_path, experiment)
     return project, experiment_path
 
@@ -648,12 +627,36 @@ def _create_custom_benchmark_project(
     rows: list[dict[str, Any]] | None = None,
 ) -> tuple[ProjectLayout, Path, list[dict[str, Any]]]:
     rows = rows or [_task_row(task_id="TASK_CUSTOM_BENCHMARK", task_image=image_tag)]
+    normalized_rows: list[dict[str, Any]] = []
     for row in rows:
-        row["task"]["benchmark"] = {
+        task_payload = json.loads(json.dumps(row["task"]))
+        task_payload["benchmark"] = {
             "adapter_id": "custom_benchmark_grader",
             "name": "custom_e2e_benchmark",
             "split": "test",
         }
+        task_image = row.get("image")
+        if not isinstance(task_image, str) or not task_image.strip():
+            environment = row.get("environment")
+            if isinstance(environment, dict):
+                candidate = environment.get("image")
+                if isinstance(candidate, str) and candidate.strip():
+                    task_image = candidate.strip()
+        if not isinstance(task_image, str) or not task_image.strip():
+            task_image = image_tag
+        normalized_rows.append(
+            {
+                "schema_version": "task_row_v1",
+                "id": task_payload["id"],
+                "image": task_image,
+                "workdir": "/task",
+                "task": task_payload,
+                "materialization": {
+                    "kind": "task_image",
+                },
+            }
+        )
+    rows = normalized_rows
     project, experiment_path = _create_simple_project(
         tmp_path,
         artifact_bundle,
@@ -672,10 +675,18 @@ def _create_custom_benchmark_project(
             "chain_failure_policy": "continue_with_flag",
         },
         "grader": {
+            "strategy": "in_task_image",
             "command": [
                 "python3",
                 _relpath(grader_path, project.root),
             ],
+            "conclusion": {
+                "mode": "direct",
+            },
+            "in_task_image": {
+                "hidden_paths": [],
+                "revealed_paths": [],
+            },
         },
     }
     _write_yaml(experiment_path, experiment)
@@ -730,7 +741,6 @@ def _write_builtin_benchmark_authoring(
         },
         "overrides": {
             "network": "none",
-            "root_read_only": True,
         },
     }
     _write_yaml(experiment_path, payload)
@@ -864,7 +874,7 @@ def artifact_bundle(tmp_path_factory: pytest.TempPathFactory) -> Path:
         "done\n"
         "test -n \"$out\"\n"
         "mkdir -p \"$(dirname \"$out\")\"\n"
-        "printf '%s\\n' '{\"schema_version\":\"agent_result_v1\",\"outcome\":\"success\",\"objective\":{\"name\":\"resolved\",\"value\":1.0}}' > \"$out\"\n",
+        "printf '%s\\n' '{\"schema_version\":\"artifact_envelope_v1\",\"artifact_type\":\"structured_json\",\"artifact\":{\"outcome\":\"success\",\"objective_value\":1.0}}' > \"$out\"\n",
         encoding="utf-8",
     )
     os.chmod(compat_probe_path, 0o755)
@@ -889,6 +899,27 @@ def artifact_bundle(tmp_path_factory: pytest.TempPathFactory) -> Path:
 #
 # Build and preflight boundaries
 #
+
+
+@pytest.mark.e2e_cli_surface
+def test_init_writes_experiment_and_task_row_scaffold(
+    tmp_path: Path,
+    lab_cli_bin: Path,
+) -> None:
+    _run(
+        [str(lab_cli_bin), "init", "--profile", "agent-eval", "--in-place"],
+        cwd=tmp_path,
+    )
+    experiment_path = tmp_path / "experiment.yaml"
+    tasks_path = tmp_path / "tasks.jsonl"
+    assert experiment_path.exists()
+    assert tasks_path.exists()
+    rows = _read_jsonl(tasks_path)
+    assert len(rows) == 1
+    assert rows[0]["schema_version"] == "task_row_v1"
+    assert rows[0]["materialization"]["kind"] == "task_image"
+    assert rows[0]["workdir"] == "/workspace/task"
+    assert rows[0]["task"]["id"] == "TASK001"
 
 
 @pytest.mark.e2e_build_preflight
@@ -1331,20 +1362,20 @@ def test_build_rejects_removed_experiment_version_field(
 
 
 @pytest.mark.e2e_build_preflight
-def test_build_accepts_public_task_spec_rows_and_writes_packaged_task_declarations(
+def test_build_writes_packaged_task_rows(
     tmp_path: Path,
     lab_cli_bin: Path,
     artifact_bundle: Path,
     fixture_image: str,
 ) -> None:
     rows = [
-        _task_row(task_id="TASK_UNVERSIONED_DECLARATION", task_image=fixture_image),
+        _task_row(task_id="TASK_PACKAGED_ROW", task_image=fixture_image),
     ]
     project, experiment_path = _create_simple_project(
         tmp_path,
         artifact_bundle,
         fixture_image,
-        exp_id="build_accepts_public_task_spec_rows_and_writes_packaged_task_declarations",
+        exp_id="build_writes_packaged_task_rows",
         rows=rows,
     )
 
@@ -1353,7 +1384,7 @@ def test_build_accepts_public_task_spec_rows_and_writes_packaged_task_declaratio
         "build",
         experiment_path,
         "--out",
-        project.builds_dir / "public_task_spec_pkg",
+        project.builds_dir / "task_row_pkg",
         "--json",
         cwd=project.root,
         expected_exit=0,
@@ -1362,9 +1393,7 @@ def test_build_accepts_public_task_spec_rows_and_writes_packaged_task_declaratio
     package_dir = Path(build["package_dir"])
     task_rows = _read_jsonl(package_dir / "tasks" / "tasks.jsonl")
     assert len(task_rows) == 1
-    _assert_packaged_task_declaration(task_rows[0], rows[0])
-    assert "image" not in task_rows[0]["task"]
-    assert "workspace" not in task_rows[0]["task"]
+    _assert_packaged_task_row(task_rows[0], rows[0])
 
 
 @pytest.mark.e2e_build_preflight
@@ -1385,7 +1414,10 @@ def test_build_rejects_runtime_command_that_mentions_runner_owned_agentlab_path(
         rows=rows,
     )
     experiment = yaml.safe_load(experiment_path.read_text(encoding="utf-8"))
-    experiment["runtime"]["agent_runtime"]["command"] = ["e2e-agent", "/agentlab/in/task.json"]
+    experiment["runtime"]["agent_runtime"]["command"] = [
+        "e2e-agent",
+        "/agentlab/in/trial_input.json",
+    ]
     _write_yaml(experiment_path, experiment)
 
     build = _run_lab(
@@ -1417,7 +1449,7 @@ def test_build_rejects_runtime_env_that_mentions_runner_owned_agentlab_path(
         fixture_image,
         exp_id="build_rejects_runtime_env_that_mentions_runner_owned_agentlab_path",
         rows=rows,
-        agent_env={"TASK_PATH": "/agentlab/in/task.json"},
+        agent_env={"TASK_PATH": "/agentlab/in/trial_input.json"},
     )
 
     build = _run_lab(
@@ -1832,20 +1864,20 @@ def test_run_happy_path_writes_sqlite_and_artifacts(
 
 
 @pytest.mark.e2e_runtime
-def test_run_accepts_strict_task_declarations_and_writes_prepared_environment_manifest(
+def test_run_accepts_task_rows_and_writes_prepared_environment_manifest(
     tmp_path: Path,
     lab_cli_bin: Path,
     artifact_bundle: Path,
     fixture_image: str,
 ) -> None:
     rows = [
-        _task_row(task_id="TASK_STRICT_DECLARATION", task_image=fixture_image),
+        _task_row(task_id="TASK_TASK_ROW_RUNTIME", task_image=fixture_image),
     ]
     project, experiment_path = _create_simple_project(
         tmp_path,
         artifact_bundle,
         fixture_image,
-        exp_id="run_accepts_strict_task_declarations_and_writes_prepared_environment_manifest",
+        exp_id="run_accepts_task_rows_and_writes_prepared_environment_manifest",
         rows=rows,
     )
 
@@ -1853,13 +1885,11 @@ def test_run_accepts_strict_task_declarations_and_writes_prepared_environment_ma
         lab_cli_bin,
         project,
         experiment_path,
-        "strict_task_declaration_pkg",
+        "task_row_runtime_pkg",
     )
     task_rows = _read_jsonl(package_dir / "tasks" / "tasks.jsonl")
     assert len(task_rows) == 1
-    _assert_packaged_task_declaration(task_rows[0], rows[0])
-    assert "image" not in task_rows[0]["task"]
-    assert "workspace" not in task_rows[0]["task"]
+    _assert_packaged_task_row(task_rows[0], rows[0])
 
     preflight = _run_lab(
         lab_cli_bin,
@@ -1908,8 +1938,8 @@ def test_scientific_run_executes_agent_in_container_not_host(
     trial_dir = _only_trial_dir(run_dir)
     agent_report = _load_agent_report(trial_dir)
 
-    assert agent_report["env"]["workspace"] == "/agentlab/workspace"
-    assert agent_report["cwd"] == "/agentlab/workspace"
+    assert agent_report["env"]["workspace"] == agent_report["cwd"]
+    assert Path(agent_report["env"]["workspace"]).is_absolute()
     assert ".scratch" not in json.dumps(agent_report, sort_keys=True)
 
     harness_stdout = (trial_dir / "harness_stdout.log").read_text(encoding="utf-8")
@@ -2179,7 +2209,7 @@ def test_materialize_full_persists_workspace_base_overlays_and_aux_mounts(
             task_image=fixture_image,
             workspace_base_ref=seed_ref,
             workspace_overlays=[_workspace_overlay("overlay/config.txt", "overlay ready\n")],
-            workspace_aux_mounts=[_aux_mount(mount_ref, "/agentlab/workspace/mounted")],
+            workspace_aux_mounts=[_aux_mount(mount_ref, "/workspace/mounted")],
             observe={
                 "seed_file": {
                     "path": "seed/README.txt",
@@ -2349,7 +2379,7 @@ def test_ab_run_exposes_views_and_query_surface(
 
 
 @pytest.mark.e2e_benchmark
-def test_custom_benchmark_build_preflight_run_writes_prediction_and_score(
+def test_custom_benchmark_build_preflight_run_writes_trial_conclusion(
     tmp_path: Path,
     lab_cli_bin: Path,
     artifact_bundle: Path,
@@ -2360,7 +2390,7 @@ def test_custom_benchmark_build_preflight_run_writes_prediction_and_score(
         artifact_bundle,
         fixture_image,
     )
-    assert rows[0]["environment"]["image"]
+    assert rows[0]["image"]
 
     package_dir = _build_package(
         lab_cli_bin,
@@ -2399,26 +2429,20 @@ def test_custom_benchmark_build_preflight_run_writes_prediction_and_score(
 
     conn = sqlite3.connect(run_dir / "run.sqlite")
     try:
-        prediction_row = conn.execute(
-            "SELECT row_json FROM benchmark_prediction_rows LIMIT 1"
-        ).fetchone()
-        score_row = conn.execute(
-            "SELECT row_json FROM benchmark_score_rows LIMIT 1"
+        conclusion_row = conn.execute(
+            "SELECT row_json FROM benchmark_conclusion_rows LIMIT 1"
         ).fetchone()
         trial_row = conn.execute("SELECT row_json FROM trial_rows LIMIT 1").fetchone()
     finally:
         conn.close()
-    assert prediction_row is not None
-    assert score_row is not None
+    assert conclusion_row is not None
     assert trial_row is not None
-    prediction = json.loads(prediction_row[0])
-    score = json.loads(score_row[0])
+    conclusion = json.loads(conclusion_row[0])
     trial = json.loads(trial_row[0])
-    assert prediction["schema_version"] == "benchmark_prediction_record_v1"
-    assert prediction["prediction"]["kind"] == "text"
-    assert score["schema_version"] == "benchmark_score_record_v1"
-    assert score["verdict"] == "pass"
-    assert score["primary_metric_value"] == 1.0
+    assert conclusion["schema_version"] == "trial_conclusion_v1"
+    assert conclusion["reported_outcome"] == "success"
+    assert conclusion["primary_metric"]["name"] == "resolved"
+    assert conclusion["primary_metric"]["value"] == 1.0
     assert trial["outcome"] == "success"
     assert trial["primary_metric_name"] == "resolved"
     assert trial["primary_metric_value"] == 1.0
@@ -2459,22 +2483,19 @@ def test_custom_benchmark_run_marks_missing_result_before_grader_executes(
     conn = sqlite3.connect(run_dir / "run.sqlite")
     try:
         raw_row = conn.execute("SELECT row_json FROM trial_rows LIMIT 1").fetchone()
-        prediction_row = conn.execute(
-            "SELECT row_json FROM benchmark_prediction_rows LIMIT 1"
-        ).fetchone()
-        score_row = conn.execute(
-            "SELECT row_json FROM benchmark_score_rows LIMIT 1"
+        conclusion_row = conn.execute(
+            "SELECT row_json FROM benchmark_conclusion_rows LIMIT 1"
         ).fetchone()
     finally:
         conn.close()
     assert raw_row is not None
-    assert prediction_row is None
-    assert score_row is None
+    assert conclusion_row is not None
     row = json.loads(raw_row[0])
-    assert row["outcome"] == "error"
+    conclusion = json.loads(conclusion_row[0])
+    assert conclusion["reported_outcome"] == "missing"
+    assert conclusion["primary_metric"]["value"] == 0.0
+    assert row["outcome"] == "missing"
     assert row["success"] is False
-    assert row["metrics"]["grade_error"] is True
-    assert row["metrics"]["grade_error_reason"] == "result_missing"
 
     harness_stderr = (trial_dir / "harness_stderr.log").read_text(encoding="utf-8")
     assert "No such file or directory: '/agentlab/out/result.json'" not in harness_stderr
@@ -2507,9 +2528,8 @@ def test_builtin_bench_v0_build_preflight_run_uses_real_builtin_benchmark_assets
         assert build["ok"] is True
         resolved_experiment = _read_json(package_dir / "resolved_experiment.json")
         assert resolved_experiment["dataset"]["suite_id"] == "bench_v0"
-        assert (
-            resolved_experiment["benchmark"]["grader"]["command"][1]
-            == "/agentlab/deps/bench/integration/agentlab/bench_benchmark_adapter.py"
+        assert resolved_experiment["benchmark"]["grader"]["command"][1].endswith(
+            "bench/integration/agentlab/bench_benchmark_adapter.py"
         )
 
         preflight = _run_lab(
@@ -2535,25 +2555,20 @@ def test_builtin_bench_v0_build_preflight_run_uses_real_builtin_benchmark_assets
 
         conn = sqlite3.connect(run_dir / "run.sqlite")
         try:
-            prediction_row = conn.execute(
-                "SELECT row_json FROM benchmark_prediction_rows LIMIT 1"
-            ).fetchone()
-            score_row = conn.execute(
-                "SELECT row_json FROM benchmark_score_rows LIMIT 1"
+            conclusion_row = conn.execute(
+                "SELECT row_json FROM benchmark_conclusion_rows LIMIT 1"
             ).fetchone()
             trial_row = conn.execute("SELECT row_json FROM trial_rows LIMIT 1").fetchone()
         finally:
             conn.close()
-        assert prediction_row is not None
-        assert score_row is not None
+        assert conclusion_row is not None
         assert trial_row is not None
-        prediction = json.loads(prediction_row[0])
-        score = json.loads(score_row[0])
+        conclusion = json.loads(conclusion_row[0])
         trial = json.loads(trial_row[0])
-        assert prediction["benchmark"]["adapter_id"] == "bench_v0"
-        assert score["benchmark"]["name"] == "bench"
-        assert score["verdict"] == "missing"
-        assert score.get("error") is None
+        assert conclusion["payload"]["benchmark"]["adapter_id"] == "bench_v0"
+        assert conclusion["payload"]["benchmark"]["name"] == "bench"
+        assert conclusion["reported_outcome"] == "missing"
+        assert conclusion["primary_metric"]["value"] == 0.0
         assert trial["outcome"] == "missing"
         assert trial["success"] is False
         assert trial["primary_metric_name"] == "resolved"
@@ -2589,9 +2604,8 @@ def test_builtin_swebench_lite_build_preflight_run_uses_real_builtin_benchmark_a
         assert build["ok"] is True
         resolved_experiment = _read_json(package_dir / "resolved_experiment.json")
         assert resolved_experiment["dataset"]["suite_id"] == "swebench_lite_curated"
-        assert (
-            resolved_experiment["benchmark"]["grader"]["command"][1]
-            == "/agentlab/deps/swebench/swebench_task_container_grader.py"
+        assert resolved_experiment["benchmark"]["grader"]["command"][1].endswith(
+            "swebench/swebench_task_container_grader.py"
         )
 
         preflight = _run_lab(
@@ -2617,24 +2631,19 @@ def test_builtin_swebench_lite_build_preflight_run_uses_real_builtin_benchmark_a
 
         conn = sqlite3.connect(run_dir / "run.sqlite")
         try:
-            prediction_row = conn.execute(
-                "SELECT row_json FROM benchmark_prediction_rows LIMIT 1"
-            ).fetchone()
-            score_row = conn.execute(
-                "SELECT row_json FROM benchmark_score_rows LIMIT 1"
+            conclusion_row = conn.execute(
+                "SELECT row_json FROM benchmark_conclusion_rows LIMIT 1"
             ).fetchone()
             trial_row = conn.execute("SELECT row_json FROM trial_rows LIMIT 1").fetchone()
         finally:
             conn.close()
-        assert prediction_row is not None
-        assert score_row is not None
+        assert conclusion_row is not None
         assert trial_row is not None
-        prediction = json.loads(prediction_row[0])
-        score = json.loads(score_row[0])
+        conclusion = json.loads(conclusion_row[0])
         trial = json.loads(trial_row[0])
-        assert prediction["benchmark"]["adapter_id"] == "swebench_task_container_grader"
-        assert score["benchmark"]["name"] == "swebench_lite_curated"
-        assert score["verdict"] == "pass"
+        assert conclusion["payload"]["benchmark"]["adapter_id"] == "swebench_task_container_grader"
+        assert conclusion["payload"]["benchmark"]["name"] == "swebench_lite_curated"
+        assert conclusion["reported_outcome"] == "success"
         assert trial["outcome"] == "success"
         assert trial["primary_metric_name"] == "resolved"
         assert trial["primary_metric_value"] == 1.0

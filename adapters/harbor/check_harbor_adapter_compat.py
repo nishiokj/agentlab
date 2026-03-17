@@ -45,7 +45,7 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     parser.add_argument(
         "--expect-external-evaluator",
         action="store_true",
-        help="Require score/prediction ext.harbor.evaluation_mode == 'external'.",
+        help="Require conclusion payload.harbor.evaluation_mode == 'external'.",
     )
     return parser.parse_args(argv)
 
@@ -103,31 +103,70 @@ def _validate_schema(payload: dict[str, Any], schema_file: str, label: str) -> N
         raise ValueError(f"{label} schema validation failed: {'; '.join(errors)}")
 
 
-def _assert_eval_mode(payload: dict[str, Any], expected_external: bool, label: str) -> None:
-    ext = payload.get("ext")
+def _assert_eval_mode(payload: dict[str, Any], expected_external: bool) -> None:
+    raw_payload = payload.get("payload")
     mode = None
-    if isinstance(ext, dict):
-        harbor = ext.get("harbor")
+    if isinstance(raw_payload, dict):
+        harbor = raw_payload.get("harbor")
         if isinstance(harbor, dict):
             mode = harbor.get("evaluation_mode")
     if expected_external and mode != "external":
         raise ValueError(
-            f"{label} expected ext.harbor.evaluation_mode='external', got '{mode}'"
+            f"conclusion expected payload.harbor.evaluation_mode='external', got '{mode}'"
         )
 
 
-def _validate_outputs(prediction_path: Path, score_path: Path, expect_external: bool) -> None:
-    prediction = _load_json(prediction_path)
-    score = _load_json(score_path)
-    _validate_schema(
-        prediction,
-        "benchmark_prediction_record_v1.jsonschema",
-        "prediction",
-    )
-    _validate_schema(score, "benchmark_score_record_v1.jsonschema", "score")
+def _validate_output(mapped_output_path: Path, expect_external: bool) -> None:
+    mapped = _load_json(mapped_output_path)
+    _validate_schema(mapped, "trial_conclusion_v1.jsonschema", "mapped_output")
     if expect_external:
-        _assert_eval_mode(prediction, True, "prediction")
-        _assert_eval_mode(score, True, "score")
+        _assert_eval_mode(mapped, True)
+
+
+def _grader_input_payload() -> dict[str, Any]:
+    return {
+        "schema_version": "grader_input_v1",
+        "ids": {
+            "run_id": "run_harbor_phase3_probe",
+            "trial_id": "trial_harbor_phase3_probe",
+            "variant_id": "control",
+            "task_id": "tb2_phase3_probe_task",
+            "repl_idx": 0,
+        },
+        "task": {
+            "id": "tb2_phase3_probe_task",
+            "benchmark": {
+                "adapter_id": "harbor_tb2",
+                "name": "terminal_bench_2",
+                "split": "test",
+            },
+        },
+        "artifact_type": "structured_json",
+        "agent_phase": {
+            "exit_code": 0,
+            "timed_out": False,
+            "result_present": True,
+            "result_schema_valid": True,
+            "started_at": "2026-03-17T00:00:00Z",
+            "ended_at": "2026-03-17T00:00:01Z",
+        },
+        "candidate_artifact": {
+            "state": "valid",
+            "artifact_type": "structured_json",
+            "source": "result.inline",
+            "payload": {
+                "outcome": True,
+                "output": {"text": "phase3 compat probe"},
+            },
+        },
+        "workspace_delta": {
+            "state": "missing",
+        },
+        "paths": {
+            "result_path": "/agentlab/out/result.json",
+        },
+        "workdir": "/workspace",
+    }
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -153,33 +192,16 @@ def main(argv: list[str] | None = None) -> int:
 
     with tempfile.TemporaryDirectory(prefix="harbor_phase3_compat_") as tmp:
         tmp_dir = Path(tmp)
-        task_path = tmp_dir / "task.json"
-        result_path = tmp_dir / "result.json"
-        prediction_path = tmp_dir / "benchmark_prediction.json"
-        score_path = tmp_dir / "benchmark_score.json"
+        grader_input_path = tmp_dir / "grader_input.json"
+        mapped_output_path = tmp_dir / "mapped_grader_output.json"
 
-        task_payload = {
-            "id": "tb2_phase3_probe_task",
-            "benchmark": {
-                "adapter_id": "harbor_tb2",
-                "name": "terminal_bench_2",
-                "split": "test",
-            },
-        }
-        result_payload = {
-            "outcome": True,
-            "output": {"text": "phase3 compat probe"},
-        }
-        task_path.write_text(json.dumps(task_payload), encoding="utf-8")
-        result_path.write_text(json.dumps(result_payload), encoding="utf-8")
+        grader_input_path.write_text(json.dumps(_grader_input_payload()), encoding="utf-8")
 
         env = os.environ.copy()
         env.update(
             {
-                "AGENTLAB_TASK_PATH": str(task_path),
-                "AGENTLAB_RESULT_PATH": str(result_path),
-                "AGENTLAB_BENCHMARK_PREDICTION_PATH": str(prediction_path),
-                "AGENTLAB_BENCHMARK_SCORE_PATH": str(score_path),
+                "AGENTLAB_GRADER_INPUT_PATH": str(grader_input_path),
+                "AGENTLAB_MAPPED_GRADER_OUTPUT_PATH": str(mapped_output_path),
                 "AGENTLAB_RUN_ID": "run_harbor_phase3_probe",
                 "AGENTLAB_TRIAL_ID": "trial_harbor_phase3_probe",
                 "AGENTLAB_VARIANT_ID": "control",
@@ -210,7 +232,7 @@ def main(argv: list[str] | None = None) -> int:
             return proc.returncode
 
         try:
-            _validate_outputs(prediction_path, score_path, expect_external)
+            _validate_output(mapped_output_path, expect_external)
         except Exception as exc:
             print(
                 "compat probe failed: adapter outputs are invalid.\n"

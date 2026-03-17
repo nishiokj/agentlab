@@ -37,48 +37,58 @@ class BenchBenchmarkAdapterTests(unittest.TestCase):
             "AGENTLAB_VARIANT_ID",
             "AGENTLAB_TASK_ID",
             "AGENTLAB_REPL_IDX",
-            "AGENTLAB_SCHEDULE_IDX",
-            "AGENTLAB_SLOT_COMMIT_ID",
-            "AGENTLAB_ATTEMPT",
-            "AGENTLAB_ROW_SEQ",
+            "AGENTLAB_GRADING_STRATEGY",
+            "AGENTLAB_GRADER_STRATEGY",
         ]
 
-    def test_inv01_bench_adapter_prediction_record_validates_schema(self) -> None:
+    def test_inv01_bench_adapter_trial_conclusion_validates_schema(self) -> None:
         task = {
             "id": "task_1",
             "benchmark": {"adapter_id": "bench_v0", "name": "bench", "split": "test"},
         }
-        payload = adapter._prediction_record(task, "diff --git a b")
+        payload = adapter.build_trial_conclusion(
+            task,
+            patch_text="diff --git a b",
+            score=None,
+            error_message="grader exploded",
+        )
         errors = validate_with_schema_file(
             payload,
-            SCHEMAS_DIR / "benchmark_prediction_record_v1.jsonschema",
+            SCHEMAS_DIR / "trial_conclusion_v1.jsonschema",
         )
         self.assertEqual(errors, [], f"schema validation errors: {errors}")
 
-    def test_inv01_bench_adapter_score_record_validates_schema(self) -> None:
+    def test_inv01_bench_adapter_missing_grader_fails_schema_validation(self) -> None:
         task = {
             "id": "task_1",
             "benchmark": {"adapter_id": "bench_v0", "name": "bench", "split": "test"},
         }
-        payload = adapter._score_record(task, None, "grader exploded")
+        payload = adapter.build_trial_conclusion(
+            task,
+            patch_text="diff --git a b",
+            score=None,
+            error_message="grader exploded",
+        )
+        payload.pop("grader")
         errors = validate_with_schema_file(
             payload,
-            SCHEMAS_DIR / "benchmark_score_record_v1.jsonschema",
+            SCHEMAS_DIR / "trial_conclusion_v1.jsonschema",
         )
-        self.assertEqual(errors, [], f"schema validation errors: {errors}")
+        self.assertTrue(errors, "missing grader must fail schema validation")
 
-    def test_inv01_bench_adapter_missing_identity_fields_fails_schema_validation(self) -> None:
+    def test_inv01_bench_adapter_missing_patch_maps_to_missing(self) -> None:
         task = {
             "id": "task_1",
             "benchmark": {"adapter_id": "bench_v0", "name": "bench", "split": "test"},
         }
-        payload = adapter._prediction_record(task, "diff --git a b")
-        payload.pop("slot_commit_id")
-        errors = validate_with_schema_file(
-            payload,
-            SCHEMAS_DIR / "benchmark_prediction_record_v1.jsonschema",
+        payload = adapter.build_trial_conclusion(
+            task,
+            patch_text=None,
+            score={"failure_label": "NO_PATCH", "overall_pass": False},
+            error_message=None,
         )
-        self.assertTrue(errors, "missing identity field must fail schema validation")
+        self.assertEqual(payload["payload"]["verdict"], "missing")
+        self.assertEqual(payload["reported_outcome"], "missing")
 
 
 if __name__ == "__main__":

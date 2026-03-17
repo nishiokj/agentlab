@@ -13,8 +13,7 @@ pub const RUN_SQLITE_FILE: &str = "run.sqlite";
 pub enum JsonRowTable {
     Evidence,
     ChainState,
-    BenchmarkPrediction,
-    BenchmarkScore,
+    BenchmarkConclusion,
 }
 
 #[derive(Debug)]
@@ -772,18 +771,9 @@ impl SqliteRunStore {
                    slot_commit_id=excluded.slot_commit_id,
                    row_json=excluded.row_json",
             ),
-            JsonRowTable::BenchmarkPrediction => (
-                "benchmark_prediction_rows",
-                "INSERT INTO benchmark_prediction_rows
-                 (run_id, schedule_idx, attempt, row_seq, slot_commit_id, row_json)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)
-                 ON CONFLICT(run_id, schedule_idx, attempt, row_seq) DO UPDATE SET
-                   slot_commit_id=excluded.slot_commit_id,
-                   row_json=excluded.row_json",
-            ),
-            JsonRowTable::BenchmarkScore => (
-                "benchmark_score_rows",
-                "INSERT INTO benchmark_score_rows
+            JsonRowTable::BenchmarkConclusion => (
+                "benchmark_conclusion_rows",
+                "INSERT INTO benchmark_conclusion_rows
                  (run_id, schedule_idx, attempt, row_seq, slot_commit_id, row_json)
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6)
                  ON CONFLICT(run_id, schedule_idx, attempt, row_seq) DO UPDATE SET
@@ -811,7 +801,7 @@ impl SqliteRunStore {
             JsonRowTable::ChainState => {
                 self.upsert_lineage_from_chain_state_row(row)?;
             }
-            JsonRowTable::BenchmarkPrediction | JsonRowTable::BenchmarkScore => {}
+            JsonRowTable::BenchmarkConclusion => {}
         }
         Ok(())
     }

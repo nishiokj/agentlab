@@ -17,4 +17,4 @@ COPY bench-requirements.txt /tmp/bench-requirements.txt
 
 RUN pip install --no-cache-dir -r /tmp/bench-requirements.txt
 
-WORKDIR /agentlab/workspace
+WORKDIR /workspace

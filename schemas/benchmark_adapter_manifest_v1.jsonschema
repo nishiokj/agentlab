@@ -37,10 +37,9 @@
     "record_schemas": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["prediction", "score"],
+      "required": ["conclusion"],
       "properties": {
-        "prediction": { "const": "benchmark_prediction_record_v1" },
-        "score": { "const": "benchmark_score_record_v1" }
+        "conclusion": { "const": "trial_conclusion_v1" }
       }
     },
     "evaluator": {

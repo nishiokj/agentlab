@@ -8,6 +8,10 @@ from pathlib import Path
 from typing import Any
 
 
+DEFAULT_MAPPED_OUTPUT_PATH = "/agentlab/out/mapped_grader_output.json"
+VALID_GRADING_STRATEGIES = {"in_task_image", "injected", "separate"}
+
+
 def _read_json(path: str | Path) -> Any:
     return json.loads(Path(path).read_text(encoding="utf-8"))
 
@@ -25,24 +29,35 @@ def _required_env(name: str) -> str:
     return value
 
 
-def _env_int(name: str, fallback: int = 0) -> int:
-    raw = os.environ.get(name)
-    if raw is None:
-        return fallback
-    try:
-        return int(raw)
-    except ValueError:
-        return fallback
+def _load_grader_input() -> dict[str, Any]:
+    payload = _read_json(_required_env("AGENTLAB_GRADER_INPUT_PATH"))
+    if isinstance(payload, dict):
+        return payload
+    raise RuntimeError("grader input must be a JSON object")
 
 
-def _identity_fields() -> dict[str, Any]:
-    slot_commit_id = os.environ.get("AGENTLAB_SLOT_COMMIT_ID", "").strip() or "slot_pending"
-    return {
-        "schedule_idx": _env_int("AGENTLAB_SCHEDULE_IDX", 0),
-        "slot_commit_id": slot_commit_id,
-        "attempt": max(_env_int("AGENTLAB_ATTEMPT", 1), 1),
-        "row_seq": max(_env_int("AGENTLAB_ROW_SEQ", 0), 0),
-    }
+def _task_payload(grader_input: dict[str, Any]) -> dict[str, Any]:
+    payload = grader_input.get("task")
+    if isinstance(payload, dict):
+        return payload
+    return {}
+
+
+def _candidate_artifact(grader_input: dict[str, Any]) -> dict[str, Any]:
+    payload = grader_input.get("candidate_artifact")
+    if isinstance(payload, dict):
+        return payload
+    return {}
+
+
+def _candidate_payload(grader_input: dict[str, Any]) -> dict[str, Any]:
+    candidate = _candidate_artifact(grader_input)
+    if candidate.get("state") != "valid":
+        return {}
+    payload = candidate.get("payload")
+    if isinstance(payload, dict):
+        return payload
+    return {}
 
 
 def _task_id(task_payload: Any) -> str:
@@ -75,23 +90,31 @@ def _benchmark_spec(task_payload: Any) -> dict[str, str]:
     return default
 
 
-def _prediction(result_payload: Any) -> dict[str, Any]:
-    if isinstance(result_payload, dict):
-        prediction = result_payload.get("prediction")
+def _prediction(artifact_payload: Any) -> dict[str, Any]:
+    if isinstance(artifact_payload, dict):
+        prediction = artifact_payload.get("prediction")
         if isinstance(prediction, str) and prediction.strip():
             return {"kind": "text", "value": prediction}
-        output = result_payload.get("output")
+        patch = artifact_payload.get("patch")
+        if isinstance(patch, str) and patch.strip():
+            return {"kind": "patch", "value": patch}
+        output = artifact_payload.get("output")
         if isinstance(output, dict):
-            patch = output.get("patch")
-            if isinstance(patch, str) and patch.strip():
-                return {"kind": "patch", "value": patch}
+            nested_patch = output.get("patch")
+            if isinstance(nested_patch, str) and nested_patch.strip():
+                return {"kind": "patch", "value": nested_patch}
     return {"kind": "text", "value": ""}
 
 
-def _objective_value(result_payload: Any) -> float:
-    if not isinstance(result_payload, dict):
+def _objective_value(artifact_payload: Any) -> float:
+    if not isinstance(artifact_payload, dict):
         return 0.0
-    objective = result_payload.get("objective")
+    direct = artifact_payload.get("objective_value")
+    if isinstance(direct, bool):
+        return float(direct)
+    if isinstance(direct, (int, float)):
+        return float(direct)
+    objective = artifact_payload.get("objective")
     if not isinstance(objective, dict):
         return 0.0
     value = objective.get("value")
@@ -107,49 +130,72 @@ def _objective_value(result_payload: Any) -> float:
     return 0.0
 
 
+def _reported_outcome(verdict: str) -> str:
+    return {
+        "pass": "success",
+        "fail": "failure",
+        "missing": "missing",
+        "error": "error",
+    }.get(verdict, "error")
+
+
+def _grader_strategy() -> str:
+    for env_name in ("AGENTLAB_GRADING_STRATEGY", "AGENTLAB_GRADER_STRATEGY"):
+        raw = os.environ.get(env_name, "").strip()
+        if raw in VALID_GRADING_STRATEGIES:
+            return raw
+    return "in_task_image"
+
+
+def _mapped_output_path() -> str:
+    raw = os.environ.get("AGENTLAB_MAPPED_GRADER_OUTPUT_PATH", "").strip()
+    if raw:
+        return raw
+    return DEFAULT_MAPPED_OUTPUT_PATH
+
+
 def main() -> int:
-    task_path = _required_env("AGENTLAB_TASK_PATH")
-    result_path = _required_env("AGENTLAB_RESULT_PATH")
-    prediction_path = _required_env("AGENTLAB_BENCHMARK_PREDICTION_PATH")
-    score_path = _required_env("AGENTLAB_BENCHMARK_SCORE_PATH")
-
-    task_payload = _read_json(task_path)
-    result_payload = _read_json(result_path)
+    grader_input = _load_grader_input()
+    task_payload = _task_payload(grader_input)
+    candidate = _candidate_artifact(grader_input)
+    artifact_payload = _candidate_payload(grader_input)
     benchmark = _benchmark_spec(task_payload)
-    objective_value = _objective_value(result_payload)
-    resolved = 1.0 if objective_value > 0.0 else 0.0
-    verdict = "pass" if resolved == 1.0 else "fail"
 
-    ids = {
-        "run_id": os.environ.get("AGENTLAB_RUN_ID", "run_unknown"),
-        "trial_id": os.environ.get("AGENTLAB_TRIAL_ID", "trial_unknown"),
-        "variant_id": os.environ.get("AGENTLAB_VARIANT_ID", "variant_unknown"),
-        "task_id": os.environ.get("AGENTLAB_TASK_ID", _task_id(task_payload)),
-        "repl_idx": _env_int("AGENTLAB_REPL_IDX", 0),
-    }
-    prediction = {
-        "schema_version": "benchmark_prediction_record_v1",
-        **_identity_fields(),
-        "ids": ids,
+    objective_value = _objective_value(artifact_payload)
+    if candidate.get("state") == "missing":
+        verdict = "missing"
+    elif candidate.get("state") == "invalid":
+        verdict = "error"
+    else:
+        verdict = "pass" if objective_value > 0.0 else "fail"
+    resolved = 1.0 if verdict == "pass" else 0.0
+
+    payload = {
         "benchmark": benchmark,
-        "prediction": _prediction(result_payload),
-    }
-    score = {
-        "schema_version": "benchmark_score_record_v1",
-        **_identity_fields(),
-        "ids": ids,
-        "benchmark": benchmark,
+        "ids": grader_input.get("ids", {}),
+        "task_id": _task_id(task_payload),
         "verdict": verdict,
-        "primary_metric_name": "resolved",
-        "primary_metric_value": resolved,
-        "metrics": {"resolved": resolved},
-        "evaluator": {
+        "resolved": resolved,
+        "objective_value": objective_value,
+        "prediction": _prediction(artifact_payload),
+        "candidate_artifact_state": candidate.get("state", "missing"),
+    }
+
+    conclusion = {
+        "schema_version": "trial_conclusion_v1",
+        "payload": payload,
+        "reported_outcome": _reported_outcome(verdict),
+        "primary_metric": {
+            "name": "resolved",
+            "value": resolved,
+        },
+        "grader": {
             "name": "custom_benchmark_grader",
-            "mode": "custom",
+            "strategy": _grader_strategy(),
+            "version": "v1",
         },
     }
-    _write_json(prediction_path, prediction)
-    _write_json(score_path, score)
+    _write_json(_mapped_output_path(), conclusion)
     return 0
 
 

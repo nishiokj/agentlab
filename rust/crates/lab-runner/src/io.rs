@@ -8,107 +8,114 @@ struct PreparedTaskEnvironment {
 
 #[derive(Debug, Clone)]
 struct TaskBoundaryMaterialization {
-    declaration: TaskDeclaration,
+    declaration: Value,
     task_payload: Value,
-    environment: TaskEnvironmentSpec,
     workspace: WorkspaceSpec,
     dependencies: Value,
-    limits: TaskDeclarationLimits,
+    materialization: TaskMaterializationSpec,
+    task_id: String,
     task_image: String,
+    task_workdir: String,
+    time_limit_ms: Option<u64>,
 }
 
-pub(crate) fn parse_task_spec(task: &Value) -> Result<TaskSpec> {
-    let task_spec: TaskSpec =
-        serde_json::from_value(task.clone()).map_err(|e| anyhow!("invalid public task_spec: {}", e))?;
-    validate_task_spec(&task_spec)?;
-    Ok(task_spec)
-}
+const DEFAULT_TASK_WORKDIR_FALLBACK: &str = "/workspace";
 
-pub(crate) fn compile_task_spec(task_spec: TaskSpec) -> Result<TaskDeclaration> {
-    let declaration = task_spec.into_task_declaration();
-    validate_task_declaration(&declaration)?;
-    Ok(declaration)
-}
-
-pub(crate) fn parse_task_declaration(task: &Value) -> Result<TaskDeclaration> {
+pub(crate) fn parse_task_row(task: &Value) -> Result<TaskRow> {
     let obj = task
         .as_object()
-        .ok_or_else(|| anyhow!("task declaration must be an object"))?;
-    if obj.get("schema_version").and_then(Value::as_str) != Some("task_declaration_v1") {
-        return Err(anyhow!(
-            "task declaration schema_version must be 'task_declaration_v1'"
-        ));
+        .ok_or_else(|| anyhow!("task row must be an object"))?;
+    if obj.get("schema_version").and_then(Value::as_str) != Some("task_row_v1") {
+        return Err(anyhow!("task row schema_version must be 'task_row_v1'"));
     }
-    let declaration: TaskDeclaration =
-        serde_json::from_value(task.clone()).map_err(|e| anyhow!("invalid task declaration: {}", e))?;
-    validate_task_declaration(&declaration)?;
-    Ok(declaration)
+    let task_row: TaskRow =
+        serde_json::from_value(task.clone()).map_err(|e| anyhow!("invalid task row: {}", e))?;
+    validate_task_row(&task_row)?;
+    Ok(task_row)
 }
 
-fn materialize_task_boundary(declaration: TaskDeclaration) -> TaskBoundaryMaterialization {
+fn materialize_task_row(task_row: TaskRow) -> TaskBoundaryMaterialization {
     TaskBoundaryMaterialization {
-        task_payload: declaration.task.clone(),
-        environment: declaration.environment.clone(),
-        workspace: declaration.workspace.clone(),
-        dependencies: declaration.dependencies.clone(),
-        limits: declaration.limits.clone(),
-        task_image: declaration.environment.image.clone(),
-        declaration,
+        declaration: serde_json::to_value(&task_row).unwrap_or_else(|_| json!({})),
+        task_payload: task_row.task.clone(),
+        workspace: WorkspaceSpec {
+            mode: WorkspaceMode::Scratch,
+            base: WorkspaceBaseSpec {
+                kind: WorkspaceBaseKind::Empty,
+                dataset_pack_ref: None,
+                repo: None,
+                commit: None,
+            },
+            overlays: Vec::new(),
+            aux_mounts: Vec::new(),
+        },
+        dependencies: json!({}),
+        materialization: task_row.materialization.clone(),
+        task_id: task_row.task_id(0),
+        task_image: task_row.image.clone(),
+        task_workdir: task_row.workdir.clone(),
+        time_limit_ms: task_row.time_limit_ms,
+    }
+}
+
+fn materialize_packaged_task_boundary(task: &Value) -> Result<TaskBoundaryMaterialization> {
+    match task.get("schema_version").and_then(Value::as_str) {
+        Some("task_row_v1") => Ok(materialize_task_row(parse_task_row(task)?)),
+        Some(other) => Err(anyhow!(
+            "packaged task schema_version '{}' is not supported at runtime; expected 'task_row_v1'",
+            other
+        )),
+        None => Err(anyhow!(
+            "packaged task row missing schema_version; expected 'task_row_v1'"
+        )),
     }
 }
 
 fn parse_task_boundary_from_packaged_task(task: &Value) -> Result<TaskBoundaryMaterialization> {
-    Ok(materialize_task_boundary(parse_task_declaration(task)?))
+    materialize_packaged_task_boundary(task)
 }
 
-fn validate_task_spec(task_spec: &TaskSpec) -> Result<()> {
-    if !task_spec.task.is_object() {
-        return Err(anyhow!("public task_spec field 'task' must be an object"));
+fn validate_task_row(task_row: &TaskRow) -> Result<()> {
+    if task_row.id.trim().is_empty() {
+        return Err(anyhow!("task row field 'id' must be a non-empty string"));
     }
-    let task_id = task_spec
-        .task
-        .get("id")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .ok_or_else(|| anyhow!("public task_spec field 'task.id' must be a non-empty string"))?;
-    if task_spec.task.get("image").is_some() {
-        return Err(anyhow!(
-            "public task_spec field 'task.image' is not allowed for task '{}'; use environment.image",
-            task_id
-        ));
+    if task_row.image.trim().is_empty() {
+        return Err(anyhow!("task row field 'image' must be a non-empty string"));
     }
-    if task_spec.task.get("workspace").is_some() {
-        return Err(anyhow!(
-            "public task_spec field 'task.workspace' is not allowed for task '{}'; use workspace",
-            task_id
-        ));
+    if task_row.workdir.trim().is_empty() {
+        return Err(anyhow!("task row field 'workdir' must be a non-empty string"));
     }
-    parse_task_environment(Some(&serde_json::to_value(&task_spec.environment)?))?;
-    parse_workspace_spec(Some(&serde_json::to_value(&task_spec.workspace)?))?;
-    parse_task_dependencies(Some(&task_spec.dependencies))?;
-    parse_task_limits(Some(&serde_json::to_value(&task_spec.limits)?))?;
-    Ok(())
-}
-
-fn validate_task_declaration(declaration: &TaskDeclaration) -> Result<()> {
-    if !declaration.task.is_object() {
-        return Err(anyhow!("task declaration field 'task' must be an object"));
+    if !Path::new(task_row.workdir.trim()).is_absolute() {
+        return Err(anyhow!("task row field 'workdir' must be an absolute path"));
     }
-    if declaration.task.get("image").is_some() {
-        return Err(anyhow!(
-            "task declaration field 'task.image' was removed; use environment.image"
-        ));
+    if !task_row.task.is_object() {
+        return Err(anyhow!("task row field 'task' must be an object"));
     }
-    if declaration.task.get("workspace").is_some() {
-        return Err(anyhow!(
-            "task declaration field 'task.workspace' was removed; sandbox topology is runner-owned"
-        ));
+    if task_row.time_limit_ms == Some(0) {
+        return Err(anyhow!("task row field 'time_limit_ms' must be > 0 when provided"));
     }
-    parse_task_environment(Some(&serde_json::to_value(&declaration.environment)?))?;
-    parse_workspace_spec(Some(&serde_json::to_value(&declaration.workspace)?))?;
-    parse_task_dependencies(Some(&declaration.dependencies))?;
-    parse_task_limits(Some(&serde_json::to_value(&declaration.limits)?))?;
+    match task_row.materialization.kind {
+        TaskMaterializationKind::TaskImage => {
+            if task_row.materialization.task_bundle_ref.is_some() {
+                return Err(anyhow!(
+                    "task row materialization.kind='task_image' does not allow task_bundle_ref"
+                ));
+            }
+        }
+        TaskMaterializationKind::BaseImageBundle => {
+            let _task_bundle_ref = task_row
+                .materialization
+                .task_bundle_ref
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| {
+                    anyhow!(
+                        "task row materialization.task_bundle_ref is required for base_image_bundle"
+                    )
+                })?;
+        }
+    }
     Ok(())
 }
 
@@ -122,165 +129,21 @@ fn validate_task_boundary_workspace_materialization(
         return Ok(());
     }
     let task_id = task_boundary
-        .task_payload
-        .get("id")
-        .and_then(|v| v.as_str())
-        .unwrap_or("<unknown_task>");
+        .task_id
+        .as_str();
     Err(anyhow!(
         "task '{}' uses workspace.mode='patch' but workspace.base.kind='empty'; patch tasks require a real base (dataset_pack or git_checkout)",
         task_id
     ))
 }
 
-fn parse_task_environment(value: Option<&Value>) -> Result<TaskEnvironmentSpec> {
-    let raw = value.ok_or_else(|| anyhow!("task declaration missing field: environment"))?;
-    let environment: TaskEnvironmentSpec =
-        serde_json::from_value(raw.clone()).map_err(|e| anyhow!("invalid environment: {}", e))?;
-    if environment.image.trim().is_empty() {
-        return Err(anyhow!("environment.image must be a non-empty string"));
-    }
-    Ok(environment)
-}
-
-fn parse_task_dependencies(value: Option<&Value>) -> Result<Value> {
-    match value {
-        None => Ok(json!({})),
-        Some(raw) if raw.is_object() => Ok(raw.clone()),
-        Some(_) => Err(anyhow!("task dependencies must be an object")),
-    }
-}
-
-fn validate_workspace_base(base: &WorkspaceBaseSpec) -> Result<()> {
-    match base.kind {
-        WorkspaceBaseKind::Empty => {
-            if base.dataset_pack_ref.is_some() || base.repo.is_some() || base.commit.is_some() {
-                return Err(anyhow!(
-                    "workspace.base.kind='empty' does not allow dataset_pack_ref, repo, or commit"
-                ));
-            }
-        }
-        WorkspaceBaseKind::DatasetPack => {
-            let dataset_pack_ref = base.dataset_pack_ref.as_deref().ok_or_else(|| {
-                anyhow!("workspace.base.dataset_pack_ref is required for dataset_pack")
-            })?;
-            let _ = parse_dataset_pack_ref_digest(dataset_pack_ref).map_err(|e| {
-                anyhow!(
-                    "invalid workspace.base.dataset_pack_ref '{}': {}",
-                    dataset_pack_ref,
-                    e
-                )
-            })?;
-            if base.repo.is_some() || base.commit.is_some() {
-                return Err(anyhow!(
-                    "workspace.base.kind='dataset_pack' does not allow repo or commit"
-                ));
-            }
-        }
-        WorkspaceBaseKind::GitCheckout => {
-            let repo = base
-                .repo
-                .as_deref()
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .ok_or_else(|| anyhow!("workspace.base.repo is required for git_checkout"))?;
-            let commit = base
-                .commit
-                .as_deref()
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .ok_or_else(|| anyhow!("workspace.base.commit is required for git_checkout"))?;
-            if repo.starts_with('/') {
-                return Err(anyhow!(
-                    "workspace.base.repo must be a repo identifier, not a path"
-                ));
-            }
-            if commit.contains(char::is_whitespace) {
-                return Err(anyhow!("workspace.base.commit must not contain whitespace"));
-            }
-            if base.dataset_pack_ref.is_some() {
-                return Err(anyhow!(
-                    "workspace.base.kind='git_checkout' does not allow dataset_pack_ref"
-                ));
-            }
-        }
-    }
-    Ok(())
-}
-
-fn parse_workspace_spec(value: Option<&Value>) -> Result<WorkspaceSpec> {
-    let raw = value.ok_or_else(|| anyhow!("task declaration missing field: workspace"))?;
-    let workspace: WorkspaceSpec =
-        serde_json::from_value(raw.clone()).map_err(|e| anyhow!("invalid workspace: {}", e))?;
-    validate_workspace_base(&workspace.base)?;
-    for (idx, overlay) in workspace.overlays.iter().enumerate() {
-        let _ = validate_workspace_relative_path(&overlay.path).map_err(|e| {
-            anyhow!(
-                "invalid workspace.overlays[{}].path '{}': {}",
-                idx,
-                overlay.path,
-                e
-            )
-        })?;
-        if let Some(encoding) = overlay.encoding.as_deref() {
-            if encoding != "utf8" && encoding != "base64" {
-                return Err(anyhow!(
-                    "workspace.overlays[{}].encoding must be 'utf8' or 'base64'",
-                    idx
-                ));
-            }
-        }
-    }
-    for (idx, mount) in workspace.aux_mounts.iter().enumerate() {
-        validate_container_workspace_path(&mount.mount_path).map_err(|e| {
-            anyhow!(
-                "invalid workspace.aux_mounts[{}].mount_path '{}': {}",
-                idx,
-                mount.mount_path,
-                e
-            )
-        })?;
-        let _ = parse_dataset_pack_ref_digest(&mount.dataset_pack_ref).map_err(|e| {
-            anyhow!(
-                "invalid workspace.aux_mounts[{}].dataset_pack_ref '{}': {}",
-                idx,
-                mount.dataset_pack_ref,
-                e
-            )
-        })?;
-    }
-    Ok(workspace)
-}
-
-fn parse_task_limits(value: Option<&Value>) -> Result<TaskDeclarationLimits> {
-    let Some(raw) = value else {
-        return Ok(TaskDeclarationLimits::default());
-    };
-    let limits: TaskDeclarationLimits =
-        serde_json::from_value(raw.clone()).map_err(|e| anyhow!("invalid limits: {}", e))?;
-    validate_limit_positive("max_steps", limits.max_steps)?;
-    validate_limit_positive("max_total_tokens", limits.max_total_tokens)?;
-    validate_limit_positive("max_tool_calls", limits.max_tool_calls)?;
-    validate_limit_positive("trial_seconds", limits.trial_seconds)?;
-    Ok(limits)
-}
-
-fn validate_limit_positive(name: &str, value: Option<u64>) -> Result<()> {
-    if value == Some(0) {
-        return Err(anyhow!("{} must be > 0 when provided", name));
-    }
-    Ok(())
-}
-
-fn validate_workspace_relative_path(path: &str) -> Result<PathBuf> {
+pub(crate) fn validate_workspace_relative_path(path: &str) -> Result<PathBuf> {
     if path.trim().is_empty() {
         return Err(anyhow!("path cannot be empty"));
     }
     let p = Path::new(path);
     if p.is_absolute() {
-        return Err(anyhow!(
-            "path must be relative to {}",
-            AGENTLAB_CONTRACT_WORKSPACE_DIR
-        ));
+        return Err(anyhow!("path must be relative to the task workdir"));
     }
     let mut normalized = PathBuf::new();
     for component in p.components() {
@@ -301,15 +164,7 @@ fn validate_workspace_relative_path(path: &str) -> Result<PathBuf> {
     Ok(normalized)
 }
 
-fn validate_container_workspace_path(path: &str) -> Result<()> {
-    if !(path == AGENTLAB_CONTRACT_WORKSPACE_DIR
-        || path.starts_with(&format!("{}/", AGENTLAB_CONTRACT_WORKSPACE_DIR)))
-    {
-        return Err(anyhow!(
-            "mount_path must be under {}",
-            AGENTLAB_CONTRACT_WORKSPACE_DIR
-        ));
-    }
+pub(crate) fn validate_container_workspace_path(path: &str) -> Result<()> {
     let p = Path::new(path);
     if !p.is_absolute() {
         return Err(anyhow!("mount_path must be absolute"));
@@ -332,7 +187,7 @@ fn parse_dataset_pack_ref_digest(dataset_pack_ref: &str) -> Result<String> {
     Ok(digest.to_ascii_lowercase())
 }
 
-fn resolve_dataset_pack_host_path(project_root: &Path, dataset_pack_ref: &str) -> Result<PathBuf> {
+pub(crate) fn resolve_dataset_pack_host_path(project_root: &Path, dataset_pack_ref: &str) -> Result<PathBuf> {
     let digest = parse_dataset_pack_ref_digest(dataset_pack_ref)?;
     let path = project_root
         .join(".lab")
@@ -517,27 +372,36 @@ fn materialize_workspace_git_checkout(
     repo: &str,
     commit: &str,
 ) -> Result<()> {
+    materialize_workspace_git_checkout_to_dir(project_root, &paths.workspace, repo, commit)
+}
+
+pub(crate) fn materialize_workspace_git_checkout_to_dir(
+    project_root: &Path,
+    workspace_dir: &Path,
+    repo: &str,
+    commit: &str,
+) -> Result<()> {
     let (cache_dir, staging_dir) = prepare_git_checkout_worktree(project_root, repo, commit)?;
-    if paths.workspace.exists() {
-        fs::remove_dir_all(&paths.workspace)?;
+    if workspace_dir.exists() {
+        fs::remove_dir_all(workspace_dir)?;
     }
-    ensure_dir(&paths.workspace)?;
-    let result = copy_dir_filtered(&staging_dir, &paths.workspace, &[".git"]);
+    ensure_dir(workspace_dir)?;
+    let result = copy_dir_filtered(&staging_dir, workspace_dir, &[".git"]);
     let cleanup_result = cleanup_git_checkout_worktree(&cache_dir, &staging_dir);
     result?;
     cleanup_result?;
     Ok(())
 }
 
-fn materialize_workspace_base(
+pub(crate) fn materialize_workspace_base_to_dir(
     project_root: &Path,
-    paths: &TrialPaths,
+    workspace_dir: &Path,
     base: &WorkspaceBaseSpec,
 ) -> Result<()> {
-    if paths.workspace.exists() {
-        fs::remove_dir_all(&paths.workspace)?;
+    if workspace_dir.exists() {
+        fs::remove_dir_all(workspace_dir)?;
     }
-    ensure_dir(&paths.workspace)?;
+    ensure_dir(workspace_dir)?;
     match base.kind {
         WorkspaceBaseKind::Empty => Ok(()),
         WorkspaceBaseKind::DatasetPack => {
@@ -552,7 +416,7 @@ fn materialize_workspace_base(
                     source.display()
                 ));
             }
-            copy_dir_filtered(&source, &paths.workspace, &[])?;
+            copy_dir_filtered(&source, workspace_dir, &[])?;
             Ok(())
         }
         WorkspaceBaseKind::GitCheckout => {
@@ -564,18 +428,26 @@ fn materialize_workspace_base(
                 .commit
                 .as_deref()
                 .ok_or_else(|| anyhow!("workspace.base.commit missing"))?;
-            materialize_workspace_git_checkout(project_root, paths, repo, commit)
+            materialize_workspace_git_checkout_to_dir(project_root, workspace_dir, repo, commit)
         }
     }
 }
 
-fn materialize_workspace_overlays(
+fn materialize_workspace_base(
+    project_root: &Path,
     paths: &TrialPaths,
+    base: &WorkspaceBaseSpec,
+) -> Result<()> {
+    materialize_workspace_base_to_dir(project_root, &paths.workspace, base)
+}
+
+pub(crate) fn materialize_workspace_overlays_to_dir(
+    workspace_dir: &Path,
     workspace_overlays: &[WorkspaceOverlaySpec],
 ) -> Result<()> {
     for file in workspace_overlays {
         let rel = validate_workspace_relative_path(&file.path)?;
-        let host_path = paths.workspace.join(rel);
+        let host_path = workspace_dir.join(rel);
         let bytes = match file.encoding.as_deref() {
             None | Some("utf8") => file.content.as_bytes().to_vec(),
             Some("base64") => BASE64_STANDARD
@@ -605,6 +477,13 @@ fn materialize_workspace_overlays(
         }
     }
     Ok(())
+}
+
+fn materialize_workspace_overlays(
+    paths: &TrialPaths,
+    workspace_overlays: &[WorkspaceOverlaySpec],
+) -> Result<()> {
+    materialize_workspace_overlays_to_dir(&paths.workspace, workspace_overlays)
 }
 
 fn copy_staged_host_path(src: &Path, dst: &Path, required: bool, label: &str) -> Result<bool> {
@@ -692,11 +571,8 @@ fn default_task_dependency_encoding() -> String {
     "utf8".to_string()
 }
 
-fn parse_task_dependency_files(
-    task_boundary: &TaskBoundaryMaterialization,
-) -> Result<Vec<TaskDependencyFileSpec>> {
-    let Some(files) = task_boundary
-        .dependencies
+fn parse_task_dependency_files_value(dependencies: &Value) -> Result<Vec<TaskDependencyFileSpec>> {
+    let Some(files) = dependencies
         .get("files")
         .filter(|value| !value.is_null())
     else {
@@ -706,11 +582,11 @@ fn parse_task_dependency_files(
         .map_err(|err| anyhow!("invalid task dependencies.files: {}", err))
 }
 
-fn materialize_task_dependencies_for_trial(
-    task_boundary: &TaskBoundaryMaterialization,
-    paths: &TrialPaths,
+pub(crate) fn materialize_task_dependencies_to_dir(
+    dependencies: &Value,
+    destination_dir: &Path,
 ) -> Result<()> {
-    for (idx, spec) in parse_task_dependency_files(task_boundary)?
+    for (idx, spec) in parse_task_dependency_files_value(dependencies)?
         .iter()
         .enumerate()
     {
@@ -741,7 +617,7 @@ fn materialize_task_dependencies_for_trial(
                 ))
             }
         };
-        let dst = paths.deps.join(rel);
+        let dst = destination_dir.join(rel);
         atomic_write_bytes(&dst, &bytes)?;
         #[cfg(unix)]
         {
@@ -749,6 +625,44 @@ fn materialize_task_dependencies_for_trial(
             perms.set_mode(if spec.executable { 0o555 } else { 0o444 });
             fs::set_permissions(&dst, perms)?;
         }
+    }
+    Ok(())
+}
+
+fn materialize_task_dependencies_for_trial(
+    task_boundary: &TaskBoundaryMaterialization,
+    paths: &TrialPaths,
+) -> Result<()> {
+    materialize_task_dependencies_to_dir(
+        &task_boundary.dependencies,
+        &paths.workspace.join(AGENTLAB_RUNNER_SUPPORT_REL_DIR),
+    )
+}
+
+fn container_workspace_rel_path(mount_path: &str) -> Result<PathBuf> {
+    validate_container_workspace_path(mount_path)?;
+    if mount_path == "/" {
+        return Ok(PathBuf::new());
+    }
+    let rel = mount_path
+        .strip_prefix('/')
+        .ok_or_else(|| anyhow!("mount_path must be absolute"))?;
+    validate_workspace_relative_path(rel)
+}
+
+pub(crate) fn materialize_workspace_aux_mounts_to_dir(
+    project_root: &Path,
+    aux_mounts: &[WorkspaceAuxMountSpec],
+    workspace_dir: &Path,
+) -> Result<()> {
+    for mount in aux_mounts {
+        let host_path = resolve_dataset_pack_host_path(project_root, &mount.dataset_pack_ref)?;
+        let rel = container_workspace_rel_path(&mount.mount_path)?;
+        let dst = workspace_dir.join(rel);
+        if dst.exists() {
+            remove_path_if_exists(&dst)?;
+        }
+        copy_staged_host_path(&host_path, &dst, true, "task_bundle_aux_mount")?;
     }
     Ok(())
 }
@@ -814,11 +728,7 @@ fn stage_workspace_patches_for_trial(
     Ok(())
 }
 
-#[derive(Debug, Clone)]
-struct BindingArgProjectionSpec {
-    binding: String,
-    flag: String,
-}
+const TASK_WORKDIR_TEMPLATE_PLACEHOLDER: &str = AGENTLAB_TASK_WORKDIR_PLACEHOLDER;
 
 #[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -839,8 +749,6 @@ struct AgentExecutionConfig {
     executor: Option<AgentExecutionExecutor>,
     image: Option<String>,
     network: String,
-    root_read_only: bool,
-    user: Option<String>,
 }
 
 #[cfg(test)]
@@ -904,15 +812,12 @@ struct AgentRuntimeConfig {
     command_raw: Vec<String>,
     image: String,
     network: String,
-    root_read_only: bool,
-    user: Option<String>,
     agent_artifact: PathBuf,
     agent_artifact_digest: Option<String>,
     agent_artifact_resolved_path: Option<PathBuf>,
     integration_level: String,
     env: BTreeMap<String, String>,
     env_from_host: Vec<String>,
-    bindings_to_args: Vec<BindingArgProjectionSpec>,
     trajectory_path: Option<String>,
     causal_extraction: Option<String>,
     #[cfg(test)]
@@ -959,53 +864,37 @@ fn parse_command_field(value: Option<&Value>, field: &str) -> Result<Option<Vec<
     }
 }
 
-fn parse_bindings_to_args(value: Option<&Value>) -> Result<Vec<BindingArgProjectionSpec>> {
-    let Some(raw) = value else {
-        return Ok(Vec::new());
-    };
-    let items = raw
-        .as_array()
-        .ok_or_else(|| anyhow!("runtime.agent_runtime.binding_args must be an array"))?;
-    let mut parsed = Vec::with_capacity(items.len());
-    for (idx, item) in items.iter().enumerate() {
-        let obj = item.as_object().ok_or_else(|| {
-            anyhow!(
-                "runtime.agent_runtime.binding_args[{}] must be an object",
-                idx
-            )
-        })?;
-        let binding = obj
-            .get("key")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|v| !v.is_empty())
-            .ok_or_else(|| {
-                anyhow!(
-                    "runtime.agent_runtime.binding_args[{}].key must be a non-empty string",
-                    idx
-                )
-            })?;
-        let flag = obj
-            .get("flag")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|v| !v.is_empty())
-            .ok_or_else(|| {
-                anyhow!(
-                    "runtime.agent_runtime.binding_args[{}].flag must be a non-empty string",
-                    idx
-                )
-            })?;
-        parsed.push(BindingArgProjectionSpec {
-            binding: binding.to_string(),
-            flag: flag.to_string(),
-        });
+fn task_workdir_support_relative_path(rel_path: &str) -> String {
+    let rel = rel_path.trim().trim_start_matches('/');
+    if rel.is_empty() {
+        AGENTLAB_RUNNER_SUPPORT_REL_DIR.to_string()
+    } else {
+        format!("{}/{}", AGENTLAB_RUNNER_SUPPORT_REL_DIR, rel)
     }
-    Ok(parsed)
 }
 
-fn contract_deps_destination_path(rel_path: &str) -> String {
-    format!("{}/{}", AGENTLAB_CONTRACT_DEPS_DIR, rel_path)
+fn task_workdir_support_destination_path(rel_path: &str) -> String {
+    format!(
+        "{}/{}",
+        AGENTLAB_TASK_WORKDIR_PLACEHOLDER,
+        task_workdir_support_relative_path(rel_path)
+    )
+}
+
+fn strip_task_workdir_support_destination_path(path: &str) -> Option<&str> {
+    let prefix = format!(
+        "{}/{}",
+        AGENTLAB_TASK_WORKDIR_PLACEHOLDER, AGENTLAB_RUNNER_SUPPORT_REL_DIR
+    );
+    if path == prefix {
+        return Some("");
+    }
+    let rest = path.strip_prefix(&prefix)?;
+    if rest.starts_with('/') {
+        Some(rest.trim_start_matches('/'))
+    } else {
+        None
+    }
 }
 
 fn reject_packaged_public_path_references(
@@ -1094,7 +983,7 @@ fn load_staging_specs_from_package(
         })?;
         specs.push(DependencyFileStagingSpec {
             source_from_host,
-            destination_path: validate_runtime_contract_path(
+            destination_path: validate_runner_staged_destination_path(
                 &entry.runtime_path,
                 &format!(
                     "staging_manifest.variants.{}[{}].runtime_path",
@@ -1142,7 +1031,7 @@ fn derive_public_command_path_staging_specs(
         })?;
         specs.push(DependencyFileStagingSpec {
             source_from_host: source,
-            destination_path: contract_deps_destination_path(&key.replace('\\', "/")),
+            destination_path: task_workdir_support_destination_path(&key.replace('\\', "/")),
             required: true,
             read_only: true,
         });
@@ -1162,10 +1051,7 @@ fn derive_public_path_staging_specs(
     )?;
     let mut seen = HashSet::new();
     for spec in &specs {
-        if let Some(rel) = spec
-            .destination_path
-            .strip_prefix(&format!("{}/", AGENTLAB_CONTRACT_DEPS_DIR))
-        {
+        if let Some(rel) = strip_task_workdir_support_destination_path(&spec.destination_path) {
             seen.insert(rel.to_string());
         }
     }
@@ -1192,7 +1078,7 @@ fn derive_public_path_staging_specs(
         })?;
         specs.push(DependencyFileStagingSpec {
             source_from_host: source,
-            destination_path: contract_deps_destination_path(&key.replace('\\', "/")),
+            destination_path: task_workdir_support_destination_path(&key.replace('\\', "/")),
             required: true,
             read_only: true,
         });
@@ -1235,25 +1121,45 @@ fn normalize_staged_support_source_path(
     Ok(resolved)
 }
 
-pub(crate) fn validate_runtime_contract_path(raw: &str, field_name: &str) -> Result<String> {
+pub(crate) fn validate_runner_staged_destination_path(raw: &str, field_name: &str) -> Result<String> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         return Err(anyhow!("{} must not be empty", field_name));
     }
+    let task_support_prefix = format!(
+        "{}/{}",
+        AGENTLAB_TASK_WORKDIR_PLACEHOLDER, AGENTLAB_RUNNER_SUPPORT_REL_DIR
+    );
+    if trimmed == task_support_prefix || trimmed.starts_with(&format!("{}/", task_support_prefix)) {
+        let rest = trimmed
+            .strip_prefix(AGENTLAB_TASK_WORKDIR_PLACEHOLDER)
+            .unwrap_or_default();
+        for component in Path::new(rest).components() {
+            if matches!(component, Component::ParentDir) {
+                return Err(anyhow!("{} cannot contain '..'", field_name));
+            }
+        }
+        return Ok(trimmed.to_string());
+    }
     let path = Path::new(trimmed);
     if !path.is_absolute() {
-        return Err(anyhow!("{} must be an absolute contract path", field_name));
+        return Err(anyhow!(
+            "{} must be under {}/{} or {}",
+            field_name,
+            AGENTLAB_TASK_WORKDIR_PLACEHOLDER,
+            AGENTLAB_RUNNER_SUPPORT_REL_DIR,
+            AGENTLAB_CONTRACT_RUNTIME_AUX_DIR
+        ));
     }
-    if !(trimmed == AGENTLAB_CONTRACT_DEPS_DIR
-        || trimmed.starts_with(&format!("{}/", AGENTLAB_CONTRACT_DEPS_DIR))
-        || trimmed == AGENTLAB_CONTRACT_STATE_DIR
-        || trimmed.starts_with(&format!("{}/", AGENTLAB_CONTRACT_STATE_DIR)))
+    if !(trimmed == AGENTLAB_CONTRACT_RUNTIME_AUX_DIR
+        || trimmed.starts_with(&format!("{}/", AGENTLAB_CONTRACT_RUNTIME_AUX_DIR)))
     {
         return Err(anyhow!(
-            "{} must be under {} or {}",
+            "{} must be under {}/{} or {}",
             field_name,
-            AGENTLAB_CONTRACT_DEPS_DIR,
-            AGENTLAB_CONTRACT_STATE_DIR
+            AGENTLAB_TASK_WORKDIR_PLACEHOLDER,
+            AGENTLAB_RUNNER_SUPPORT_REL_DIR,
+            AGENTLAB_CONTRACT_RUNTIME_AUX_DIR
         ));
     }
     for component in path.components() {
@@ -1298,7 +1204,7 @@ fn parse_build_runtime_asset_specs(
                 project_root,
                 &format!("{}[{}].build_source_path", field_name, idx),
             )?,
-            destination_path: validate_runtime_contract_path(
+            destination_path: validate_runner_staged_destination_path(
                 destination_path,
                 &format!("{}[{}].runtime_path", field_name, idx),
             )?,
@@ -1360,7 +1266,7 @@ fn resolve_runtime_binding_value(
     field_name: &str,
 ) -> Result<String> {
     if name == "WORKSPACE" {
-        return Ok(AGENTLAB_CONTRACT_WORKSPACE_DIR.to_string());
+        return Ok(TASK_WORKDIR_TEMPLATE_PLACEHOLDER.to_string());
     }
     if let Some(value) = binding_lookup_string(bindings, name, field_name)? {
         return Ok(value);
@@ -1470,39 +1376,6 @@ fn resolve_env_templates(
     Ok(resolved)
 }
 
-fn project_bindings_to_args(
-    bindings: &Value,
-    specs: &[BindingArgProjectionSpec],
-) -> Result<Vec<String>> {
-    if specs.is_empty() {
-        return Ok(Vec::new());
-    }
-    let mut projected = Vec::with_capacity(specs.len() * 2);
-    for spec in specs {
-        let value = binding_lookup(bindings, &spec.binding).ok_or_else(|| {
-            anyhow!(
-                "missing required config key '{}' for runtime.agent_runtime.binding_args",
-                spec.binding
-            )
-        })?;
-        let token = match value {
-            Value::String(v) => v.clone(),
-            Value::Number(v) => v.to_string(),
-            Value::Bool(v) => v.to_string(),
-            _ => {
-                return Err(anyhow!(
-                    "binding '{}' must resolve to string|number|bool (got {})",
-                    spec.binding,
-                    value_type_name(value)
-                ));
-            }
-        };
-        projected.push(spec.flag.clone());
-        projected.push(token);
-    }
-    Ok(projected)
-}
-
 fn resolve_agent_runtime(
     json_value: &Value,
     exp_dir: &Path,
@@ -1602,7 +1475,7 @@ fn resolve_agent_runtime_with_context(
         || agent.pointer("/support_files").is_some()
     {
         return Err(anyhow!(
-            "runtime.agent_runtime hard cut: use runtime.agent_runtime.{{artifact,image,command,env,network,root_read_only,user}}"
+            "runtime.agent_runtime hard cut: use runtime.agent_runtime.{{artifact,image,command,env,network}}"
         ));
     }
     for (pointer, message) in [
@@ -1652,16 +1525,8 @@ fn resolve_agent_runtime_with_context(
         .filter(|v| !v.is_empty())
         .unwrap_or("none")
         .to_string();
-    let execution_root_read_only = agent
-        .pointer("/root_read_only")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(true);
-    let execution_user =
-        parse_optional_nonempty_string(agent.pointer("/user"), "runtime.agent_runtime.user")?;
     #[cfg(test)]
     let execution_network_for_test = execution_network.clone();
-    #[cfg(test)]
-    let execution_user_for_test = execution_user.clone();
     let artifact_raw = parse_optional_nonempty_string(
         agent.pointer("/artifact"),
         "runtime.agent_runtime.artifact",
@@ -1736,7 +1601,6 @@ fn resolve_agent_runtime_with_context(
             "runtime.agent_runtime.secret_env is not supported; use $NAME runtime bindings in runtime.agent_runtime.command or runtime.agent_runtime.env"
         ));
     }
-    let bindings_to_args = Vec::new();
     let env_from_host = Vec::new();
     let dependency_file_staging = match &context {
         PathResolutionContext::Build { exp_dir, .. } => {
@@ -1756,15 +1620,12 @@ fn resolve_agent_runtime_with_context(
         command_raw: command,
         image: execution_image,
         network: execution_network,
-        root_read_only: execution_root_read_only,
-        user: execution_user,
         agent_artifact,
         agent_artifact_digest,
         agent_artifact_resolved_path,
         integration_level,
         env,
         env_from_host,
-        bindings_to_args,
         trajectory_path,
         causal_extraction,
         #[cfg(test)]
@@ -1782,8 +1643,6 @@ fn resolve_agent_runtime_with_context(
                     .to_string(),
             ),
             network: execution_network_for_test,
-            root_read_only: execution_root_read_only,
-            user: execution_user_for_test,
         },
         #[cfg(test)]
         io: AgentRuntimeIoConfig {
@@ -1967,6 +1826,35 @@ fn resolve_benchmark_runtime_assets(
             project_root,
         )?,
     );
+    if let Some(mapper) = experiment
+        .pointer("/benchmark/grader/conclusion/mapper")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        if let Some(rel) = resolve_existing_public_path_reference(
+            mapper,
+            exp_dir,
+            "benchmark.grader.conclusion.mapper",
+        )? {
+            let source = normalize_path(&exp_dir.join(&rel));
+            fs::metadata(&source).with_context(|| {
+                format!(
+                    "failed to read benchmark.grader.conclusion.mapper public path reference '{}' resolved to '{}'",
+                    mapper,
+                    source.display()
+                )
+            })?;
+            merge_dependency_file_staging(&mut support_files, vec![DependencyFileStagingSpec {
+                source_from_host: source,
+                destination_path: task_workdir_support_destination_path(
+                    &rel.to_string_lossy().replace('\\', "/"),
+                ),
+                required: true,
+                read_only: true,
+            }]);
+        }
+    }
     Ok(support_files)
 }
 
@@ -2135,7 +2023,6 @@ struct TrialPaths {
     in_dir: PathBuf,
     workspace: PathBuf,
     state: PathBuf,
-    deps: PathBuf,
     out: PathBuf,
     tmp: PathBuf,
     runtime: RunnerRuntimeHostPaths,
@@ -2168,7 +2055,6 @@ impl TrialPaths {
             in_dir: runtime.in_dir.clone(),
             workspace: runtime.workspace_dir.clone(),
             state: runtime.state_dir.clone(),
-            deps: runtime.deps_dir.clone(),
             out: runtime.out_dir.clone(),
             tmp: runtime.tmp_dir.clone(),
             runtime,
@@ -2180,7 +2066,6 @@ impl TrialPaths {
         ensure_dir(&self.in_dir)?;
         ensure_dir(&self.workspace)?;
         ensure_dir(&self.state)?;
-        ensure_dir(&self.deps)?;
         ensure_dir(&self.out)?;
         ensure_dir(&self.tmp)?;
         if seed_workspace_from_exp_dir {
@@ -2222,45 +2107,88 @@ impl Drop for TrialPaths {
     }
 }
 
-fn build_agent_task(
+fn build_trial_input(
     json_value: &Value,
     run_id: &str,
     trial_id: &str,
     variant: &Variant,
-    task_idx: usize,
+    _task_idx: usize,
     repl: usize,
     task_boundary: &TaskBoundaryMaterialization,
 ) -> Value {
     let normalized_task_payload = normalize_task_prompt_aliases(&task_boundary.task_payload);
-    let mut policy = json_value
-        .pointer("/policy")
+    let time_limit_ms = task_boundary.time_limit_ms.unwrap_or(600_000);
+    let requested_network_mode = json_value
+        .pointer("/policy/task_sandbox/network")
+        .and_then(Value::as_str)
+        .unwrap_or("none");
+    let allowed_hosts = json_value
+        .pointer("/policy/task_sandbox/allowed_hosts")
         .cloned()
-        .unwrap_or_else(|| json!({}));
-    if policy.pointer("/timeout_ms").is_none() {
-        set_json_pointer_value(&mut policy, "/timeout_ms", json!(600000)).ok();
-    }
-    if let Some(trial_seconds) = task_boundary.limits.trial_seconds {
-        set_json_pointer_value(&mut policy, "/timeout_ms", json!(trial_seconds * 1000)).ok();
-    }
+        .unwrap_or_else(|| json!([]));
+    let sanitization_profile = json_value
+        .pointer("/policy/sanitization_profile")
+        .and_then(Value::as_str)
+        .unwrap_or("hermetic_functional");
+    let integration_level = json_value
+        .pointer("/runtime/agent_runtime/integration_level")
+        .and_then(Value::as_str)
+        .unwrap_or("cli_basic");
+    let artifact_type = json_value
+        .pointer("/agent/artifact_type")
+        .and_then(Value::as_str)
+        .unwrap_or("structured_json");
 
     let mut input = json!({
-        "schema_version": "agent_task_v1",
+        "schema_version": "trial_input_v1",
         "ids": {
             "run_id": run_id,
             "trial_id": trial_id,
             "variant_id": variant.id,
-            "task_id": task_boundary.task_payload.get("id").and_then(|v| v.as_str()).unwrap_or(&format!("task_{}", task_idx)),
+            "task_id": task_boundary.task_id.as_str(),
             "repl_idx": repl
         },
         "task": normalized_task_payload,
-        "bindings": variant.bindings.clone(),
-        "dependencies": task_boundary.dependencies.clone(),
-        "policy": policy,
+        "artifact_type": artifact_type,
+        "design": {
+            "sanitization_profile": sanitization_profile,
+            "integration_level": integration_level
+        },
+        "runtime": {
+            "network_mode": requested_network_mode,
+            "allowed_hosts": allowed_hosts,
+            "task_image": task_boundary.task_image,
+            "workdir": task_boundary.task_workdir,
+            "time_limit_ms": time_limit_ms
+        }
     });
     if let Some(obj) = input.as_object_mut() {
         obj.remove("ext");
     }
     input
+}
+
+fn build_task_sandbox_plan(
+    task_boundary: &TaskBoundaryMaterialization,
+    agent_runtime: &AgentRuntimeConfig,
+    time_limit_ms: u64,
+) -> TaskSandboxPlan {
+    TaskSandboxPlan {
+        image: task_boundary.task_image.clone(),
+        workdir: task_boundary.task_workdir.clone(),
+        materialization: task_boundary.materialization.clone(),
+        io_mounts: IoMountPlan {
+            in_dir: AGENTLAB_CONTRACT_IN_DIR.to_string(),
+            out_dir: AGENTLAB_CONTRACT_OUT_DIR.to_string(),
+            telemetry_mounts: Vec::new(),
+        },
+        artifact_mount: ArtifactMountPlan {
+            host_artifact_path: agent_runtime.agent_artifact.to_string_lossy().to_string(),
+            container_artifact_dir: "/opt/agent".to_string(),
+        },
+        network_mode: agent_runtime.network.clone(),
+        time_limit_ms,
+    }
 }
 
 fn prepared_task_environment_manifest_path(trial_dir: &Path) -> PathBuf {
@@ -2304,6 +2232,87 @@ fn load_prepared_task_environment_manifest(
     Ok(manifest)
 }
 
+fn resolve_task_bundle_host_path(
+    project_root: &Path,
+    trial_dir: &Path,
+    task_bundle_ref: &str,
+) -> Result<PathBuf> {
+    let raw = task_bundle_ref.trim();
+    if raw.is_empty() {
+        return Err(anyhow!("task bundle ref cannot be empty"));
+    }
+    let bundle_path = Path::new(raw);
+    if bundle_path.is_absolute() {
+        return Ok(bundle_path.to_path_buf());
+    }
+    if let Some(run_dir) = infer_run_dir_from_path(trial_dir) {
+        let run_candidate = run_dir.join(bundle_path);
+        if run_candidate.exists() {
+            return Ok(run_candidate);
+        }
+    }
+    let project_candidate = project_root.join(bundle_path);
+    if project_candidate.exists() {
+        return Ok(project_candidate);
+    }
+    Err(anyhow!(
+        "task bundle ref '{}' could not be resolved relative to run_dir or project_root",
+        task_bundle_ref
+    ))
+}
+
+fn materialize_task_bundle_for_trial(
+    project_root: &Path,
+    trial_dir: &Path,
+    paths: &TrialPaths,
+    task_boundary: &TaskBoundaryMaterialization,
+) -> Result<()> {
+    let task_bundle_ref = task_boundary
+        .materialization
+        .task_bundle_ref
+        .as_deref()
+        .ok_or_else(|| {
+            anyhow!(
+                "task '{}' is missing materialization.task_bundle_ref for base_image_bundle",
+                task_boundary.task_id
+            )
+        })?;
+    let source = resolve_task_bundle_host_path(project_root, trial_dir, task_bundle_ref)?;
+    if paths.workspace.exists() {
+        fs::remove_dir_all(&paths.workspace)?;
+    }
+    ensure_dir(&paths.workspace)?;
+    if source.is_dir() {
+        copy_dir_filtered(&source, &paths.workspace, &[])?;
+        return Ok(());
+    }
+    if !source.is_file() {
+        return Err(anyhow!(
+            "task bundle source is not a file or directory: {}",
+            source.display()
+        ));
+    }
+    let Some(tar_flag) = agent_artifact_archive_flag(&source) else {
+        return Err(anyhow!(
+            "task bundle archive must use .tar/.tar.gz/.tgz: {}",
+            source.display()
+        ));
+    };
+    let bundle_arg = source.to_string_lossy().to_string();
+    let workspace_arg = paths.workspace.to_string_lossy().to_string();
+    let unpack_out = Command::new("tar")
+        .args([tar_flag, bundle_arg.as_str(), "-C", workspace_arg.as_str()])
+        .output()?;
+    if !unpack_out.status.success() {
+        return Err(anyhow!(
+            "failed to unpack task bundle {}: {}",
+            source.display(),
+            output_error_detail(&unpack_out)
+        ));
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
 fn prepare_task_environment(
     project_root: &Path,
@@ -2320,8 +2329,6 @@ fn prepare_task_environment(
 ) -> Result<PreparedTaskEnvironment> {
     let trial_paths = TrialPaths::new(trial_dir, project_root)?;
     trial_paths.prepare(false)?;
-    materialize_task_dependencies_for_trial(task_boundary, &trial_paths)?;
-    stage_dependencies_for_trial(agent_runtime, &trial_paths)?;
     if let Some(workspace_ref) = existing_workspace_ref {
         let artifact_store = ArtifactStore::new(
             infer_run_dir_from_path(trial_dir)
@@ -2330,13 +2337,27 @@ fn prepare_task_environment(
         );
         restore_workspace_from_object_ref(&artifact_store, workspace_ref, &trial_paths.workspace)?;
     } else {
-        materialize_workspace_base(project_root, &trial_paths, &task_boundary.workspace.base)?;
+        match task_boundary.materialization.kind {
+            TaskMaterializationKind::TaskImage => {
+                materialize_workspace_base(project_root, &trial_paths, &task_boundary.workspace.base)?;
+                materialize_workspace_overlays(&trial_paths, &task_boundary.workspace.overlays)?;
+            }
+            TaskMaterializationKind::BaseImageBundle => {
+                materialize_task_bundle_for_trial(project_root, trial_dir, &trial_paths, task_boundary)?;
+            }
+        }
     }
-    materialize_workspace_overlays(&trial_paths, &task_boundary.workspace.overlays)?;
-    let dynamic_mounts =
-        resolve_workspace_aux_mounts(project_root, &task_boundary.workspace.aux_mounts)?;
+    if matches!(task_boundary.materialization.kind, TaskMaterializationKind::TaskImage) {
+        materialize_task_dependencies_for_trial(task_boundary, &trial_paths)?;
+    }
+    stage_dependencies_for_trial(agent_runtime, &trial_paths)?;
+    let dynamic_mounts = if matches!(task_boundary.materialization.kind, TaskMaterializationKind::TaskImage) {
+        resolve_workspace_aux_mounts(project_root, &task_boundary.workspace.aux_mounts)?
+    } else {
+        Vec::new()
+    };
 
-    let input = build_agent_task(
+    let input = build_trial_input(
         trial_experiment,
         run_id,
         trial_id,
@@ -2347,26 +2368,22 @@ fn prepare_task_environment(
     );
     let input_bytes = serde_json::to_vec_pretty(&input)?;
     let io_paths = prepare_io_paths(&trial_paths, &input_bytes)?;
+    let resolved_time_limit_ms = resolve_trial_timeout_ms(&input).unwrap_or(600000);
     let runtime_env = build_runtime_contract_env(
         run_id,
         &input,
         &io_paths,
         Some(task_boundary.task_image.as_str()),
-        resolve_trial_timeout_ms(&input),
+        Some(resolved_time_limit_ms),
     );
     let manifest = PreparedTaskEnvironmentManifest {
         schema_version: "prepared_task_environment_v1".to_string(),
         declaration: task_boundary.declaration.clone(),
-        declaration_digest: canonical_json_digest(&serde_json::to_value(&task_boundary.declaration)?),
+        declaration_digest: canonical_json_digest(&task_boundary.declaration),
         run_id: run_id.to_string(),
         trial_id: trial_id.to_string(),
         variant_id: variant.id.clone(),
-        task_id: task_boundary
-            .task_payload
-            .get("id")
-            .and_then(|v| v.as_str())
-            .unwrap_or(&format!("task_{}", task_idx))
-            .to_string(),
+        task_id: task_boundary.task_id.clone(),
         task_index: task_idx,
         repl_idx: repl,
         task_image: task_boundary.task_image.clone(),
@@ -2379,15 +2396,19 @@ fn prepare_task_environment(
             })
             .collect(),
         contract_files: PreparedContractFilePaths {
-            trial_input: io_paths.input_host.to_string_lossy().to_string(),
-            task: io_paths.task_path.clone(),
-            bindings: io_paths.bindings_path.clone(),
-            dependencies: io_paths.dependencies_path.clone(),
-            policy: io_paths.policy_path.clone(),
+            trial_input: io_paths.trial_input_path.clone(),
+            grader_input: io_paths.grader_input_path.clone(),
             result: io_paths.result_path.clone(),
+            raw_grader_output: io_paths.raw_grader_output_path.clone(),
+            mapped_grader_output: io_paths.mapped_grader_output_path.clone(),
             trajectory: io_paths.trajectory_path.clone(),
         },
         runtime_env: runtime_env.clone(),
+        task_sandbox_plan: Some(build_task_sandbox_plan(
+            task_boundary,
+            agent_runtime,
+            resolved_time_limit_ms,
+        )),
     };
     write_prepared_task_environment_manifest(trial_dir, &manifest)?;
 
@@ -2501,11 +2522,8 @@ fn json_row_table_from_path(path: &Path) -> Option<JsonRowTable> {
     if name.contains("task_chain") || name.contains("chain_state") {
         return Some(JsonRowTable::ChainState);
     }
-    if name.contains("prediction") {
-        return Some(JsonRowTable::BenchmarkPrediction);
-    }
-    if name.contains("score") {
-        return Some(JsonRowTable::BenchmarkScore);
+    if name.contains("conclusion") {
+        return Some(JsonRowTable::BenchmarkConclusion);
     }
     None
 }
@@ -2897,17 +2915,23 @@ fn build_runtime_contract_env(
         .unwrap_or(0);
 
     let mut env = BTreeMap::new();
-    env.insert(AGENTLAB_ENV_TASK_PATH.to_string(), io.task_path.clone());
     env.insert(
-        AGENTLAB_ENV_BINDINGS_PATH.to_string(),
-        io.bindings_path.clone(),
+        AGENTLAB_ENV_TRIAL_INPUT_PATH.to_string(),
+        io.trial_input_path.clone(),
     );
     env.insert(
-        AGENTLAB_ENV_DEPENDENCIES_PATH.to_string(),
-        io.dependencies_path.clone(),
+        AGENTLAB_ENV_GRADER_INPUT_PATH.to_string(),
+        io.grader_input_path.clone(),
     );
-    env.insert(AGENTLAB_ENV_POLICY_PATH.to_string(), io.policy_path.clone());
     env.insert(AGENTLAB_ENV_RESULT_PATH.to_string(), io.result_path.clone());
+    env.insert(
+        AGENTLAB_ENV_RAW_GRADER_OUTPUT_PATH.to_string(),
+        io.raw_grader_output_path.clone(),
+    );
+    env.insert(
+        AGENTLAB_ENV_MAPPED_GRADER_OUTPUT_PATH.to_string(),
+        io.mapped_grader_output_path.clone(),
+    );
     env.insert(
         AGENTLAB_ENV_TRAJECTORY_PATH.to_string(),
         io.trajectory_path.clone(),
@@ -2919,14 +2943,6 @@ fn build_runtime_contract_env(
     if let Some(task_image) = task_image.map(str::trim).filter(|v| !v.is_empty()) {
         env.insert(AGENTLAB_ENV_TASK_IMAGE.to_string(), task_image.to_string());
     }
-    env.insert(
-        AGENTLAB_ENV_BENCHMARK_PREDICTION_PATH.to_string(),
-        output_peer_path(&io.result_path, BENCHMARK_PREDICTION_FILENAME),
-    );
-    env.insert(
-        AGENTLAB_ENV_BENCHMARK_SCORE_PATH.to_string(),
-        output_peer_path(&io.result_path, BENCHMARK_SCORE_FILENAME),
-    );
     env.insert(AGENTLAB_ENV_REPL_IDX.to_string(), repl_idx.to_string());
     if let Some(timeout_ms) = timeout_ms {
         env.insert(AGENTLAB_ENV_TIMEOUT_MS.to_string(), timeout_ms.to_string());
@@ -3033,6 +3049,8 @@ impl AgentAdapter for PrebuiltCommandAdapter {
             benchmark_grading_enabled: request.benchmark_grading_enabled,
             run_id: request.run_id,
             task_image: request.task_image,
+            task_workdir: request.task_workdir,
+            task_materialization_kind: request.task_materialization_kind.clone(),
             agent_artifact: request.agent_artifact,
         };
         run_command_contract_trial(&prebuilt_request)
@@ -3046,11 +3064,14 @@ impl AgentAdapter for PrebuiltCommandAdapter {
 fn run_container_sidecar_command(
     request: &AdapterRunRequest<'_>,
     image: &str,
-    workspace: Option<&str>,
+    workspace: &str,
     command: &[String],
     runtime_overrides_env: &BTreeMap<String, String>,
-    label: &str,
+    _label: &str,
+    extra_mounts: &[ResolvedMountReference],
 ) -> Result<Output> {
+    let mut merged_mounts = request.dynamic_mounts.to_vec();
+    merged_mounts.extend(extra_mounts.iter().cloned());
     let sidecar_request = AdapterRunRequest {
         runtime_experiment: request.runtime_experiment,
         runtime: request.runtime,
@@ -3058,13 +3079,15 @@ fn run_container_sidecar_command(
         runtime_env: request.runtime_env,
         runtime_overrides_env,
         trial_paths: request.trial_paths,
-        dynamic_mounts: request.dynamic_mounts,
+        dynamic_mounts: &merged_mounts,
         io_paths: request.io_paths,
         network_mode: request.network_mode,
         benchmark_grader: None,
         benchmark_grading_enabled: false,
         run_id: request.run_id,
         task_image: request.task_image,
+        task_workdir: request.task_workdir,
+        task_materialization_kind: request.task_materialization_kind.clone(),
         agent_artifact: None,
     };
     let mut cmd = build_baked_container_command(
@@ -3075,15 +3098,7 @@ fn run_container_sidecar_command(
         command,
         None,
     );
-    let output = cmd.output()?;
-    if output.status.success() {
-        return Ok(output);
-    }
-    Err(anyhow!(
-        "{} failed: {}",
-        label,
-        output_error_detail(&output)
-    ))
+    cmd.output().map_err(Into::into)
 }
 
 fn run_external_agent_runtime_trial(request: &AdapterRunRequest<'_>) -> Result<ProcessRunResult> {
@@ -3102,7 +3117,7 @@ fn run_external_agent_runtime_trial(request: &AdapterRunRequest<'_>) -> Result<P
 
     let task_sandbox_image = resolve_task_sandbox_image(request)?;
     ensure_container_image_ready(&task_sandbox_image)?;
-    let workspace = resolve_container_workspace(request);
+    let workspace = resolve_container_workspace(request)?;
 
     let image = resolve_agent_execution_image(request)?;
     ensure_container_image_ready(&image)?;
@@ -3120,6 +3135,8 @@ fn run_external_agent_runtime_trial(request: &AdapterRunRequest<'_>) -> Result<P
         benchmark_grading_enabled: request.benchmark_grading_enabled,
         run_id: request.run_id,
         task_image: request.task_image,
+        task_workdir: request.task_workdir,
+        task_materialization_kind: request.task_materialization_kind.clone(),
         agent_artifact: request.agent_artifact,
     };
     let cmd = build_baked_container_command(
@@ -3134,61 +3151,247 @@ fn run_external_agent_runtime_trial(request: &AdapterRunRequest<'_>) -> Result<P
     let stderr_log_path = request.trial_paths.trial_dir.join("harness_stderr.log");
     let agent_result = run_adapter_process(
         cmd,
-        &request.io_paths.output_host,
+        &request.io_paths.result_host,
         None,
         &stdout_log_path,
         &stderr_log_path,
     )?;
 
-    if let Some(grader_command) = resolve_benchmark_grader_command(request)? {
-        let grade_error_marker_path = request.trial_paths.out.join(BENCHMARK_GRADE_ERROR_FILENAME);
-        let result_path = &request.io_paths.output_host;
-        if !result_path.exists() || result_path.metadata().map(|meta| meta.len()).unwrap_or(0) == 0
-        {
-            fs::write(&grade_error_marker_path, b"result_missing\n")?;
-            if agent_result.status == "0" {
-                return Ok(ProcessRunResult {
-                    status: BENCHMARK_GRADING_POLICY_EXIT_CODE.to_string(),
-                });
-            }
-            return Ok(agent_result);
-        }
+    Ok(agent_result)
+}
 
-        let mut overrides = request.runtime_overrides_env.clone();
-        overrides.insert(
-            AGENTLAB_ENV_AGENT_EXIT_STATUS.to_string(),
-            agent_result.status.clone(),
-        );
-        if let Err(err) = run_container_sidecar_command(
-            request,
-            &task_sandbox_image,
-            workspace,
-            &grader_command,
-            &overrides,
-            "benchmark grader",
-        ) {
-            fs::write(
-                &grade_error_marker_path,
-                format!("grader_command_failed:{}\n", err).into_bytes(),
-            )?;
-            return Ok(ProcessRunResult {
-                status: BENCHMARK_GRADING_POLICY_EXIT_CODE.to_string(),
-            });
+struct ResolvedGradingPhase {
+    image: String,
+    workdir: String,
+    command: Vec<String>,
+    extra_mounts: Vec<ResolvedMountReference>,
+}
+
+fn resolve_grading_bundle_host_path(
+    request: &AdapterRunRequest<'_>,
+    raw_bundle: &str,
+) -> Result<PathBuf> {
+    let rendered = replace_task_workdir_placeholder(raw_bundle, request.task_workdir);
+    if rendered.starts_with("/agentlab/") || rendered.starts_with(AGENTLAB_TASK_WORKDIR_PLACEHOLDER) {
+        return map_container_path_to_host(&rendered, request.trial_paths);
+    }
+    Ok(PathBuf::from(rendered))
+}
+
+fn wrap_injected_grading_command(
+    copy_dest: &str,
+    mounted_source: &str,
+    host_path: &Path,
+    command: &[String],
+) -> Vec<String> {
+    let inject = if host_path.is_dir() {
+        format!(
+            "mkdir -p {copy_dest}\ncp -R {mounted_source}/. {copy_dest}/",
+            copy_dest = shell_quote(copy_dest),
+            mounted_source = shell_quote(mounted_source),
+        )
+    } else if let Some(tar_flag) = agent_artifact_archive_flag(host_path) {
+        format!(
+            "mkdir -p {copy_dest}\ntar {tar_flag} {mounted_source} -C {copy_dest}",
+            copy_dest = shell_quote(copy_dest),
+            tar_flag = tar_flag,
+            mounted_source = shell_quote(mounted_source),
+        )
+    } else {
+        format!(
+            "mkdir -p {copy_dest}\ncp {mounted_source} {copy_dest}/",
+            copy_dest = shell_quote(copy_dest),
+            mounted_source = shell_quote(mounted_source),
+        )
+    };
+    vec![
+        "/bin/sh".to_string(),
+        "-lc".to_string(),
+        format!("set -e\n{}\nexec {}", inject, shell_join(command)),
+    ]
+}
+
+fn resolve_grading_phase(
+    request: &AdapterRunRequest<'_>,
+    grader: &BenchmarkGraderConfig,
+    base_command: &[String],
+) -> Result<ResolvedGradingPhase> {
+    let task_image = resolve_task_sandbox_image(request)?;
+    let task_workdir = resolve_container_workspace(request)?;
+    match grader.strategy {
+        GradingStrategy::InTaskImage => Ok(ResolvedGradingPhase {
+            image: task_image,
+            workdir: task_workdir.to_string(),
+            command: base_command.to_vec(),
+            extra_mounts: Vec::new(),
+        }),
+        GradingStrategy::Separate => {
+            let separate = grader
+                .separate
+                .as_ref()
+                .ok_or_else(|| anyhow!("benchmark.grader.separate is required when strategy='separate'"))?;
+            Ok(ResolvedGradingPhase {
+                image: separate.image.clone(),
+                workdir: separate.workdir.clone(),
+                command: base_command.to_vec(),
+                extra_mounts: Vec::new(),
+            })
         }
-        if !request
-            .trial_paths
-            .out
-            .join(BENCHMARK_SCORE_FILENAME)
-            .exists()
-        {
-            fs::write(&grade_error_marker_path, b"score_record_missing\n")?;
-            return Ok(ProcessRunResult {
-                status: BENCHMARK_GRADING_POLICY_EXIT_CODE.to_string(),
-            });
+        GradingStrategy::Injected => {
+            let injected = grader
+                .injected
+                .as_ref()
+                .ok_or_else(|| anyhow!("benchmark.grader.injected is required when strategy='injected'"))?;
+            let bundle_host_path = resolve_grading_bundle_host_path(request, &injected.bundle)?;
+            if !bundle_host_path.exists() {
+                return Err(anyhow!(
+                    "benchmark grader bundle not found for injected strategy: {}",
+                    bundle_host_path.display()
+                ));
+            }
+            let mount_name = bundle_host_path
+                .file_name()
+                .and_then(|value| value.to_str())
+                .map(sanitize_for_fs)
+                .filter(|value| !value.is_empty())
+                .unwrap_or_else(|| "grader_bundle".to_string());
+            let mounted_source = format!("{}/{}", AGENTLAB_CONTRACT_GRADER_AUX_DIR, mount_name);
+            let command = wrap_injected_grading_command(
+                &injected.copy_dest,
+                &mounted_source,
+                &bundle_host_path,
+                base_command,
+            );
+            Ok(ResolvedGradingPhase {
+                image: task_image,
+                workdir: task_workdir.to_string(),
+                command,
+                extra_mounts: vec![ResolvedMountReference {
+                    host_path: bundle_host_path,
+                    mount_path: mounted_source,
+                }],
+            })
         }
     }
+}
 
-    Ok(agent_result)
+fn run_benchmark_grading_phase(
+    request: &AdapterRunRequest<'_>,
+    agent_exit_status: &str,
+) -> Result<()> {
+    if !request.benchmark_grading_enabled {
+        return Ok(());
+    }
+    let Some(grader) = request.benchmark_grader else {
+        return Ok(());
+    };
+    let Some(grader_command) = resolve_benchmark_grader_command(request)? else {
+        return Ok(());
+    };
+
+    let grade_error_marker_path = request.trial_paths.out.join(BENCHMARK_GRADE_ERROR_FILENAME);
+    let result_path = &request.io_paths.result_host;
+    if !result_path.exists() || result_path.metadata().map(|meta| meta.len()).unwrap_or(0) == 0 {
+        fs::write(&grade_error_marker_path, b"result_missing\n")?;
+        return Ok(());
+    }
+
+    let resolved = resolve_grading_phase(request, grader, &grader_command)?;
+    ensure_container_image_ready(&resolved.image)?;
+
+    let mut overrides = request.runtime_overrides_env.clone();
+    overrides.insert(
+        AGENTLAB_ENV_AGENT_EXIT_STATUS.to_string(),
+        agent_exit_status.to_string(),
+    );
+    let grader_output = run_container_sidecar_command(
+        request,
+        &resolved.image,
+        &resolved.workdir,
+        &resolved.command,
+        &overrides,
+        "benchmark grader",
+        &resolved.extra_mounts,
+    )?;
+    let expected_output_path = request
+        .trial_paths
+        .out
+        .join(benchmark_grader_expected_output_filename(request.benchmark_grader));
+    let expected_output_present = expected_output_path.exists()
+        && expected_output_path
+            .metadata()
+            .map(|meta| meta.len())
+            .unwrap_or(0)
+            > 0;
+    if !expected_output_present {
+        let reason = if grader_output.status.success() {
+            benchmark_grader_expected_output_filename(request.benchmark_grader).to_string()
+        } else {
+            format!("grader_command_failed:{}", output_error_detail(&grader_output))
+        };
+        let marker = if benchmark_grader_uses_mapper(request.benchmark_grader) {
+            if reason.starts_with("grader_command_failed:") {
+                reason
+            } else {
+                "raw_grader_output_missing".to_string()
+            }
+        } else if reason.starts_with("grader_command_failed:") {
+            reason
+        } else {
+            "mapped_grader_output_missing".to_string()
+        };
+        fs::write(&grade_error_marker_path, format!("{}\n", marker).into_bytes())?;
+    }
+    Ok(())
+}
+
+fn run_benchmark_conclusion_mapper_phase(request: &AdapterRunRequest<'_>) -> Result<()> {
+    if !request.benchmark_grading_enabled {
+        return Ok(());
+    }
+    let Some(grader) = request.benchmark_grader else {
+        return Ok(());
+    };
+    let Some(mapper_command) = resolve_benchmark_conclusion_mapper_command(request, grader)? else {
+        return Ok(());
+    };
+
+    let grade_error_marker_path = request.trial_paths.out.join(BENCHMARK_GRADE_ERROR_FILENAME);
+    let raw_output_path = request.trial_paths.out.join(RAW_GRADER_OUTPUT_FILENAME);
+    let raw_output_present =
+        raw_output_path.exists() && raw_output_path.metadata().map(|meta| meta.len()).unwrap_or(0) > 0;
+    if !raw_output_present {
+        fs::write(&grade_error_marker_path, b"raw_grader_output_missing\n")?;
+        return Ok(());
+    }
+
+    let resolved = resolve_grading_phase(request, grader, &mapper_command)?;
+    ensure_container_image_ready(&resolved.image)?;
+    let mapper_output = run_container_sidecar_command(
+        request,
+        &resolved.image,
+        &resolved.workdir,
+        &resolved.command,
+        request.runtime_overrides_env,
+        "benchmark conclusion mapper",
+        &resolved.extra_mounts,
+    )?;
+    let mapped_output_path = request.trial_paths.out.join(MAPPED_GRADER_OUTPUT_FILENAME);
+    let mapped_output_present = mapped_output_path.exists()
+        && mapped_output_path
+            .metadata()
+            .map(|meta| meta.len())
+            .unwrap_or(0)
+            > 0;
+    if !mapped_output_present {
+        let marker = if mapper_output.status.success() {
+            "mapped_grader_output_missing".to_string()
+        } else {
+            format!("mapper_command_failed:{}", output_error_detail(&mapper_output))
+        };
+        fs::write(&grade_error_marker_path, format!("{}\n", marker).into_bytes())?;
+    }
+    Ok(())
 }
 
 fn resolve_benchmark_grader_command(
@@ -3203,18 +3406,82 @@ fn resolve_benchmark_grader_command(
     if grader.command.is_empty() {
         return Ok(None);
     }
-    let rendered = grader.command.clone();
+    let workspace = resolve_container_workspace(request)?;
+    let rendered = grader
+        .command
+        .iter()
+        .map(|token| replace_task_workdir_placeholder(token, workspace))
+        .collect::<Vec<_>>();
     if let Some(script_path) = rendered.get(1).map(|value| value.trim()) {
-        if Path::new(script_path).is_absolute() && !is_runner_staged_script_path(script_path) {
+        if Path::new(script_path).is_absolute()
+            && !is_runner_staged_script_path(script_path)
+            && !matches_contract_runtime_root(script_path, workspace)
+        {
             return Err(anyhow!(
-                "forbidden benchmark grader script path '{}': script must be under {} or {}",
+                "forbidden benchmark grader script path '{}': script must be under {} or the task workdir",
                 script_path,
-                AGENTLAB_CONTRACT_DEPS_DIR,
-                AGENTLAB_CONTRACT_STATE_DIR
+                AGENTLAB_CONTRACT_RUNTIME_AUX_DIR
             ));
         }
     }
     Ok(Some(rendered))
+}
+
+fn benchmark_grader_uses_mapper(grader: Option<&BenchmarkGraderConfig>) -> bool {
+    grader.is_some_and(|grader| matches!(grader.conclusion.mode, GraderConclusionMode::Mapper))
+}
+
+fn benchmark_grader_expected_output_filename(
+    grader: Option<&BenchmarkGraderConfig>,
+) -> &'static str {
+    if benchmark_grader_uses_mapper(grader) {
+        RAW_GRADER_OUTPUT_FILENAME
+    } else {
+        MAPPED_GRADER_OUTPUT_FILENAME
+    }
+}
+
+fn benchmark_grader_expected_output_container_path(
+    grader: Option<&BenchmarkGraderConfig>,
+) -> &'static str {
+    if benchmark_grader_uses_mapper(grader) {
+        DEFAULT_CONTAINER_RAW_GRADER_OUTPUT_PATH
+    } else {
+        DEFAULT_CONTAINER_MAPPED_GRADER_OUTPUT_PATH
+    }
+}
+
+fn resolve_benchmark_conclusion_mapper_command(
+    request: &AdapterRunRequest<'_>,
+    grader: &BenchmarkGraderConfig,
+) -> Result<Option<Vec<String>>> {
+    if !matches!(grader.conclusion.mode, GraderConclusionMode::Mapper) {
+        return Ok(None);
+    }
+    let mapper = grader
+        .conclusion
+        .mapper
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            anyhow!(
+                "benchmark.grader.conclusion.mapper is required when benchmark.grader.conclusion.mode='mapper'"
+            )
+        })?;
+    let workspace = resolve_container_workspace(request)?;
+    let rendered = replace_task_workdir_placeholder(mapper, workspace);
+    if Path::new(&rendered).is_absolute()
+        && !is_runner_staged_script_path(&rendered)
+        && !matches_contract_runtime_root(&rendered, workspace)
+    {
+        return Err(anyhow!(
+            "forbidden benchmark conclusion mapper path '{}': mapper must be under {} or the task workdir",
+            rendered,
+            AGENTLAB_CONTRACT_RUNTIME_AUX_DIR
+        ));
+    }
+    Ok(Some(vec![rendered]))
 }
 
 fn resolve_agent_execution_image(request: &AdapterRunRequest<'_>) -> Result<String> {
@@ -3222,17 +3489,19 @@ fn resolve_agent_execution_image(request: &AdapterRunRequest<'_>) -> Result<Stri
 }
 
 fn resolve_task_sandbox_image(request: &AdapterRunRequest<'_>) -> Result<String> {
-    request
-        .task_image
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToString::to_string)
-        .ok_or_else(|| anyhow!("task environment.image is required for task sandbox"))
+    let image = request.task_image.trim();
+    if image.is_empty() {
+        return Err(anyhow!("task image is required for task sandbox"));
+    }
+    Ok(image.to_string())
 }
 
-fn resolve_container_workspace<'a>(request: &'a AdapterRunRequest<'_>) -> Option<&'a str> {
-    let _ = request;
-    Some(AGENTLAB_CONTRACT_WORKSPACE_DIR)
+fn resolve_container_workspace<'a>(request: &'a AdapterRunRequest<'_>) -> Result<&'a str> {
+    let workdir = request.task_workdir.trim();
+    if workdir.is_empty() {
+        return Err(anyhow!("task workdir is required for task sandbox"));
+    }
+    Ok(workdir)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3245,24 +3514,8 @@ fn append_container_sandbox_args(
     cmd: &mut Command,
     request: &AdapterRunRequest<'_>,
     plane: ContainerPlane,
-    workspace: Option<&str>,
-) {
-    let root_read_only = match plane {
-        ContainerPlane::AgentRuntime => request.runtime.root_read_only,
-        ContainerPlane::TaskSandbox => true,
-    };
-    if root_read_only {
-        cmd.arg("--read-only");
-    }
-
-    let run_as_user = match plane {
-        ContainerPlane::AgentRuntime => request.runtime.user.as_deref(),
-        ContainerPlane::TaskSandbox => None,
-    };
-    if let Some(user) = run_as_user {
-        cmd.args(["-u", user]);
-    }
-
+    workspace: &str,
+) -> Result<()> {
     let network_mode = match plane {
         ContainerPlane::AgentRuntime => request.runtime.network.as_str(),
         ContainerPlane::TaskSandbox => request.network_mode,
@@ -3324,24 +3577,8 @@ fn append_container_sandbox_args(
         "-v",
         &format!(
             "{}:{}",
-            request.trial_paths.state.display(),
-            AGENTLAB_CONTRACT_STATE_DIR
-        ),
-    ]);
-    cmd.args([
-        "-v",
-        &format!(
-            "{}:{}",
-            request.trial_paths.deps.display(),
-            AGENTLAB_CONTRACT_DEPS_DIR
-        ),
-    ]);
-    cmd.args([
-        "-v",
-        &format!(
-            "{}:{}",
             request.trial_paths.workspace.display(),
-            AGENTLAB_CONTRACT_WORKSPACE_DIR
+            workspace
         ),
     ]);
     let sandbox_profile = request
@@ -3375,35 +3612,40 @@ fn append_container_sandbox_args(
     if matches!(plane, ContainerPlane::AgentRuntime) {
         cmd.args(["--tmpfs", "/opt/bench:rw"]);
     }
-    if let Some(workspace) = workspace {
-        cmd.args(["-w", workspace]);
-    }
+    cmd.args(["-w", workspace]);
+    Ok(())
 }
 
 fn append_container_env_args(
     cmd: &mut Command,
     request: &AdapterRunRequest<'_>,
-    workspace: Option<&str>,
+    workspace: &str,
 ) {
     let mut path_overridden = false;
     for (key, value) in request.runtime_overrides_env {
         if key == "PATH" {
             path_overridden = true;
         }
-        cmd.arg("-e").arg(format!("{}={}", key, value));
+        cmd.arg("-e").arg(format!(
+            "{}={}",
+            key,
+            replace_task_workdir_placeholder(value, workspace)
+        ));
     }
     for (key, value) in request.runtime_env {
         if key == "PATH" {
             path_overridden = true;
         }
-        cmd.arg("-e").arg(format!("{}={}", key, value));
+        cmd.arg("-e").arg(format!(
+            "{}={}",
+            key,
+            replace_task_workdir_placeholder(value, workspace)
+        ));
     }
     if request.agent_artifact.is_some() && !path_overridden {
         cmd.arg("-e").arg(AGENT_ARTIFACT_PATH_ENV_VALUE);
     }
-    if let Some(workspace) = workspace {
-        cmd.arg("-e").arg(format!("WORKSPACE={}", workspace));
-    }
+    cmd.arg("-e").arg(format!("WORKSPACE={}", workspace));
 }
 
 fn append_container_entrypoint(
@@ -3422,6 +3664,13 @@ fn append_container_entrypoint(
             &request.io_paths.result_path,
             BENCHMARK_GRADE_ERROR_FILENAME,
         );
+        let expected_output_path =
+            benchmark_grader_expected_output_container_path(request.benchmark_grader);
+        let missing_output_marker = if benchmark_grader_uses_mapper(request.benchmark_grader) {
+            "raw_grader_output_missing"
+        } else {
+            "mapped_grader_output_missing"
+        };
         let wrapped = format!(
             "set +e\n\
              rm -f {marker}\n\
@@ -3438,11 +3687,12 @@ fn append_container_entrypoint(
              fi\n\
              {grader}\n\
              grader_status=$?\n\
-             if [ \"$grader_status\" -ne 0 ]; then\n\
-               printf '%s\\n' \"grader_command_failed:$grader_status\" > {marker}\n\
-             fi\n\
-             if [ ! -s \"${{{score_env}}}\" ]; then\n\
-               printf '%s\\n' \"score_record_missing\" >> {marker}\n\
+             if [ ! -s {expected_output_path} ]; then\n\
+               if [ \"$grader_status\" -ne 0 ]; then\n\
+                 printf '%s\\n' \"grader_command_failed:$grader_status\" > {marker}\n\
+               else\n\
+                 printf '%s\\n' \"{missing_output_marker}\" > {marker}\n\
+               fi\n\
              fi\n\
              if [ -s {marker} ]; then\n\
                exit {grade_error_code}\n\
@@ -3457,7 +3707,8 @@ fn append_container_entrypoint(
             agent_exit_env = AGENTLAB_ENV_AGENT_EXIT_STATUS,
             result_path = shell_quote(&request.io_paths.result_path),
             grader = shell_join(&grader_command),
-            score_env = AGENTLAB_ENV_BENCHMARK_SCORE_PATH,
+            expected_output_path = shell_quote(expected_output_path),
+            missing_output_marker = missing_output_marker,
             grade_error_code = BENCHMARK_GRADING_POLICY_EXIT_CODE,
         );
         cmd.arg("/bin/sh");
@@ -3472,14 +3723,15 @@ fn build_baked_container_command(
     request: &AdapterRunRequest<'_>,
     plane: ContainerPlane,
     image: &str,
-    workspace: Option<&str>,
+    workspace: &str,
     command: &[String],
     grader_command: Option<Vec<String>>,
 ) -> Command {
     let mut cmd = Command::new("docker");
     cmd.arg("run").arg("--rm").args(["--pull", "never"]);
     append_container_platform_arg(&mut cmd, image);
-    append_container_sandbox_args(&mut cmd, request, plane, workspace);
+    append_container_sandbox_args(&mut cmd, request, plane, workspace)
+        .expect("task workdir should be resolved before container command build");
     append_container_env_args(&mut cmd, request, workspace);
     cmd.arg(image);
     append_container_entrypoint(&mut cmd, request, command, grader_command);
@@ -3761,9 +4013,23 @@ fn resolve_runtime_agent_command(request: &AdapterRunRequest<'_>) -> Result<Vec<
     if request.runtime.command_raw.is_empty() {
         return Err(anyhow!("resolved runtime.agent_runtime.command is empty"));
     }
-    let mut command = request.runtime.command_raw.clone();
-    command.extend(request.variant_args.iter().cloned());
+    let mut command = request
+        .runtime
+        .command_raw
+        .iter()
+        .map(|token| replace_task_workdir_placeholder(token, request.task_workdir))
+        .collect::<Vec<_>>();
+    command.extend(
+        request
+            .variant_args
+            .iter()
+            .map(|token| replace_task_workdir_placeholder(token, request.task_workdir)),
+    );
     Ok(command)
+}
+
+fn replace_task_workdir_placeholder(raw: &str, task_workdir: &str) -> String {
+    raw.replace(TASK_WORKDIR_TEMPLATE_PLACEHOLDER, task_workdir)
 }
 
 struct PreflightProbeRoot {
@@ -3782,7 +4048,9 @@ struct PreflightProbeContext {
     io_paths: PreparedTrialIo,
     dynamic_mounts: Vec<ResolvedMountReference>,
     runtime_env: BTreeMap<String, String>,
-    task_image: Option<String>,
+    task_image: String,
+    task_workdir: String,
+    task_materialization_kind: TaskMaterializationKind,
 }
 
 fn create_preflight_probe_root(label: &str) -> Result<PreflightProbeRoot> {
@@ -3849,6 +4117,12 @@ fn build_preflight_probe_context(
         &runtime_profile.agent_runtime,
         None,
     )?;
+    let probe_task_image = prepared.manifest.task_sandbox_image().to_string();
+    let probe_task_workdir = prepared
+        .manifest
+        .task_sandbox_workdir()
+        .unwrap_or(task_boundary.task_workdir.as_str())
+        .to_string();
     let mut input = prepared.trial_input.clone();
     set_json_pointer_value(
         &mut input,
@@ -3864,7 +4138,7 @@ fn build_preflight_probe_context(
         "preflight_probe",
         &input,
         &io_paths,
-        Some(task_boundary.task_image.as_str()),
+        Some(probe_task_image.as_str()),
         smoke_timeout_ms,
     );
     runtime_env.insert(AGENTLAB_ENV_PREFLIGHT_SMOKE.to_string(), "1".to_string());
@@ -3874,7 +4148,9 @@ fn build_preflight_probe_context(
         io_paths,
         dynamic_mounts: prepared.dynamic_mounts,
         runtime_env,
-        task_image: Some(task_boundary.task_image),
+        task_image: probe_task_image,
+        task_workdir: probe_task_workdir,
+        task_materialization_kind: task_boundary.materialization.kind.clone(),
     })
 }
 
@@ -3897,7 +4173,9 @@ fn build_preflight_probe_request<'a>(
         benchmark_grader,
         benchmark_grading_enabled,
         run_id: "preflight_probe",
-        task_image: context.task_image.as_deref(),
+        task_image: context.task_image.as_str(),
+        task_workdir: context.task_workdir.as_str(),
+        task_materialization_kind: context.task_materialization_kind.clone(),
         agent_artifact: Some(runtime_profile.agent_runtime.agent_artifact.as_path()),
     }
 }
@@ -3920,6 +4198,23 @@ fn run_preflight_contract_smoke(
 ) -> Result<PreflightContractSmokeExecution> {
     let adapter = adapter_registry_entry(&request.runtime.adapter_ref)?;
     let proc_result = adapter.run_trial(request)?;
+    let trial_input: Value = serde_json::from_slice(&fs::read(&request.io_paths.trial_input_host)?)?;
+    let (trial_output, result_parse_error) = load_trial_output_resilient(&request.io_paths.result_host)?;
+    write_grader_input_file(
+        request.io_paths,
+        &trial_input,
+        &trial_output,
+        request.trial_paths,
+        request.task_workdir,
+        &proc_result.status,
+        result_parse_error.as_deref(),
+        &Utc::now().to_rfc3339(),
+        &Utc::now().to_rfc3339(),
+        None,
+        None,
+    )?;
+    run_benchmark_grading_phase(request, &proc_result.status)?;
+    run_benchmark_conclusion_mapper_phase(request)?;
     let stdout =
         read_optional_text_file(&request.trial_paths.trial_dir.join("harness_stdout.log"))?;
     let stderr =
@@ -4048,31 +4343,30 @@ fn validate_preflight_benchmark_smoke_outputs(
     status: &str,
 ) -> Vec<String> {
     let mut failures = Vec::new();
-    let prediction_path = request.trial_paths.out.join(BENCHMARK_PREDICTION_FILENAME);
-    let score_path = request.trial_paths.out.join(BENCHMARK_SCORE_FILENAME);
+    let mapped_grader_output_path = request
+        .trial_paths
+        .out
+        .join(MAPPED_GRADER_OUTPUT_FILENAME);
     let grade_error_path = request.trial_paths.out.join(BENCHMARK_GRADE_ERROR_FILENAME);
 
-    match load_optional_json_record_with_schema(
-        "benchmark_prediction_record_v1.jsonschema",
-        &prediction_path,
+    let mapped_output_valid = match load_optional_json_record_with_schema(
+        "trial_conclusion_v1.jsonschema",
+        &mapped_grader_output_path,
     ) {
-        Ok(Some(_)) => {}
-        Ok(None) => failures.push(format!(
-            "contract smoke did not write benchmark prediction record: {}",
-            prediction_path.display()
-        )),
-        Err(err) => failures.push(format!("benchmark prediction record invalid: {}", err)),
-    }
-    match load_optional_json_record_with_schema("benchmark_score_record_v1.jsonschema", &score_path)
-    {
-        Ok(Some(_)) => {}
-        Ok(None) => failures.push(format!(
-            "contract smoke did not write benchmark score record: {}",
-            score_path.display()
-        )),
-        Err(err) => failures.push(format!("benchmark score record invalid: {}", err)),
-    }
-    if grade_error_path.exists() {
+        Ok(Some(_)) => true,
+        Ok(None) => {
+            failures.push(format!(
+            "contract smoke did not write mapped grader output: {}",
+            mapped_grader_output_path.display()
+        ));
+            false
+        }
+        Err(err) => {
+            failures.push(format!("mapped grader output invalid: {}", err));
+            false
+        }
+    };
+    if !mapped_output_valid && grade_error_path.exists() {
         let marker_reason =
             fs::read_to_string(&grade_error_path).unwrap_or_else(|_| "grade_error".to_string());
         let reason = marker_reason.trim();
@@ -4084,7 +4378,7 @@ fn validate_preflight_benchmark_smoke_outputs(
                 reason
             }
         ));
-    } else if status == BENCHMARK_GRADING_POLICY_EXIT_CODE.to_string() {
+    } else if !mapped_output_valid && status == BENCHMARK_GRADING_POLICY_EXIT_CODE.to_string() {
         failures.push(format!(
             "benchmark smoke exited with grading policy code {} without a grade error marker",
             BENCHMARK_GRADING_POLICY_EXIT_CODE
@@ -4107,7 +4401,7 @@ fn collect_preflight_contract_smoke_failures(
         ));
         contract_failed = true;
     }
-    let result_failures = validate_preflight_result_payload(&request.io_paths.output_host);
+    let result_failures = validate_preflight_result_payload(&request.io_paths.result_host);
     if !result_failures.is_empty() {
         contract_failed = true;
     }
@@ -4344,83 +4638,277 @@ fn load_trial_output_resilient(path: &Path) -> Result<(Value, Option<String>)> {
     }
 }
 
+fn result_file_ref_path(result_value: &Value) -> Option<&str> {
+    result_value
+        .get("artifact")
+        .and_then(Value::as_str)
+        .or_else(|| result_value.pointer("/artifact/path").and_then(Value::as_str))
+}
+
+fn artifact_type_from_trial_input(trial_input: &Value) -> ArtifactType {
+    match trial_input
+        .pointer("/artifact_type")
+        .and_then(Value::as_str)
+        .unwrap_or("structured_json")
+    {
+        "patch_submission" => ArtifactType::PatchSubmission,
+        "text_response" => ArtifactType::TextResponse,
+        "file_ref" => ArtifactType::FileRef,
+        _ => ArtifactType::StructuredJson,
+    }
+}
+
+fn extract_candidate_artifact_record(
+    result_value: &Value,
+    expected_artifact_type: ArtifactType,
+) -> CandidateArtifactRecord {
+    if result_value
+        .pointer("/error/code")
+        .and_then(Value::as_str)
+        .is_some_and(|code| code == "result_missing")
+    {
+        return CandidateArtifactRecord {
+            state: CandidateArtifactState::Missing,
+            artifact_type: expected_artifact_type,
+            source: CandidateArtifactSource::None,
+            payload: None,
+        };
+    }
+
+    match serde_json::from_value::<ArtifactEnvelopeV1>(result_value.clone()) {
+        Ok(envelope) if envelope.artifact_type == expected_artifact_type => {
+            let source = if matches!(envelope.artifact_type, ArtifactType::FileRef) {
+                CandidateArtifactSource::ResultFileRef
+            } else {
+                CandidateArtifactSource::ResultInline
+            };
+            let state = if matches!(envelope.artifact_type, ArtifactType::FileRef) {
+                match result_file_ref_path(result_value) {
+                    Some(path)
+                        if path == DEFAULT_CONTAINER_RESULT_PATH
+                            || path.starts_with(&format!("{}/", AGENTLAB_CONTRACT_OUT_DIR)) =>
+                    {
+                        CandidateArtifactState::Valid
+                    }
+                    _ => CandidateArtifactState::Invalid,
+                }
+            } else {
+                CandidateArtifactState::Valid
+            };
+            CandidateArtifactRecord {
+                state,
+                artifact_type: envelope.artifact_type,
+                source,
+                payload: Some(envelope.artifact),
+            }
+        }
+        Ok(envelope) => CandidateArtifactRecord {
+            state: CandidateArtifactState::Invalid,
+            artifact_type: envelope.artifact_type,
+            source: CandidateArtifactSource::None,
+            payload: Some(envelope.artifact),
+        },
+        Err(_) => CandidateArtifactRecord {
+            state: CandidateArtifactState::Invalid,
+            artifact_type: expected_artifact_type,
+            source: CandidateArtifactSource::None,
+            payload: Some(result_value.clone()),
+        },
+    }
+}
+
+fn stage_grader_aux_copy(
+    trial_paths: &TrialPaths,
+    filename: &str,
+    source: &Path,
+) -> Result<Option<String>> {
+    if !source.exists() {
+        return Ok(None);
+    }
+    let host_path = trial_paths.in_dir.join("grader").join(filename);
+    copy_file_if_exists(source, &host_path)?;
+    Ok(Some(format!("{}/{}", AGENTLAB_CONTRACT_GRADER_AUX_DIR, filename)))
+}
+
+fn build_grader_input_value(
+    trial_input: &Value,
+    trial_output: &Value,
+    trial_paths: &TrialPaths,
+    task_workdir: &str,
+    agent_exit_status: &str,
+    result_parse_error: Option<&str>,
+    started_at: &str,
+    ended_at: &str,
+    diff_path: Option<&Path>,
+    patch_path: Option<&Path>,
+) -> Result<GraderInputV1> {
+    let ids = ContractIds {
+        run_id: trial_input
+            .pointer("/ids/run_id")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+        trial_id: trial_input
+            .pointer("/ids/trial_id")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+        variant_id: trial_input
+            .pointer("/ids/variant_id")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+        task_id: trial_input
+            .pointer("/ids/task_id")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+        repl_idx: trial_input
+            .pointer("/ids/repl_idx")
+            .and_then(Value::as_u64)
+            .map(|value| value as u32),
+        schedule_idx: trial_input
+            .pointer("/ids/schedule_idx")
+            .and_then(Value::as_u64)
+            .map(|value| value as u32),
+    };
+    let artifact_type = artifact_type_from_trial_input(trial_input);
+    let candidate_artifact = extract_candidate_artifact_record(trial_output, artifact_type.clone());
+    let diff_container_path = match diff_path {
+        Some(path) => stage_grader_aux_copy(trial_paths, "workspace_diff_incremental.json", path)?,
+        None => None,
+    };
+    let patch_container_path = match patch_path {
+        Some(path) => stage_grader_aux_copy(trial_paths, "workspace_patch_incremental.json", path)?,
+        None => None,
+    };
+    Ok(GraderInputV1 {
+        schema_version: "grader_input_v1".to_string(),
+        ids,
+        task: trial_input.pointer("/task").cloned().unwrap_or_else(|| json!({})),
+        artifact_type,
+        agent_phase: GraderInputAgentPhase {
+            exit_code: agent_exit_status.parse::<i32>().ok(),
+            timed_out: false,
+            result_present: !matches!(candidate_artifact.state, CandidateArtifactState::Missing),
+            result_schema_valid: result_parse_error.is_none()
+                && matches!(candidate_artifact.state, CandidateArtifactState::Valid),
+            started_at: started_at.to_string(),
+            ended_at: ended_at.to_string(),
+        },
+        candidate_artifact,
+        workspace_delta: WorkspaceDeltaContract {
+            state: if diff_container_path.is_some() {
+                WorkspaceDeltaState::Available
+            } else {
+                WorkspaceDeltaState::Missing
+            },
+            diff_path: diff_container_path,
+            patch_path: patch_container_path,
+        },
+        paths: GraderInputPaths {
+            result_path: DEFAULT_CONTAINER_RESULT_PATH.to_string(),
+        },
+        workdir: task_workdir.to_string(),
+    })
+}
+
+fn write_grader_input_file(
+    io_paths: &PreparedTrialIo,
+    trial_input: &Value,
+    trial_output: &Value,
+    trial_paths: &TrialPaths,
+    task_workdir: &str,
+    agent_exit_status: &str,
+    result_parse_error: Option<&str>,
+    started_at: &str,
+    ended_at: &str,
+    diff_path: Option<&Path>,
+    patch_path: Option<&Path>,
+) -> Result<()> {
+    let grader_input = build_grader_input_value(
+        trial_input,
+        trial_output,
+        trial_paths,
+        task_workdir,
+        agent_exit_status,
+        result_parse_error,
+        started_at,
+        ended_at,
+        diff_path,
+        patch_path,
+    )?;
+    atomic_write_json_pretty(&io_paths.grader_input_host, &serde_json::to_value(grader_input)?)?;
+    Ok(())
+}
+
 fn resolve_trial_io_host_path(path: &str, paths: &TrialPaths) -> Result<PathBuf> {
     map_container_path_to_host(path, paths)
 }
 
 fn prepare_io_paths(paths: &TrialPaths, input_bytes: &[u8]) -> Result<PreparedTrialIo> {
-    let task_path = DEFAULT_CONTAINER_TASK_PATH.to_string();
-    let bindings_path = DEFAULT_CONTAINER_BINDINGS_PATH.to_string();
-    let dependencies_path = DEFAULT_CONTAINER_DEPENDENCIES_PATH.to_string();
-    let policy_path = DEFAULT_CONTAINER_POLICY_PATH.to_string();
+    let trial_input_path = DEFAULT_CONTAINER_TRIAL_INPUT_PATH.to_string();
+    let grader_input_path = DEFAULT_CONTAINER_GRADER_INPUT_PATH.to_string();
     let result_path = DEFAULT_CONTAINER_RESULT_PATH.to_string();
+    let raw_grader_output_path = DEFAULT_CONTAINER_RAW_GRADER_OUTPUT_PATH.to_string();
+    let mapped_grader_output_path = DEFAULT_CONTAINER_MAPPED_GRADER_OUTPUT_PATH.to_string();
     let trajectory_path = DEFAULT_CONTAINER_TRAJECTORY_PATH.to_string();
-    let task_host = resolve_trial_io_host_path(DEFAULT_CONTAINER_TASK_PATH, paths)?;
-    let bindings_host = resolve_trial_io_host_path(DEFAULT_CONTAINER_BINDINGS_PATH, paths)?;
-    let dependencies_host = resolve_trial_io_host_path(DEFAULT_CONTAINER_DEPENDENCIES_PATH, paths)?;
-    let policy_host = resolve_trial_io_host_path(DEFAULT_CONTAINER_POLICY_PATH, paths)?;
+    let trial_input_host = resolve_trial_io_host_path(DEFAULT_CONTAINER_TRIAL_INPUT_PATH, paths)?;
+    let grader_input_host = resolve_trial_io_host_path(DEFAULT_CONTAINER_GRADER_INPUT_PATH, paths)?;
     let result_host = resolve_trial_io_host_path(DEFAULT_CONTAINER_RESULT_PATH, paths)?;
+    let raw_grader_output_host =
+        resolve_trial_io_host_path(DEFAULT_CONTAINER_RAW_GRADER_OUTPUT_PATH, paths)?;
+    let mapped_grader_output_host =
+        resolve_trial_io_host_path(DEFAULT_CONTAINER_MAPPED_GRADER_OUTPUT_PATH, paths)?;
     let trajectory_host = resolve_trial_io_host_path(DEFAULT_CONTAINER_TRAJECTORY_PATH, paths)?;
-    let input_host = resolve_trial_io_host_path(DEFAULT_CONTAINER_TRIAL_INPUT_PATH, paths)?;
-    let output_host = resolve_trial_io_host_path(DEFAULT_CONTAINER_RESULT_PATH, paths)?;
     let events_host = resolve_trial_io_host_path(DEFAULT_CONTAINER_TRAJECTORY_PATH, paths)?;
 
     for host_path in [
-        &task_host,
-        &bindings_host,
-        &dependencies_host,
-        &policy_host,
+        &trial_input_host,
+        &grader_input_host,
         &result_host,
+        &raw_grader_output_host,
+        &mapped_grader_output_host,
         &trajectory_host,
-        &input_host,
     ] {
         if let Some(parent) = host_path.parent() {
             ensure_dir(parent)?;
         }
     }
 
-    if let Some(parent) = input_host.parent() {
-        ensure_dir(parent)?;
-    }
-    fs::write(&input_host, input_bytes)?;
-
-    let input_value: Value = serde_json::from_slice(input_bytes)?;
-    let task_value = input_value.pointer("/task").cloned().unwrap_or(json!({}));
-    let bindings_value = input_value
-        .pointer("/bindings")
-        .cloned()
-        .unwrap_or(json!({}));
-    let dependencies_value = input_value
-        .pointer("/dependencies")
-        .cloned()
-        .unwrap_or_else(|| json!({}));
-    let policy_value = input_value
-        .pointer("/policy")
-        .cloned()
-        .unwrap_or_else(|| json!({}));
-
-    atomic_write_json_pretty(&task_host, &task_value)?;
-    atomic_write_json_pretty(&bindings_host, &bindings_value)?;
-    atomic_write_json_pretty(&dependencies_host, &dependencies_value)?;
-    atomic_write_json_pretty(&policy_host, &policy_value)?;
+    fs::write(&trial_input_host, input_bytes)?;
 
     if result_host.exists() {
         let _ = fs::remove_file(&result_host);
     }
+    if raw_grader_output_host.exists() {
+        let _ = fs::remove_file(&raw_grader_output_host);
+    }
+    if mapped_grader_output_host.exists() {
+        let _ = fs::remove_file(&mapped_grader_output_host);
+    }
     if trajectory_host.exists() {
         let _ = fs::remove_file(&trajectory_host);
     }
+    if grader_input_host.exists() {
+        let _ = fs::remove_file(&grader_input_host);
+    }
 
     Ok(PreparedTrialIo {
-        input_host,
-        output_host,
+        trial_input_host,
+        grader_input_host,
+        result_host,
         events_host,
-        task_path,
-        bindings_path,
-        dependencies_path,
-        policy_path,
+        trial_input_path,
+        grader_input_path,
         result_path,
+        raw_grader_output_path,
+        mapped_grader_output_path,
         trajectory_path,
+        #[cfg(test)]
+        input_host: resolve_trial_io_host_path(DEFAULT_CONTAINER_TRIAL_INPUT_PATH, paths)?,
+        #[cfg(test)]
+        output_host: resolve_trial_io_host_path(DEFAULT_CONTAINER_RESULT_PATH, paths)?,
     })
 }
 
@@ -4503,7 +4991,6 @@ fn materialize_trial_runtime_layout(
             copy_dir_preserve_contents(&paths.in_dir, &trial_dir.join("in"))?;
             copy_dir_preserve_contents(&paths.out, &trial_dir.join("out"))?;
             copy_dir_preserve_contents(&paths.state, &trial_dir.join("state"))?;
-            copy_dir_preserve_contents(&paths.deps, &trial_dir.join("deps"))?;
             copy_dir_preserve_contents(&paths.workspace, &trial_dir.join("workspace"))?;
             copy_dir_preserve_contents(&paths.tmp, &trial_dir.join("tmp"))?;
             copy_file_if_exists(
@@ -4586,6 +5073,7 @@ fn write_state_inventory(
     effective_network_mode: &str,
     invocation_source: &str,
     task_sandbox_image: Option<&str>,
+    task_sandbox_workdir: Option<&str>,
 ) -> Result<()> {
     let sanitization_profile = json_value
         .pointer("/design/sanitization_profile")
@@ -4602,20 +5090,17 @@ fn write_state_inventory(
     } else {
         "unknown"
     };
+    let workspace_path = task_sandbox_workdir.unwrap_or(DEFAULT_TASK_WORKDIR_FALLBACK);
 
     let mounts = vec![
         json!({"name": "in", "path": AGENTLAB_CONTRACT_IN_DIR, "writable": false}),
-        json!({"name": "workspace", "path": AGENTLAB_CONTRACT_WORKSPACE_DIR, "writable": true}),
-        json!({"name": "state", "path": AGENTLAB_CONTRACT_STATE_DIR, "writable": true}),
-        json!({"name": "deps", "path": AGENTLAB_CONTRACT_DEPS_DIR, "writable": true}),
+        json!({"name": "workdir", "path": workspace_path, "writable": true}),
         json!({"name": "out", "path": AGENTLAB_CONTRACT_OUT_DIR, "writable": true}),
         json!({"name": "tmp", "path": "/tmp", "writable": true}),
     ];
     let mut agent_runtime_mounts = vec![
         json!({"name": "in", "path": AGENTLAB_CONTRACT_IN_DIR, "writable": false}),
-        json!({"name": "workspace", "path": AGENTLAB_CONTRACT_WORKSPACE_DIR, "writable": true}),
-        json!({"name": "state", "path": AGENTLAB_CONTRACT_STATE_DIR, "writable": true}),
-        json!({"name": "deps", "path": AGENTLAB_CONTRACT_DEPS_DIR, "writable": true}),
+        json!({"name": "workdir", "path": workspace_path, "writable": true}),
         json!({"name": "out", "path": AGENTLAB_CONTRACT_OUT_DIR, "writable": true}),
         json!({"name": "tmp", "path": "/tmp", "writable": true}),
     ];
@@ -4626,9 +5111,7 @@ fn write_state_inventory(
     }));
     let mut task_sandbox_mounts = vec![
         json!({"name": "in", "path": AGENTLAB_CONTRACT_IN_DIR, "writable": false}),
-        json!({"name": "workspace", "path": AGENTLAB_CONTRACT_WORKSPACE_DIR, "writable": true}),
-        json!({"name": "state", "path": AGENTLAB_CONTRACT_STATE_DIR, "writable": true}),
-        json!({"name": "deps", "path": AGENTLAB_CONTRACT_DEPS_DIR, "writable": true}),
+        json!({"name": "workdir", "path": workspace_path, "writable": true}),
         json!({"name": "out", "path": AGENTLAB_CONTRACT_OUT_DIR, "writable": true}),
         json!({"name": "tmp", "path": "/tmp", "writable": true}),
     ];
@@ -4675,7 +5158,7 @@ fn write_state_inventory(
                 "executor": "docker",
                 "image": agent_runtime_image,
                 "image_digest": agent_runtime_image_digest,
-                "workspace": AGENTLAB_CONTRACT_WORKSPACE_DIR,
+                "workdir": workspace_path,
                 "mounts": agent_runtime_mounts,
                 "network_mode": agent_runtime.network
             },
@@ -4683,7 +5166,7 @@ fn write_state_inventory(
                 "executor": "docker",
                 "image": task_sandbox_image,
                 "image_digest": task_sandbox_image_digest,
-                "workspace": AGENTLAB_CONTRACT_WORKSPACE_DIR,
+                "workdir": workspace_path,
                 "mounts": task_sandbox_mounts,
                 "network_mode": mode_effective
             }

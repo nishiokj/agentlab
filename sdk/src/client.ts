@@ -249,15 +249,11 @@ export class LabClient {
       this.readJsonFileIfExists(join(benchmarkDir, 'summary.json')),
     ]);
 
-    const [predictions, scores] = await Promise.all([
-      this.readJsonl(join(benchmarkDir, 'predictions.jsonl')),
-      this.readJsonl(join(benchmarkDir, 'scores.jsonl')),
-    ]);
+    const conclusions = await this.readJsonl(join(benchmarkDir, 'conclusions.jsonl'));
 
     return {
       manifest: manifest as ReadBenchmarkResponse['manifest'],
-      predictions: predictions as ReadBenchmarkResponse['predictions'],
-      scores: scores as ReadBenchmarkResponse['scores'],
+      conclusions: conclusions as ReadBenchmarkResponse['conclusions'],
       summary: summary as ReadBenchmarkResponse['summary'],
     };
   }

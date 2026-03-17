@@ -440,7 +440,7 @@ fn resolve_preflight_images(
             passed: false,
             severity: PreflightSeverity::Error,
             message: format!(
-                "failed to parse packaged task declarations while collecting task images: {}",
+                "failed to parse packaged task_row_v1 rows while collecting task images: {}",
                 format_preview(&scan.parse_errors, 3)
             ),
         });
@@ -451,7 +451,7 @@ fn resolve_preflight_images(
             passed: false,
             severity: PreflightSeverity::Error,
             message: format!(
-                "tasks missing environment.image: {}",
+                "tasks missing image: {}",
                 format_preview(&scan.missing_task_ids, 5)
             ),
         });
@@ -842,7 +842,7 @@ fn check_dataset_task_ids(
                 continue;
             }
         };
-        let id = parsed.task_payload.get("id").and_then(|v| v.as_str());
+        let id = Some(parsed.task_id.as_str());
 
         match id {
             Some(id_str) if !id_str.is_empty() => {
@@ -875,7 +875,7 @@ fn check_dataset_task_ids(
             passed: false,
             severity: PreflightSeverity::Error,
             message: format!(
-                "malformed task rows (expected current unversioned task contract): {}",
+                "malformed task rows (expected packaged task_row_v1): {}",
                 format_preview(&malformed_boundary_rows, 3)
             ),
         });
@@ -1192,10 +1192,19 @@ fn check_benchmark_grader_reachable_with_scan(
 }
 
 fn is_runner_staged_script_path(path: &str) -> bool {
-    path == AGENTLAB_CONTRACT_DEPS_DIR
-        || path.starts_with(&format!("{}/", AGENTLAB_CONTRACT_DEPS_DIR))
-        || path == AGENTLAB_CONTRACT_STATE_DIR
-        || path.starts_with(&format!("{}/", AGENTLAB_CONTRACT_STATE_DIR))
+    path == AGENTLAB_CONTRACT_IN_DIR
+        || path.starts_with(&format!("{}/", AGENTLAB_CONTRACT_IN_DIR))
+        || path
+            == format!(
+                "{}/{}",
+                AGENTLAB_TASK_WORKDIR_PLACEHOLDER, AGENTLAB_RUNNER_SUPPORT_REL_DIR
+            )
+        || path.starts_with(&format!(
+            "{}/{}/",
+            AGENTLAB_TASK_WORKDIR_PLACEHOLDER, AGENTLAB_RUNNER_SUPPORT_REL_DIR
+        ))
+        || path == AGENTLAB_CONTRACT_RUNTIME_AUX_DIR
+        || path.starts_with(&format!("{}/", AGENTLAB_CONTRACT_RUNTIME_AUX_DIR))
 }
 
 fn check_container_ready(

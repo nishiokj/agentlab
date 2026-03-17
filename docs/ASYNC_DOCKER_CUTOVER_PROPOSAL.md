@@ -1,33 +1,114 @@
 # Async Docker Cutover Proposal
 
-Status: proposal. This is a major architectural change.
+Status: Proposal  
+Date: 2026-03-13
 
-## Summary
+## Executive Summary
 
-Replace the synchronous `std::process::Command`-based Docker invocation layer with an async Bollard + Tokio architecture. Restructure the trial execution hot path around three explicit phases (materialize, execute, grade) with programmatic container lifecycle control. Simultaneously simplify the experiment YAML authoring, task boundary contract, variant model, and output envelope.
+This is not just a transport swap from `std::process::Command` shell-outs to Bollard. It is a hard cutover to a cleaner execution model with explicit ownership boundaries:
 
-This is a full-stack change touching the experiment schema, build stage, runtime executor, grading pipeline, and CLI entry points.
+1. Authoring and benchmark compilers own user intent and benchmark-specific translation.
+2. Build owns validation, path resolution, mapper execution, and sealing.
+3. The run engine owns durable scheduling, retries, and slot commit semantics.
+4. The agent sandbox owns only candidate artifact production.
+5. The grader sandbox owns only grading output production.
+
+The main design decision is simple:
+
+1. Agent success is not a benchmark verdict.
+2. Grader exit code is not a benchmark verdict.
+3. The only benchmark verdict is a validated `trial_conclusion_v1` carried by `mapped_grader_output.json`.
+
+The async Docker cutover is required because the target flow needs explicit container lifecycle control: create, start, exec, copy-in, copy-out, inspect, stream stats, cancel, and remove. Shell-wrapped `docker run` calls are the wrong abstraction for that.
+
+This document is the source of truth for the cutover. Older patch specs should be treated as stale wherever they disagree with this proposal.
 
 ---
 
-## Part 1: Experiment Schema Overhaul
+## Scope
 
-### Current state
+### In scope
 
-Experiments are authored either as YAML directly or via a JavaScript SDK (`ExperimentBuilder`) that emits YAML. The YAML mixes runtime plumbing with user intent. Variants are split into `baseline` + `variant_plan[]` with special semantics. The agent command is specified inline. Workspace materialization details (overlays, aux_mounts, dependency files) leak into the experiment definition.
+1. New authoring and sealed-spec boundary for experiment execution.
+2. Build-time benchmark mapping into generic task rows.
+3. Fixed agent CLI contract.
+4. Mandatory grading contract and normalized conclusion boundary.
+5. Durable run-state orchestration around ephemeral per-attempt sandboxes.
+6. Async Docker runtime built on Tokio + Bollard.
+7. Run-time environment injection semantics.
 
-**Current YAML shape** (`experiment.yaml`):
-- `experiment` — id, name, description, workload_type, owner, tags
-- `dataset` — suite_id, provider, path, schema_version, split_id, limit
-- `design` — sanitization_profile, comparison, replications, random_seed, shuffle_tasks, max_concurrency
-- `baseline` — variant_id, bindings
-- `variant_plan[]` — variant_id, bindings
-- `runtime.agent` — command, image, io (input_arg, output_arg), artifact, image_source, env, env_from_host
-- `runtime.policy` — timeout_ms, network, sandbox (mode, root_read_only, hardening, resources)
-- `benchmark` — policy (task_model, evaluator_mode, scoring_lifecycle, chain_failure_policy), adapter (command, manifest)
-- `validity` — fail_on_state_leak, fail_on_profile_invariant_violation
+### Out of scope
 
-### New YAML shape
+1. Full analysis layer redesign.
+2. Remote worker protocol redesign.
+3. Legacy-shape backward compatibility shims.
+4. Durable in-flight process reattachment.
+5. Non-container scientific execution modes.
+
+---
+
+## Architectural Split
+
+This cutover only makes sense if the planes are separated cleanly.
+
+| Plane | Owns | Must Not Own |
+|---|---|---|
+| Authoring | Experiment intent, variants, policy, mapper references | Host paths, mount topology, hidden-test procedures |
+| Build / Compile | Validation, relative path resolution, artifact hashing, mapper execution, sealed `experiment.json` | Secret values, run-time state, active trial orchestration |
+| Run Orchestrator | Durable schedule, slot attempts, preflight, retries, commit journal | Benchmark verdict logic, benchmark-native task parsing |
+| Agent Sandbox | Executing agent binary against `trial_input.json`, writing `result.json`, and optionally emitting declared telemetry | Hidden tests, grader assets, slot commit decisions |
+| Grader Sandbox | Evaluating agent output and writing normalized `trial_conclusion_v1` into `mapped_grader_output.json` | Scheduling, retries, mutating authoring or task inputs |
+| Persistence | Host path contract, committed trial facts, attestation | Benchmark-specific execution behavior |
+
+Two important consequences fall out of this split:
+
+1. Benchmark-specific semantics must compile into generic run-time boundaries before `lab-cli run` starts.
+2. Mounts are not user-facing configuration. Logical IO roots are first-class. Bind mounts are only the local Docker realization of those roots.
+
+---
+
+## Non-Negotiable Invariants
+
+1. There is exactly one scientific execution shape: durable runner orchestrator plus ephemeral containers.
+2. The agent never sees hidden tests, oracle data, or grader-only assets during the agent phase.
+3. Grading is mandatory for scored experiments. The runner must not infer pass/fail from agent or grader exit code alone.
+4. Benchmark-specific translation happens at build time through mappers or built-in compilers, not in the hot path of run execution.
+5. Relative paths are authoring-only. The sealed spec contains machine-scoped absolute paths and digests.
+6. Secret values are injected at run time only. They are never embedded into the sealed package.
+7. Sandboxes are disposable. Durable state exists at the run and committed-slot layers, not in container memory.
+8. Slot commit is the exactly-once boundary. Attempts may be retried.
+9. Agent output, runner execution records, and grader conclusions are separate records with separate owners.
+10. Copies across boundaries are allowed only when isolation requires them. Redundant staging and duplicate ownership are design bugs.
+
+---
+
+## Target User Flow
+
+The intended flow is:
+
+1. User authors experiment YAML with variants, policies, grading strategy, and optional mapper references.
+2. Build compiles that YAML into sealed `experiment.json`, resolving relative paths to absolute machine paths and hashing artifacts.
+3. `lab-cli run` accepts run-time env injection and creates a run-local execution overlay.
+4. The durable run engine expands the schedule and drives slot attempts.
+5. Each attempt materializes an agent sandbox, runs the agent contract, materializes grading, runs grading, validates outputs, and commits the slot.
+
+The important separation is:
+
+1. YAML expresses intent.
+2. Sealed JSON expresses machine-resolved configuration.
+3. Run overlay expresses ephemeral run-time inputs such as secrets.
+4. Attempts execute sandboxes.
+5. Commit persists facts.
+
+---
+
+## Authoring Contract
+
+### Authoring YAML
+
+The experiment YAML should express only user intent and build-time references. It should not encode container-internal paths or Docker command fragments.
+
+Example:
 
 ```yaml
 experiment:
@@ -36,815 +117,1592 @@ experiment:
   owner: jevin
 
 dataset:
-  path: ./swebench_lite_tasks.jsonl
+  source: ./datasets/swebench_lite.jsonl
+  task_mapper: ./mappers/swebench_task_mapper.py
 
 agent:
-  artifact: .lab/agents/nova-current.tar.gz
-  # No command. Agent implements CLI contract:
-  #   <binary> --input <path> --output <path> [variant args]
+  artifact: ./.lab/agents/rex-current.tar.gz
+  executable: bin/rex
+  artifact_type: patch_submission
 
 variants:
   glm_5:
-    bindings: { model_provider: z.ai-coder, model: glm-5 }
+    bindings: { model_provider: z_ai, model: glm-5 }
     args: [--session-key, "${TRIAL_ID}", --dangerous]
-  gpt_5_3:
+  gpt_5_spark:
     bindings: { model_provider: codex, model: gpt-5.3-codex-spark }
     args: [--session-key, "${TRIAL_ID}", --dangerous]
 
-artifact_type: patch_submission
-
 grading:
-  strategy: image_baked
-  command: [python, /opt/bench/run_tests.py]
+  strategy: in_task_image
+  command: [python, /opt/grader/run.py]
+  conclusion:
+    mode: mapper
+    mapper: ./mappers/swebench_conclusion_mapper.py
+  in_task_image:
+    hidden_paths: [/testbed/.hidden]
+    revealed_paths: [/testbed/.hidden]
 
 design:
   replications: 1
-  max_concurrency: 1
+  max_concurrency: 4
   random_seed: 42
 
 limits:
-  trial_seconds: 600
+  time_limit_ms: 600000
 
 network:
   mode: full
 ```
 
-### Changes
+### Build-time mappers
 
-1. **No `command`** — the agent binary implements a CLI contract. The runner constructs the invocation: `<binary> --input <input_path> --output <output_path> [variant args]`. The binary path is derived from the mounted artifact.
+Users may need to provide two different mappers:
 
-2. **Flat variant map** — variants are keyed by ID. No baseline/treatment distinction. That's an analysis-time concern, not a runtime one. Removes `baseline` and `variant_plan[]` top-level keys.
+1. `task_mapper`
+   Translates benchmark-native rows into generic task rows the runner can execute.
+2. `conclusion_mapper`
+   Translates grader-native output into the normalized conclusion boundary when the grader cannot emit the generic conclusion schema directly.
 
-3. **No workspace spec in YAML** — workspace details (base kind, overlays, aux_mounts, dependencies) move to the task JSONL. The experiment YAML doesn't know about workspace materialization.
+These are build-time or grading-time boundary adapters. They are not runner topology hooks.
 
-4. **`artifact_type` declared at experiment level** — declares what the agent produces (e.g. `patch_submission`). Narrow set of types initially.
+### What authoring must not contain
 
-5. **`grading` with `strategy`** — one of three strategies (see Part 5).
-
-6. **`runtime` section eliminated** — replaced by `agent`, `network`, `limits`. Sandbox hardening becomes implicit (always enabled).
-
-### Files affected
-
-- `rust/crates/lab-runner/src/config.rs` (1710 lines) — experiment YAML parsing, knob validation, runtime resolution. **Major rewrite** of all config parsing functions.
-- `rust/crates/lab-runner/src/validations.rs` (1488 lines) — preflight checks reference current schema shape. **Rewrite** preflight validators against new schema.
-- `schemas/resolved_experiment.jsonschema` — **Replace** with new schema.
-- `scripts/build-curated-swebench-lite.mjs` and all `build_swebench_curated_ab_experiment.mjs` instances — **Delete or rewrite** to emit new YAML shape.
-
-### Types to change (`types.rs`)
-
-- **Delete**: `BenchmarkPolicyConfig.task_model`, `BenchmarkPolicyConfig.scoring_lifecycle`, `BenchmarkPolicyConfig.evaluator_mode`, `BenchmarkPolicyConfig.chain_failure_policy`
-- **Delete**: `StatePolicy` enum (`IsolatePerTrial`, `PersistPerTask`, `Accumulate`)
-- **Delete**: `TaskModel` enum (`Independent`, `Dependent`)
-- **Restructure**: `Variant` — remove `runtime_overrides`, keep `id`, `bindings`, `args`, `env`
-- **Add**: `GradingStrategy` enum (`ImageBaked`, `Injected`, `Separate`)
-- **Add**: `ArtifactType` enum (initially `PatchSubmission`)
-- **Add**: `GradingConfig` struct (`strategy`, `command`, `script_path?`, `image?`)
+1. Host absolute paths after build output is sealed.
+2. Container mount destinations like `/opt/agent`, `/agentlab/in`, or `/workspace`.
+3. Hidden-test file movement procedures.
+4. User-authored `docker run` fragments.
+5. Secret values.
 
 ---
 
-## Part 2: Task JSONL Overhaul
+## Sealed Spec and Run Overlay
 
-### Current state
+### Build output
 
-Each line in the task JSONL is a full `TaskDeclaration` with `schema_version`, `task` (opaque payload), `environment` (image), `workspace` (mode, base, overlays, aux_mounts), `dependencies`, and `limits`. The runner materializes the workspace on the host from these specs.
+Build becomes compile-and-seal:
 
-### New task JSONL shape
+1. Validate authoring schema.
+2. Resolve relative paths to absolute machine paths.
+3. Execute benchmark input mapping into generic task rows.
+4. Resolve and hash the agent artifact.
+5. Resolve and hash any mapper scripts or grader assets referenced by the experiment.
+6. Emit sealed `experiment.json`.
+7. Emit `checksums.json`.
+
+The sealed spec is machine-scoped and immutable. It is the only thing the run engine consumes.
+
+### Run-time env injection
+
+Run-time secrets are injected through the run CLI, not embedded into the sealed package.
+
+Example:
+
+```bash
+lab-cli run experiments/swebench_eval.yaml \
+  --env OPENAI_API_KEY=... \
+  --env ZAI_CODER_API_KEY=...
+```
+
+Semantics:
+
+1. `lab-cli run` may implicitly build first if the input is authoring YAML.
+2. `--env` values are injected into the agent phase only by default.
+3. Grader env injection is separate and must be explicit if ever needed.
+4. The run records env key names, scopes, and provenance in run metadata, but not raw secret values.
+5. `continue` must fail fast if required env keys are missing when execution resumes.
+
+This keeps the sealed package reproducible while still allowing real credentials at execution time.
+
+### Why the sealed spec and run overlay are separate
+
+Without this separation we get one of two bad outcomes:
+
+1. Secrets leak into the sealed artifact.
+2. The sealed artifact is no longer the actual source of truth for execution inputs.
+
+The correct model is:
+
+1. sealed experiment for machine-resolved static inputs
+2. run overlay for ephemeral secrets and run-scoped overrides
+
+---
+
+## Generic Task Boundary
+
+The task mapper must emit a generic task row the runner can schedule without benchmark-specific parsing.
+
+Suggested shape:
 
 ```json
 {
   "id": "django__django-12345",
   "image": "swebench/sweb.eval.x86_64.django__django-12345:latest",
   "workdir": "/testbed",
-  "prompt": "Fix the issue described in the following problem statement...",
-  "workspace": { "kind": "image_provided" },
-  "grading": { "enabled": true }
+  "time_limit_ms": 600000,
+  "task": {
+    "problem_statement": "Fix the failing behavior described here...",
+    "repo": "django/django",
+    "base_commit": "abc123"
+  },
+  "materialization": {
+    "kind": "task_image"
+  }
 }
 ```
 
-### Changes
+The runner should only need:
 
-1. **`workdir` is required** — becomes `docker run -w <workdir>`. No more runner-side workspace path resolution.
+1. `id`
+2. `image`
+3. `workdir`
+4. opaque benchmark task payload
+5. `time_limit_ms`, with experiment-level default applied when omitted
+6. enough materialization metadata to make the container executable from the declared workdir
 
-2. **`workspace.kind: image_provided`** — new variant (per `WORKSPACE_AND_GRADING_OVERHAUL.md`). The image already contains the workspace. No host-side materialization, no git checkout, no dataset pack extraction, no overlay application.
+Fallback task shape:
 
-3. **Simplified shape** — `environment` wrapper removed, `image` is top-level. `dependencies` and `limits` removed from per-task (limits are experiment-level). Dependencies that were files-in-JSON move to image build time.
+```json
+{
+  "id": "task_123",
+  "image": "ubuntu:22.04",
+  "workdir": "/workspace/task",
+  "materialization": {
+    "kind": "base_image_bundle",
+    "task_bundle_ref": "tasks/task_bundles/task_123.tar"
+  },
+  "task": {
+    "problem_statement": "..."
+  }
+}
+```
 
-### Types to change (`types.rs`)
+`base_image_bundle` means the task row does not ship a fully baked task image. Instead, build seals a runnable task bundle, and runtime copies that bundle into the declared workdir of the declared base image. Runtime does not install dependencies in this phase.
 
-- **Add**: `WorkspaceBaseKind::ImageProvided` variant
-- **Simplify**: `TaskDeclaration` — remove `environment` wrapper (image is top-level), remove `dependencies`, remove `limits` (experiment-level)
-- **Add**: `workdir: String` field
-- **Delete**: `TaskSpec` (redundant with simplified `TaskDeclaration`)
-- **Delete**: `TaskBoundaryMaterialization` struct in `io.rs` (replaced by simpler per-task config)
+Anything beyond that is a build-time concern unless it is required for runtime sandbox creation.
 
-### Files affected
+### Why this matters
 
-- `rust/crates/lab-runner/src/io.rs` — `parse_task_declaration()`, `parse_task_spec()`, `validate_task_declaration()`, `validate_task_spec()`, `materialize_task_boundary()`, `parse_task_boundary_from_packaged_task()`. **All rewritten** to parse new shape.
-- `rust/crates/lab-runner/src/types.rs` — type changes listed above.
-- `schemas/task_declaration_v1.jsonschema` — **Replace** with new schema.
-- `scripts/build_swebench_lite_task_boundary_v3.py` — **Delete** (task boundary v3 concept replaced).
+The run engine should never need to understand:
+
+1. how SWE-bench encodes a task
+2. how Bench v0 encodes a task
+3. how hidden tests are represented upstream
+4. how a benchmark-native grader emits its own score format
+
+That translation belongs to build-time compilers and mappers.
 
 ---
 
-## Part 3: Build Stage Simplification
+## Trial Contract
 
-### Current state
+The runner-agent-grader ABI should be explicit and narrow.
 
-`build_experiment_package()` in `lifecycle.rs:2931-3135` does:
-- Load YAML with overrides
-- Create package directory structure
-- Stage tasks and dataset (copy JSONL)
-- Stage task workspace dependencies (resolve dataset packs, git checkouts to host paths)
-- Rewrite runtime/benchmark asset paths for portability
-- Stage command path references and env path references
-- Write resolved_experiment.json with all paths rewritten
-- Calculate SHA256 checksums of all package files
-- Write checksums.json and package.lock
+### IO contract surface
 
-This is ~200 lines of path staging, rewriting, and portability logic that exists because the current design externalizes workspace state from the image.
+Required IO roots:
 
-### New build stage
+1. `/agentlab/in`
+2. `/agentlab/out`
 
-Build becomes **compile**: validate + seal.
+Optional IO roots:
 
-1. Load YAML
-2. Validate schema (experiment, dataset, variants, grading, limits)
-3. Validate dataset JSONL (all tasks have `id`, `image`, `workdir`)
-4. Resolve relative paths (dataset path, agent artifact path)
-5. Compute agent artifact digest (SHA256)
-6. Write sealed `experiment.json` with resolved paths + digest
-7. Write `checksums.json`
+1. `/agentlab/metrics/<declared-id>`
 
-No task workspace dependency staging. No runtime asset path rewriting. No dataset pack resolution. No git checkout caching. The sealed JSON is a direct representation of the YAML with paths resolved and the artifact pinned.
+Local Docker may realize these as bind mounts. Another executor may realize them differently. The IO roots are the contract; the mount implementation is not.
 
-### Functions to delete from `lifecycle.rs`
+The execution workdir is a separate concern from the IO contract. It may come from the task image itself or from a sealed task bundle copied into a declared base image, but it should not be promoted into a fixed public path like `/agentlab/workspace`.
 
-- `stage_task_workspace_dependencies_for_package()` (2287-2367)
-- `stage_source_into_package()` (2377-2416)
-- `stage_public_runtime_path_reference()` (2417-2451)
-- `rewrite_packaged_runtime_asset_entries()` (2453-2490)
-- `stage_command_path_refs_for_package()` (2492-2535)
-- `stage_runtime_command_env_path_refs_for_package()` (2537-2593)
-- `collect_command_staging_entries()` (2595-2629)
-- `collect_runtime_command_env_staging_entries()` (2631-2687)
-- `lookup_runtime_staging_entry()` (2688-2701)
-- `matches_contract_runtime_root()` (2702-2707)
-- `collect_packaged_runtime_asset_entries()` (2709-2747)
-- `merge_runtime_path_staging_entries()` (2749-2764)
-- `write_runtime_staging_manifest()` (2765-2828)
-- `rewrite_runtime_paths_for_package()` (2829-2868)
-- `rewrite_benchmark_paths_for_package()` (2870-2912)
+### Primary files
 
-That's ~630 lines of build-stage path staging deleted.
+1. `/agentlab/in/trial_input.json`
+2. `/agentlab/in/grader_input.json`
+3. `/agentlab/out/result.json`
+4. optional `/agentlab/out/raw_grader_output.json`
+5. `/agentlab/out/mapped_grader_output.json`
+6. optional runner-owned auxiliary grading inputs under `/agentlab/in/grader/...`
+7. any telemetry files explicitly declared by the experiment under mounted `/agentlab/metrics/<declared-id>/...`
 
-### Functions to rewrite
+### Ownership
 
-- `build_experiment_package()` (2931-3135) — **Rewrite** to the simplified compile flow above.
+1. The runner owns `trial_input.json`, `grader_input.json`, runner-created auxiliary grading inputs, logs, and execution metadata.
+2. The agent owns `result.json` and any declared telemetry files it emits.
+3. The grader owns `raw_grader_output.json` when mapper mode is used, and any declared telemetry files it emits.
+4. `mapped_grader_output.json` is the canonical grading boundary. It is written either directly by the grader or by the explicit grader-mapping phase.
+
+This is a hard separation. The runner should not fabricate `result.json`, and the agent should not fabricate `mapped_grader_output.json`.
+
+### What is not part of the base contract
+
+1. No mounted `control.json` file in the base design. Durable scheduling and crash retry do not require a per-trial control mount.
+2. No generic `/agentlab/deps` mount. Support files belong in the agent artifact, the grader bundle/image, or the workspace materialization procedure.
+3. No fixed `/agentlab/workspace` contract root. The working directory is execution context, not IO ABI.
+
+### Optional telemetry contract
+
+Telemetry mounts exist only when the experiment author declares them.
+
+Suggested declaration shape:
+
+```yaml
+agent:
+  telemetry:
+    - id: hook_events
+      phase: agent
+      rel_path: hooks/events.jsonl
+      schema: hook_events_v1
+      collect: tail
+```
+
+Lifecycle:
+
+1. User declares telemetry in YAML.
+2. Build resolves and validates that declaration into the sealed experiment spec.
+3. Attempt planning allocates host paths only for declared telemetry entries and splits them by phase.
+4. The runner mounts `/agentlab/metrics/<declared-id>` for each declared entry.
+5. Experiment-side code writes the declared file or files there.
+6. The runner collector reads only those declared paths using the declared schema and collect mode.
+7. The runner enriches collected rows with run-owned identity and writes canonical fact rows.
+8. DuckDB reads the canonical fact rows, not the raw emitted telemetry files.
+
+If telemetry is not declared:
+
+1. no metrics mount exists
+2. nothing is collected from that surface
+
+The canonical write target is still the runner-owned fact sink. The live DuckDB database is a query mirror over those appended facts, not the source of truth.
+
+### Metric provenance
+
+The proposal should separate where metrics come from instead of flattening them into one vague bucket.
+
+1. Runner structural metrics come from runner-owned timers and process observation.
+   Examples: phase start/end timestamps, wall-clock duration, exit code, timeout, signal.
+2. Agent-reported metrics come from `result.json.metrics`.
+   The runner persists them as agent-owned values and does not reinterpret them as benchmark truth.
+3. Telemetry-derived metrics exist only when a telemetry surface is declared and the declared schema supports aggregation.
+   Example: declared `hook_events_v1` telemetry can be aggregated into token counts, tool-call counts, or model-call latency summaries.
+4. Grader-reported metrics come from `trial_conclusion_v1.payload` or optional projection fields.
+
+This matters because "latency" and "tokens" are not magic runner facts. If we want them in the new flow, we need to be able to point to a concrete producer:
+
+1. runner timing for structural duration
+2. declared hook telemetry for token and call aggregation
+3. agent `result.json.metrics` for agent-owned opaque metrics
+4. grader conclusion payload for grading-owned metrics
 
 ---
 
-## Part 4: Async Docker Executor (Bollard + Tokio)
+## Agent CLI Contract
 
-### Current state
+The agent runtime must implement a fixed CLI contract.
 
-All Docker interaction is via synchronous `std::process::Command` shell-outs in `io.rs`:
+Suggested invocation:
 
-- `build_baked_container_command()` (3471-3487) — constructs `docker run --rm` command
-- `append_container_sandbox_args()` (3244-3382) — adds ~140 lines of `-v`, `--network`, `--read-only`, `--security-opt`, `--cap-drop`, `--cpus`, `--memory`, `--tmpfs` args
-- `append_container_env_args()` (3383-3407) — adds `-e KEY=VALUE` args
-- `append_container_entrypoint()` (3409-3469) — wraps agent+grader in shell script
-- `run_external_agent_runtime_trial()` (3089-3192) — orchestrates: validate artifact → pull images → build command → spawn process → optionally run grader sidecar
-- `run_adapter_process()` (4180-4273) — spawns child process, captures stdout/stderr to files
-- `run_container_sidecar_command()` (3046-3087) — runs grader as separate docker run
-- `ensure_container_image_ready()` (3534-3583) — `docker image inspect` + `docker pull`
-- `resolve_container_image_digest()` (3585-3623) — `docker image inspect --format`
-
-The adapter pattern (`AgentAdapter` trait in `core.rs:599`) wraps this:
-- `BuiltinCommandAdapter.run_trial()` → `run_command_contract_trial()` → `run_external_agent_runtime_trial()`
-- `PrebuiltCommandAdapter.run_trial()` → same path with env overrides
-
-### New architecture: `lab-docker` crate
-
-Create a new crate `rust/crates/lab-docker` that owns all Docker interaction via Bollard.
-
-```
-lab-docker/
-  src/
-    lib.rs           — public API
-    client.rs        — Bollard client wrapper, image operations
-    container.rs     — container lifecycle (create, start, exec, wait, remove)
-    mounts.rs        — mount builder (IO contract mounts, agent artifact mount)
-    exec.rs          — exec builder (run commands inside containers)
-    types.rs         — ContainerConfig, ExecResult, MountSpec, etc.
+```text
+<artifact-exec> run --input /agentlab/in/trial_input.json --output /agentlab/out/result.json [variant args...]
 ```
 
-#### Core types
+Notes:
 
-```rust
-/// What the trial executor works with — one container's full lifecycle.
-pub struct ContainerSession {
-    client: Docker,
-    container_id: String,
-    image: String,
-}
+1. The runner constructs the invocation.
+2. The executable path is derived from the mounted artifact plus `agent.executable`.
+3. Variant `args` are appended as literal `argv`.
+4. The agent starts in the declared task `workdir`.
+5. The runner may also inject stable identity env vars, but input and output are explicit CLI arguments.
 
-/// Mount specification for the IO contract.
-pub struct TrialMountSpec {
-    pub input_host: PathBuf,      // → /agentlab/in:ro
-    pub output_host: PathBuf,     // → /agentlab/out
-    pub metrics_host: PathBuf,    // → /agentlab/metrics
-    pub agent_artifact: PathBuf,  // → /opt/agent:ro
-}
+This removes the current ambiguity where the runner both exports stable paths and also synthesizes custom IO templates in multiple ways.
 
-/// Result of an exec call inside a container.
-pub struct ExecOutcome {
-    pub exit_code: i64,
-    pub stdout: String,
-    pub stderr: String,
-}
-```
+### Allowed templating in variant args
 
-#### Container lifecycle API
+Only runner-owned scalar substitutions should be allowed in `variant.args`, for example:
 
-```rust
-impl ContainerSession {
-    /// Create and start a container from a task image.
-    pub async fn create(
-        client: &Docker,
-        image: &str,
-        workdir: &str,
-        mounts: &TrialMountSpec,
-        env: &[(String, String)],
-        network_mode: &str,
-    ) -> Result<Self>;
+1. `${TRIAL_ID}`
+2. `${VARIANT_ID}`
+3. `${TASK_ID}`
 
-    /// Execute a command inside the running container.
-    pub async fn exec(&self, cmd: &[&str], workdir: Option<&str>) -> Result<ExecOutcome>;
+No templating should expose host paths or mount destinations.
 
-    /// Copy files into the container (for Injected grading).
-    pub async fn copy_in(&self, archive: &[u8], dest_path: &str) -> Result<()>;
+### Trial input shape
 
-    /// Copy files out of the container (for collecting artifacts).
-    pub async fn copy_out(&self, src_path: &str) -> Result<Vec<u8>>;
+`trial_input.json` should remain a runner-owned envelope that combines:
 
-    /// Wait for the container's main process to exit.
-    pub async fn wait(&self) -> Result<i64>;
+1. trial identity
+2. opaque task payload
+3. variant bindings
+4. limits and timeouts
+5. requested network mode
+6. execution facts that are safe for the agent to know about
 
-    /// Remove the container.
-    pub async fn remove(self) -> Result<()>;
-
-    /// Pull an image if not present locally.
-    pub async fn ensure_image(client: &Docker, image: &str) -> Result<()>;
-}
-```
-
-#### What this replaces in `io.rs`
-
-| Current function | Lines | Replacement |
-|---|---|---|
-| `build_baked_container_command()` | 3471-3487 | `ContainerSession::create()` |
-| `append_container_sandbox_args()` | 3244-3382 | `ContainerSession::create()` config |
-| `append_container_env_args()` | 3383-3407 | `ContainerSession::create()` env param |
-| `append_container_entrypoint()` | 3409-3469 | `ContainerSession::exec()` calls |
-| `run_external_agent_runtime_trial()` | 3089-3192 | `TrialExecutor` (see Part 6) |
-| `run_adapter_process()` | 4180-4273 | `ContainerSession::exec()` + `wait()` |
-| `run_container_sidecar_command()` | 3046-3087 | `ContainerSession::exec()` |
-| `ensure_container_image_ready()` | 3534-3583 | `ContainerSession::ensure_image()` |
-| `resolve_container_image_digest()` | 3585-3623 | Bollard `inspect_image()` |
-| `resolve_container_platform()` | 3517-3527 | Bollard platform config |
-| `append_container_platform_arg()` | 3528-3531 | Bollard platform config |
-| `resolve_local_image_alias()` | 3510-3516 | `ensure_image()` with alias logic |
-
-### Workspace dependencies
-
-Add to `rust/Cargo.toml` workspace dependencies:
-
-```toml
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "fs", "process", "sync"] }
-bollard = "0.18"
-futures-util = "0.3"
-```
-
-Add `rust/crates/lab-docker/Cargo.toml`:
-
-```toml
-[dependencies]
-bollard.workspace = true
-tokio.workspace = true
-futures-util.workspace = true
-anyhow.workspace = true
-serde.workspace = true
-serde_json.workspace = true
-lab-core = { path = "../lab-core" }
-```
+The existing `trial_input_v1` schema is a reasonable starting point. The main cutover requirement is that the agent consumes a stable runner-owned envelope rather than benchmark-native task rows directly.
 
 ---
 
-## Part 5: Grading Pipeline
+## Agent Result Envelope
 
-### Current state
+The agent produces a candidate artifact envelope, not a benchmark verdict.
 
-Grading is conflated with trial execution. The grader runs either:
-1. As part of a shell-script wrapper baked into the container entrypoint (`append_container_entrypoint()` in `io.rs:3409-3469`) — agent and grader run sequentially in one `docker run` via `/bin/sh -lc "agent_cmd; grader_cmd"`.
-2. As a sidecar `docker run` via `run_container_sidecar_command()` (`io.rs:3046-3087`).
+Suggested shape:
 
-The grader reads `result.json`, computes a prediction, runs evaluation, and writes `benchmark_prediction.json` + `benchmark_score.json` to `/agentlab/out/`.
+```json
+{
+  "schema_version": "artifact_envelope_v1",
+  "artifact_type": "patch_submission",
+  "artifact": {
+    "base_commit": "abc123",
+    "patch_format": "unified_diff",
+    "patch": "diff --git a/..."
+  },
+  "metadata": {
+    "agent_version": "rex-2026-03-13"
+  }
+}
+```
 
-The runner then loads these files (`lifecycle.rs:354-378`) and persists them to SQLite.
+Initial `artifact_type` values can be narrow:
 
-### New grading architecture: three strategies
+1. `patch_submission`
+2. `text_response`
+3. `structured_json`
+4. `file_ref`
 
-All three strategies share the same contract:
-- **Input**: output envelope from `/agentlab/out/result.json` (with declared `artifact_type`)
-- **Output**: score record written to `/agentlab/out/score.json`
+The agent envelope says what the agent produced. It does not say whether the benchmark considers that correct.
+
+### Candidate artifact extraction
+
+The lifecycle needs one more explicit step: the runner must turn the raw result envelope into a canonical candidate artifact record.
+
+Rules:
+
+1. The sealed experiment declares the expected logical `artifact_type`.
+2. The agent writes `result.json`.
+3. The runner validates the envelope schema and validates that the declared artifact matches the expected `artifact_type`.
+4. The agent may provide the artifact inline in `result.json` or by file reference under `/agentlab/out`.
+5. The runner resolves that into a runner-owned `CandidateArtifactRecord` with a concrete validity state.
+6. If extraction fails, that becomes contract state. Grading still runs.
+
+The important boundary is:
+
+1. `result.json` is the agent's declaration of its candidate artifact.
+2. artifact extraction is the runner's validation and canonicalization step.
+3. benchmark verdict still belongs to grading.
+
+### Runner-owned workspace delta
+
+Regardless of `artifact_type` or workspace materialization kind, the runner should also persist an observed workspace delta for every attempt.
+
+That is a separate lifecycle from the agent artifact:
+
+1. immediately before agent execution, the runner captures a pre-agent observation of the execution work state
+2. immediately after agent execution, the runner captures a post-agent observation of the same state
+3. the runner derives a delta from pre to post and persists it
+4. the runner may derive a patch-like text representation when that delta format supports it
+
+Observation depends on workspace realization:
+
+1. `task_image` -> snapshot the execution workdir inside the container
+2. `base_image_bundle` -> snapshot the execution workdir inside the container after the sealed task bundle has been copied into place
+
+This delta is runner-owned evidence. It is not the agent artifact. Some benchmarks may grade the declared candidate artifact, some may prefer the observed workspace delta, and some may inspect both. That choice belongs in the grading logic, not in the agent ABI.
+
+---
+
+## Grader Input and Mapped Output
+
+The grader must not infer everything from exit codes or missing files. It should receive a normalized runner-owned grading input envelope.
+
+### Grader input
+
+Suggested shape:
+
+```json
+{
+  "schema_version": "grader_input_v1",
+  "ids": {
+    "run_id": "run_...",
+    "trial_id": "trial_...",
+    "variant_id": "glm_5",
+    "task_id": "django__django-12345"
+  },
+  "task": {
+    "problem_statement": "Fix the failing behavior described here..."
+  },
+  "artifact_type": "patch_submission",
+  "agent_phase": {
+    "exit_code": 124,
+    "timed_out": true,
+    "result_present": false,
+    "result_schema_valid": false,
+    "started_at": "2026-03-13T10:00:00Z",
+    "ended_at": "2026-03-13T10:10:00Z"
+  },
+  "candidate_artifact": {
+    "state": "valid",
+    "artifact_type": "patch_submission",
+    "source": "result.inline",
+    "payload": {
+      "base_commit": "abc123",
+      "patch_format": "unified_diff",
+      "patch": "diff --git a/..."
+    }
+  },
+  "workspace_delta": {
+    "state": "available",
+    "diff_path": "/agentlab/in/grader/workspace_diff.json",
+    "patch_path": "/agentlab/in/grader/workspace.patch"
+  },
+  "paths": {
+    "result_path": "/agentlab/out/result.json"
+  },
+  "workdir": "/testbed"
+}
+```
+
+This is the key hardening move for edge cases:
+
+1. Grading still runs when the agent timed out.
+2. Grading still runs when `result.json` is missing or malformed.
+3. The runner does not invent a benchmark verdict on behalf of the grader.
+
+### Mapped grader output
+
+The grader must emit a normalized conclusion boundary that preserves grader-owned output without forcing benchmark-specific fields into the runner ABI.
+
+Suggested shape:
+
+```json
+{
+  "schema_version": "trial_conclusion_v1",
+  "payload": {
+    "verdict": "pass",
+    "resolved": 1.0,
+    "tests_passed": 42,
+    "tests_total": 42
+  },
+  "reported_outcome": "success",
+  "primary_metric": {
+    "name": "resolved",
+    "value": 1.0
+  },
+  "grader": {
+    "name": "swebench",
+    "strategy": "in_task_image",
+    "version": "v1"
+  }
+}
+```
+
+This `trial_conclusion_v1` payload is stored in the canonical mapped output file at `/agentlab/out/mapped_grader_output.json`.
+
+If grading cannot produce a valid mapped output, the runner must persist a separate runner-owned grading failure record and commit the slot with status `grading_failed`. It must not fabricate a pass/fail conclusion on the grader's behalf.
+
+### Conclusion mapping
+
+Preferred path:
+
+1. grader writes `trial_conclusion_v1` directly to `/agentlab/out/mapped_grader_output.json`
+
+Allowed escape hatch:
+
+1. grader writes benchmark-native output to `/agentlab/out/raw_grader_output.json`
+2. an explicit `grader_mapping` phase runs after grading
+3. `conclusion_mapper` reads the raw output and writes `trial_conclusion_v1` to `/agentlab/out/mapped_grader_output.json`
+
+Either way, the committed contract is the normalized conclusion record.
+
+### Runner persistence of grading
+
+The runner should persist the grading boundary exactly as it was produced, plus runner-owned contract state.
+
+That means:
+
+1. `mapped_output_state` is runner-owned contract state.
+2. `payload` is grader-owned grading output.
+3. `reported_outcome` and `primary_metric`, if present, are grader-owned or mapper-owned reporting projections.
+4. If those projection fields are absent, the committed trial record just carries the raw payload and the contract state.
+5. The runner must not fabricate a benchmark verdict, score, or success bit that the grading boundary did not provide.
+
+---
+
+## Durable Orchestration Model
+
+The experiment runner is a durable state machine, but the dynamic state must be tracked in the right places.
+
+### Static vs dynamic state
+
+1. Variant is static configuration.
+2. Schedule slot is the durable unit of planned work.
+3. Attempt is the ephemeral execution instance of a slot.
+
+So the answer to "per variant, per trial, are we using traits or state?" is:
+
+1. Variants are not stateful actors.
+2. Slots and attempts are where dynamic execution state lives.
+
+### Durable source of truth
+
+The durable source of truth should be:
+
+1. sealed experiment spec
+2. schedule progress
+3. slot commit journal
+4. committed trial artifacts and facts
+
+Attempt-local state may be persisted for observability, but it is not the correctness boundary.
+
+### Recommended slot/attempt phases
+
+Attempts should move through these phases:
+
+1. `pending`
+2. `agent_materializing`
+3. `agent_running`
+4. `agent_finished`
+5. `grader_materializing`
+6. `grader_running`
+7. `grader_mapping`
+8. `commit_pending`
+9. `committed`
+10. `abandoned`
+
+Only `committed` advances durable schedule progress.
+
+### Crash semantics
+
+The durable behavior is:
+
+1. committed slots survive crash
+2. active attempts may be abandoned and retried
+3. exactly-once applies to slot publication, not to process attempts
+
+---
+
+## Data Model and Procedure Inputs
+
+The right mental model here is not "a big `TrialExecutor` object." The right mental model is:
+
+1. durable trial state records
+2. small enums that select procedures
+3. low-level functions that consume one state record and produce the next one
+
+Whether that ends up implemented as a module, namespace, or a thin struct wrapper is secondary. The important thing is the data and the transitions.
+
+### Enums that actually drive behavior
+
+These are the enums that should branch the low-level execution procedures.
 
 ```rust
+pub enum TaskMaterializationKind {
+    TaskImage,
+    BaseImageBundle,
+}
+
 pub enum GradingStrategy {
-    /// Grader is baked into the task image. Hidden from agent via
-    /// mv/rename during agent phase, unhidden for grading phase.
-    ImageBaked {
-        command: Vec<String>,
-        hidden_path: String,        // e.g. "/opt/bench"
-        hidden_rename: String,      // e.g. "/opt/.bench_hidden"
-    },
+    InTaskImage,
+    Injected,
+    Separate,
+}
 
-    /// Grader script is copied into the container after agent exits.
+pub enum TrialPhase {
+    Pending,
+    AgentMaterializing,
+    AgentRunning,
+    AgentFinished,
+    GraderMaterializing,
+    GraderRunning,
+    GraderMapping,
+    CommitPending,
+    Committed,
+    Abandoned,
+}
+
+pub enum ContractFileState {
+    Missing,
+    PresentInvalid,
+    Valid,
+}
+```
+
+These are upstream policy selectors. They are not incidental implementation details:
+
+1. `TaskMaterializationKind` decides whether runtime uses a task image as-is or copies a sealed task bundle into a declared base image.
+2. `GradingStrategy` decides how grader assets become visible and whether the grader reuses the task container.
+3. `TrialPhase` is the durable progression for one attempt.
+4. `ContractFileState` prevents us from collapsing "file missing" and "file malformed" into the same vague failure bucket.
+
+### Core state records
+
+Suggested state records:
+
+```rust
+pub struct TrialSlot {
+    pub schedule_idx: u32,
+    pub variant_id: String,
+    pub task_id: String,
+    pub repl_idx: u32,
+}
+
+pub struct TrialAttemptKey {
+    pub schedule_idx: u32,
+    pub attempt: u32,
+}
+
+pub struct TrialAttemptState {
+    pub key: TrialAttemptKey,
+    pub slot: TrialSlot,
+    pub phase: TrialPhase,
+    pub fs: AttemptFsLayout,
+    pub task_sandbox: Option<TaskSandboxState>,
+    pub grading_sandbox: Option<GradingSandboxState>,
+    pub agent_phase: Option<AgentPhaseRecord>,
+    pub grading_phase: Option<GradingPhaseRecord>,
+    pub mapping_phase: Option<GraderMappingPhaseRecord>,
+    pub candidate_artifact: Option<CandidateArtifactRecord>,
+    pub workspace_delta: Option<WorkspaceDeltaRecord>,
+}
+
+pub struct AttemptFsLayout {
+    pub attempt_dir: String,
+    pub in_dir: String,
+    pub out_dir: String,
+    pub telemetry_mounts: Vec<DeclaredTelemetryMount>,
+    pub logs_dir: String,
+}
+
+pub struct DeclaredTelemetryMount {
+    pub id: String,
+    pub phase: TelemetryPhase,
+    pub host_dir: String,
+    pub container_dir: String,
+    pub rel_path: String,
+    pub schema: Option<String>,
+    pub collect_mode: CollectMode,
+}
+
+pub enum TelemetryPhase {
+    Agent,
+    Grader,
+}
+
+pub enum CollectMode {
+    Tail,
+    AfterPhase,
+}
+
+pub struct AgentPhaseRecord {
+    pub started_at: String,
+    pub ended_at: String,
+    pub exit_code: Option<i32>,
+    pub signal: Option<String>,
+    pub timed_out: bool,
+    pub result_state: ContractFileState,
+    pub stdout_path: String,
+    pub stderr_path: String,
+}
+
+pub struct GradingPhaseRecord {
+    pub started_at: String,
+    pub ended_at: String,
+    pub exit_code: Option<i32>,
+    pub signal: Option<String>,
+    pub timed_out: bool,
+    pub raw_output_state: ContractFileState,
+    pub stdout_path: String,
+    pub stderr_path: String,
+}
+
+pub struct GraderMappingPhaseRecord {
+    pub started_at: String,
+    pub ended_at: String,
+    pub mapped_output_state: ContractFileState,
+    pub stdout_path: String,
+    pub stderr_path: String,
+}
+
+pub struct CandidateArtifactRecord {
+    pub state: CandidateArtifactState,
+    pub artifact_type: String,
+    pub source: CandidateArtifactSource,
+    pub payload: Option<serde_json::Value>,
+}
+
+pub enum CandidateArtifactState {
+    Missing,
+    Invalid,
+    Valid,
+}
+
+pub enum CandidateArtifactSource {
+    ResultInline,
+    ResultFileRef,
+    None,
+}
+
+pub struct WorkspaceDeltaRecord {
+    pub observation_kind: WorkspaceObservationKind,
+    pub pre_observation_path: String,
+    pub post_observation_path: String,
+    pub diff_path: String,
+    pub patch_path: Option<String>,
+}
+
+pub struct WorkspaceObservationRecord {
+    pub observation_kind: WorkspaceObservationKind,
+    pub observation_path: String,
+}
+
+pub enum WorkspaceObservationKind {
+    ContainerTree,
+}
+```
+
+Two points matter here:
+
+1. `TrialSlot` is schedule-level and durable.
+2. `TrialAttemptState` is the evolving record that each low-level step updates.
+3. `AttemptFsLayout` is just the runner's local filesystem layout for one attempt. It is allocated by the runner after slot claim, then consumed by planning and execution code. It is not a user-facing contract.
+
+Its lifecycle is:
+
+1. the runner allocates it immediately after claiming an attempt
+2. plan derivation reads it to choose concrete host paths for mounts and files
+3. execution code writes contract inputs, logs, and optional declared telemetry into it
+4. commit code persists references or copies out whatever must survive the attempt
+5. the remainder is disposable attempt-local scratch space
+
+### Spec vs plan vs state
+
+These terms should be used consistently:
+
+1. `spec`
+   Durable declarative input. Loaded from the sealed experiment, task row, variant config, or grading config. A spec says what should be true, not how this specific attempt will realize it.
+2. `plan`
+   Attempt-local operational instructions derived from specs plus run overlay plus host allocation. A plan can include host paths, chosen mount realizations, selected images, and exact procedure branches.
+3. `state`
+   Observed runtime facts after a step has executed. Container ids, exit codes, file validity states, and timestamps are state.
+
+In other words:
+
+1. `TaskRow`, `VariantSpec`, `GradingConfig` are specs.
+2. `TaskSandboxPlan` and `GradingSandboxPlan` are plans.
+3. `TrialAttemptState`, `TaskSandboxState`, and `GradingPhaseRecord` are state.
+
+### Task sandbox planning data
+
+Task sandbox materialization should be driven by an explicit plan record, not by ad-hoc branching deep in execution code.
+
+```rust
+pub struct TaskSandboxPlan {
+    pub image: String,
+    pub workdir: String,
+    pub materialization: TaskMaterializationPlan,
+    pub io_mounts: IoMountPlan,
+    pub artifact_mount: ArtifactMountPlan,
+    pub network_mode: String,
+    pub time_limit_ms: u64,
+}
+
+pub struct IoMountPlan {
+    pub in_dir: String,
+    pub out_dir: String,
+    pub telemetry_mounts: Vec<DeclaredTelemetryMount>,
+}
+
+pub struct ArtifactMountPlan {
+    pub host_artifact_path: String,
+    pub container_artifact_dir: String,
+}
+
+pub enum TaskMaterializationPlan {
+    TaskImage,
+    BaseImageBundle {
+        task_bundle_ref: String,
+    },
+}
+
+pub struct TaskSandboxState {
+    pub container_id: String,
+    pub image: String,
+    pub workdir: String,
+    pub materialization: TaskMaterializationPlan,
+}
+```
+
+Important consequence:
+
+1. `TaskImage` means runtime does not populate the workdir. The declared image is already executable from that workdir.
+2. `BaseImageBundle` means build produced a sealed task bundle, and runtime copies that bundle into the declared workdir of the declared base image.
+3. Dataset packs, git checkouts, or any other upstream benchmark source formats are build-time compiler inputs, not runtime materialization branches.
+
+That difference should be obvious in the data shape.
+
+### Grading sandbox planning data
+
+Grading must have its own plan record because it is governed by a different upstream enum and different low-level steps.
+
+```rust
+pub struct GradingSandboxPlan {
+    pub strategy: GradingStrategy,
+    pub command: Vec<String>,
+    pub io_mounts: IoMountPlan,
+    pub output_mode: GraderOutputMode,
+    pub details: GradingSandboxDetails,
+}
+
+pub enum GradingSandboxDetails {
+    InTaskImage {
+        hidden_paths: Vec<String>,
+        revealed_paths: Vec<String>,
+    },
     Injected {
-        script_host_path: PathBuf,
-        script_container_path: String,
-        command: Vec<String>,
+        bundle_host_path: String,
+        copy_dest: String,
     },
-
-    /// Grader runs in a separate container with the output mounted in.
     Separate {
         image: String,
-        command: Vec<String>,
+        workdir: String,
     },
 }
-```
 
-#### ImageBaked execution flow
+pub struct GradingSandboxState {
+    pub container_id: String,
+    pub strategy: GradingStrategy,
+    pub workdir: String,
+}
 
-```rust
-// 1. Hide grading assets from agent
-session.exec(&["mv", "/opt/bench", "/opt/.bench_hidden"], None).await?;
+pub enum GraderOutputMode {
+    DirectMapped,
+    RawThenMap {
+        mapper_ref: String,
+    },
+}
 
-// 2. Run agent
-session.exec(&agent_command, Some(workdir)).await?;
-
-// 3. Unhide grading assets
-session.exec(&["mv", "/opt/.bench_hidden", "/opt/bench"], None).await?;
-
-// 4. Run grader
-session.exec(&grader_command, Some(workdir)).await?;
-
-// 5. Collect score
-let score = session.copy_out("/agentlab/out/score.json").await?;
-```
-
-This replaces the 60-line shell script wrapper in `append_container_entrypoint()` with explicit, auditable exec calls.
-
-#### Injected execution flow
-
-```rust
-// 1. Run agent
-session.exec(&agent_command, Some(workdir)).await?;
-
-// 2. Copy grader script into container
-let archive = tar_file(&script_host_path)?;
-session.copy_in(&archive, "/opt/grader/").await?;
-
-// 3. Run grader
-session.exec(&grader_command, Some(workdir)).await?;
-```
-
-#### Separate execution flow
-
-```rust
-// 1. Run agent in task container
-session.exec(&agent_command, Some(workdir)).await?;
-
-// 2. Copy output envelope out
-let result = session.copy_out("/agentlab/out/result.json").await?;
-session.remove().await?;
-
-// 3. Create grader container, mount result in
-let grader_session = ContainerSession::create(
-    &client, &grader_image, "/", &grader_mounts, &[], network_mode
-).await?;
-grader_session.exec(&grader_command, None).await?;
-let score = grader_session.copy_out("/agentlab/out/score.json").await?;
-grader_session.remove().await?;
-```
-
-### Output envelope contract
-
-The agent writes a structured output envelope to `/agentlab/out/result.json`:
-
-```json
-{
-  "schema_version": "output_envelope_v1",
-  "artifact_type": "patch_submission",
-  "format": "v1",
-  "base_commit": "abc123",
-  "patch_format": "unified_diff",
-  "patch": "diff --git a/..."
+pub struct GraderMappingPlan {
+    pub mapper_ref: String,
 }
 ```
 
-`artifact_type` matches the experiment-level declaration. Initially supported:
-- `patch_submission` — unified diff patch (SWE-bench)
+This is the important separation you were pointing at:
 
-Future types (not implemented now):
-- `text_response` — free-text answer
-- `structured_json` — schema-validated JSON
-- `file_artifact` — reference to a file in the output directory
+1. task sandbox materialization is about workspace and agent execution
+2. grading sandbox materialization is about hidden assets and verdict production
 
-### Score record contract
+They are related, but they are not the same procedure and should not share one overloaded config object.
 
-The grader writes to `/agentlab/out/score.json`:
+### Low-level procedure surface
 
-```json
-{
-  "schema_version": "score_record_v1",
-  "verdict": "pass",
-  "primary_metric_name": "resolved",
-  "primary_metric_value": 1.0,
-  "metrics": { "tests_passed": 42, "tests_total": 42 },
-  "evaluator": { "name": "swebench.test_runner", "version": "v1" }
-}
+The low-level implementation should look like procedure steps over these records:
+
+```rust
+fn derive_task_sandbox_plan(
+    slot: &TrialSlot,
+    task: &TaskRow,
+    variant: &VariantSpec,
+    fs: &AttemptFsLayout,
+) -> TaskSandboxPlan;
+fn materialize_task_sandbox(plan: &TaskSandboxPlan) -> TaskSandboxState;
+fn capture_pre_agent_workspace(
+    task_sandbox: &TaskSandboxState,
+    attempt: &TrialAttemptState,
+) -> WorkspaceObservationRecord;
+fn run_agent_phase(state: &TaskSandboxState, attempt: &TrialAttemptState) -> AgentPhaseRecord;
+fn capture_post_agent_workspace(
+    task_sandbox: &TaskSandboxState,
+    attempt: &TrialAttemptState,
+) -> WorkspaceObservationRecord;
+fn derive_workspace_delta(
+    attempt: &TrialAttemptState,
+) -> WorkspaceDeltaRecord;
+fn extract_candidate_artifact(
+    attempt: &TrialAttemptState,
+    result_path: &str,
+) -> CandidateArtifactRecord;
+
+fn derive_grading_sandbox_plan(
+    slot: &TrialSlot,
+    grading: &GradingConfig,
+    task_sandbox: &TaskSandboxState,
+    agent_phase: &AgentPhaseRecord,
+) -> GradingSandboxPlan;
+fn materialize_grading_sandbox(plan: &GradingSandboxPlan) -> GradingSandboxState;
+fn run_grading_phase(state: &GradingSandboxState, attempt: &TrialAttemptState) -> GradingPhaseRecord;
+fn run_grader_mapping_phase(
+    plan: &GraderMappingPlan,
+    attempt: &TrialAttemptState,
+) -> GraderMappingPhaseRecord;
+
+fn collect_declared_telemetry(
+    fs: &AttemptFsLayout,
+    phase: TelemetryPhase,
+    attempt: &TrialAttemptState,
+) -> CollectedTelemetry;
+
+fn build_commit_record(attempt: &TrialAttemptState) -> SlotCommitRecord;
 ```
 
-### Files affected
+The point is not the exact function names. The point is:
 
-- **Delete**: `adapters/swebench/swebench_task_container_grader.py` (per `WORKSPACE_AND_GRADING_OVERHAUL.md`)
-- **Delete**: `adapters/swebench/swebench_official_benchmark_adapter.py`
-- **Delete**: `adapters/swebench/_swebench_meta.py`
-- **Delete**: `adapters/swebench/__init__.py`
-- **Replace**: `schemas/benchmark_prediction_record_v1.jsonschema` → `schemas/output_envelope_v1.jsonschema`
-- **Replace**: `schemas/benchmark_score_record_v1.jsonschema` → `schemas/score_record_v1.jsonschema`
+1. planning and materialization are separate
+2. task and grading each get their own plan/state records
+3. workspace observation and candidate-artifact extraction are explicit steps
+4. every step consumes explicit data and returns explicit data
+5. declared telemetry ingestion is an explicit step, not an accidental side effect
 
 ---
 
-## Part 6: Trial Executor Rewrite
+## Program Runtime Procedure
 
-### Current state
+This is the concrete flow the program should execute.
 
-The trial execution hot path spans three files via `include!()`:
-- `lifecycle.rs` — `TrialExecutor::execute_slot()` (lines 88-769, ~680 lines) orchestrates the trial
-- `io.rs` — `prepare_task_environment()` (2308-2401), `run_external_agent_runtime_trial()` (3089-3192), and ~30 helper functions
-- `core.rs` — `AdapterRunRequest` (172-186), `AgentAdapter` trait (599-605)
+### 1. `lab-cli run` entry
 
-The flow is: `execute_slot()` → `prepare_task_environment()` → `run_external_agent_runtime_trial()` → `build_baked_container_command()` → `run_adapter_process()`. Everything is synchronous. The grader is baked into the entrypoint shell script or run as a sidecar.
+1. Parse CLI args.
+2. If the input is authoring YAML, build it into sealed `experiment.json`.
+3. Read run-time env injection flags and build a run overlay.
+4. Create the run directory and initialize durable run metadata.
+5. Load or initialize schedule progress.
 
-### New trial executor
+### 2. Schedule creation
 
-Replace the monolithic `execute_slot()` + adapter pattern with an async three-phase executor.
+1. Read the sealed experiment spec.
+2. Load compiled task rows.
+3. Expand variants x tasks x replications into `TrialSlot` records.
+4. Persist the schedule and `next_schedule_index`.
 
-```rust
-pub struct TrialExecutor {
-    docker: Docker,
-}
+At this point the durable inputs are fixed:
 
-impl TrialExecutor {
-    /// Execute a single trial: materialize → run agent → grade → collect.
-    pub async fn execute_trial(
-        &self,
-        task: &TaskConfig,
-        variant: &Variant,
-        trial_id: &str,
-        agent_artifact: &Path,
-        grading: &GradingConfig,
-        limits: &TrialLimits,
-        env: &[(String, String)],
-        trial_paths: &TrialPaths,
-    ) -> Result<TrialExecutionResult> {
-        // Phase 1: Materialize
-        let mounts = self.build_mounts(trial_paths, agent_artifact);
-        ContainerSession::ensure_image(&self.docker, &task.image).await?;
-        let session = ContainerSession::create(
-            &self.docker,
-            &task.image,
-            &task.workdir,
-            &mounts,
-            env,
-            &limits.network_mode,
-        ).await?;
+1. sealed experiment spec
+2. run overlay
+3. schedule progress
 
-        // Phase 2: Execute agent
-        let agent_cmd = self.build_agent_command(agent_artifact, trial_paths, variant);
-        if matches!(grading.strategy, GradingStrategy::ImageBaked { .. }) {
-            session.exec(&["mv", &grading.hidden_path, &grading.hidden_rename], None).await?;
-        }
-        let agent_result = session.exec(&agent_cmd, Some(&task.workdir)).await?;
+### 3. Worker takes one slot
 
-        // Phase 3: Grade
-        let score = self.execute_grading(&session, grading, trial_paths).await?;
+For one `TrialSlot`:
 
-        // Collect outputs
-        let result_envelope = self.load_output_envelope(trial_paths)?;
-        session.remove().await?;
+1. allocate `TrialAttemptKey { schedule_idx, attempt }`
+2. allocate `AttemptFsLayout`
+3. write initial `TrialAttemptState { phase = Pending }`
+4. advance it to `AgentMaterializing`
 
-        Ok(TrialExecutionResult { agent_result, score, result_envelope })
-    }
-}
-```
+### 4. Derive task sandbox plan
 
-### What gets deleted from `io.rs`
+Inputs:
 
-The following function groups are replaced by `lab-docker` + the new `TrialExecutor`:
+1. `TrialSlot`
+2. `TaskRow`
+3. `VariantSpec`
+4. `AttemptFsLayout`
+5. run overlay
 
-**Docker command construction** (~250 lines):
-- `build_baked_container_command()` (3471-3487)
-- `append_container_sandbox_args()` (3244-3382)
-- `append_container_env_args()` (3383-3407)
-- `append_container_entrypoint()` (3409-3469)
-- `resolve_container_platform()` / `append_container_platform_arg()` (3517-3531)
-- `resolve_local_image_alias()` (3510-3516)
-- `resolve_container_workspace()` (3233-3236)
-- `resolve_agent_execution_image()` (3220-3222)
-- `resolve_task_sandbox_image()` (3224-3231)
+Outputs:
 
-**Trial execution** (~200 lines):
-- `run_external_agent_runtime_trial()` (3089-3192)
-- `run_command_contract_trial()` (2946-2949)
-- `run_container_sidecar_command()` (3046-3087)
-- `run_adapter_process()` (4180-4273)
+1. `TaskSandboxPlan`
 
-**Image management** (~90 lines):
-- `ensure_container_image_ready()` (3534-3583)
-- `resolve_container_image_digest()` (3585-3623)
-- `repair_agent_artifact_layout()` (3630-3659)
-- `resolve_agent_artifact_mount_dir()` (3661-3677)
+This step decides:
 
-**Workspace materialization for non-ImageProvided** (~200 lines, retained but gated):
-- `materialize_workspace_base()` (532-570) — add `ImageProvided` arm (no-op)
-- `materialize_workspace_git_checkout()` (514-530) — retained for `GitCheckout` kind
-- `ensure_git_checkout_cache()` (394-434) — retained
-- `materialize_workspace_overlays()` (572-608) — retained for non-ImageProvided
+1. task image
+2. execution workdir
+3. whether runtime uses `TaskImage` or `BaseImageBundle`
+4. IO mount realization for `/agentlab/in`, `/agentlab/out`, plus any declared `phase = agent` telemetry mounts
+5. agent artifact mount realization
+6. network settings and the resolved `time_limit_ms`
 
-**Chain state** (~200 lines, deleted per `WORKSPACE_AND_GRADING_OVERHAUL.md`):
-- `capture_workspace_object_ref()` / `capture_workspace_object_ref_with_limit()` (2729-2795)
-- `restore_workspace_from_object_ref()` (2797-2847)
-- `resolve_chain_label()` (2848-2861)
-- All chain state resolution in `lifecycle.rs` execute_slot() (lines 146-156, 296-304, 431-441, 549-583)
+This step does not create containers yet.
 
-**Adapter pattern** (~60 lines, deleted):
-- `AgentAdapter` trait (`core.rs:599-605`)
-- `BuiltinCommandAdapter` (`io.rs:2993-3005`)
-- `PrebuiltCommandAdapter` (`io.rs:3007-3044`)
-- `AdapterRunRequest` struct (`core.rs:172-186`)
-- `command_contract_capabilities()` (`io.rs:2937-2944`)
-- `prebuilt_adapter_profile_value()` (`io.rs:2986-2991`)
+### 5. Materialize task sandbox
 
-**Pause/control protocol** (retained but reimplemented):
-- `pause_command_contract_trial()` (2951-2984) — reimplemented via `ContainerSession::exec()`
-- `write_adapter_continue_control()` / `write_adapter_control_action()` (4532-4557) — retained
+Input:
 
-### What stays in `io.rs`
+1. `TaskSandboxPlan`
 
-- Task declaration parsing (`parse_task_declaration()`, validation functions) — rewritten for new schema
-- IO path preparation (`prepare_io_paths()`) — simplified
-- Trial output loading (`load_trial_output_resilient()`) — retained
-- Workspace snapshot/diff functions — retained for evidence collection but moved to optional
-- Shell quoting utilities — may still be needed for exec commands
-- Binding resolution (`project_bindings_to_args()`, `resolve_command_templates()`) — retained but simplified
+Output:
 
----
+1. `TaskSandboxState`
 
-## Part 7: Scheduling & Lifecycle Integration
+Procedure:
 
-### Current state
+1. write `trial_input.json` into `AttemptFsLayout.in_dir`
+2. create the task container from the declared task image or base image
+3. attach `/agentlab/in`, `/agentlab/out`, and any declared agent telemetry mounts
+4. attach the agent artifact mount
+5. if materialization mode is `BaseImageBundle`, copy the sealed task bundle into the declared workdir
+6. if materialization mode is `TaskImage`, do not mutate the workdir contents
+7. persist `TaskSandboxState`
+8. capture and persist the pre-agent workspace observation for this attempt
 
-`lifecycle.rs` handles:
-- `execute_schedule_engine_parallel()` (1796-2153) — main scheduling loop
-- `execute_parallel_worker_trial()` (1716-1793) — worker thread closure
-- `DeterministicCommitter` (1193-1339) — ordered slot commitment
-- `RunCoordinator::commit_trial_slot()` (996-1191) — persistence
+### 6. Run agent phase
 
-Workers execute trials in `std::thread` via `LocalThreadWorkerBackend`. Results are sent back via channels and committed in order.
+Input:
 
-### Changes
+1. `TaskSandboxState`
+2. `TrialAttemptState`
 
-The scheduling layer stays mostly intact. The key change is the worker execution closure:
+Output:
 
-**Current** (`execute_parallel_worker_trial()`, lifecycle.rs:1716-1793):
-```rust
-// Sync closure called in std::thread
-let trial_result = executor.execute_slot(dispatch, ...)?;
-```
+1. `AgentPhaseRecord`
 
-**New**:
-```rust
-// Async closure called in tokio::task
-let trial_result = trial_executor.execute_trial(task, variant, ...).await?;
-```
+Procedure:
 
-`LocalThreadWorkerBackend` (`core.rs:228-596`) switches from `std::thread::spawn` to `tokio::task::spawn`. The `WorkerBackend` trait (`core.rs:216-226`) becomes async:
+1. exec the fixed agent CLI command
+2. stream stdout/stderr to host logs
+3. for each declared telemetry entry with `phase = agent` and `collect_mode = Tail`, tail the declared file while the agent runs
+4. after process exit, read any declared `phase = agent` telemetry entries with `collect_mode = AfterPhase`
+5. validate and ingest only the telemetry entries declared in the sealed spec
+6. append the resulting runner-enriched fact rows into the run sink
+7. incrementally refresh the analysis-owned run-local DuckDB mirror from appended fact rows
+8. enforce timeout and resource policy
+9. after process exit, inspect `/agentlab/out/result.json`
+10. capture and persist the post-agent workspace observation
+11. derive and persist the workspace delta from pre-agent to post-agent state
+12. extract and persist the canonical candidate artifact according to the declared `artifact_type`
+13. classify `result_state` as `Missing`, `PresentInvalid`, or `Valid`
+14. persist `AgentPhaseRecord`
+15. update `TrialAttemptState.phase = AgentFinished`
 
-```rust
-#[async_trait]
-trait WorkerBackend {
-    async fn submit(&self, dispatch: TrialDispatch) -> Result<WorkerTicket>;
-    async fn poll_completions(&self, timeout: Duration) -> Vec<TrialCompletion>;
-    async fn request_stop(&self, worker_id: &str, reason: &str) -> Result<()>;
-}
-```
+### 7. Derive grading sandbox plan
 
-### CLI entry point change
+Inputs:
 
-`lab-cli/src/main.rs` currently calls `lab_runner::run_experiment_with_options()` synchronously. It needs a tokio runtime.
+1. `TrialSlot`
+2. `GradingConfig`
+3. `TaskSandboxState`
+4. `AgentPhaseRecord`
+5. `AttemptFsLayout`
 
-```rust
-// Current (main.rs:781)
-fn main() -> Result<()> {
+Output:
 
-// New
-#[tokio::main]
-async fn main() -> Result<()> {
-```
+1. `GradingSandboxPlan`
 
-Lab-runner's public API becomes async:
+This step decides:
 
-```rust
-// Current (core.rs:1432-1453)
-pub fn run_experiment(path: &Path) -> Result<RunResult>
-pub fn run_experiment_with_options(path: &Path, options: RunExecutionOptions) -> Result<RunResult>
+1. which `GradingStrategy` branch applies
+2. whether grading reuses the task container or creates a new container
+3. what hidden paths must be masked or restored
+4. what grader bundle or image must be used
+5. whether grading writes mapped output directly or raw output for a later mapper phase
+6. which IO mounts the grader sees, including only declared `phase = grader` telemetry mounts if any exist
 
-// New
-pub async fn run_experiment(path: &Path) -> Result<RunResult>
-pub async fn run_experiment_with_options(path: &Path, options: RunExecutionOptions) -> Result<RunResult>
-```
+### 8. Materialize grader sandbox
 
-### TUI consideration
+Input:
 
-Lab-cli uses `ratatui` + `crossterm` for TUI rendering. The TUI event loop can run on a dedicated thread (as it does now) while tokio drives the trial execution. No fundamental conflict — the TUI thread communicates with the async runtime via channels, same as today.
+1. `GradingSandboxPlan`
 
----
+Output:
 
-## Part 8: Chain State & Workspace Evidence Removal
+1. `GradingSandboxState`
 
-Per `WORKSPACE_AND_GRADING_OVERHAUL.md`, chain state is deleted. Each trial gets a fresh workspace.
+Procedure:
 
-### Types to delete (`types.rs`)
+1. if `InTaskImage`, prepare the existing task container for grader visibility rules
+2. if `Injected`, copy the grader bundle after the agent phase completes
+3. if `Separate`, create the grader container with only declared inputs visible
+4. write `grader_input.json` into `AttemptFsLayout.in_dir`, including candidate artifact state and workspace delta refs
+5. attach declared grader telemetry mounts if the plan includes them
+6. persist `GradingSandboxState`
 
-- `ChainRuntimeState` struct (line 733)
-- `StatePolicy` enum (line 665) — `IsolatePerTrial`, `PersistPerTask`, `Accumulate`
+### 9. Run grading phase
 
-### Functions to delete
+Input:
 
-**`lifecycle.rs`:**
-- Chain key resolution (execute_slot lines 146-156)
-- `existing_workspace_ref` resolution from chain state (lines 172-178 in prepare_task_environment call)
-- Chain state update after trial (lines 431-441)
-- Chain root snapshot tracking (lines 296-304)
-- `resolve_chain_label()` calls
-- Trial result JSON fields: `latest_workspace_ref`, `chain_root_snapshot_ref`
-- Chain state record assembly and persistence (lines 549-583)
-- `task_chain_states.jsonl` writing
+1. `GradingSandboxState`
+2. `TrialAttemptState`
 
-**`io.rs`:**
-- `restore_workspace_from_object_ref()` (2797-2847)
-- `restore_workspace_from_object_ref_with_limit()` (called by above)
-- `capture_workspace_object_ref()` (2729-2735)
-- `capture_workspace_object_ref_with_limit()` (2737-2795)
-- `resolve_chain_label()` (2848-2861)
+Output:
 
-**`config.rs`:**
-- `StatePolicy` parsing and validation
+1. `GradingPhaseRecord`
 
-### Evidence that stays (optional, per-trial)
+Procedure:
 
-Pre/post workspace snapshots and diffs are useful for debugging and can remain as optional evidence collection. For `ImageProvided` workspaces, these happen via `docker exec git diff` inside the container rather than host filesystem walks.
+1. exec the grader command
+2. stream grader stdout/stderr to host logs
+3. for each declared telemetry entry with `phase = grader` and `collect_mode = Tail`, tail the declared file while grading runs
+4. after process exit, read any declared `phase = grader` telemetry entries with `collect_mode = AfterPhase`
+5. validate and ingest only the telemetry entries declared in the sealed spec
+6. append the resulting runner-enriched fact rows into the run sink
+7. incrementally refresh the analysis-owned run-local DuckDB mirror from appended fact rows
+8. inspect `/agentlab/out/raw_grader_output.json` only when output mode is `RawThenMap`
+9. inspect `/agentlab/out/mapped_grader_output.json` only when output mode is `DirectMapped`
+10. classify `raw_output_state` as `Missing`, `PresentInvalid`, or `Valid`
+11. persist `GradingPhaseRecord`
+
+### 10. Run grader mapping phase
+
+Input:
+
+1. `GraderMappingPlan`
+2. `TrialAttemptState`
+
+Output:
+
+1. `GraderMappingPhaseRecord`
+
+Procedure:
+
+1. run this phase only when grading output mode is `RawThenMap`
+2. execute the declared mapper against `/agentlab/out/raw_grader_output.json`
+3. require the mapper to write `/agentlab/out/mapped_grader_output.json`
+4. classify `mapped_output_state` as `Missing`, `PresentInvalid`, or `Valid`
+5. persist `GraderMappingPhaseRecord`
+
+### 11. Commit slot
+
+Input:
+
+1. fully populated `TrialAttemptState`
+
+Output:
+
+1. committed slot publication
+
+Procedure:
+
+1. build the slot commit record from attempt state
+2. append intent/commit rows to the slot commit journal
+3. persist the final `TrialRecord`, including runner-owned contract state plus raw grading payload and any explicit reporting projection fields
+4. ensure the analysis-owned run-local DuckDB mirror has consumed all committed fact rows for this slot
+5. advance `next_schedule_index`
+6. mark the slot completed exactly once
+
+### 12. Crash behavior
+
+If the program crashes:
+
+1. committed slots remain committed
+2. in-flight `TrialAttemptState` records are reconciled as abandoned attempts
+3. the slot may be retried with a new `TrialAttemptKey`
+
+That is the full procedure. The durable unit is the slot. The operational unit is the attempt.
 
 ---
 
-## Part 9: Module Restructuring
+## Per-Attempt Execution Flow
 
-### Current state
+Each attempt should execute the following phases.
 
-Lab-runner is a single crate with 6 source files stitched together via `include!()` in `lib.rs`:
+### 1. Preflight and slot claim
 
-```
-lib.rs (36 lines) — includes everything
-├── core.rs (1480 lines) — types, traits, leases, entrypoints
-├── lifecycle.rs (3564 lines) — scheduling, packaging, execution
-├── io.rs (5057 lines) — workspace, Docker, IO, adapters, preflight
-├── runner.rs (3400 lines) — continue/recover/replay/fork/pause/kill
-├── validations.rs (1488 lines) — preflight checks
-├── config.rs (1710 lines) — experiment config parsing
-├── types.rs (1053 lines) — shared types
-├── sink.rs (293 lines) — run sink trait
-├── persistence/ — SQLite store
-└── tests.rs (12298 lines) — test suite
-```
+1. Resolve required env names and fail early if missing.
+2. Ensure required images are available or pullable.
+3. Acquire a slot attempt under the durable scheduler.
 
-Total: ~30,379 lines in one compilation unit (via `include!()`).
+### 2. Materialize agent sandbox
 
-### New structure
+This phase should branch directly on `TaskMaterializationKind`:
 
-```
-lab-docker/          — NEW CRATE: async Docker client wrapper
-  src/
-    lib.rs
-    client.rs        — Bollard client, image ops
-    container.rs     — ContainerSession lifecycle
-    mounts.rs        — mount specification builder
-    types.rs
+1. `TaskImage`
+2. `BaseImageBundle`
 
-lab-runner/
-  src/
-    lib.rs           — module declarations (no more include!())
-    types.rs         — shared types (slimmed)
-    config.rs        — experiment YAML parsing (rewritten for new schema)
-    build.rs         — NEW: build/compile stage (extracted from lifecycle.rs)
-    executor.rs      — NEW: async TrialExecutor (three-phase)
-    grading.rs       — NEW: GradingStrategy implementations
-    scheduler.rs     — extracted from lifecycle.rs (schedule engine, worker backend)
-    coordinator.rs   — extracted from lifecycle.rs (DeterministicCommitter, slot commitment)
-    ops.rs           — extracted from runner.rs (continue/recover/pause/kill)
-    preflight.rs     — extracted from validations.rs
-    persistence/     — SQLite store (unchanged)
-    sink.rs          — run sink (unchanged)
-    evidence.rs      — workspace snapshots, diffs (extracted from io.rs)
-    tests/           — test modules (split from monolithic tests.rs)
-```
+#### `TaskImage`
 
-### Key principle
+1. Create an ephemeral task container from the task image.
+2. Mount `/agentlab/in`, `/agentlab/out`, and only the declared `phase = agent` telemetry roots, if any were declared.
+3. Mount the agent artifact read-only.
+4. Do not populate the workdir at runtime.
+5. Set the container workdir to the task's declared image workdir.
+6. Ensure grader-only assets are absent or masked during this phase.
 
-The `include!()` pattern is eliminated. Each file becomes a proper module with explicit `pub` exports. This enables incremental compilation and makes dependencies between modules visible.
+#### `BaseImageBundle`
+
+1. Create the task container from the declared base image.
+2. Mount `/agentlab/in`, `/agentlab/out`, and only the declared `phase = agent` telemetry roots, if any were declared.
+3. Mount the agent artifact read-only.
+4. Copy the sealed task bundle into the declared workdir.
+5. Set the container workdir to that declared workdir.
+6. Do not install dependencies or run setup steps in this phase.
+
+There should be no separate dataset mount root and no generic deps mount root here. Upstream dataset packs, git checkouts, or overlays must already have been compiled into the task bundle at build time.
+
+The result should be an executable sandbox, not a pile of copied files.
+
+Before the agent starts, the runner captures a pre-agent workspace observation:
+
+1. for `TaskImage`, from the execution workdir inside the container
+2. for `BaseImageBundle`, from the execution workdir inside the container after the task bundle copy completes
+
+### 3. Run the agent contract
+
+1. Execute the fixed agent CLI contract.
+2. Stream stdout, stderr, and runner-owned structural metrics.
+3. Collect only telemetry that was explicitly declared for `phase = agent`.
+4. Enforce timeouts, network policy, rootfs policy, and resource limits.
+5. Persist a runner-owned agent phase record regardless of exit status.
+
+### 4. Collect agent outputs
+
+1. Validate whether `result.json` exists.
+2. Validate whether `result.json` matches the artifact envelope schema.
+3. Extract the canonical candidate artifact according to the declared `artifact_type`.
+4. Capture the post-agent workspace observation.
+5. Derive and persist the workspace delta from pre-agent to post-agent state.
+6. Persist canonical copies or references into the trial directory.
+7. Build `grader_input.json` from the task row, attempt identity, agent phase record, candidate artifact state, and workspace delta.
+
+### 5. Materialize grader sandbox
+
+This phase should branch directly on `GradingStrategy`.
+
+There are three allowed strategies:
+
+1. `in_task_image`
+2. `injected`
+3. `separate`
+
+The agent sandbox and grader sandbox may be the same container across phases for `in_task_image`, but they are still distinct phases with a hard state transition.
+
+#### `InTaskImage`
+
+1. Verify the hidden grader paths exist in the task image.
+2. Before agent phase, move or mask those paths out of the agent-visible location.
+3. After agent phase, restore those paths.
+4. Reuse the same task container for grader execution.
+
+#### `Injected`
+
+1. Keep grader assets completely absent during agent phase.
+2. After agent exit, copy the grader bundle into the container exactly once.
+3. Execute the grader command against `grader_input.json` and `result.json`.
+
+#### `Separate`
+
+1. Create a separate grader container from the declared grader image.
+2. Expose only the declared outputs and runner-owned grading input.
+3. Do not expose hidden assets or grader image contents to the agent container.
+4. Execute grading in the separate container and collect either raw or mapped grading output according to the configured conclusion mode.
+
+### 6. Run grading
+
+1. Execute the declared grader command.
+2. Require a valid normalized mapped grading output before the trial can be marked graded.
+3. Record grader stdout, stderr, and runner-owned structural execution metadata.
+4. Collect only telemetry that was explicitly declared for `phase = grader`.
+
+### 7. Run grader mapping
+
+1. Skip this phase when grading output mode is `DirectMapped`.
+2. Execute the declared mapper against `raw_grader_output.json`.
+3. Require the mapper to write `mapped_grader_output.json`.
+4. Persist a runner-owned mapping phase record regardless of success.
+
+### 8. Commit slot
+
+A slot is committable only when:
+
+1. the attempt has a persisted agent phase record
+2. the attempt has either a valid mapped grading output or a separate runner-owned grading failure record with slot status `grading_failed`
+3. all trial facts for the slot are durably written
+
+Only then should the scheduler advance `next_schedule_index`.
 
 ---
 
-## Part 10: Migration Strategy
+## Grading Strategies
 
-This is too large for a single PR. Recommended sequence:
+All strategies share the same contract:
 
-### Phase 1: Foundation (non-breaking)
+1. grader reads `grader_input.json`
+2. grader may read `result.json`
+3. grader may read runner-owned auxiliary grading inputs referenced by `grader_input.json`, including workspace delta files when present
+4. grader writes `mapped_grader_output.json` directly, or writes `raw_grader_output.json` for a later mapper phase
 
-1. **Add `lab-docker` crate** with Bollard wrapper. No callers yet. Write integration tests against Docker daemon.
-2. **Add `tokio` and `bollard` to workspace deps**. Add `tokio` to `lab-cli` with `#[tokio::main]`.
-3. **Add `WorkspaceBaseKind::ImageProvided`** to types.rs. Add no-op arm to `materialize_workspace_base()`. Add validation. This is per `WORKSPACE_AND_GRADING_OVERHAUL.md`.
-4. **Add output envelope schema** (`schemas/output_envelope_v1.jsonschema`) and score record schema (`schemas/score_record_v1.jsonschema`).
+### Conclusion mapping
 
-### Phase 2: Delete dead code
+The canonical grading boundary is always `mapped_grader_output.json`.
 
-5. **Delete swebench adapter shims** (per `WORKSPACE_AND_GRADING_OVERHAUL.md`).
-6. **Delete chain state machinery** — `ChainRuntimeState`, `StatePolicy`, `capture/restore_workspace_object_ref`, chain resolution in execute_slot.
-7. **Delete baseline/treatment variant semantics** — flatten to variant map.
+1. `direct` mode means the grader writes `trial_conclusion_v1` directly to `mapped_grader_output.json`.
+2. `mapper` mode means the grader writes `raw_grader_output.json`, then the explicit `grader_mapping` phase translates that into `trial_conclusion_v1` in `mapped_grader_output.json`.
+3. Commit consumes only the mapped output file. Raw output is supporting evidence, not the final grading boundary.
 
-### Phase 3: New executor (parallel path)
+### `in_task_image`
 
-8. **Implement async `TrialExecutor`** in `lab-runner/src/executor.rs` using `lab-docker`. Wire it as an alternative to the current sync path behind a feature flag or config switch.
-9. **Implement `GradingStrategy`** enum and the three grading flows.
-10. **Implement new experiment YAML parser** alongside old one (new schema version discriminator).
+Use when the task image already contains the hidden tests or grader assets.
 
-### Phase 4: Cutover
+Flow:
 
-11. **Switch default executor** to async path.
-12. **Delete old sync Docker path** — `build_baked_container_command()`, `append_container_*()`, `run_external_agent_runtime_trial()`, `run_adapter_process()`, `AgentAdapter` trait, adapter implementations.
-13. **Delete old experiment schema parser**.
-14. **Module restructuring** — break `include!()` monolith into proper modules.
+1. hide grader assets before agent phase
+2. run agent
+3. reveal grader assets after agent phase
+4. run grader
 
-### Phase 5: Cleanup
+Pros:
 
-15. **Delete `TaskBoundaryMaterialization`**, `TaskSpec` (redundant after simplification).
-16. **Delete build-stage path staging functions** from lifecycle.rs.
-17. **Rewrite tests** against new types and async executor.
-18. **Update preflight** to use `lab-docker` for image checks and smoke tests.
+1. one task image per task
+2. no extra image build for grading
+
+Risks:
+
+1. masking and unmasking must be correct
+2. a visibility leak here is a hard invariant violation
+
+### `injected`
+
+Use when the grader bundle should be copied into the task container only after the agent exits.
+
+Flow:
+
+1. run agent
+2. copy grader bundle into container
+3. run grader
+
+Pros:
+
+1. no hidden assets during agent phase
+2. simpler than a second container
+
+Risks:
+
+1. copy-in must be explicit and limited
+2. grader bundle integrity must be hashed in the sealed spec
+
+### `separate`
+
+Use when grading must happen in a different image or stronger isolation boundary.
+
+Flow:
+
+1. run agent in task container
+2. expose only declared artifacts and runner-owned grading input to grader container
+3. run grader in separate container
+
+Pros:
+
+1. strongest isolation
+2. easiest to reason about hidden assets
+
+Risks:
+
+1. more container lifecycle complexity
+2. extra boundary crossing for result exposure
+
+### Default recommendation
+
+1. prefer `in_task_image` when the benchmark already ships per-task images with hidden tests
+2. prefer `separate` when the grader environment meaningfully differs from the task image
+3. use `injected` only when copy-in is the simplest safe boundary
 
 ---
 
-## Appendix: Line-count impact estimate
+## Environment and Secret Handling
 
-### Deleted (approximate)
+Environment handling needs a tighter policy than we have today.
 
-| Source | Lines | What |
-|---|---|---|
-| `io.rs` Docker command construction | ~250 | `build_baked_container_command`, `append_container_*` |
-| `io.rs` trial execution | ~200 | `run_external_agent_runtime_trial`, `run_adapter_process` |
-| `io.rs` image management | ~90 | `ensure_container_image_ready`, digest resolution |
-| `io.rs` chain state | ~200 | `capture/restore_workspace_object_ref` |
-| `io.rs` adapter impls | ~60 | `BuiltinCommandAdapter`, `PrebuiltCommandAdapter` |
-| `lifecycle.rs` chain state | ~150 | chain resolution, chain records, chain state updates |
-| `lifecycle.rs` build staging | ~630 | all `stage_*`, `rewrite_*`, `collect_*` functions |
-| `core.rs` adapter pattern | ~50 | `AgentAdapter` trait, `AdapterRunRequest` |
-| `config.rs` old schema parsing | ~500 | baseline/treatment, old runtime shape |
-| `adapters/swebench/` | ~420 | all four Python files |
-| `tests.rs` (affected tests) | ~2000 | tests for deleted functionality |
-| **Total deleted** | **~4,550** | |
+### Default rule
 
-### Added (approximate)
+Run-supplied env applies to the agent phase only.
 
-| Source | Lines | What |
-|---|---|---|
-| `lab-docker` crate | ~800 | Bollard wrapper, container lifecycle, mounts, types |
-| `executor.rs` | ~300 | Async TrialExecutor, three-phase flow |
-| `grading.rs` | ~200 | GradingStrategy implementations |
-| `build.rs` | ~150 | Simplified build/compile |
-| New config parsing | ~400 | New YAML schema parser |
-| New schemas | ~100 | output_envelope, score_record JSON schemas |
-| New tests | ~1500 | Tests for new executor, grading, config |
-| **Total added** | **~3,450** | |
+That prevents accidental leakage of agent credentials into grading.
 
-**Net effect**: ~1,100 fewer lines, dramatically simpler architecture, async foundation for future work.
+### Explicit grader env
+
+If a grader truly requires env from the operator, it must be declared separately and explicitly. Do not reuse the agent env channel silently.
+
+### What gets persisted
+
+Persist:
+
+1. env key name
+2. scope: `agent` or `grader`
+3. provenance: inline, host-env, env-file
+
+Do not persist:
+
+1. raw env value
+2. derived secret contents
+
+### Resume behavior
+
+`continue` must:
+
+1. know which env keys are required
+2. fail before scheduling if those keys are not provided again
+
+This avoids the current brittle behavior where continuation depends on shell history or `.env` side effects.
+
+---
+
+## Storage and Host Path Rules
+
+This proposal depends on the host path contract being enforced consistently.
+
+### Path rules
+
+1. The runner constructs host paths through typed path structs, not ad-hoc `.join()` chains.
+2. Finalized trial outputs are runner-owned durable artifacts.
+3. Committed slot publication is the only correctness boundary for progress.
+
+### No-duplicate-copies rule
+
+The system should not create multiple logical owners for the same data.
+
+Allowed:
+
+1. a mount from host path to contract root
+2. a single deliberate copy across an isolation boundary when a strategy requires it
+
+Not allowed:
+
+1. staging the same agent artifact into multiple host-owned directories
+2. copying grader assets through intermediate scratch directories without ownership meaning
+3. duplicating result artifacts just to satisfy an awkward contract
+
+If two components need the same bytes, prefer:
+
+1. one canonical host location
+2. one declared read-only mount or deliberate read path
+
+---
+
+## Failure Semantics and Edge Cases
+
+The current design is too soft on edge cases. These behaviors need to be explicit.
+
+| Case | Required behavior |
+|---|---|
+| Agent exits `0`, but `result.json` is missing | Agent phase is recorded as contract failure. Grading still runs with `result_present = false`. |
+| Agent exits non-zero, but writes a valid `result.json` | Grading still runs. The non-zero exit is execution metadata, not a verdict. |
+| Agent times out or is OOM-killed | Runner records the failure and still constructs `grader_input.json`. Grader classifies if possible. |
+| `result.json` parses, but candidate artifact extraction fails | Runner records `candidate_artifact.state = invalid`. Grading still runs and may still use workspace delta if relevant. |
+| Pre/post workspace observation fails | Runner records a workspace-delta observation failure as runner-owned infra state. Grading may continue if it does not require workspace delta. |
+| Grader exits non-zero, but writes a valid `mapped_grader_output.json` | Valid mapped output wins. Exit code is recorded as grader anomaly, not treated as the verdict. |
+| Grader exits `0`, but required grading output is missing or invalid | Commit the slot with status `grading_failed`. Do not fabricate a scientific verdict. |
+| Grader writes valid `raw_grader_output.json`, but mapping fails or `mapped_grader_output.json` is invalid | Commit the slot with status `grading_failed`. Preserve raw output and mapping failure state as evidence. |
+| Crash after grading but before commit | Attempt may be retried. Slot publication remains exactly-once. |
+| Hidden tests become visible during agent phase | Hard invariant violation. Fail the run or mark the slot infra-invalid. |
+| Required env not present on `continue` | Fail preflight before scheduling any slot. |
+| `base_image_bundle` task would require runtime dependency installation to become executable | Invalid configuration. Build must have produced a runnable task bundle already. |
+
+One more rule is important:
+
+1. "no benchmark verdict" is a first-class outcome category
+
+That is how we represent grader failures or infrastructure failures without lying to analysis.
+
+---
+
+## Why Async Docker Is Required
+
+The target execution model needs operations that are awkward or brittle as shell-outs:
+
+1. create container without immediately conflating agent and grader phases
+2. exec multiple commands into a running container
+3. hide and reveal grader assets as separate operations
+4. stream logs and resource metrics while the process runs
+5. copy assets in after the agent phase
+6. read files out deterministically
+7. cancel, inspect, and clean up containers without shell-script wrappers
+
+This is why the cutover should introduce a dedicated Docker runtime crate, for example `lab-docker`, that owns:
+
+1. image ensure and inspect
+2. container create, start, exec, wait, remove
+3. mount specification construction
+4. copy-in and copy-out helpers
+5. structured log and stats streaming
+
+The runner should depend on that crate, not on handwritten `docker run` command assembly.
+
+---
+
+## Runner Integration
+
+The scheduler and durable commit machinery can remain conceptually similar, but the worker execution model should change.
+
+### Attempt procedure responsibilities
+
+The async low-level attempt procedure should:
+
+1. building the contract roots for one attempt
+2. materializing the agent sandbox
+3. running the agent contract
+4. assembling `grader_input.json`
+5. materializing grading
+6. running the explicit grader-mapping phase when required
+7. validating `mapped_grader_output.json`
+8. returning a commit-ready attempt result
+
+### Scheduler responsibilities
+
+The scheduler should continue to own:
+
+1. slot ordering
+2. concurrency limits
+3. retries
+4. pruning or failure policies
+5. exactly-once commit publication
+
+### Worker model
+
+The local worker backend should move from blocking threads toward Tokio tasks. The point is not fashion. The point is that container lifecycle is now explicitly async and should not be pushed through a sync shell wrapper API.
+
+---
+
+## Migration Plan
+
+This should be delivered in phases.
+
+### Phase 1: Contract and schema cut
+
+1. Add the new authoring schema shape.
+2. Define sealed `experiment.json`.
+3. Define `artifact_envelope_v1`, `grader_input_v1`, and `trial_conclusion_v1`.
+4. Define the generic task-row shape emitted by mappers.
+5. Define the fixed grading file contract: `raw_grader_output.json` and `mapped_grader_output.json`.
+
+### Phase 2: Build pipeline cut
+
+1. Compile relative paths to absolute paths.
+2. Hash artifacts and mapper assets.
+3. Execute task mappers at build time.
+4. Reject legacy runtime staging keys.
+
+### Phase 3: Async executor behind a flag
+
+1. Introduce `lab-docker`.
+2. Implement the async attempt procedure plus its state records.
+3. Support all three grading strategies.
+4. Persist attempt phase records, including `grader_mapping`, and validate slot commit behavior.
+
+### Phase 4: Make grading mandatory
+
+1. Remove any path that treats agent exit code as the benchmark result.
+2. Require a normalized mapped grading output for every trial.
+3. Add hard failures for hidden-asset leaks and missing mapped output.
+
+### Phase 5: Delete legacy execution paths
+
+1. Remove sync shell-based Docker invocation.
+2. Remove runtime-owned workspace patch staging and file staging.
+3. Remove dual execution modes and executor-choice branches.
+4. Reject old run state that assumes the removed model.
+
+---
+
+## Acceptance Criteria
+
+This cutover is complete only when all of the following are true:
+
+1. `lab-cli run ... --env KEY=value` injects env without embedding values into the sealed package.
+2. Build emits only absolute machine-scoped paths and hashed artifacts.
+3. Benchmark-native task rows are compiled into generic task rows before run starts.
+4. Agent command shape is fixed and runner-constructed.
+5. Agent phase never sees hidden tests or grader-only assets.
+6. A committed trial record cannot claim a successful or failed scientific outcome without a valid `mapped_grader_output.json` carrying `trial_conclusion_v1`.
+7. Missing or malformed `result.json` still produces a grading attempt and a truthful final status.
+8. A valid `mapped_grader_output.json` is accepted even when grader exit code is non-zero.
+9. Every attempt persists a runner-owned pre/post workspace delta regardless of `artifact_type` or task materialization mode.
+10. Crash between grading and commit does not double-publish a slot.
+11. Local execution no longer relies on shell-generated `docker run` scripts for normal trial execution.
+
+---
+
+## Final Position
+
+The valuable change here is not "Tokio" or "Bollard" by itself. The valuable change is a system that is easier to reason about:
+
+1. build compiles and seals
+2. run orchestrates durably
+3. agent produces a candidate artifact
+4. grader produces raw or mapped grading output, and optional mapper stage normalizes it
+5. commit publishes the slot exactly once
+
+If the implementation preserves those seams, the async Docker cutover will simplify the system. If it only swaps transport libraries while keeping the current mixed ownership model, it will not.

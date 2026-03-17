@@ -74,6 +74,25 @@ fn load_optional_json_record_with_schema(schema_name: &str, path: &Path) -> Resu
     Ok(Some(value))
 }
 
+fn mapped_grader_output_state(
+    trial_conclusion_row: Option<&Value>,
+    grade_error_reason: Option<&str>,
+) -> Option<&'static str> {
+    if trial_conclusion_row.is_some() {
+        Some("valid")
+    } else if let Some(reason) = grade_error_reason {
+        if reason.starts_with("mapped_grader_output_invalid:") {
+            Some("present_invalid")
+        } else if reason.starts_with("mapped_grader_output_missing:") {
+            Some("missing")
+        } else {
+            Some("missing")
+        }
+    } else {
+        None
+    }
+}
+
 fn trial_index_from_trial_id(trial_id: &str) -> Option<usize> {
     trial_id
         .strip_prefix("trial_")
@@ -191,6 +210,11 @@ impl TrialExecutor {
             dynamic_mounts,
             trial_input: input,
         } = prepared;
+        let task_sandbox_image = prepared_manifest.task_sandbox_image().to_string();
+        let task_sandbox_workdir = prepared_manifest
+            .task_sandbox_workdir()
+            .unwrap_or(task_boundary.task_workdir.as_str())
+            .to_string();
         let input_bytes = serde_json::to_vec_pretty(&input)?;
         let trial_input_ref = artifact_store.put_bytes(&input_bytes)?;
         let mut bootstrap_store = BackingSqliteStore::open(run_dir)?;
@@ -222,12 +246,12 @@ impl TrialExecutor {
                 "network_mode_effective": effective_network_mode,
                 "agent_runtime": {
                     "image": agent_runtime.image.clone(),
-                    "workspace": AGENTLAB_CONTRACT_WORKSPACE_DIR,
+                    "workdir": task_sandbox_workdir.as_str(),
                 },
                 "task_sandbox": {
                     "executor": "docker",
-                    "image": prepared_manifest.task_image.clone(),
-                    "workspace": AGENTLAB_CONTRACT_WORKSPACE_DIR
+                    "image": task_sandbox_image.as_str(),
+                    "workdir": task_sandbox_workdir.as_str()
                 }
             },
             "policy_merge": {
@@ -277,12 +301,11 @@ impl TrialExecutor {
             schedule_idx,
             &variant.id,
             &task_boundary.task_payload,
-            Some(prepared_manifest.task_image.as_str()),
-            &io_paths.input_host,
+            Some(task_sandbox_image.as_str()),
+            &io_paths.trial_input_host,
         )?;
         let runtime_env = prepared_manifest.runtime_env.clone();
-        let benchmark_prediction_path = trial_paths.out.join(BENCHMARK_PREDICTION_FILENAME);
-        let benchmark_score_path = trial_paths.out.join(BENCHMARK_SCORE_FILENAME);
+        let mapped_grader_output_path = trial_paths.out.join(MAPPED_GRADER_OUTPUT_FILENAME);
         let benchmark_grade_error_path = trial_paths.out.join(BENCHMARK_GRADE_ERROR_FILENAME);
         let adapter = adapter_registry_entry(&agent_runtime.adapter_ref)?;
         let trial_evidence_dir = trial_dir.join("evidence");
@@ -308,9 +331,10 @@ impl TrialExecutor {
             trial_output_error_payload("result_missing", "agent did not write a result payload");
         let mut result_parse_error: Option<String> = None;
         let trial_started_at = Instant::now();
+        let mut agent_phase_started_at = Utc::now().to_rfc3339();
+        let mut agent_phase_ended_at = agent_phase_started_at.clone();
         for attempt in 0..policy_config.retry_max_attempts {
-            let _ = fs::remove_file(&benchmark_prediction_path);
-            let _ = fs::remove_file(&benchmark_score_path);
+            let _ = fs::remove_file(&mapped_grader_output_path);
             let _ = fs::remove_file(&benchmark_grade_error_path);
 
             let run_request = AdapterRunRequest {
@@ -326,13 +350,17 @@ impl TrialExecutor {
                 benchmark_grader: benchmark_config.grader.as_ref(),
                 benchmark_grading_enabled,
                 run_id,
-                task_image: Some(prepared_manifest.task_image.as_str()),
+                task_image: task_sandbox_image.as_str(),
+                task_workdir: task_sandbox_workdir.as_str(),
+                task_materialization_kind: task_boundary.materialization.kind.clone(),
                 agent_artifact: Some(agent_runtime.agent_artifact.as_path()),
             };
+            agent_phase_started_at = Utc::now().to_rfc3339();
             let proc_result = adapter.run_trial(&run_request)?;
+            agent_phase_ended_at = Utc::now().to_rfc3339();
             status = proc_result.status;
 
-            let (loaded_output, parse_error) = load_trial_output_resilient(&io_paths.output_host)?;
+            let (loaded_output, parse_error) = load_trial_output_resilient(&io_paths.result_host)?;
             trial_output = loaded_output;
             result_parse_error = parse_error;
 
@@ -347,49 +375,9 @@ impl TrialExecutor {
             break;
         }
 
-        let mut deferred_benchmark_prediction_records = Vec::new();
-        let mut deferred_benchmark_score_records = Vec::new();
+        let mut deferred_trial_conclusion_records = Vec::new();
+        let mut trial_conclusion_row: Option<Value> = None;
         let mut grade_error_reason: Option<String> = None;
-        let mut missing_score_reason: Option<String> = None;
-        if benchmark_grading_enabled {
-            match load_optional_json_record_with_schema(
-                "benchmark_prediction_record_v1.jsonschema",
-                &benchmark_prediction_path,
-            ) {
-                Ok(Some(row)) => deferred_benchmark_prediction_records.push(row),
-                Ok(None) => {}
-                Err(err) => {
-                    grade_error_reason = Some(format!("prediction_record_invalid: {}", err));
-                }
-            }
-            match load_optional_json_record_with_schema(
-                "benchmark_score_record_v1.jsonschema",
-                &benchmark_score_path,
-            ) {
-                Ok(Some(row)) => deferred_benchmark_score_records.push(row),
-                Ok(None) => {
-                    missing_score_reason = Some(format!(
-                        "score_record_missing: {}",
-                        benchmark_score_path.display()
-                    ));
-                }
-                Err(err) => {
-                    grade_error_reason = Some(format!("score_record_invalid: {}", err));
-                }
-            }
-            if grade_error_reason.is_none() && benchmark_grade_error_path.exists() {
-                let marker_reason = fs::read_to_string(&benchmark_grade_error_path)
-                    .unwrap_or_else(|_| "grade_error".to_string());
-                grade_error_reason = Some(marker_reason.trim().to_string());
-            }
-            if grade_error_reason.is_none() {
-                if let Some(reason) = missing_score_reason.take() {
-                    grade_error_reason = Some(reason);
-                } else if status == BENCHMARK_GRADING_POLICY_EXIT_CODE.to_string() {
-                    grade_error_reason = Some("grading_policy_exit".to_string());
-                }
-            }
-        }
 
         let post_snapshot_manifest = collect_workspace_snapshot_manifest(&trial_paths.workspace)?;
         let post_snapshot_path = trial_evidence_dir.join("workspace_post_snapshot.json");
@@ -416,6 +404,76 @@ impl TrialExecutor {
         let diff_cumulative_ref = artifact_store.put_file(&diff_cumulative_path)?;
         let patch_incremental_ref = artifact_store.put_file(&patch_incremental_path)?;
         let patch_cumulative_ref = artifact_store.put_file(&patch_cumulative_path)?;
+        if benchmark_grading_enabled {
+            write_grader_input_file(
+                &io_paths,
+                &input,
+                &trial_output,
+                &trial_paths,
+                task_sandbox_workdir.as_str(),
+                &status,
+                result_parse_error.as_deref(),
+                &agent_phase_started_at,
+                &agent_phase_ended_at,
+                Some(&diff_incremental_path),
+                Some(&patch_incremental_path),
+            )?;
+            let grading_request = AdapterRunRequest {
+                runtime_experiment: trial_experiment,
+                runtime: agent_runtime,
+                variant_args: &variant_runtime.variant_args,
+                runtime_env: &runtime_env,
+                runtime_overrides_env: agent_runtime_env,
+                trial_paths: &trial_paths,
+                dynamic_mounts: &dynamic_mounts,
+                io_paths: &io_paths,
+                network_mode: effective_network_mode,
+                benchmark_grader: benchmark_config.grader.as_ref(),
+                benchmark_grading_enabled,
+                run_id,
+                task_image: task_sandbox_image.as_str(),
+                task_workdir: task_sandbox_workdir.as_str(),
+                task_materialization_kind: task_boundary.materialization.kind.clone(),
+                agent_artifact: Some(agent_runtime.agent_artifact.as_path()),
+            };
+            run_benchmark_grading_phase(&grading_request, &status)?;
+            run_benchmark_conclusion_mapper_phase(&grading_request)?;
+            let grade_error_marker_reason = if benchmark_grade_error_path.exists() {
+                Some(
+                    fs::read_to_string(&benchmark_grade_error_path)
+                        .unwrap_or_else(|_| "grade_error".to_string())
+                        .trim()
+                        .to_string(),
+                )
+            } else {
+                None
+            };
+            match load_optional_json_record_with_schema(
+                "trial_conclusion_v1.jsonschema",
+                &mapped_grader_output_path,
+            ) {
+                Ok(Some(row)) => {
+                    deferred_trial_conclusion_records.push(row.clone());
+                    trial_conclusion_row = Some(row);
+                }
+                Ok(None) => {
+                    grade_error_reason = Some(
+                        grade_error_marker_reason.unwrap_or_else(|| {
+                            format!("mapped_grader_output_missing: {}", mapped_grader_output_path.display())
+                        }),
+                    );
+                }
+                Err(err) => {
+                    grade_error_reason = Some(format!("mapped_grader_output_invalid: {}", err));
+                }
+            }
+            if grade_error_reason.is_none()
+                && benchmark_grade_error_path.exists()
+                && status == BENCHMARK_GRADING_POLICY_EXIT_CODE.to_string()
+            {
+                grade_error_reason = Some("grading_policy_exit".to_string());
+            }
+        }
         let workspace_bundle_ref = if workspace_diff_is_empty(&diff_incremental) {
             chain_states
                 .get(&chain_key)
@@ -591,6 +649,7 @@ impl TrialExecutor {
             effective_network_mode,
             invocation_source.as_str(),
             Some(task_boundary.task_image.as_str()),
+            Some(task_boundary.task_workdir.as_str()),
         )?;
 
         let manifest_path = resolve_agent_runtime_manifest_path(&trial_paths)?;
@@ -600,62 +659,86 @@ impl TrialExecutor {
             let _ = validate_hooks(&manifest, &io_paths.events_host, &schema);
         }
 
-        let benchmark_score_row = deferred_benchmark_score_records.first();
-        let mut outcome = trial_output
+        let trial_conclusion_outcome = trial_conclusion_row
+            .as_ref()
+            .and_then(|row| row.pointer("/reported_outcome"))
+            .and_then(Value::as_str);
+        let mapped_trial_outcome = trial_conclusion_outcome
+            .and_then(trial_conclusion_outcome_to_trial_outcome);
+        let agent_outcome = trial_output
             .get("outcome")
             .and_then(|v| v.as_str())
             .unwrap_or("error")
             .to_string();
-        if benchmark_grading_enabled && grade_error_reason.is_none() {
-            if let Some(mapped_outcome) = benchmark_score_row
-                .and_then(|row| row.pointer("/verdict"))
-                .and_then(Value::as_str)
-                .and_then(benchmark_verdict_to_trial_outcome)
-            {
-                outcome = mapped_outcome.to_string();
-            }
+        let mut outcome = agent_outcome.clone();
+        if benchmark_grading_enabled {
+            outcome = if grade_error_reason.is_some() {
+                "grading_failed".to_string()
+            } else if let Some(mapped_outcome) = mapped_trial_outcome {
+                mapped_outcome.to_string()
+            } else {
+                "missing".to_string()
+            };
         }
         let mut metrics = trial_output.get("metrics").cloned().unwrap_or(json!({}));
         if let Some(obj) = metrics.as_object_mut() {
             obj.insert("status_code".to_string(), json!(status.clone()));
-            if let Some(verdict) = benchmark_score_row
-                .and_then(|row| row.pointer("/verdict"))
-                .and_then(Value::as_str)
+            if let Some(mapped_state) =
+                mapped_grader_output_state(trial_conclusion_row.as_ref(), grade_error_reason.as_deref())
             {
-                obj.insert("benchmark_verdict".to_string(), json!(verdict));
+                obj.insert(
+                    "mapped_grader_output_state".to_string(),
+                    json!(mapped_state),
+                );
+            }
+            if let Some(reported_outcome) = trial_conclusion_outcome {
+                obj.insert(
+                    "trial_conclusion_reported_outcome".to_string(),
+                    json!(reported_outcome),
+                );
+            }
+            if let Some(row) = trial_conclusion_row.as_ref() {
+                if let Some(payload) = row.pointer("/payload") {
+                    obj.insert("trial_conclusion_payload".to_string(), payload.clone());
+                }
+                if let Some(name) = row.pointer("/grader/name").and_then(Value::as_str) {
+                    obj.insert("trial_conclusion_grader".to_string(), json!(name));
+                }
+                if let Some(strategy) = row.pointer("/grader/strategy").and_then(Value::as_str) {
+                    obj.insert(
+                        "trial_conclusion_grader_strategy".to_string(),
+                        json!(strategy),
+                    );
+                }
             }
             if let Some(reason) = grade_error_reason.as_ref() {
                 obj.insert("grade_error".to_string(), json!(true));
                 obj.insert("grade_error_reason".to_string(), json!(reason));
             }
         }
-        let benchmark_primary = benchmark_score_row.and_then(|row| {
+        let mapped_primary = trial_conclusion_row.as_ref().and_then(|row| {
             let name = row
-                .pointer("/primary_metric_name")
+                .pointer("/primary_metric/name")
                 .and_then(Value::as_str)
                 .map(str::to_string)?;
             let value = row
-                .pointer("/primary_metric_value")
+                .pointer("/primary_metric/value")
                 .cloned()
                 .unwrap_or(json!(null));
             Some((name, value))
         });
-        let (primary_metric_name, primary_metric_value) = if benchmark_grading_enabled
-            && grade_error_reason.is_none()
-        {
-            if let Some((name, value)) = benchmark_primary {
+        let (primary_metric_name, primary_metric_value) = if benchmark_grading_enabled {
+            if grade_error_reason.is_some() {
+                ("grading_failed".to_string(), json!(null))
+            } else if let Some((name, value)) = mapped_primary {
                 (name, value)
-            } else if let Some(obj) = trial_output.get("objective").and_then(|v| v.as_object()) {
-                let name = obj
-                    .get("name")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("primary_metric")
-                    .to_string();
-                let value = obj.get("value").cloned().unwrap_or(json!(null));
-                (name, value)
+            } else if let Some(row) = trial_conclusion_row.as_ref() {
+                (
+                    "trial_conclusion_payload".to_string(),
+                    row.pointer("/payload").cloned().unwrap_or(json!(null)),
+                )
             } else {
-                let fallback = if outcome == "success" { 1.0 } else { 0.0 };
-                ("success".to_string(), json!(fallback))
+                ("grading_failed".to_string(), json!(null))
             }
         } else if let Some(obj) = trial_output.get("objective").and_then(|v| v.as_object()) {
             let name = obj
@@ -735,9 +818,14 @@ impl TrialExecutor {
         run_sink.append_event_rows(&event_rows)?;
         run_sink.append_variant_snapshot(&variant_snapshot_rows)?;
 
-        let failure_classification = if grade_error_reason.is_some() {
-            trial_guard.complete("failed", Some("grade_error"))?;
-            Some("grade_error".to_string())
+        let failure_classification = if benchmark_grading_enabled {
+            if grade_error_reason.is_some() {
+                trial_guard.complete("failed", Some("grade_error"))?;
+                Some("grade_error".to_string())
+            } else {
+                trial_guard.complete("completed", None)?;
+                None
+            }
         } else if status != "0" {
             trial_guard.complete("failed", Some("agent_exit_nonzero"))?;
             Some("agent_exit_nonzero".to_string())
@@ -755,15 +843,20 @@ impl TrialExecutor {
         materialize_trial_runtime_layout(&trial_dir, &trial_paths, materialize_mode)?;
         trial_paths.cleanup_scratch()?;
 
-        let slot_status = if grade_error_reason.is_none() && status == "0" && outcome != "error" {
+        let slot_status = if benchmark_grading_enabled {
+            if grade_error_reason.is_none() {
+                "completed"
+            } else {
+                "grading_failed"
+            }
+        } else if status == "0" && outcome != "error" {
             "completed"
         } else {
             "failed"
         };
         let mut result =
             TrialExecutionResult::minimal(trial_id, slot_status, Some(slot.variant_idx));
-        result.deferred_benchmark_prediction_records = deferred_benchmark_prediction_records;
-        result.deferred_benchmark_score_records = deferred_benchmark_score_records;
+        result.deferred_trial_conclusion_records = deferred_trial_conclusion_records;
         result.failure_classification = failure_classification;
         Ok(result)
     }
@@ -785,14 +878,14 @@ fn slot_commit_payload_digest_for_result(
         "variant_snapshot_rows": trial_result.deferred_variant_snapshot_rows.clone(),
         "evidence_rows": trial_result.deferred_evidence_records.clone(),
         "chain_state_rows": trial_result.deferred_chain_state_records.clone(),
-        "benchmark_prediction_rows": trial_result.deferred_benchmark_prediction_records.clone(),
-        "benchmark_score_rows": trial_result.deferred_benchmark_score_records.clone(),
+        "trial_conclusion_rows": trial_result.deferred_trial_conclusion_records.clone(),
     });
     Ok(canonical_json_digest(&payload))
 }
 
 fn annotate_row_identity(
     value: &mut Value,
+    run_id: &str,
     schedule_idx: usize,
     slot_commit_id: &str,
     attempt: usize,
@@ -801,6 +894,7 @@ fn annotate_row_identity(
     let Some(obj) = value.as_object_mut() else {
         return;
     };
+    obj.insert("run_id".to_string(), json!(run_id));
     obj.insert("schedule_idx".to_string(), json!(schedule_idx));
     obj.insert("slot_commit_id".to_string(), json!(slot_commit_id));
     obj.insert("attempt".to_string(), json!(attempt));
@@ -809,6 +903,7 @@ fn annotate_row_identity(
 
 fn annotate_value_rows(
     rows: &[Value],
+    run_id: &str,
     schedule_idx: usize,
     slot_commit_id: &str,
     attempt: usize,
@@ -817,7 +912,14 @@ fn annotate_value_rows(
         .enumerate()
         .map(|(row_seq, row)| {
             let mut next = row.clone();
-            annotate_row_identity(&mut next, schedule_idx, slot_commit_id, attempt, row_seq);
+            annotate_row_identity(
+                &mut next,
+                run_id,
+                schedule_idx,
+                slot_commit_id,
+                attempt,
+                row_seq,
+            );
             next
         })
         .collect()
@@ -925,6 +1027,7 @@ impl RunCoordinator {
             variant_snapshots: 0,
             evidence: 0,
             chain_states: 0,
+            conclusions: 0,
             predictions: 0,
             scores: 0,
         };
@@ -998,8 +1101,7 @@ impl RunCoordinator {
         policy_config: &PolicyConfig,
         evidence_records_path: &Path,
         task_chain_states_path: &Path,
-        benchmark_predictions_path: &Path,
-        benchmark_scores_path: &Path,
+        benchmark_conclusions_path: &Path,
         schedule_progress: &mut ScheduleProgress,
         schedule_idx: usize,
         trial_index: usize,
@@ -1024,8 +1126,9 @@ impl RunCoordinator {
             variant_snapshots: trial_result.deferred_variant_snapshot_rows.len(),
             evidence: trial_result.deferred_evidence_records.len(),
             chain_states: trial_result.deferred_chain_state_records.len(),
-            predictions: trial_result.deferred_benchmark_prediction_records.len(),
-            scores: trial_result.deferred_benchmark_score_records.len(),
+            conclusions: trial_result.deferred_trial_conclusion_records.len(),
+            predictions: 0,
+            scores: 0,
         };
         append_slot_commit_record(
             run_dir,
@@ -1049,6 +1152,7 @@ impl RunCoordinator {
 
         let evidence_rows = annotate_value_rows(
             &trial_result.deferred_evidence_records,
+            &schedule_progress.run_id,
             schedule_idx,
             &slot_commit_id,
             attempt,
@@ -1058,6 +1162,7 @@ impl RunCoordinator {
         }
         let chain_rows = annotate_value_rows(
             &trial_result.deferred_chain_state_records,
+            &schedule_progress.run_id,
             schedule_idx,
             &slot_commit_id,
             attempt,
@@ -1065,23 +1170,15 @@ impl RunCoordinator {
         for record in &chain_rows {
             append_jsonl(task_chain_states_path, record)?;
         }
-        let prediction_rows = annotate_value_rows(
-            &trial_result.deferred_benchmark_prediction_records,
+        let conclusion_rows = annotate_value_rows(
+            &trial_result.deferred_trial_conclusion_records,
+            &schedule_progress.run_id,
             schedule_idx,
             &slot_commit_id,
             attempt,
         );
-        for row in &prediction_rows {
-            append_jsonl(benchmark_predictions_path, row)?;
-        }
-        let score_rows = annotate_value_rows(
-            &trial_result.deferred_benchmark_score_records,
-            schedule_idx,
-            &slot_commit_id,
-            attempt,
-        );
-        for row in &score_rows {
-            append_jsonl(benchmark_scores_path, row)?;
+        for row in &conclusion_rows {
+            append_jsonl(benchmark_conclusions_path, row)?;
         }
         let trial_rows = annotate_trial_rows(
             &trial_result.deferred_trial_records,
@@ -1289,8 +1386,7 @@ impl DeterministicCommitter {
         policy_config: &PolicyConfig,
         evidence_records_path: &Path,
         task_chain_states_path: &Path,
-        benchmark_predictions_path: &Path,
-        benchmark_scores_path: &Path,
+        benchmark_conclusions_path: &Path,
         schedule_progress: &mut ScheduleProgress,
         trial_index: usize,
         pruned_variants: &mut HashSet<usize>,
@@ -1317,8 +1413,7 @@ impl DeterministicCommitter {
                         policy_config,
                         evidence_records_path,
                         task_chain_states_path,
-                        benchmark_predictions_path,
-                        benchmark_scores_path,
+                        benchmark_conclusions_path,
                         schedule_progress,
                         schedule_idx,
                         trial_index,
@@ -1823,8 +1918,7 @@ fn execute_schedule_engine_parallel(
     max_concurrency: usize,
 ) -> Result<ScheduleEngineOutcome> {
     let benchmark_dir = run_dir.join("benchmark");
-    let benchmark_predictions_path = benchmark_dir.join("predictions.jsonl");
-    let benchmark_scores_path = benchmark_dir.join("scores.jsonl");
+    let benchmark_conclusions_path = benchmark_dir.join("conclusions.jsonl");
 
     let requested_dispatch_capacity = max_concurrency.max(1);
     let worker_context = Arc::new(ParallelWorkerExecutionContext {
@@ -1914,8 +2008,7 @@ fn execute_schedule_engine_parallel(
         policy_config,
         evidence_records_path,
         task_chain_states_path,
-        &benchmark_predictions_path,
-        &benchmark_scores_path,
+        &benchmark_conclusions_path,
         schedule_progress,
         *trial_index,
         pruned_variants,
@@ -2049,8 +2142,7 @@ fn execute_schedule_engine_parallel(
             policy_config,
             evidence_records_path,
             task_chain_states_path,
-            &benchmark_predictions_path,
-            &benchmark_scores_path,
+            &benchmark_conclusions_path,
             schedule_progress,
             *trial_index,
             pruned_variants,
@@ -2117,8 +2209,7 @@ fn execute_schedule_engine_parallel(
             policy_config,
             evidence_records_path,
             task_chain_states_path,
-            &benchmark_predictions_path,
-            &benchmark_scores_path,
+            &benchmark_conclusions_path,
             schedule_progress,
             *trial_index,
             pruned_variants,
@@ -2133,8 +2224,7 @@ fn execute_schedule_engine_parallel(
         policy_config,
         evidence_records_path,
         task_chain_states_path,
-        &benchmark_predictions_path,
-        &benchmark_scores_path,
+        &benchmark_conclusions_path,
         schedule_progress,
         *trial_index,
         pruned_variants,
@@ -2284,88 +2374,97 @@ fn copy_path_into_package(source: &Path, destination: &Path) -> Result<()> {
     ))
 }
 
-fn stage_task_workspace_dependencies_for_package(
-    tasks: &[TaskDeclaration],
-    project_root: &Path,
-    package_dir: &Path,
-) -> Result<()> {
-    let mut dataset_pack_refs = HashSet::new();
-    let mut git_checkout_commits: BTreeMap<String, HashSet<String>> = BTreeMap::new();
-
-    for (idx, task) in tasks.iter().enumerate() {
-        if matches!(task.workspace.base.kind, WorkspaceBaseKind::DatasetPack) {
-            let dataset_pack_ref = task
-                .workspace
-                .base
-                .dataset_pack_ref
-                .clone()
-                .ok_or_else(|| {
-                    anyhow!(
-                        "package build missing workspace.base.dataset_pack_ref for packaged task row {}",
-                        idx + 1
-                    )
-                })?;
-            dataset_pack_refs.insert(dataset_pack_ref);
-        }
-
-        if matches!(task.workspace.base.kind, WorkspaceBaseKind::GitCheckout) {
-            let repo = task
-                .workspace
-                .base
-                .repo
-                .clone()
-                .ok_or_else(|| {
-                    anyhow!(
-                        "package build missing workspace.base.repo for packaged task row {}",
-                        idx + 1
-                    )
-                })?;
-            let commit = task
-                .workspace
-                .base
-                .commit
-                .clone()
-                .ok_or_else(|| {
-                    anyhow!(
-                        "package build missing workspace.base.commit for packaged task row {}",
-                        idx + 1
-                    )
-                })?;
-            git_checkout_commits.entry(repo).or_default().insert(commit);
-        }
-
-        for mount in &task.workspace.aux_mounts {
-            dataset_pack_refs.insert(mount.dataset_pack_ref.clone());
-        }
+fn packaged_task_bundle_rel_path(task_id: &str, task_idx: usize, source: Option<&Path>) -> PathBuf {
+    let stem = format!("{}_{}", sanitize_for_fs(task_id), task_idx + 1);
+    let base = PathBuf::from("tasks").join("task_bundles");
+    let Some(source) = source else {
+        return base.join(stem);
+    };
+    let Some(name) = source.file_name().and_then(|value| value.to_str()) else {
+        return base.join(stem);
+    };
+    if source.is_dir() {
+        return base.join(stem);
     }
-
-    for dataset_pack_ref in dataset_pack_refs {
-        let digest = parse_dataset_pack_ref_digest(&dataset_pack_ref)?;
-        let source = resolve_dataset_pack_host_path(project_root, &dataset_pack_ref)?;
-        let destination = package_dir
-            .join(".lab")
-            .join("dataset_packs")
-            .join("sha256")
-            .join(digest);
-        copy_path_into_package(&source, &destination)?;
-    }
-
-    for (repo, commits) in git_checkout_commits {
-        for commit in commits {
-            let _ = hydrate_git_checkout_cache(project_root, &repo, &commit)?;
-        }
-        let source = git_repo_cache_dir(project_root, &repo);
-        let destination = package_dir
-            .join(".lab")
-            .join("git_checkouts")
-            .join(sanitize_for_fs(&repo));
-        copy_path_into_package(&source, &destination)?;
-    }
-
-    Ok(())
+    base.join(format!("{}_{}", stem, name))
 }
 
-fn write_packaged_task_declarations(path: &Path, tasks: &[TaskDeclaration]) -> Result<()> {
+fn resolve_task_bundle_source_for_package(
+    raw: &str,
+    dataset_dir: &Path,
+    exp_dir: &Path,
+) -> Result<PathBuf> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(anyhow!("task bundle ref cannot be empty"));
+    }
+    let source = Path::new(trimmed);
+    if source.is_absolute() {
+        return Ok(source.to_path_buf());
+    }
+    let dataset_candidate = dataset_dir.join(source);
+    if dataset_candidate.exists() {
+        return Ok(dataset_candidate);
+    }
+    let exp_candidate = exp_dir.join(source);
+    if exp_candidate.exists() {
+        return Ok(exp_candidate);
+    }
+    Err(anyhow!(
+        "task bundle ref '{}' could not be resolved relative to dataset or experiment directory",
+        raw
+    ))
+}
+
+fn stage_task_row_bundle_for_package(
+    task_row: &TaskRow,
+    task_idx: usize,
+    dataset_dir: &Path,
+    exp_dir: &Path,
+    package_dir: &Path,
+) -> Result<TaskRow> {
+    let mut staged = task_row.clone();
+    if !matches!(staged.materialization.kind, TaskMaterializationKind::BaseImageBundle) {
+        return Ok(staged);
+    }
+    let raw_bundle_ref = staged
+        .materialization
+        .task_bundle_ref
+        .as_deref()
+        .ok_or_else(|| {
+            anyhow!(
+                "task '{}' is missing materialization.task_bundle_ref for base_image_bundle",
+                staged.id
+            )
+        })?;
+    let source = resolve_task_bundle_source_for_package(raw_bundle_ref, dataset_dir, exp_dir)?;
+    let bundle_rel = packaged_task_bundle_rel_path(&staged.id, task_idx, Some(&source));
+    copy_path_into_package(&source, &package_dir.join(&bundle_rel))?;
+    staged.materialization.task_bundle_ref = Some(as_portable_rel(&bundle_rel));
+    Ok(staged)
+}
+
+fn compile_tasks_for_package(
+    tasks: &[Value],
+    _project_root: &Path,
+    exp_dir: &Path,
+    dataset_path: &Path,
+    package_dir: &Path,
+) -> Result<Vec<Value>> {
+    let dataset_dir = dataset_path.parent().unwrap_or(exp_dir);
+    let mut compiled = Vec::with_capacity(tasks.len());
+    for (idx, task) in tasks.iter().enumerate() {
+        let task_row = parse_task_row(task).with_context(|| {
+            format!("package build task {} is not a valid task_row_v1", idx + 1)
+        })?;
+        let row =
+            stage_task_row_bundle_for_package(&task_row, idx, dataset_dir, exp_dir, package_dir)?;
+        compiled.push(serde_json::to_value(row)?);
+    }
+    Ok(compiled)
+}
+
+fn write_packaged_tasks(path: &Path, tasks: &[Value]) -> Result<()> {
     let mut bytes = Vec::new();
     for task in tasks {
         serde_json::to_writer(&mut bytes, task)?;
@@ -2433,9 +2532,9 @@ fn stage_public_runtime_path_reference(
         )
     })?;
     if copies.contains_key(&rel_portable) {
-        return Ok(contract_deps_destination_path(&rel_portable));
+        return Ok(task_workdir_support_destination_path(&rel_portable));
     }
-    let packaged_rel = PathBuf::from(PACKAGED_RUNTIME_DEPS_DIR).join(rel);
+    let packaged_rel = PathBuf::from(PACKAGED_RUNTIME_ASSETS_DIR).join(rel);
     let packaged_rel_portable = as_portable_rel(&packaged_rel);
     let destination = package_dir.join(&packaged_rel);
     copy_path_into_package(&resolved, &destination)?;
@@ -2443,11 +2542,17 @@ fn stage_public_runtime_path_reference(
     manifest_entries.push(RuntimePathStagingManifestEntry {
         original_relative_path: rel_portable.clone(),
         packaged_path: packaged_rel_portable,
-        runtime_path: contract_deps_destination_path(&rel_portable),
+        runtime_path: task_workdir_support_destination_path(&rel_portable),
         required: true,
         read_only: true,
     });
-    Ok(contract_deps_destination_path(&rel_portable))
+    Ok(task_workdir_support_destination_path(&rel_portable))
+}
+
+fn is_runner_staged_destination_path(raw: &str) -> bool {
+    strip_task_workdir_support_destination_path(raw).is_some()
+        || raw == AGENTLAB_CONTRACT_RUNTIME_AUX_DIR
+        || raw.starts_with(&format!("{}/", AGENTLAB_CONTRACT_RUNTIME_AUX_DIR))
 }
 
 fn rewrite_packaged_runtime_asset_entries(
@@ -2470,7 +2575,7 @@ fn rewrite_packaged_runtime_asset_entries(
             raw,
             exp_dir,
             package_dir,
-            PACKAGED_RUNTIME_DEPS_DIR,
+            PACKAGED_RUNTIME_ASSETS_DIR,
             "dep",
             file_copies,
             file_counter,
@@ -2486,6 +2591,73 @@ fn rewrite_packaged_runtime_asset_entries(
         }
         set_json_pointer_value(item, "/packaged_path", json!(rel))?;
     }
+    Ok(())
+}
+
+fn rewrite_optional_package_source_path(
+    value: Option<&mut Value>,
+    field_name: &str,
+    exp_dir: &Path,
+    package_dir: &Path,
+    subdir: &str,
+    prefix: &str,
+    file_copies: &mut BTreeMap<String, String>,
+    file_counter: &mut usize,
+) -> Result<()> {
+    let Some(item) = value else {
+        return Ok(());
+    };
+    let Some(raw) = item.as_str().map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(());
+    };
+    let rel = stage_source_into_package(
+        raw,
+        exp_dir,
+        package_dir,
+        subdir,
+        prefix,
+        file_copies,
+        file_counter,
+    )
+    .with_context(|| {
+        format!(
+            "failed to stage {} '{}' into sealed package",
+            field_name, raw
+        )
+    })?;
+    *item = Value::String(rel);
+    Ok(())
+}
+
+fn stage_optional_public_runtime_path_for_package(
+    value: Option<&mut Value>,
+    field_name: &str,
+    exp_dir: &Path,
+    package_dir: &Path,
+    public_path_copies: &mut BTreeMap<String, String>,
+    staging_manifest_entries: &mut Vec<RuntimePathStagingManifestEntry>,
+) -> Result<()> {
+    let Some(item) = value else {
+        return Ok(());
+    };
+    let Some(raw) = item.as_str().map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(());
+    };
+    if is_runner_staged_destination_path(raw) {
+        return Ok(());
+    }
+    let Some(rel) = resolve_existing_public_path_reference(raw, exp_dir, field_name)? else {
+        return Ok(());
+    };
+    let contract_path = stage_public_runtime_path_reference(
+        &rel,
+        exp_dir,
+        package_dir,
+        public_path_copies,
+        staging_manifest_entries,
+        field_name,
+    )?;
+    *item = Value::String(contract_path);
     Ok(())
 }
 
@@ -2512,6 +2684,9 @@ fn stage_command_path_refs_for_package(
             ));
         }
         if idx == 0 {
+            continue;
+        }
+        if is_runner_staged_destination_path(token) {
             continue;
         }
         let Some(rel) = resolve_existing_public_path_reference(
@@ -2571,6 +2746,9 @@ fn stage_runtime_command_env_path_refs_for_package(
                     key
                 ));
             }
+            if is_runner_staged_destination_path(raw) {
+                continue;
+            }
             let Some(rel) = resolve_existing_public_path_reference(
                 raw,
                 exp_dir,
@@ -2609,7 +2787,7 @@ fn collect_command_staging_entries(
         let Some(runtime_path) = item.as_str().map(str::trim) else {
             return Err(anyhow!("{}[{}] must be a string", field_name, idx));
         };
-        if !runtime_path.starts_with(AGENTLAB_CONTRACT_DEPS_DIR) {
+        if strip_task_workdir_support_destination_path(runtime_path).is_none() {
             continue;
         }
         if !seen.insert(runtime_path.to_string()) {
@@ -2665,7 +2843,7 @@ fn collect_runtime_command_env_staging_entries(
             let Some(runtime_path) = value.as_str().map(str::trim) else {
                 return Err(anyhow!("runtime.agent_runtime.env.{} must be a string", key));
             };
-            if !runtime_path.starts_with(AGENTLAB_CONTRACT_DEPS_DIR) {
+            if strip_task_workdir_support_destination_path(runtime_path).is_none() {
                 continue;
             }
             if !seen.insert(runtime_path.to_string()) {
@@ -2735,7 +2913,7 @@ fn collect_packaged_runtime_asset_entries(
                 packaged_path,
                 &format!("{}[{}].packaged_path", field_name, idx),
             )?,
-            runtime_path: validate_runtime_contract_path(
+            runtime_path: validate_runner_staged_destination_path(
                 runtime_path,
                 &format!("{}[{}].runtime_path", field_name, idx),
             )?,
@@ -2900,6 +3078,24 @@ fn rewrite_benchmark_paths_for_package(
         public_path_copies,
         staging_manifest_entries,
     )?;
+    stage_optional_public_runtime_path_for_package(
+        benchmark_root.pointer_mut("/grader/conclusion/mapper"),
+        "benchmark.grader.conclusion.mapper",
+        exp_dir,
+        package_dir,
+        public_path_copies,
+        staging_manifest_entries,
+    )?;
+    rewrite_optional_package_source_path(
+        benchmark_root.pointer_mut("/grader/injected/bundle"),
+        "benchmark.grader.injected.bundle",
+        exp_dir,
+        package_dir,
+        "files",
+        "grader_bundle",
+        file_copies,
+        file_counter,
+    )?;
     stage_command_path_refs_for_package(
         benchmark_root.pointer_mut("/adapter/command"),
         "benchmark.adapter.command",
@@ -2972,19 +3168,25 @@ pub fn build_experiment_package(
     ensure_dir(&package_dir.join("agent_builds"))?;
     ensure_dir(&package_dir.join("tasks"))?;
     ensure_dir(&package_dir.join("files"))?;
-    ensure_dir(&package_dir.join(PACKAGED_RUNTIME_DEPS_DIR))?;
+    ensure_dir(&package_dir.join(PACKAGED_RUNTIME_ASSETS_DIR))?;
 
     let dataset_path = resolve_dataset_path(&json_value, &loaded.exp_dir)?;
     let dataset_target = package_dir.join("tasks").join("tasks.jsonl");
-    let packaged_tasks = load_task_specs_for_build(&dataset_path, &json_value)?;
-    write_packaged_task_declarations(&dataset_target, &packaged_tasks)?;
+    let raw_tasks = load_task_rows_for_build(&dataset_path, &json_value)?;
+    let packaged_tasks = compile_tasks_for_package(
+        &raw_tasks,
+        &loaded.project_root,
+        &loaded.exp_dir,
+        &dataset_path,
+        &package_dir,
+    )?;
+    write_packaged_tasks(&dataset_target, &packaged_tasks)?;
     let dataset_rel = PathBuf::from("tasks").join("tasks.jsonl");
     set_json_pointer_value(
         &mut json_value,
         "/dataset/path",
         json!(as_portable_rel(&dataset_rel)),
     )?;
-    stage_task_workspace_dependencies_for_package(&packaged_tasks, &loaded.project_root, &package_dir)?;
 
     let mut artifact_copies: BTreeMap<String, String> = BTreeMap::new();
     let mut file_copies: BTreeMap<String, String> = BTreeMap::new();
@@ -3160,7 +3362,7 @@ fn run_experiment_with_behavior(
     let _engine_lease_guard = start_engine_lease_heartbeat(&run_dir, &run_id)?;
     let mut run_guard = RunControlGuard::new(&run_dir, &run_id);
 
-    for subdir in ["tasks", "files", "agent_builds", PACKAGED_RUNTIME_DEPS_DIR] {
+    for subdir in ["tasks", "files", "agent_builds", PACKAGED_RUNTIME_ASSETS_DIR] {
         let source = exp_dir.join(subdir);
         if source.exists() {
             copy_path_into_package(&source, &run_dir.join(subdir))?;

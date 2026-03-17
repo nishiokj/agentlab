@@ -418,50 +418,27 @@ export interface BenchmarkAdapterManifest {
   };
   execution_mode: 'predict_then_score' | 'integrated_score';
   record_schemas: {
-    prediction: 'benchmark_prediction_record_v1';
-    score: 'benchmark_score_record_v1';
+    conclusion: 'trial_conclusion_v1';
   };
   evaluator: BenchmarkEvaluator;
   capabilities?: JsonMap;
   ext?: JsonMap;
 }
 
-export interface BenchmarkPredictionRecord {
-  schema_version: 'benchmark_prediction_record_v1';
+export interface TrialConclusionRecord {
+  schema_version: 'trial_conclusion_v1';
   ts?: string;
-  ids: CommonTrialIds;
-  benchmark: BenchmarkIdentity;
-  prediction: {
-    kind: 'patch' | 'text' | 'json' | 'artifact_ref';
-    value?: unknown;
-    artifact_ref?: string;
-    metadata?: JsonMap;
+  payload: JsonMap;
+  reported_outcome?: string;
+  primary_metric?: {
+    name: string;
+    value: unknown;
   };
-  metrics?: JsonMap;
-  ext?: JsonMap;
-}
-
-export interface BenchmarkScoreRecord {
-  schema_version: 'benchmark_score_record_v1';
-  ts?: string;
-  ids: CommonTrialIds;
-  benchmark: BenchmarkIdentity;
-  verdict: 'pass' | 'fail' | 'missing' | 'error';
-  primary_metric_name: string;
-  primary_metric_value: number;
-  metrics?: JsonMap;
-  evaluator: BenchmarkEvaluator;
-  artifacts?: Array<{
-    ref: string;
-    logical_name?: string;
-    mime_type?: string;
-  }>;
-  error?: {
-    error_type?: string;
-    message?: string;
-    stack?: string;
+  grader: {
+    name: string;
+    strategy: 'in_task_image' | 'injected' | 'separate';
+    version?: string;
   };
-  ext?: JsonMap;
 }
 
 export interface BenchmarkSummaryVariant {
@@ -508,7 +485,6 @@ export interface ReadBenchmarkArgs extends CommandOptions {
 
 export interface ReadBenchmarkResponse {
   manifest: BenchmarkAdapterManifest | null;
-  predictions: BenchmarkPredictionRecord[];
-  scores: BenchmarkScoreRecord[];
+  conclusions: TrialConclusionRecord[];
   summary: BenchmarkSummary | null;
 }

@@ -1046,7 +1046,7 @@ describe('LabClient.readEvidence() and readBenchmark()', () => {
     assert.deepEqual(result.taskChains, []);
   });
 
-  test('readBenchmark parses manifest, predictions, scores, and summary', async () => {
+  test('readBenchmark parses manifest, conclusions, and summary', async () => {
     const runDir = join(dir, 'run_003');
     const benchmarkDir = join(runDir, 'benchmark');
     mkdirSync(benchmarkDir, { recursive: true });
@@ -1059,43 +1059,29 @@ describe('LabClient.readEvidence() and readBenchmark()', () => {
         benchmark: { name: 'demo', split: 'dev' },
         execution_mode: 'predict_then_score',
         record_schemas: {
-          prediction: 'benchmark_prediction_record_v1',
-          score: 'benchmark_score_record_v1',
+          conclusion: 'trial_conclusion_v1',
         },
         evaluator: { name: 'demo_eval', mode: 'custom' },
       }),
     );
     writeFileSync(
-      join(benchmarkDir, 'predictions.jsonl'),
+      join(benchmarkDir, 'conclusions.jsonl'),
       `${JSON.stringify({
-        schema_version: 'benchmark_prediction_record_v1',
-        ids: {
-          run_id: 'run_003',
-          trial_id: 'trial_1',
-          variant_id: 'control',
-          task_id: 'task_1',
-          repl_idx: 0,
+        schema_version: 'trial_conclusion_v1',
+        payload: {
+          ids: {
+            run_id: 'run_003',
+            trial_id: 'trial_1',
+            variant_id: 'control',
+            task_id: 'task_1',
+            repl_idx: 0,
+          },
+          benchmark: { adapter_id: 'demo_adapter', name: 'demo', split: 'dev' },
+          resolved: 1,
         },
-        benchmark: { adapter_id: 'demo_adapter', name: 'demo', split: 'dev' },
-        prediction: { kind: 'json', value: { answer: 'x' } },
-      })}\n`,
-    );
-    writeFileSync(
-      join(benchmarkDir, 'scores.jsonl'),
-      `${JSON.stringify({
-        schema_version: 'benchmark_score_record_v1',
-        ids: {
-          run_id: 'run_003',
-          trial_id: 'trial_1',
-          variant_id: 'control',
-          task_id: 'task_1',
-          repl_idx: 0,
-        },
-        benchmark: { adapter_id: 'demo_adapter', name: 'demo', split: 'dev' },
-        verdict: 'pass',
-        primary_metric_name: 'resolved',
-        primary_metric_value: 1,
-        evaluator: { name: 'demo_eval', mode: 'custom' },
+        reported_outcome: 'success',
+        primary_metric: { name: 'resolved', value: 1 },
+        grader: { name: 'demo_eval', strategy: 'in_task_image' },
       })}\n`,
     );
     writeFileSync(
@@ -1113,8 +1099,8 @@ describe('LabClient.readEvidence() and readBenchmark()', () => {
     const result = await client.readBenchmark({ runDir: 'run_003' });
 
     assert.equal(result.manifest?.schema_version, 'benchmark_adapter_manifest_v1');
-    assert.equal(result.predictions.length, 1);
-    assert.equal(result.scores.length, 1);
+    assert.equal(result.conclusions.length, 1);
+    assert.equal(result.conclusions[0]?.reported_outcome, 'success');
     assert.equal(result.summary?.schema_version, 'benchmark_summary_v1');
   });
 
@@ -1125,7 +1111,6 @@ describe('LabClient.readEvidence() and readBenchmark()', () => {
     const result = await client.readBenchmark({ runDir: 'run_004' });
     assert.equal(result.manifest, null);
     assert.equal(result.summary, null);
-    assert.deepEqual(result.predictions, []);
-    assert.deepEqual(result.scores, []);
+    assert.deepEqual(result.conclusions, []);
   });
 });

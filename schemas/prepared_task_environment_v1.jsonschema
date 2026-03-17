@@ -50,14 +50,20 @@
     "contract_files": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["trial_input", "task", "bindings", "dependencies", "policy", "result", "trajectory"],
+      "required": [
+        "trial_input",
+        "grader_input",
+        "result",
+        "raw_grader_output",
+        "mapped_grader_output",
+        "trajectory"
+      ],
       "properties": {
         "trial_input": { "type": "string", "minLength": 1 },
-        "task": { "type": "string", "minLength": 1 },
-        "bindings": { "type": "string", "minLength": 1 },
-        "dependencies": { "type": "string", "minLength": 1 },
-        "policy": { "type": "string", "minLength": 1 },
+        "grader_input": { "type": "string", "minLength": 1 },
         "result": { "type": "string", "minLength": 1 },
+        "raw_grader_output": { "type": "string", "minLength": 1 },
+        "mapped_grader_output": { "type": "string", "minLength": 1 },
         "trajectory": { "type": "string", "minLength": 1 }
       }
     },

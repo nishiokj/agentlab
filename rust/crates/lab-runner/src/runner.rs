@@ -456,7 +456,7 @@ pub fn replay_trial(run_dir: &Path, trial_id: &str, strict: bool) -> Result<Repl
     ensure_dir(&replay_dir)?;
 
     let replay_trial_id = format!("{}_{}", trial_id, replay_id);
-    let task_boundary = materialize_task_boundary(prepared_manifest.declaration.clone());
+    let task_boundary = materialize_packaged_task_boundary(&prepared_manifest.declaration)?;
     validate_task_boundary_workspace_materialization(&task_boundary)?;
 
     let replay_trial_dir = replay_dir.join("trial_1");
@@ -506,13 +506,18 @@ pub fn replay_trial(run_dir: &Path, trial_id: &str, strict: bool) -> Result<Repl
     )?;
     set_json_pointer_value(&mut input, "/runtime/control_plane/mode", json!("file"))?;
     let input_bytes = serde_json::to_vec_pretty(&input)?;
+    let replay_task_sandbox_image = replay_prepared_manifest.task_sandbox_image().to_string();
+    let replay_task_sandbox_workdir = replay_prepared_manifest
+        .task_sandbox_workdir()
+        .unwrap_or(task_boundary.task_workdir.as_str())
+        .to_string();
 
     let io_paths = prepare_io_paths(&trial_paths, &input_bytes)?;
     let runtime_env = build_runtime_contract_env(
         &run_id,
         &input,
         &io_paths,
-        Some(replay_prepared_manifest.task_image.as_str()),
+        Some(replay_task_sandbox_image.as_str()),
         resolve_trial_timeout_ms(&input),
     );
     let adapter = adapter_registry_entry(&agent_runtime.adapter_ref)?;
@@ -529,13 +534,15 @@ pub fn replay_trial(run_dir: &Path, trial_id: &str, strict: bool) -> Result<Repl
         benchmark_grader: None,
         benchmark_grading_enabled: false,
         run_id: &run_id,
-        task_image: Some(replay_prepared_manifest.task_image.as_str()),
+        task_image: replay_task_sandbox_image.as_str(),
+        task_workdir: replay_task_sandbox_workdir.as_str(),
+        task_materialization_kind: task_boundary.materialization.kind.clone(),
         agent_artifact: Some(agent_runtime.agent_artifact.as_path()),
     };
     let proc_result = adapter.run_trial(&run_request)?;
     let status = proc_result.status;
 
-    let (trial_output, result_parse_error) = load_trial_output_resilient(&io_paths.output_host)?;
+    let (trial_output, result_parse_error) = load_trial_output_resilient(&io_paths.result_host)?;
 
     let outcome = trial_output
         .get("outcome")
@@ -658,10 +665,11 @@ fn fork_trial_inner(
     let parent_output = load_trial_output_payload(&run_dir, &run_id, from_trial).ok();
     let (variants, _) = load_run_variants(&run_dir, &json_value)?;
     let variant_id = prepared_manifest.variant_id.as_str();
-    let variant = find_variant_by_id(&variants, variant_id)?;
+    let mut variant = find_variant_by_id(&variants, variant_id)?.clone();
+    apply_variant_binding_overrides(&mut variant, set_bindings)?;
     let runtime_profile = resolve_variant_runtime_profile(
         &json_value,
-        variant,
+        &variant,
         &run_dir,
         &RunBehavior::default(),
         &RunExecutionOptions::default(),
@@ -695,7 +703,7 @@ fn fork_trial_inner(
     let fork_dir = run_dir.join("forks").join(&fork_id);
     ensure_dir(&fork_dir)?;
     let fork_trial_id = format!("{}_{}", from_trial, fork_id);
-    let task_boundary = materialize_task_boundary(prepared_manifest.declaration.clone());
+    let task_boundary = materialize_packaged_task_boundary(&prepared_manifest.declaration)?;
     validate_task_boundary_workspace_materialization(&task_boundary)?;
 
     let fork_trial_dir = fork_dir.join("trial_1");
@@ -721,7 +729,7 @@ fn fork_trial_inner(
         &run_id,
         &fork_trial_id,
         &runtime_experiment,
-        variant,
+        &variant,
         prepared_manifest.task_index,
         prepared_manifest.repl_idx,
         &task_boundary,
@@ -735,7 +743,6 @@ fn fork_trial_inner(
         dynamic_mounts,
         trial_input: mut input,
     } = prepared;
-    apply_binding_overrides(&mut input, set_bindings)?;
     set_json_pointer_value(
         &mut input,
         "/ext/fork",
@@ -754,13 +761,18 @@ fn fork_trial_inner(
     )?;
     set_json_pointer_value(&mut input, "/runtime/control_plane/mode", json!("file"))?;
     let input_bytes = serde_json::to_vec_pretty(&input)?;
+    let fork_task_sandbox_image = fork_prepared_manifest.task_sandbox_image().to_string();
+    let fork_task_sandbox_workdir = fork_prepared_manifest
+        .task_sandbox_workdir()
+        .unwrap_or(task_boundary.task_workdir.as_str())
+        .to_string();
 
     let io_paths = prepare_io_paths(&trial_paths, &input_bytes)?;
     let runtime_env = build_runtime_contract_env(
         &run_id,
         &input,
         &io_paths,
-        Some(fork_prepared_manifest.task_image.as_str()),
+        Some(fork_task_sandbox_image.as_str()),
         resolve_trial_timeout_ms(&input),
     );
     let adapter = adapter_registry_entry(&agent_runtime.adapter_ref)?;
@@ -777,13 +789,15 @@ fn fork_trial_inner(
         benchmark_grader: None,
         benchmark_grading_enabled: false,
         run_id: &run_id,
-        task_image: Some(fork_prepared_manifest.task_image.as_str()),
+        task_image: fork_task_sandbox_image.as_str(),
+        task_workdir: fork_task_sandbox_workdir.as_str(),
+        task_materialization_kind: task_boundary.materialization.kind.clone(),
         agent_artifact: Some(agent_runtime.agent_artifact.as_path()),
     };
     let proc_result = adapter.run_trial(&run_request)?;
     let status = proc_result.status;
 
-    let (trial_output, result_parse_error) = load_trial_output_resilient(&io_paths.output_host)?;
+    let (trial_output, result_parse_error) = load_trial_output_resilient(&io_paths.result_host)?;
     let outcome = trial_output
         .get("outcome")
         .and_then(|v| v.as_str())
@@ -1466,10 +1480,7 @@ fn resolve_resume_selector(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ContractPathRoot {
     In,
-    State,
     Out,
-    Deps,
-    Workspace,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1481,9 +1492,7 @@ enum ContractPathMode {
 #[derive(Debug, Clone)]
 struct ContractPathHostRoots {
     in_dir: PathBuf,
-    state_dir: PathBuf,
     out_dir: PathBuf,
-    deps_dir: PathBuf,
     workspace_dir: PathBuf,
 }
 
@@ -1491,9 +1500,7 @@ impl ContractPathHostRoots {
     fn from_trial_paths(paths: &TrialPaths) -> Self {
         Self {
             in_dir: paths.in_dir.clone(),
-            state_dir: paths.state.clone(),
             out_dir: paths.out.clone(),
-            deps_dir: paths.deps.clone(),
             workspace_dir: paths.workspace.clone(),
         }
     }
@@ -1501,9 +1508,7 @@ impl ContractPathHostRoots {
     fn from_trial_dir(trial_dir: &Path) -> Self {
         Self {
             in_dir: trial_dir.join("in"),
-            state_dir: trial_dir.join("state"),
             out_dir: trial_dir.join("out"),
-            deps_dir: trial_dir.join("deps"),
             workspace_dir: trial_dir.join("workspace"),
         }
     }
@@ -1511,10 +1516,7 @@ impl ContractPathHostRoots {
     fn base_for(&self, root: ContractPathRoot) -> &Path {
         match root {
             ContractPathRoot::In => self.in_dir.as_path(),
-            ContractPathRoot::State => self.state_dir.as_path(),
             ContractPathRoot::Out => self.out_dir.as_path(),
-            ContractPathRoot::Deps => self.deps_dir.as_path(),
-            ContractPathRoot::Workspace => self.workspace_dir.as_path(),
         }
     }
 }
@@ -1535,38 +1537,28 @@ fn resolve_contract_path_components(path: &str) -> Option<(ContractPathRoot, &st
     if let Some(rest) = strip_contract_prefix(path, AGENTLAB_CONTRACT_IN_DIR) {
         return Some((ContractPathRoot::In, rest));
     }
-    if let Some(rest) = strip_contract_prefix(path, AGENTLAB_CONTRACT_STATE_DIR) {
-        return Some((ContractPathRoot::State, rest));
-    }
     if let Some(rest) = strip_contract_prefix(path, AGENTLAB_CONTRACT_OUT_DIR) {
         return Some((ContractPathRoot::Out, rest));
-    }
-    if let Some(rest) = strip_contract_prefix(path, AGENTLAB_CONTRACT_DEPS_DIR) {
-        return Some((ContractPathRoot::Deps, rest));
-    }
-    if let Some(rest) = strip_contract_prefix(path, AGENTLAB_CONTRACT_WORKSPACE_DIR) {
-        return Some((ContractPathRoot::Workspace, rest));
     }
     None
 }
 
+fn strip_task_workdir_placeholder_prefix(path: &str) -> Option<&str> {
+    if path == AGENTLAB_TASK_WORKDIR_PLACEHOLDER {
+        return Some("");
+    }
+    let rest = path.strip_prefix(AGENTLAB_TASK_WORKDIR_PLACEHOLDER)?;
+    if rest.starts_with('/') {
+        Some(rest)
+    } else {
+        None
+    }
+}
+
 fn mode_allows_root(mode: ContractPathMode, root: ContractPathRoot) -> bool {
     match mode {
-        ContractPathMode::ContainerMount => matches!(
-            root,
-            ContractPathRoot::In
-                | ContractPathRoot::State
-                | ContractPathRoot::Out
-                | ContractPathRoot::Deps
-                | ContractPathRoot::Workspace
-        ),
-        ContractPathMode::RuntimeEvents => matches!(
-            root,
-            ContractPathRoot::In
-                | ContractPathRoot::State
-                | ContractPathRoot::Out
-                | ContractPathRoot::Workspace
-        ),
+        ContractPathMode::ContainerMount => matches!(root, ContractPathRoot::In | ContractPathRoot::Out),
+        ContractPathMode::RuntimeEvents => matches!(root, ContractPathRoot::In | ContractPathRoot::Out),
     }
 }
 
@@ -1587,6 +1579,11 @@ fn map_contract_path_to_host(
                 raw
             ),
         });
+    }
+    if matches!(mode, ContractPathMode::ContainerMount) {
+        if let Some(rest) = strip_task_workdir_placeholder_prefix(raw) {
+            return Ok(roots.workspace_dir.join(rest.trim_start_matches('/')));
+        }
     }
     if !raw.starts_with('/') {
         return Err(match mode {
@@ -1821,19 +1818,19 @@ fn resolve_selector_checkpoint(
     Ok(None)
 }
 
-fn apply_binding_overrides(
-    input: &mut Value,
+fn apply_variant_binding_overrides(
+    variant: &mut Variant,
     set_bindings: &BTreeMap<String, Value>,
 ) -> Result<()> {
     if set_bindings.is_empty() {
         return Ok(());
     }
-    if input.pointer("/bindings").is_none() {
-        set_json_pointer_value(input, "/bindings", json!({}))?;
+    if !variant.bindings.is_object() {
+        variant.bindings = json!({});
     }
     for (key, value) in set_bindings {
-        let pointer = format!("/bindings/{}", key.split('.').collect::<Vec<_>>().join("/"));
-        set_json_pointer_value(input, &pointer, value.clone())?;
+        let pointer = format!("/{}", key.split('.').collect::<Vec<_>>().join("/"));
+        set_json_pointer_value(&mut variant.bindings, &pointer, value.clone())?;
     }
     Ok(())
 }
@@ -1932,38 +1929,6 @@ fn parse_dx_command_field_named(value: Option<&Value>, field: &str) -> Result<Ve
         Some(_) => Err(anyhow!("{} must be a string or string[]", field)),
         None => Err(anyhow!("{} is required", field)),
     }
-}
-
-fn parse_dx_arg_map(value: Option<&Value>, field: &str) -> Result<Value> {
-    let Some(raw) = value else {
-        return Ok(json!([]));
-    };
-    let items = raw
-        .as_array()
-        .ok_or_else(|| anyhow!("{} must be an array", field))?;
-    let mut mapped = Vec::with_capacity(items.len());
-    for (idx, item) in items.iter().enumerate() {
-        let obj = item
-            .as_object()
-            .ok_or_else(|| anyhow!("{}[{}] must be an object", field, idx))?;
-        let key = obj
-            .get("key")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|v| !v.is_empty())
-            .ok_or_else(|| anyhow!("{}[{}].key must be a non-empty string", field, idx))?;
-        let flag = obj
-            .get("flag")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|v| !v.is_empty())
-            .ok_or_else(|| anyhow!("{}[{}].flag must be a non-empty string", field, idx))?;
-        mapped.push(json!({
-            "key": key,
-            "flag": flag,
-        }));
-    }
-    Ok(Value::Array(mapped))
 }
 
 fn resolve_dx_artifact_path(raw: &str, exp_dir: &Path, project_root: &Path) -> PathBuf {
@@ -2537,6 +2502,7 @@ fn resolve_existing_public_path_reference(
     if trimmed.is_empty()
         || trimmed.starts_with('/')
         || trimmed.starts_with('-')
+        || trimmed.starts_with(AGENTLAB_TASK_WORKDIR_PLACEHOLDER)
         || trimmed.contains('$')
         || trimmed.contains("://")
     {
@@ -2646,89 +2612,6 @@ fn dx_runtime_asset_value(build_source_path: &Path, runtime_path: &str) -> Value
         "required": true,
         "read_only": true
     })
-}
-
-fn parse_dx_provider_env_field(
-    value: Option<&Value>,
-    field_name: &str,
-) -> Result<Vec<(String, String)>> {
-    let Some(value) = value else {
-        return Ok(Vec::new());
-    };
-    let mut pairs = Vec::new();
-    match value {
-        Value::Object(obj) => {
-            for (provider, env_name_raw) in obj {
-                let provider = provider.trim();
-                let env_name = env_name_raw
-                    .as_str()
-                    .ok_or_else(|| anyhow!("{}['{}'] must be a string", field_name, provider))?
-                    .trim();
-                if provider.is_empty() || env_name.is_empty() {
-                    return Err(anyhow!(
-                        "{} entries must use non-empty provider and env values",
-                        field_name
-                    ));
-                }
-                pairs.push((provider.to_string(), env_name.to_string()));
-            }
-        }
-        Value::Array(items) => {
-            for (idx, item) in items.iter().enumerate() {
-                if let Some(token) = item.as_str() {
-                    let trimmed = token.trim();
-                    let (provider, env_name) = trimmed.split_once('=').ok_or_else(|| {
-                        anyhow!(
-                            "{}[{}] must use provider=ENV format (got '{}')",
-                            field_name,
-                            idx,
-                            token
-                        )
-                    })?;
-                    if provider.trim().is_empty() || env_name.trim().is_empty() {
-                        return Err(anyhow!(
-                            "{}[{}] must use non-empty provider and env values",
-                            field_name,
-                            idx
-                        ));
-                    }
-                    pairs.push((provider.trim().to_string(), env_name.trim().to_string()));
-                    continue;
-                }
-                let obj = item
-                    .as_object()
-                    .ok_or_else(|| anyhow!("{}[{}] must be a string or object", field_name, idx))?;
-                let provider = obj
-                    .get("provider")
-                    .and_then(Value::as_str)
-                    .map(str::trim)
-                    .filter(|value| !value.is_empty())
-                    .ok_or_else(|| anyhow!("{}[{}].provider is required", field_name, idx))?;
-                let env_name = obj
-                    .get("env")
-                    .and_then(Value::as_str)
-                    .map(str::trim)
-                    .filter(|value| !value.is_empty())
-                    .ok_or_else(|| anyhow!("{}[{}].env is required", field_name, idx))?;
-                pairs.push((provider.to_string(), env_name.to_string()));
-            }
-        }
-        _ => {
-            return Err(anyhow!(
-                "{} must be an object, string[], or object[]",
-                field_name
-            ))
-        }
-    }
-    Ok(pairs)
-}
-
-fn dx_provider_env_value(provider_env: &[(String, String)]) -> Value {
-    let mut mapping = serde_json::Map::new();
-    for (provider, env_name) in provider_env {
-        mapping.insert(provider.clone(), Value::String(env_name.clone()));
-    }
-    Value::Object(mapping)
 }
 
 fn parse_dx_agent_build(
@@ -3183,12 +3066,14 @@ fn normalize_experiment_authoring(
             }),
             json!([
                 "python3",
-                "/agentlab/deps/bench/integration/agentlab/bench_benchmark_adapter.py"
+                task_workdir_support_destination_path(
+                    "bench/integration/agentlab/bench_benchmark_adapter.py"
+                )
             ]),
             json!([
                 dx_runtime_asset_value(
                     &builtin_assets_root.join("bench"),
-                    "/agentlab/deps/bench"
+                    &task_workdir_support_destination_path("bench")
                 )
             ]),
         ),
@@ -3208,12 +3093,12 @@ fn normalize_experiment_authoring(
             }),
             json!([
                 "python3",
-                "/agentlab/deps/swebench/swebench_task_container_grader.py"
+                task_workdir_support_destination_path("swebench/swebench_task_container_grader.py")
             ]),
             json!([
                 dx_runtime_asset_value(
                     &builtin_assets_root.join("adapters").join("swebench"),
-                    "/agentlab/deps/swebench"
+                    &task_workdir_support_destination_path("swebench")
                 )
             ]),
         ),
@@ -3238,11 +3123,6 @@ fn normalize_experiment_authoring(
             network_mode
         ));
     }
-    let root_read_only = json_value
-        .pointer("/overrides/root_read_only")
-        .and_then(Value::as_bool)
-        .unwrap_or(true);
-
     let limit = json_value.pointer("/limit").and_then(Value::as_u64);
     let replications = json_value
         .pointer("/replications")
@@ -3307,8 +3187,7 @@ fn normalize_experiment_authoring(
                 "artifact_resolved_path": agent_build.artifact_path.to_string_lossy().to_string(),
                 "image": agent_build.image.clone(),
                 "env": agent_build.env.clone(),
-                "network": network_mode,
-                "root_read_only": root_read_only
+                "network": network_mode
             }
         },
         "policy": {

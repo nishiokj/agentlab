@@ -4,12 +4,14 @@ use base64::Engine as _;
 use chrono::Utc;
 use lab_core::{
     canonical_json_digest, ensure_dir, runner_runtime_host_paths, sha256_bytes, sha256_file,
-    ArtifactStore, RunnerRuntimeHostPaths, AGENTLAB_CONTRACT_DEPS_DIR, AGENTLAB_CONTRACT_IN_DIR,
-    AGENTLAB_CONTRACT_OUT_DIR, AGENTLAB_CONTRACT_STATE_DIR, AGENTLAB_CONTRACT_WORKSPACE_DIR,
-    AGENTLAB_ENV_BINDINGS_PATH, AGENTLAB_ENV_DEPENDENCIES_PATH, AGENTLAB_ENV_POLICY_PATH,
-    AGENTLAB_ENV_REPL_IDX, AGENTLAB_ENV_RESULT_PATH, AGENTLAB_ENV_RUN_ID, AGENTLAB_ENV_TASK_ID,
-    AGENTLAB_ENV_TASK_PATH, AGENTLAB_ENV_TIMEOUT_MS, AGENTLAB_ENV_TRAJECTORY_PATH,
-    AGENTLAB_ENV_TRIAL_ID, AGENTLAB_ENV_VARIANT_ID,
+    ArtifactStore, RunnerRuntimeHostPaths, AGENTLAB_CONTRACT_GRADER_AUX_DIR,
+    AGENTLAB_CONTRACT_IN_DIR, AGENTLAB_CONTRACT_OUT_DIR, AGENTLAB_CONTRACT_RUNTIME_AUX_DIR,
+    AGENTLAB_ENV_GRADER_INPUT_PATH, AGENTLAB_ENV_MAPPED_GRADER_OUTPUT_PATH,
+    AGENTLAB_ENV_RAW_GRADER_OUTPUT_PATH, AGENTLAB_ENV_REPL_IDX, AGENTLAB_ENV_RESULT_PATH,
+    AGENTLAB_ENV_RUN_ID, AGENTLAB_ENV_TASK_ID, AGENTLAB_ENV_TIMEOUT_MS,
+    AGENTLAB_ENV_TRAJECTORY_PATH, AGENTLAB_ENV_TRIAL_ID, AGENTLAB_ENV_TRIAL_INPUT_PATH,
+    AGENTLAB_ENV_VARIANT_ID, AGENTLAB_RUNNER_SUPPORT_REL_DIR,
+    AGENTLAB_TASK_WORKDIR_PLACEHOLDER,
 };
 use lab_hooks::{load_manifest, validate_hooks};
 use lab_provenance::{default_attestation, write_attestation};
@@ -182,7 +184,9 @@ struct AdapterRunRequest<'a> {
     benchmark_grader: Option<&'a BenchmarkGraderConfig>,
     benchmark_grading_enabled: bool,
     run_id: &'a str,
-    task_image: Option<&'a str>,
+    task_image: &'a str,
+    task_workdir: &'a str,
+    task_materialization_kind: TaskMaterializationKind,
     agent_artifact: Option<&'a Path>,
 }
 

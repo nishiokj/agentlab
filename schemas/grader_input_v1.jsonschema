@@ -1,0 +1,113 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agent-lab.local/schemas/grader_input_v1.json",
+  "title": "Grader Input v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "ids",
+    "task",
+    "artifact_type",
+    "agent_phase",
+    "candidate_artifact",
+    "workspace_delta",
+    "paths",
+    "workdir"
+  ],
+  "properties": {
+    "schema_version": { "const": "grader_input_v1" },
+    "ids": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["run_id", "trial_id", "variant_id", "task_id"],
+      "properties": {
+        "run_id": { "type": "string", "minLength": 1 },
+        "trial_id": { "type": "string", "minLength": 1 },
+        "variant_id": { "type": "string", "minLength": 1 },
+        "task_id": { "type": "string", "minLength": 1 },
+        "repl_idx": { "type": "integer", "minimum": 0 },
+        "schedule_idx": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "task": {
+      "type": "object",
+      "additionalProperties": true
+    },
+    "artifact_type": {
+      "type": "string",
+      "enum": [
+        "patch_submission",
+        "text_response",
+        "structured_json",
+        "file_ref"
+      ]
+    },
+    "agent_phase": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "timed_out",
+        "result_present",
+        "result_schema_valid",
+        "started_at",
+        "ended_at"
+      ],
+      "properties": {
+        "exit_code": { "type": ["integer", "null"] },
+        "timed_out": { "type": "boolean" },
+        "result_present": { "type": "boolean" },
+        "result_schema_valid": { "type": "boolean" },
+        "started_at": { "type": "string", "format": "date-time" },
+        "ended_at": { "type": "string", "format": "date-time" }
+      }
+    },
+    "candidate_artifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["state", "artifact_type", "source"],
+      "properties": {
+        "state": {
+          "type": "string",
+          "enum": ["missing", "invalid", "valid"]
+        },
+        "artifact_type": {
+          "type": "string",
+          "enum": [
+            "patch_submission",
+            "text_response",
+            "structured_json",
+            "file_ref"
+          ]
+        },
+        "source": {
+          "type": "string",
+          "enum": ["result.inline", "result.file_ref", "none"]
+        },
+        "payload": {}
+      }
+    },
+    "workspace_delta": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["state"],
+      "properties": {
+        "state": {
+          "type": "string",
+          "enum": ["available", "missing", "invalid"]
+        },
+        "diff_path": { "type": "string", "minLength": 1 },
+        "patch_path": { "type": "string", "minLength": 1 }
+      }
+    },
+    "paths": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["result_path"],
+      "properties": {
+        "result_path": { "type": "string", "minLength": 1 }
+      }
+    },
+    "workdir": { "type": "string", "minLength": 1 }
+  }
+}
