@@ -1,6 +1,6 @@
 use anyhow::{anyhow, Context, Result};
 use chrono::Utc;
-use lab_core::{canonical_json_digest, ensure_dir, sha256_bytes, sha256_file};
+use lab_core::{canonical_json_digest, ensure_dir, sha256_file};
 use lab_schemas::compile_schema;
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
@@ -8,8 +8,9 @@ use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Component, Path, PathBuf};
 
-use crate::persistence::sqlite_store::SqliteRunStore as BackingSqliteStore;
-use crate::types::*;
+use crate::persistence::store::SqliteRunStore as BackingSqliteStore;
+use crate::trial::spec::parse_task_row;
+use crate::model::*;
 
 // ---------------------------------------------------------------------------
 // Atomic write helpers
@@ -39,7 +40,10 @@ pub(crate) fn atomic_write_bytes(path: &Path, bytes: &[u8]) -> Result<()> {
 }
 
 pub(crate) fn atomic_write_json_pretty(path: &Path, value: &Value) -> Result<()> {
-    validate_schema_contract_value(value, format!("json write {}", path.display()).as_str())?;
+    crate::package::validate::validate_schema_contract_value(
+        value,
+        format!("json write {}", path.display()).as_str(),
+    )?;
     let bytes = serde_json::to_vec_pretty(value)?;
     atomic_write_bytes(path, &bytes)
 }
@@ -76,7 +80,6 @@ pub(crate) fn load_json_file(path: &Path) -> Result<Value> {
         "run_control.json" => Some(RUNTIME_KEY_RUN_CONTROL),
         "run_session_state.json" => Some(RUNTIME_KEY_RUN_SESSION_STATE),
         "schedule_progress.json" => Some(RUNTIME_KEY_SCHEDULE_PROGRESS),
-        "parallel_worker_control.json" => Some(RUNTIME_KEY_PARALLEL_WORKER_CONTROL),
         "engine_lease.json" => Some(RUNTIME_KEY_ENGINE_LEASE),
         _ => None,
     };
@@ -133,176 +136,6 @@ pub(crate) fn experiment_max_concurrency(json_value: &Value) -> usize {
         .and_then(|v| v.as_u64())
         .unwrap_or(1);
     (raw.max(1)).min(usize::MAX as u64) as usize
-}
-
-// ---------------------------------------------------------------------------
-// Validation helpers
-// ---------------------------------------------------------------------------
-
-pub(crate) fn validate_required_fields(json_value: &Value) -> Result<()> {
-    if json_value
-        .pointer("/version")
-        .and_then(|value| value.as_str())
-        .is_some_and(|value| value.trim() == "1.0")
-    {
-        return Err(anyhow!("legacy experiment version '1.0' is not supported"));
-    }
-    for (pointer, message) in [
-        (
-            "/runtime/agent",
-            "use runtime.agent_runtime plus policy.task_sandbox only",
-        ),
-        (
-            "/runtime/sandbox",
-            "use runtime.agent_runtime plus policy.task_sandbox only",
-        ),
-        (
-            "/runtime/policy",
-            "use runtime.agent_runtime plus policy.task_sandbox only",
-        ),
-        (
-            "/runtime/agent_runtime/io",
-            "commands consume the trial contract directly; no runner IO remapping is supported",
-        ),
-        (
-            "/runtime/agent_runtime/workspace_patches",
-            "workspace patches were removed; task-owned inputs must come from task rows or packaged artifacts",
-        ),
-        (
-            "/runtime/agent_runtime/launch",
-            "launch indirection was removed; use runtime.agent_runtime.{artifact,image,command,env}",
-        ),
-        (
-            "/runtime/agent_runtime/env_from_host",
-            "use $NAME runtime bindings resolved from variant bindings or lab run --env/--env-file",
-        ),
-        (
-            "/runtime/agent_runtime/binding_args",
-            "commands are literal argv; project bindings directly in runtime.agent_runtime.command",
-        ),
-        (
-            "/runtime/agent_runtime/support_files",
-            "runtime support file staging was removed; package files in the agent artifact or benchmark-owned sealed assets",
-        ),
-        (
-            "/runtime/agent_runtime/secret_env",
-            "use $NAME runtime bindings resolved from variant bindings or lab run --env/--env-file",
-        ),
-        (
-            "/runtime/dependencies/file_staging",
-            "host-path file staging was removed; package files in the agent artifact or task rows",
-        ),
-        (
-            "/runtime/dependencies/assets",
-            "dependency asset staging was removed; task-owned inputs must be embedded in task rows",
-        ),
-        (
-            "/runtime/dependencies/secret_files",
-            "secret file staging was removed; inject secrets at launch time, not through authored host paths",
-        ),
-        (
-            "/benchmark/grader/support_files",
-            "benchmark grader support_files was removed; reference grader files directly in grader.command or use runner-owned built-ins",
-        ),
-        (
-            "/benchmark/adapter/support_files",
-            "benchmark adapter support_files was removed; benchmark assets must be runner-owned sealed assets",
-        ),
-    ] {
-        if json_value.pointer(pointer).is_some() {
-            return Err(anyhow!(
-                "{} was removed in the hard cutover; {}",
-                pointer,
-                message
-            ));
-        }
-    }
-    let required: &[&str] = &[
-        "/experiment/workload_type",
-        "/design/replications",
-        "/policy/timeout_ms",
-        "/policy/task_sandbox/network",
-        "/baseline/variant_id",
-    ];
-    let mut missing = Vec::new();
-    for pointer in required {
-        let value = json_value.pointer(pointer);
-        let is_missing = match value {
-            None => true,
-            Some(Value::String(s)) => s.is_empty(),
-            Some(Value::Number(n)) => {
-                n.as_u64() == Some(0)
-                    && (*pointer == "/design/replications" || *pointer == "/policy/timeout_ms")
-            }
-            _ => false,
-        };
-        if is_missing {
-            missing.push(*pointer);
-        }
-    }
-    if json_value.pointer("/runtime/agent_runtime").is_none() {
-        missing.push("/runtime/agent_runtime");
-    }
-    if json_value.pointer("/policy/task_sandbox").is_none() {
-        missing.push("/policy/task_sandbox");
-    }
-    let has_command = match json_value.pointer("/runtime/agent_runtime/command") {
-        Some(Value::String(s)) => !s.trim().is_empty(),
-        Some(Value::Array(parts)) if !parts.is_empty() => parts
-            .iter()
-            .all(|part| part.as_str().map(|s| !s.trim().is_empty()).unwrap_or(false)),
-        _ => false,
-    };
-    if !has_command {
-        missing.push("/runtime/agent_runtime/command");
-    }
-    let artifact = json_value
-        .pointer("/runtime/agent_runtime/artifact")
-        .and_then(|v| v.as_str())
-        .map(str::trim)
-        .unwrap_or("");
-    if artifact.is_empty() {
-        missing.push("/runtime/agent_runtime/artifact");
-    }
-    let image = json_value
-        .pointer("/runtime/agent_runtime/image")
-        .and_then(|v| v.as_str())
-        .map(str::trim)
-        .unwrap_or("");
-    if image.is_empty() {
-        missing.push("/runtime/agent_runtime/image");
-    }
-    let sandbox_network = json_value
-        .pointer("/policy/task_sandbox/network")
-        .and_then(|v| v.as_str())
-        .map(str::trim)
-        .unwrap_or("");
-    if sandbox_network.is_empty() {
-        missing.push("/policy/task_sandbox/network");
-    }
-    if json_value.pointer("/benchmark").is_some() {
-        let has_grader_command = match json_value.pointer("/benchmark/grader/command") {
-            Some(Value::Array(parts)) if !parts.is_empty() => parts
-                .iter()
-                .all(|part| part.as_str().map(|s| !s.trim().is_empty()).unwrap_or(false)),
-            _ => false,
-        };
-        if !has_grader_command {
-            missing.push("/benchmark/grader/command");
-        }
-    }
-    if missing.is_empty() {
-        Ok(())
-    } else {
-        let lines = missing
-            .iter()
-            .map(|p| format!("  - {}", p))
-            .collect::<Vec<_>>();
-        Err(anyhow!(
-            "experiment.yaml missing required fields:\n{}",
-            lines.join("\n")
-        ))
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -393,197 +226,6 @@ pub(crate) fn require_exact_object_keys(
         }
     }
     Ok(())
-}
-
-pub(crate) fn resolve_package_path_under_root(
-    package_dir: &Path,
-    rel_path: &str,
-    field_name: &str,
-) -> Result<PathBuf> {
-    let trimmed = rel_path.trim();
-    if trimmed.is_empty() {
-        return Err(anyhow!("{} must be a non-empty relative path", field_name));
-    }
-    if Path::new(trimmed).is_absolute() {
-        return Err(anyhow!("{} must be relative to package root", field_name));
-    }
-    let resolved = normalize_path(&package_dir.join(trimmed));
-    let root = canonicalize_best_effort(package_dir);
-    let resolved_cmp = canonicalize_best_effort(&resolved);
-    if !resolved_cmp.starts_with(&root) {
-        return Err(anyhow!(
-            "{} escapes package root: '{}' (root: {})",
-            field_name,
-            rel_path,
-            root.display()
-        ));
-    }
-    Ok(resolved)
-}
-
-pub(crate) fn verify_sealed_package_integrity(
-    package_dir: &Path,
-    manifest: &Value,
-) -> Result<Value> {
-    require_exact_object_keys(
-        manifest,
-        &[
-            "schema_version",
-            "created_at",
-            "resolved_experiment",
-            "checksums_ref",
-            "package_digest",
-        ],
-        "sealed package manifest",
-    )?;
-    if manifest.pointer("/schema_version").and_then(Value::as_str) != Some("sealed_run_package_v2")
-    {
-        return Err(anyhow!(
-            "preflight_failed: manifest schema_version must be 'sealed_run_package_v2'"
-        ));
-    }
-    let checksums_ref = manifest
-        .pointer("/checksums_ref")
-        .and_then(Value::as_str)
-        .ok_or_else(|| anyhow!("sealed package manifest missing checksums_ref"))?;
-    let checksums_path =
-        resolve_package_path_under_root(package_dir, checksums_ref, "checksums_ref")?;
-    let checksums = load_json_file(&checksums_path)?;
-    if checksums.pointer("/schema_version").and_then(Value::as_str)
-        != Some("sealed_package_checksums_v2")
-    {
-        return Err(anyhow!(
-            "preflight_failed: checksums schema_version must be 'sealed_package_checksums_v2'"
-        ));
-    }
-    let files = checksums
-        .pointer("/files")
-        .and_then(Value::as_object)
-        .ok_or_else(|| anyhow!("preflight_failed: checksums.json missing object field 'files'"))?;
-    for (rel, expected_digest) in files {
-        let expected = expected_digest.as_str().ok_or_else(|| {
-            anyhow!(
-                "preflight_failed: checksums entry '{}' must be a string digest",
-                rel
-            )
-        })?;
-        let file_path = resolve_package_path_under_root(package_dir, rel, "checksums.files")?;
-        if !file_path.is_file() {
-            return Err(anyhow!(
-                "preflight_failed: checksummed file missing: {}",
-                file_path.display()
-            ));
-        }
-        let actual = sha256_file(&file_path)?;
-        if !expected.eq_ignore_ascii_case(actual.as_str()) {
-            return Err(anyhow!(
-                "preflight_failed: checksum mismatch for '{}' (expected {}, got {})",
-                rel,
-                expected,
-                actual
-            ));
-        }
-    }
-    if !files.contains_key("resolved_experiment.json") {
-        return Err(anyhow!(
-            "preflight_failed: checksums must include 'resolved_experiment.json'"
-        ));
-    }
-    if !files.contains_key(STAGING_MANIFEST_FILE) {
-        return Err(anyhow!(
-            "preflight_failed: checksums must include '{}'",
-            STAGING_MANIFEST_FILE
-        ));
-    }
-    let computed_digest = canonical_json_digest(
-        checksums
-            .pointer("/files")
-            .ok_or_else(|| anyhow!("preflight_failed: checksums missing files object"))?,
-    );
-    let manifest_digest = manifest
-        .pointer("/package_digest")
-        .and_then(Value::as_str)
-        .ok_or_else(|| anyhow!("sealed package manifest missing package_digest"))?;
-    if computed_digest != manifest_digest {
-        return Err(anyhow!(
-            "preflight_failed: package digest mismatch (manifest={}, computed={})",
-            manifest_digest,
-            computed_digest
-        ));
-    }
-    let lock_path = package_dir.join("package.lock");
-    let lock = load_json_file(&lock_path).map_err(|err| {
-        anyhow!(
-            "preflight_failed: package.lock missing or unreadable at {}: {}",
-            lock_path.display(),
-            err
-        )
-    })?;
-    if lock.pointer("/package_digest").and_then(Value::as_str) != Some(manifest_digest) {
-        return Err(anyhow!(
-            "preflight_failed: package.lock digest does not match manifest package_digest"
-        ));
-    }
-    let resolved_path = resolve_package_path_under_root(
-        package_dir,
-        "resolved_experiment.json",
-        "checksums.files",
-    )?;
-    let resolved_experiment = load_json_file(&resolved_path).map_err(|err| {
-        anyhow!(
-            "preflight_failed: resolved_experiment.json missing or unreadable at {}: {}",
-            resolved_path.display(),
-            err
-        )
-    })?;
-    let staging_manifest_path =
-        resolve_package_path_under_root(package_dir, STAGING_MANIFEST_FILE, "checksums.files")?;
-    load_json_file(&staging_manifest_path).map_err(|err| {
-        anyhow!(
-            "preflight_failed: {} missing or unreadable at {}: {}",
-            STAGING_MANIFEST_FILE,
-            staging_manifest_path.display(),
-            err
-        )
-    })?;
-    Ok(resolved_experiment)
-}
-
-pub(crate) fn load_sealed_package_for_run(path: &Path) -> Result<LoadedExperimentInput> {
-    let canonical = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-    let (manifest_path, exp_dir) = if canonical.is_dir() {
-        let manifest = canonical.join("manifest.json");
-        if !manifest.is_file() {
-            return Err(anyhow!(
-                "run_input_invalid_kind: expected sealed package dir or manifest"
-            ));
-        }
-        (manifest, canonical)
-    } else if canonical
-        .file_name()
-        .and_then(|name| name.to_str())
-        .is_some_and(|name| name == "manifest.json")
-    {
-        let exp_dir = canonical
-            .parent()
-            .ok_or_else(|| anyhow!("manifest has no parent directory"))?
-            .to_path_buf();
-        (canonical, exp_dir)
-    } else {
-        return Err(anyhow!(
-            "run_input_invalid_kind: expected sealed package dir or manifest"
-        ));
-    };
-    let manifest = load_json_file(&manifest_path)?;
-    let json_value = verify_sealed_package_integrity(&exp_dir, &manifest)?;
-    let project_root = find_project_root(&exp_dir)
-        .canonicalize()
-        .unwrap_or_else(|_| find_project_root(&exp_dir));
-    Ok(LoadedExperimentInput {
-        json_value,
-        exp_dir,
-        project_root,
-    })
 }
 
 // ---------------------------------------------------------------------------
@@ -872,23 +514,6 @@ pub(crate) fn validate_required_evidence_classes(
     Ok(())
 }
 
-pub(crate) fn validate_schema_contract_value(value: &Value, context: &str) -> Result<()> {
-    let Some(schema_version) = value.pointer("/schema_version").and_then(Value::as_str) else {
-        return Ok(());
-    };
-    let schema_name = format!("{}.jsonschema", schema_version);
-    compile_schema(&schema_name).map_err(|err| {
-        anyhow!(
-            "missing schema contract for schema_version '{}' in {} (expected schemas/{}): {}",
-            schema_version,
-            context,
-            schema_name,
-            err
-        )
-    })?;
-    Ok(())
-}
-
 // ---------------------------------------------------------------------------
 // Schedule building & progress tracking
 // ---------------------------------------------------------------------------
@@ -956,55 +581,6 @@ pub(crate) fn build_trial_schedule(
     }
 
     slots
-}
-
-pub(crate) fn legacy_slot_commit_id(run_id: &str, slot: &SlotCompletion) -> String {
-    let raw = format!(
-        "legacy:{}:{}:{}:{}",
-        run_id, slot.schedule_index, slot.trial_id, slot.status
-    );
-    let digest = sha256_bytes(raw.as_bytes());
-    format!("legacy_{}", &digest[..24])
-}
-
-pub(crate) fn normalize_schedule_progress(progress: &mut ScheduleProgress) {
-    progress.schema_version = "schedule_progress_v2".to_string();
-    for slot in &mut progress.completed_slots {
-        if slot.attempt == 0 {
-            slot.attempt = 1;
-        }
-        if slot.slot_commit_id.trim().is_empty() {
-            slot.slot_commit_id = legacy_slot_commit_id(&progress.run_id, slot);
-        }
-    }
-}
-
-pub(crate) fn load_schedule_progress(run_dir: &Path) -> Result<ScheduleProgress> {
-    let store = BackingSqliteStore::open(run_dir)?;
-    let Some(value) = store.get_runtime_json(RUNTIME_KEY_SCHEDULE_PROGRESS)? else {
-        return Err(anyhow!(
-            "schedule_progress_v2 not found in sqlite runtime_kv for {}",
-            run_dir.display()
-        ));
-    };
-    let mut progress: ScheduleProgress = serde_json::from_value(value)?;
-    if progress.schema_version != "schedule_progress_v2" {
-        return Err(anyhow!(
-            "unsupported schedule_progress schema_version '{}' for {}",
-            progress.schema_version,
-            run_dir.display()
-        ));
-    }
-    normalize_schedule_progress(&mut progress);
-    Ok(progress)
-}
-
-pub(crate) fn write_schedule_progress(run_dir: &Path, progress: &ScheduleProgress) -> Result<()> {
-    let mut next = progress.clone();
-    normalize_schedule_progress(&mut next);
-    let value = serde_json::to_value(next)?;
-    let mut store = BackingSqliteStore::open(run_dir)?;
-    store.put_runtime_json(RUNTIME_KEY_SCHEDULE_PROGRESS, &value)
 }
 
 // ---------------------------------------------------------------------------
@@ -1513,7 +1089,7 @@ pub(crate) fn apply_experiment_overrides(
     overrides_path: &Path,
     project_root: &Path,
 ) -> Result<Value> {
-    let overrides = load_experiment_overrides(overrides_path)?;
+    let overrides = crate::package::validate::load_experiment_overrides(overrides_path)?;
     if overrides.values.is_empty() {
         return Ok(experiment);
     }
@@ -1527,7 +1103,7 @@ pub(crate) fn apply_experiment_overrides(
     } else {
         project_root.join(&manifest_rel)
     };
-    let manifest = load_knob_manifest(&manifest_path)?;
+    let manifest = crate::package::validate::load_knob_manifest(&manifest_path)?;
 
     let mut by_id: BTreeMap<String, KnobDef> = BTreeMap::new();
     for knob in manifest.knobs {
@@ -1538,190 +1114,16 @@ pub(crate) fn apply_experiment_overrides(
         let knob = by_id
             .get(id)
             .ok_or_else(|| anyhow!("override references unknown knob id: {}", id))?;
-        validate_knob_value(knob, value)?;
+        crate::package::validate::validate_knob_value(knob, value)?;
         set_json_pointer_value(&mut experiment, &knob.json_pointer, value.clone())?;
     }
 
     Ok(experiment)
 }
 
-pub(crate) fn load_experiment_overrides(overrides_path: &Path) -> Result<ExperimentOverrides> {
-    let overrides_schema = compile_schema("experiment_overrides_v1.jsonschema")?;
-    let overrides_data = fs::read_to_string(overrides_path)?;
-    let overrides_json: Value = serde_json::from_str(&overrides_data)?;
-    if let Err(errors) = overrides_schema.validate(&overrides_json) {
-        let mut msgs = Vec::new();
-        for e in errors {
-            msgs.push(e.to_string());
-        }
-        return Err(anyhow!(
-            "overrides schema validation failed ({}): {}",
-            overrides_path.display(),
-            msgs.join("; ")
-        ));
-    }
-    let overrides: ExperimentOverrides = serde_json::from_value(overrides_json)?;
-    if overrides.schema_version != "experiment_overrides_v1" {
-        return Err(anyhow!(
-            "unsupported overrides schema_version: {}",
-            overrides.schema_version
-        ));
-    }
-    Ok(overrides)
-}
-
-pub(crate) fn load_knob_manifest(manifest_path: &Path) -> Result<KnobManifest> {
-    let manifest_schema = compile_schema("knob_manifest_v1.jsonschema")?;
-    let manifest_data = fs::read_to_string(manifest_path)?;
-    let manifest_json: Value = serde_json::from_str(&manifest_data)?;
-    if let Err(errors) = manifest_schema.validate(&manifest_json) {
-        let mut msgs = Vec::new();
-        for e in errors {
-            msgs.push(e.to_string());
-        }
-        return Err(anyhow!(
-            "knob manifest schema validation failed ({}): {}",
-            manifest_path.display(),
-            msgs.join("; ")
-        ));
-    }
-    let manifest: KnobManifest = serde_json::from_value(manifest_json)?;
-    if manifest.schema_version != "knob_manifest_v1" {
-        return Err(anyhow!(
-            "unsupported knob manifest schema_version: {}",
-            manifest.schema_version
-        ));
-    }
-    Ok(manifest)
-}
-
-pub(crate) fn validate_knob_value(knob: &KnobDef, value: &Value) -> Result<()> {
-    if !value_matches_type(value, &knob.value_type) {
-        return Err(anyhow!(
-            "override value type mismatch for knob {}: expected {}, got {}",
-            knob.id,
-            knob.value_type,
-            value_type_name(value)
-        ));
-    }
-
-    if let Some(options) = knob.options.as_ref() {
-        if !options.iter().any(|opt| opt == value) {
-            return Err(anyhow!(
-                "override value for knob {} is not in allowed options",
-                knob.id
-            ));
-        }
-    }
-
-    if let Some(min) = knob.minimum {
-        if let Some(v) = value.as_f64() {
-            if v < min {
-                return Err(anyhow!(
-                    "override value for knob {} is below minimum {}",
-                    knob.id,
-                    min
-                ));
-            }
-        }
-    }
-    if let Some(max) = knob.maximum {
-        if let Some(v) = value.as_f64() {
-            if v > max {
-                return Err(anyhow!(
-                    "override value for knob {} is above maximum {}",
-                    knob.id,
-                    max
-                ));
-            }
-        }
-    }
-    Ok(())
-}
-
-pub fn validate_knob_overrides(manifest_path: &Path, overrides_path: &Path) -> Result<()> {
-    let manifest = load_knob_manifest(manifest_path)?;
-    let overrides = load_experiment_overrides(overrides_path)?;
-    let mut by_id: BTreeMap<String, KnobDef> = BTreeMap::new();
-    for knob in manifest.knobs {
-        by_id.insert(knob.id.clone(), knob);
-    }
-    for (id, value) in overrides.values.iter() {
-        let knob = by_id
-            .get(id)
-            .ok_or_else(|| anyhow!("override references unknown knob id: {}", id))?;
-        validate_knob_value(knob, value)?;
-    }
-    Ok(())
-}
-
 // ---------------------------------------------------------------------------
 // Dataset & tasks
 // ---------------------------------------------------------------------------
-
-pub(crate) fn resolve_dataset_path_in_package(
-    json_value: &Value,
-    package_dir: &Path,
-) -> Result<PathBuf> {
-    let rel = json_value
-        .pointer("/dataset/path")
-        .and_then(Value::as_str)
-        .ok_or_else(|| anyhow!("dataset.path missing"))?;
-    resolve_package_path_under_root(package_dir, rel, "dataset.path")
-}
-
-pub(crate) fn load_task_rows_for_build(path: &Path, json_value: &Value) -> Result<Vec<Value>> {
-    let limit = json_value
-        .pointer("/dataset/limit")
-        .and_then(|v| v.as_u64())
-        .map(|v| v as usize);
-    if limit == Some(0) {
-        return Ok(Vec::new());
-    }
-    let dataset_ref = json_value
-        .pointer("/dataset/path")
-        .and_then(Value::as_str)
-        .unwrap_or("<missing>");
-    let dataset_suite = json_value
-        .pointer("/dataset/suite_id")
-        .and_then(Value::as_str)
-        .unwrap_or("<unknown>");
-    let file = fs::File::open(path).with_context(|| {
-        format!(
-            "failed to open dataset file '{}' (resolved from dataset.path='{}', dataset.suite_id='{}')",
-            path.display(),
-            dataset_ref,
-            dataset_suite
-        )
-    })?;
-    let reader = BufReader::new(file);
-    let mut tasks = Vec::new();
-    for (idx, line) in reader.lines().enumerate() {
-        let line = line?;
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        if limit.is_some_and(|max| tasks.len() >= max) {
-            break;
-        }
-        let task: Value = serde_json::from_str(trimmed)?;
-        let task_id = task
-            .pointer("/task/id")
-            .or_else(|| task.pointer("/id"))
-            .and_then(Value::as_str)
-            .unwrap_or("<unknown_task>");
-        if crate::parse_task_row(&task).is_err() {
-            return Err(anyhow!(
-                "dataset row {} task '{}' is not a valid task_row_v1",
-                idx + 1,
-                task_id
-            ));
-        }
-        tasks.push(task);
-    }
-    Ok(tasks)
-}
 
 pub(crate) fn load_tasks(path: &Path, json_value: &Value) -> Result<Vec<Value>> {
     let limit = json_value
@@ -1754,7 +1156,7 @@ pub(crate) fn load_tasks(path: &Path, json_value: &Value) -> Result<Vec<Value>> 
             .or_else(|| task.pointer("/id"))
             .and_then(Value::as_str)
             .unwrap_or("<unknown_task>");
-        if crate::parse_task_row(&task).is_err() {
+        if parse_task_row(&task).is_err() {
             return Err(anyhow!(
                 "dataset row {} task '{}' is not a valid packaged task_row_v1",
                 idx + 1,

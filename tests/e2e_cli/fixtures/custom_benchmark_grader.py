@@ -9,6 +9,7 @@ from typing import Any
 
 
 DEFAULT_MAPPED_OUTPUT_PATH = "/agentlab/out/mapped_grader_output.json"
+DEFAULT_RAW_OUTPUT_PATH = "/agentlab/out/raw_grader_output.json"
 VALID_GRADING_STRATEGIES = {"in_task_image", "injected", "separate"}
 
 
@@ -41,6 +42,25 @@ def _task_payload(grader_input: dict[str, Any]) -> dict[str, Any]:
     if isinstance(payload, dict):
         return payload
     return {}
+
+
+def _agent_exit_code(grader_input: dict[str, Any]) -> int | None:
+    payload = grader_input.get("agent_phase")
+    if not isinstance(payload, dict):
+        return None
+    value = payload.get("exit_code")
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value)
+    if isinstance(value, str):
+        try:
+            return int(value.strip())
+        except ValueError:
+            return None
+    return None
 
 
 def _candidate_artifact(grader_input: dict[str, Any]) -> dict[str, Any]:
@@ -147,6 +167,11 @@ def _grader_strategy() -> str:
     return "in_task_image"
 
 
+def _is_preflight_smoke() -> bool:
+    raw = os.environ.get("AGENTLAB_PREFLIGHT_SMOKE", "").strip().lower()
+    return raw in {"1", "true", "yes", "on"}
+
+
 def _mapped_output_path() -> str:
     raw = os.environ.get("AGENTLAB_MAPPED_GRADER_OUTPUT_PATH", "").strip()
     if raw:
@@ -154,15 +179,62 @@ def _mapped_output_path() -> str:
     return DEFAULT_MAPPED_OUTPUT_PATH
 
 
+def _raw_output_path() -> str:
+    raw = os.environ.get("AGENTLAB_RAW_GRADER_OUTPUT_PATH", "").strip()
+    if raw:
+        return raw
+    return DEFAULT_RAW_OUTPUT_PATH
+
+
+def _grading_behavior(task_payload: dict[str, Any]) -> dict[str, Any]:
+    payload = task_payload.get("grading_behavior")
+    if isinstance(payload, dict):
+        return payload
+    return {}
+
+
+def _int_value(value: Any, default: int = 0) -> int:
+    if isinstance(value, bool):
+        return int(value)
+    if isinstance(value, int):
+        return value
+    if isinstance(value, float):
+        return int(value)
+    if isinstance(value, str):
+        try:
+            return int(value.strip())
+        except ValueError:
+            return default
+    return default
+
+
+def _bool_value(value: Any, default: bool = False) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes", "on"}:
+            return True
+        if normalized in {"0", "false", "no", "off"}:
+            return False
+    return default
+
+
 def main() -> int:
     grader_input = _load_grader_input()
     task_payload = _task_payload(grader_input)
+    grading_behavior = {} if _is_preflight_smoke() else _grading_behavior(task_payload)
     candidate = _candidate_artifact(grader_input)
     artifact_payload = _candidate_payload(grader_input)
     benchmark = _benchmark_spec(task_payload)
+    agent_exit_code = _agent_exit_code(grader_input)
 
     objective_value = _objective_value(artifact_payload)
-    if candidate.get("state") == "missing":
+    if agent_exit_code not in (None, 0):
+        verdict = "error"
+    elif candidate.get("state") == "missing":
         verdict = "missing"
     elif candidate.get("state") == "invalid":
         verdict = "error"
@@ -180,6 +252,19 @@ def main() -> int:
         "prediction": _prediction(artifact_payload),
         "candidate_artifact_state": candidate.get("state", "missing"),
     }
+
+    forced_grader_exit = _int_value(grading_behavior.get("grader_exit_code"), 0)
+    if forced_grader_exit != 0:
+        print(
+            f"custom_benchmark_grader.py forced exit {forced_grader_exit}",
+            file=sys.stderr,
+        )
+        return forced_grader_exit
+
+    if _bool_value(grading_behavior.get("emit_raw_only"), False):
+        payload["mapper_exit_code"] = _int_value(grading_behavior.get("mapper_exit_code"), 0)
+        _write_json(_raw_output_path(), payload)
+        return 0
 
     conclusion = {
         "schema_version": "trial_conclusion_v1",

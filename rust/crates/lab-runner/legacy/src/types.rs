@@ -3,7 +3,7 @@ use serde_json::Value;
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
-use crate::sink::{EventRow, MetricRow, TrialRecord, VariantSnapshotRow};
+use crate::persistence::{EventRow, MetricRow, TrialRecord, VariantSnapshotRow};
 
 // ---------------------------------------------------------------------------
 // Constants from runner_part1_core.rs
@@ -44,15 +44,9 @@ pub(crate) const DEFAULT_MAX_WORKSPACE_BUNDLE_BYTES: u64 = 256 * 1024 * 1024;
 pub(crate) const DEFAULT_PREFLIGHT_IMAGE_PROBE_PARALLELISM: usize = 2;
 pub(crate) const MAX_PREFLIGHT_IMAGE_PROBE_PARALLELISM: usize = 8;
 pub(crate) const DEFAULT_PREFLIGHT_CONTRACT_SMOKE_TIMEOUT_MS: u64 = 10_000;
-pub(crate) const LOCAL_WORKER_CAPACITY_ERROR_PREFIX: &str = "local worker backend at capacity:";
-pub(crate) const LOCAL_WORKER_MAX_COMPLETIONS_PER_POLL: usize = 256;
 pub(crate) const RUNTIME_DISK_HEADROOM_CHECK_INTERVAL_SECONDS: u64 = 1;
 pub(crate) const RUNTIME_RUN_SIZE_CHECK_INTERVAL_SECONDS: u64 = 5;
 pub(crate) const RUN_DIR_CREATE_MAX_ATTEMPTS: usize = 64;
-pub(crate) const PARALLEL_WORKER_CONTROL_SCHEMA_V1: &str = "parallel_worker_control_v1";
-pub(crate) const PARALLEL_WORKER_CONTROL_RESPONSE_COMPLETED: &str = "completed";
-pub(crate) const PARALLEL_WORKER_CONTROL_RESPONSE_FAILED: &str = "failed";
-pub(crate) const KILL_RUN_WORKER_CONTROL_TIMEOUT_SECONDS: u64 = 30;
 pub(crate) const OPERATION_LEASE_TTL_SECONDS: i64 = 30;
 pub(crate) const ENGINE_LEASE_HEARTBEAT_SECONDS: i64 = 2;
 pub(crate) const ENGINE_LEASE_TTL_SECONDS: i64 = 6;
@@ -75,7 +69,6 @@ pub(crate) const PREBUILT_AGENT_ADAPTER_VERSION: &str = "v1";
 
 pub(crate) const RUNTIME_KEY_RUN_CONTROL: &str = "run_control_v2";
 pub(crate) const RUNTIME_KEY_RUN_SESSION_STATE: &str = "run_session_state_v1";
-pub(crate) const RUNTIME_KEY_PARALLEL_WORKER_CONTROL: &str = "parallel_worker_control_v1";
 pub(crate) const RUNTIME_KEY_SCHEDULE_PROGRESS: &str = "schedule_progress_v2";
 pub(crate) const RUNTIME_KEY_ENGINE_LEASE: &str = "engine_lease_v1";
 
@@ -103,14 +96,7 @@ impl Default for AgentAdapterRef {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct AgentAdapterCapabilities {
-    pub(crate) pause: bool,
-    pub(crate) control_ack: bool,
-    pub(crate) event_stream: bool,
-    pub(crate) strict_replay: bool,
-}
-
+#[cfg(test)]
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct ActiveAdapterControl {
     #[serde(
@@ -130,49 +116,14 @@ pub(crate) struct ActiveAdapterControl {
     pub(crate) events_path: Option<String>,
 }
 
+#[cfg(test)]
 pub(crate) fn default_active_adapter_id() -> String {
     BUILTIN_COMMAND_ADAPTER_ID.to_string()
 }
 
+#[cfg(test)]
 pub(crate) fn default_active_adapter_version() -> String {
     BUILTIN_COMMAND_ADAPTER_VERSION.to_string()
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct AdapterPauseAck {
-    pub(crate) checkpoint_acked: bool,
-    pub(crate) stop_acked: bool,
-}
-
-#[allow(dead_code)]
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub(crate) struct WorkerTicket {
-    pub(crate) worker_id: String,
-    pub(crate) ticket_id: String,
-    pub(crate) trial_id: String,
-}
-
-#[allow(dead_code)]
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
-pub(crate) struct TrialCompletion {
-    pub(crate) ticket: WorkerTicket,
-    pub(crate) schedule_idx: usize,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) completion_seq: Option<u64>,
-    pub(crate) terminal_status: String,
-    pub(crate) classification: String,
-    pub(crate) artifacts: Value,
-    pub(crate) metrics: Value,
-    pub(crate) runtime_summary: Value,
-}
-
-#[allow(dead_code)]
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub(crate) struct WorkerPauseAck {
-    pub(crate) worker_id: String,
-    pub(crate) trial_id: String,
-    pub(crate) label: String,
-    pub(crate) accepted: bool,
 }
 
 #[derive(Debug)]
@@ -181,6 +132,7 @@ pub struct RunResult {
     pub run_id: String,
 }
 
+#[derive(Debug)]
 pub struct ReplayResult {
     pub replay_dir: PathBuf,
     pub replay_id: String,
@@ -190,6 +142,7 @@ pub struct ReplayResult {
     pub harness_status: String,
 }
 
+#[derive(Debug)]
 pub struct ForkResult {
     pub fork_dir: PathBuf,
     pub fork_id: String,
@@ -202,6 +155,7 @@ pub struct ForkResult {
     pub fallback_mode: String,
 }
 
+#[derive(Debug)]
 pub struct PauseResult {
     pub run_id: String,
     pub trial_id: String,
@@ -210,6 +164,7 @@ pub struct PauseResult {
     pub stop_acked: bool,
 }
 
+#[derive(Debug)]
 pub struct KillResult {
     pub run_id: String,
     pub run_dir: PathBuf,
@@ -217,10 +172,19 @@ pub struct KillResult {
     pub killed_trials: Vec<String>,
 }
 
+#[derive(Debug)]
 pub struct ResumeResult {
     pub trial_id: String,
-    pub selector: String,
-    pub fork: ForkResult,
+    pub mode: ResumeMode,
+    pub selector: Option<String>,
+    pub fork: Option<ForkResult>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResumeMode {
+    RuntimeUnpause,
+    Fork,
 }
 
 pub struct RecoverResult {
@@ -389,91 +353,12 @@ pub struct RunExecutionOptions {
     pub runtime_env_files: Vec<PathBuf>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub(crate) struct RunSessionState {
-    pub(crate) schema_version: String,
-    pub(crate) run_id: String,
-    pub(crate) behavior: RunBehavior,
-    pub(crate) execution: RunExecutionOptions,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ScheduleEngineOutcome {
     Completed,
     Paused,
     Killed,
     Interrupted,
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub(crate) enum ParallelWorkerControlAction {
-    Pause,
-    Stop,
-}
-
-impl ParallelWorkerControlAction {
-    pub(crate) fn as_str(self) -> &'static str {
-        match self {
-            Self::Pause => "pause",
-            Self::Stop => "stop",
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub(crate) struct ParallelWorkerControlRequest {
-    pub(crate) request_id: String,
-    pub(crate) action: ParallelWorkerControlAction,
-    pub(crate) requested_at: String,
-    pub(crate) target_trial_ids: Vec<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) label: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) reason: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub(crate) struct ParallelWorkerControlResponse {
-    pub(crate) request_id: String,
-    pub(crate) action: ParallelWorkerControlAction,
-    pub(crate) status: String,
-    pub(crate) processed_at: String,
-    pub(crate) processed_trial_ids: Vec<String>,
-    pub(crate) failed_trials: Vec<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) checkpoint_acked: Option<bool>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) stop_acked: Option<bool>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) message: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub(crate) struct ParallelWorkerControlState {
-    pub(crate) schema_version: String,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) request: Option<ParallelWorkerControlRequest>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) response: Option<ParallelWorkerControlResponse>,
-    pub(crate) updated_at: String,
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct RunControlActiveTrial {
-    pub(crate) trial_id: String,
-    pub(crate) worker_id: String,
-    pub(crate) schedule_idx: Option<usize>,
-    pub(crate) variant_id: Option<String>,
-    pub(crate) started_at: Option<String>,
-    pub(crate) control: Option<ActiveAdapterControl>,
-}
-
-#[derive(Debug, Clone)]
-pub(crate) struct RunControlPauseMetadata {
-    pub(crate) label: String,
-    pub(crate) requested_at: String,
-    pub(crate) requested_by: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -602,17 +487,9 @@ impl TrialExecutionResult {
     }
 }
 
-#[derive(Default)]
-pub(crate) struct BufferedRunSink {
-    pub(crate) trial_records: Vec<TrialRecord>,
-    pub(crate) metric_rows: Vec<MetricRow>,
-    pub(crate) event_rows: Vec<EventRow>,
-    pub(crate) variant_snapshot_rows: Vec<VariantSnapshotRow>,
-}
-
 // Preflight types from runner_part3_engine.rs
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub enum PreflightSeverity {
     Error,
     Warning,
@@ -1236,8 +1113,10 @@ pub(crate) enum TrialPhase {
     GraderMaterializing,
     GraderRunning,
     GraderMapping,
+    Paused,
     CommitPending,
     Committed,
+    Killed,
     Abandoned,
 }
 
@@ -1456,6 +1335,8 @@ pub(crate) struct TrialAttemptState {
     pub(crate) key: TrialAttemptKey,
     pub(crate) slot: AttemptSlotRef,
     pub(crate) phase: TrialPhase,
+    #[serde(default)]
+    pub(crate) paused_from_phase: Option<TrialPhase>,
     pub(crate) fs: AttemptFsLayout,
     #[serde(default)]
     pub(crate) task_sandbox: Option<TaskSandboxState>,
@@ -1481,10 +1362,6 @@ pub(crate) struct TrialAttemptState {
 pub(crate) struct ResolvedMountReference {
     pub(crate) host_path: PathBuf,
     pub(crate) mount_path: String,
-}
-
-pub(crate) struct ProcessRunResult {
-    pub(crate) status: String,
 }
 
 pub(crate) struct PreparedTrialIo {

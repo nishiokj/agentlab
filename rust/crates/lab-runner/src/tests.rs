@@ -1,11 +1,86 @@
 #[cfg(test)]
 mod tests {
     use super::*;
-    use lab_core::{
-        AGENTLAB_GRADER_INPUT_PATH, AGENTLAB_MAPPED_GRADER_OUTPUT_PATH, AGENTLAB_RAW_GRADER_OUTPUT_PATH,
-        AGENTLAB_RESULT_PATH, AGENTLAB_TRAJECTORY_PATH, AGENTLAB_TRIAL_INPUT_PATH,
-    };
+
+    // Standard library
+    use std::collections::{BTreeMap, HashMap, HashSet};
+    use std::fs;
+    use std::io::Write;
+    #[cfg(unix)]
+    use std::os::unix::fs::{symlink, PermissionsExt};
+    use std::path::{Path, PathBuf};
+    use std::process::Command;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::thread;
+    use std::time::{Duration, Instant};
+
+    // External crates
+    use anyhow::Result;
+    use chrono::Utc;
+    use lab_schemas::compile_schema;
+    use serde::Deserialize;
+    use serde_json::{json, Value};
+
+    // lab_core
+    use lab_core::{
+        canonical_json_digest, ensure_dir, sha256_bytes, sha256_file, ArtifactStore,
+        AGENTLAB_CONTRACT_IN_DIR, AGENTLAB_CONTRACT_OUT_DIR,
+        AGENTLAB_ENV_GRADER_INPUT_PATH, AGENTLAB_ENV_REPL_IDX, AGENTLAB_ENV_RESULT_PATH,
+        AGENTLAB_ENV_RUN_ID, AGENTLAB_ENV_TASK_ID, AGENTLAB_ENV_TIMEOUT_MS,
+        AGENTLAB_ENV_TRIAL_ID, AGENTLAB_ENV_TRIAL_INPUT_PATH, AGENTLAB_ENV_VARIANT_ID,
+        AGENTLAB_GRADER_INPUT_PATH, AGENTLAB_MAPPED_GRADER_OUTPUT_PATH,
+        AGENTLAB_RAW_GRADER_OUTPUT_PATH, AGENTLAB_RESULT_PATH,
+        AGENTLAB_RUNNER_SUPPORT_REL_DIR, AGENTLAB_TASK_WORKDIR_PLACEHOLDER,
+        AGENTLAB_TRAJECTORY_PATH, AGENTLAB_TRIAL_INPUT_PATH,
+    };
+
+    // Crate modules
+    use crate::config::*;
+    use crate::experiment::commit::{
+        make_slot_commit_id, load_jsonl_value_rows, DeterministicCommitter, RunCoordinator,
+    };
+    use crate::experiment::control::*;
+    use crate::experiment::lease::{
+        acquire_run_operation_lease, engine_lease_is_stale, operation_lease_is_stale,
+        EngineLeaseRecord, OperationLeaseRecord, RunOperationType,
+    };
+    use crate::experiment::preflight::*;
+    use crate::experiment::runner::*;
+    use crate::experiment::runtime::*;
+    use crate::experiment::state::*;
+    use crate::model::*;
+    use crate::package::authoring::*;
+    use crate::package::compile::*;
+    use crate::package::sealed::*;
+    use crate::package::staging::*;
+    use crate::package::validate::*;
+    use crate::persistence::journal::*;
+    use crate::persistence::rows::*;
+    use crate::persistence::store::*;
+    use crate::persistence::store::SqliteRunStore as BackingSqliteStore;
+    use crate::trial::artifacts::load_trial_output_resilient;
+    use crate::trial::env::{build_exec_env, resolve_runtime_agent_command};
+    use crate::trial::execution::{
+        map_container_path_to_host, resolve_agent_artifact_mount_dir, resolve_container_platform,
+        validate_container_workspace_path,
+    };
+    use crate::trial::grade::benchmark_retry_inputs;
+    use crate::trial::execution::AdapterRunRequest;
+    use crate::trial::preflight::stage_benchmark_trial_preflight;
+    use crate::trial::prepare::{
+        build_runtime_contract_env, build_trial_input, normalize_task_prompt_aliases,
+        prepare_task_environment, resolve_trial_io_host_path, resolve_trial_timeout_ms,
+        PreparedTaskEnvironment, TrialPaths,
+    };
+    use crate::trial::spec::{
+        parse_task_boundary_from_packaged_task, parse_task_row,
+        TaskBoundaryMaterialization, TaskMaterializationKind, TaskMaterializationSpec,
+    };
+    use crate::trial::state::{
+        write_trial_state, AttemptFsLayout, AttemptSlotRef, TaskSandboxState, TrialAttemptKey,
+        TrialAttemptState, TrialPhase, TrialStateGuard,
+    };
+    use crate::util::*;
 
     type BenchmarkAdapterConfig = BenchmarkGraderConfig;
     const AGENTLAB_CONTRACT_STATE_DIR: &str = "/agentlab/state";
@@ -92,10 +167,8 @@ mod tests {
 
     fn harness_success_output_command() -> Vec<String> {
         vec![
-            "sh".to_string(),
-            "-lc".to_string(),
-            "out=''; while [ \"$#\" -gt 0 ]; do case \"$1\" in --output) out=\"$2\"; shift 2 ;; --input) shift 2 ;; *) shift ;; esac; done; test -n \"$out\"; printf '%s' '{\"schema_version\":\"agent_result_v1\",\"outcome\":\"success\",\"checkpoints\":[]}' > \"$out\"".to_string(),
-            "--".to_string(),
+            "/bin/sh".to_string(),
+            "/opt/agent/bin/write_success_result.sh".to_string(),
         ]
     }
 
@@ -144,102 +217,17 @@ mod tests {
             .any(|pair| pair[0] == flag && pair[1] == value)
     }
 
-    fn workspace_base_empty() -> WorkspaceBaseSpec {
-        WorkspaceBaseSpec {
-            kind: WorkspaceBaseKind::Empty,
-            dataset_pack_ref: None,
-            repo: None,
-            commit: None,
-        }
-    }
-
-    fn workspace_base_dataset_pack(dataset_pack_ref: &str) -> WorkspaceBaseSpec {
-        WorkspaceBaseSpec {
-            kind: WorkspaceBaseKind::DatasetPack,
-            dataset_pack_ref: Some(dataset_pack_ref.to_string()),
-            repo: None,
-            commit: None,
-        }
-    }
-
-    fn workspace_base_git_checkout(repo: &str, commit: &str) -> WorkspaceBaseSpec {
-        WorkspaceBaseSpec {
-            kind: WorkspaceBaseKind::GitCheckout,
-            dataset_pack_ref: None,
-            repo: Some(repo.to_string()),
-            commit: Some(commit.to_string()),
-        }
-    }
-
-    fn workspace_overlay(
-        path: &str,
-        content: &str,
-        encoding: Option<&str>,
-    ) -> WorkspaceOverlaySpec {
-        WorkspaceOverlaySpec {
-            path: path.to_string(),
-            content: content.to_string(),
-            encoding: encoding.map(str::to_string),
-            executable: false,
-        }
-    }
-
-    fn workspace_aux_mount(dataset_pack_ref: &str, mount_path: &str) -> WorkspaceAuxMountSpec {
-        WorkspaceAuxMountSpec {
-            dataset_pack_ref: dataset_pack_ref.to_string(),
-            mount_path: mount_path.to_string(),
-        }
-    }
-
     fn scratch_workspace() -> WorkspaceSpec {
         WorkspaceSpec {
             mode: WorkspaceMode::Scratch,
-            base: workspace_base_empty(),
+            base: WorkspaceBaseSpec {
+                kind: WorkspaceBaseKind::Empty,
+                dataset_pack_ref: None,
+                repo: None,
+                commit: None,
+            },
             overlays: Vec::new(),
             aux_mounts: Vec::new(),
-        }
-    }
-
-    fn task_boundary_with_workspace(
-        task_payload: Value,
-        task_image: &str,
-        task_workdir: &str,
-        workspace: WorkspaceSpec,
-        dependencies: Value,
-        time_limit_ms: Option<u64>,
-        materialization: TaskMaterializationSpec,
-    ) -> TaskBoundaryMaterialization {
-        let materialization_kind = match materialization.kind {
-            TaskMaterializationKind::TaskImage => "task_image",
-            TaskMaterializationKind::BaseImageBundle => "base_image_bundle",
-        };
-        let task_id = task_payload
-            .get("id")
-            .and_then(Value::as_str)
-            .map(str::to_string)
-            .unwrap_or_else(|| "task_0".to_string());
-        let declaration = json!({
-            "schema_version": "task_row_v1",
-            "id": task_id,
-            "image": task_image,
-            "workdir": task_workdir,
-            "time_limit_ms": time_limit_ms,
-            "task": task_payload.clone(),
-            "materialization": {
-                "kind": materialization_kind,
-                "task_bundle_ref": materialization.task_bundle_ref.clone()
-            }
-        });
-        TaskBoundaryMaterialization {
-            declaration,
-            task_payload,
-            workspace,
-            dependencies,
-            materialization,
-            task_id,
-            task_image: task_image.to_string(),
-            task_workdir: task_workdir.to_string(),
-            time_limit_ms,
         }
     }
 
@@ -249,18 +237,35 @@ mod tests {
         task_workdir: &str,
         time_limit_ms: Option<u64>,
     ) -> TaskBoundaryMaterialization {
-        task_boundary_with_workspace(
+        let task_id = task_payload
+            .get("id")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .unwrap_or_else(|| "task_0".to_string());
+        let materialization = TaskMaterializationSpec {
+            kind: TaskMaterializationKind::TaskImage,
+            task_bundle_ref: None,
+        };
+        let declaration = json!({
+            "schema_version": "task_row_v1",
+            "id": task_id,
+            "image": task_image,
+            "workdir": task_workdir,
+            "time_limit_ms": time_limit_ms,
+            "task": task_payload.clone(),
+            "materialization": { "kind": "task_image" }
+        });
+        TaskBoundaryMaterialization {
+            declaration,
             task_payload,
-            task_image,
-            task_workdir,
-            scratch_workspace(),
-            json!({}),
+            workspace: scratch_workspace(),
+            dependencies: json!({}),
+            materialization,
+            task_id,
+            task_image: task_image.to_string(),
+            task_workdir: task_workdir.to_string(),
             time_limit_ms,
-            TaskMaterializationSpec {
-                kind: TaskMaterializationKind::TaskImage,
-                task_bundle_ref: None,
-            },
-        )
+        }
     }
 
     fn runtime_task_boundary_from_row(task_row: Value) -> TaskBoundaryMaterialization {
@@ -337,6 +342,23 @@ mod tests {
         ensure_dir(&bin_dir).expect("test bundle bin dir");
         for name in ["sh", "python", "python3", "node", "rex"] {
             fs::copy("/bin/sh", bin_dir.join(name)).expect("copy test bundle executable");
+        }
+        let write_success_script = bin_dir.join("write_success_result.sh");
+        fs::write(
+            &write_success_script,
+            concat!(
+                "#!/bin/sh\n",
+                "printf '%s' '{\"schema_version\":\"agent_result_v1\",\"outcome\":\"success\",\"checkpoints\":[]}' > /agentlab/out/result.json\n"
+            ),
+        )
+        .expect("write test bundle success script");
+        #[cfg(unix)]
+        {
+            let mut perms = fs::metadata(&write_success_script)
+                .expect("script metadata")
+                .permissions();
+            perms.set_mode(0o755);
+            fs::set_permissions(&write_success_script, perms).expect("script permissions");
         }
         bundle_root
     }
@@ -421,57 +443,40 @@ mod tests {
         }
     }
 
-    #[test]
-    fn adapter_registry_supports_prebuilt_codex_and_rex_jesus() {
-        let codex = adapter_registry_entry(&AgentAdapterRef {
-            id: PREBUILT_CODEX_ADAPTER_ID.to_string(),
-            version: PREBUILT_AGENT_ADAPTER_VERSION.to_string(),
-        })
-        .expect("codex prebuilt adapter");
-        assert!(codex.capabilities().pause);
-
-        let rex = adapter_registry_entry(&AgentAdapterRef {
-            id: PREBUILT_REX_JESUS_ADAPTER_ID.to_string(),
-            version: PREBUILT_AGENT_ADAPTER_VERSION.to_string(),
-        })
-        .expect("rex prebuilt adapter");
-        assert!(rex.capabilities().pause);
+    fn docker_runtime_available() -> bool {
+        crate::backend::docker::DockerRuntime::connect()
+            .and_then(|runtime| runtime.ping())
+            .is_ok()
     }
 
-    #[test]
-    fn adapter_registry_error_lists_supported_adapters() {
-        let err = match adapter_registry_entry(&AgentAdapterRef {
-            id: "unknown.adapter".to_string(),
-            version: "v0".to_string(),
-        }) {
-            Ok(_) => panic!("unsupported adapter should fail"),
-            Err(err) => err,
-        };
-        let msg = err.to_string();
-        assert!(
-            msg.contains(&format!(
-                "{}@{}",
-                BUILTIN_COMMAND_ADAPTER_ID, BUILTIN_COMMAND_ADAPTER_VERSION
-            )),
-            "message should include builtin adapter: {}",
-            msg
+    fn ensure_docker_test_image(image: &str) {
+        crate::backend::docker::DockerRuntime::connect()
+            .expect("docker runtime")
+            .ensure_image(image)
+            .expect("container image");
+    }
+
+    fn build_docker_test_image(root: &Path, tag_suffix: &str, dockerfile: &str) -> String {
+        ensure_docker_test_image("python:3.11-slim");
+        let dockerfile_path = root.join("Dockerfile");
+        fs::write(&dockerfile_path, dockerfile).expect("dockerfile");
+        let tag = format!(
+            "agentlab-test-{}-{}:{}",
+            sanitize_for_fs(tag_suffix),
+            std::process::id(),
+            Utc::now().timestamp_micros()
         );
+        let output = Command::new("docker")
+            .args(["build", "-t", &tag, root.to_string_lossy().as_ref()])
+            .output()
+            .expect("docker build");
         assert!(
-            msg.contains(&format!(
-                "{}@{}",
-                PREBUILT_CODEX_ADAPTER_ID, PREBUILT_AGENT_ADAPTER_VERSION
-            )),
-            "message should include codex prebuilt adapter: {}",
-            msg
+            output.status.success(),
+            "docker build failed:\nstdout:\n{}\nstderr:\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
         );
-        assert!(
-            msg.contains(&format!(
-                "{}@{}",
-                PREBUILT_REX_JESUS_ADAPTER_ID, PREBUILT_AGENT_ADAPTER_VERSION
-            )),
-            "message should include rex prebuilt adapter: {}",
-            msg
-        );
+        tag
     }
 
     fn write_resolved_experiment(
@@ -656,9 +661,9 @@ mod tests {
         let output_ref = artifact_store
             .put_bytes(&serde_json::to_vec_pretty(&trial_output).expect("trial output bytes"))
             .expect("output ref");
-        let workspace_ref =
-            capture_workspace_object_ref(&artifact_store, &trial_dir.join("workspace"))
-                .expect("workspace ref");
+        let workspace_ref = artifact_store
+            .put_bytes(b"workspace_placeholder")
+            .expect("workspace ref");
         let checkpoint_labels = trial_output
             .get("checkpoints")
             .and_then(Value::as_array)
@@ -722,7 +727,15 @@ mod tests {
 
     fn active_control_for_trial(trial_dir: &Path) -> ActiveAdapterControl {
         let control_path = trial_dir.join("state").join("lab_control.json");
-        write_adapter_continue_control(&control_path).expect("control file");
+        let payload = json!({
+            "schema_version": "control_plane_v1",
+            "seq": 0,
+            "action": "continue",
+            "label": null,
+            "requested_at": Utc::now().to_rfc3339(),
+            "requested_by": "run_loop",
+        });
+        atomic_write_json_pretty(&control_path, &payload).expect("control file");
         ActiveAdapterControl {
             adapter_id: BUILTIN_COMMAND_ADAPTER_ID.to_string(),
             adapter_version: BUILTIN_COMMAND_ADAPTER_VERSION.to_string(),
@@ -1061,16 +1074,16 @@ mod tests {
             .and_then(|v| v.as_array())
             .expect("task sandbox mounts");
         assert!(
-            !agent_runtime_mounts.iter().any(|row| {
-                row.get("name").and_then(|v| v.as_str()) == Some("deps")
-            }),
+            !agent_runtime_mounts
+                .iter()
+                .any(|row| { row.get("name").and_then(|v| v.as_str()) == Some("deps") }),
             "agent runtime deps mount unexpectedly present: {:?}",
             agent_runtime_mounts
         );
         assert!(
-            !task_sandbox_mounts.iter().any(|row| {
-                row.get("name").and_then(|v| v.as_str()) == Some("deps")
-            }),
+            !task_sandbox_mounts
+                .iter()
+                .any(|row| { row.get("name").and_then(|v| v.as_str()) == Some("deps") }),
             "task sandbox deps mount unexpectedly present: {:?}",
             task_sandbox_mounts
         );
@@ -1592,7 +1605,8 @@ mod tests {
             Err(err) => err,
         };
         assert!(
-            err.to_string().contains("runtime.dependencies.file_staging is not supported"),
+            err.to_string()
+                .contains("runtime.dependencies.file_staging is not supported"),
             "unexpected error: {}",
             err
         );
@@ -1664,7 +1678,8 @@ mod tests {
             Err(err) => err,
         };
         assert!(
-            err.to_string().contains("runtime.dependencies.secret_files is not supported"),
+            err.to_string()
+                .contains("runtime.dependencies.secret_files is not supported"),
             "unexpected error: {}",
             err
         );
@@ -1696,54 +1711,6 @@ mod tests {
                 .contains("runtime.agent_runtime.secret_env is not supported"),
             "unexpected error: {}",
             err
-        );
-    }
-
-    #[test]
-    fn stage_dependencies_for_trial_copies_into_trial_namespaces() {
-        let root = TempDirGuard::new("agentlab_host_file_staging_copy");
-        let exp_dir = root.path.join("exp");
-        ensure_dir(&exp_dir).expect("exp");
-        fs::write(exp_dir.join("fixture.txt"), "fixture").expect("exp fixture");
-        let trial_dir = root.path.join("trial_1");
-        ensure_dir(&trial_dir).expect("trial");
-        let paths = TrialPaths::new(&trial_dir, &exp_dir).expect("paths");
-        paths.prepare(true).expect("prepare");
-
-        let source_db = root.path.join("graphd.db");
-        fs::write(&source_db, "db-bytes").expect("source db");
-
-        let mut agent_runtime = legacy_contract_runtime_fixture();
-        agent_runtime.command_raw = vec![];
-        agent_runtime.image.clear();
-        agent_runtime.sandbox_image = None;
-        agent_runtime.execution = agent_execution_fixture(None);
-        agent_runtime.dependency_file_staging = vec![
-            DependencyFileStagingSpec {
-                source_from_host: source_db.clone(),
-                destination_path: format!("{}/.graphd/graphd.db", AGENTLAB_CONTRACT_STATE_DIR),
-                required: true,
-                read_only: false,
-            },
-            DependencyFileStagingSpec {
-                source_from_host: root.path.join("missing-wal"),
-                destination_path: format!(
-                    "{}/.graphd/graphd.db-wal",
-                    AGENTLAB_CONTRACT_STATE_DIR
-                ),
-                required: false,
-                read_only: false,
-            },
-        ];
-
-        stage_dependencies_for_trial(&agent_runtime, &paths).expect("stage host files");
-        assert_eq!(
-            fs::read_to_string(paths.state.join(".graphd").join("graphd.db")).expect("staged db"),
-            "db-bytes"
-        );
-        assert!(
-            !paths.state.join(".graphd").join("graphd.db-wal").exists(),
-            "optional missing source should not create destination"
         );
     }
 
@@ -2107,101 +2074,6 @@ mod tests {
     }
 
     #[test]
-    fn pause_run_uses_default_events_path_for_supported_integration_levels() {
-        let (_root, run_dir) = create_run_dir("agentlab_pause_events_required", "run_1");
-        write_resolved_experiment(&run_dir, "cli_events", false);
-        let trial_dir = seed_parent_trial(&run_dir, "trial_1", json!([]), "running", None);
-        let control_path = trial_dir.join("state").join("lab_control.json");
-        let events_path = trial_dir.join("state").join("events.jsonl");
-        let control = active_control_for_trial(&trial_dir);
-        write_test_run_control(
-            &run_dir,
-            "run_1",
-            "running",
-            Some("trial_1"),
-            Some(&control),
-        );
-
-        let ack_thread = spawn_pause_ack_writer(control_path.clone(), events_path);
-        let paused = pause_run(&run_dir, None, Some("pause"), 2).expect("pause success");
-        ack_thread.join().expect("ack writer thread");
-        assert_eq!(paused.label, "pause");
-    }
-
-    #[test]
-    fn pause_run_completes_checkpoint_then_stop_and_updates_state() {
-        let (_root, run_dir) = create_run_dir("agentlab_pause_success", "run_1");
-        write_resolved_experiment(&run_dir, "cli_events", true);
-        let trial_dir = seed_parent_trial(&run_dir, "trial_1", json!([]), "running", None);
-        let control_path = trial_dir.join("state").join("lab_control.json");
-        let events_path = trial_dir.join("state").join("events.jsonl");
-        let control = active_control_for_trial(&trial_dir);
-        write_test_run_control(
-            &run_dir,
-            "run_1",
-            "running",
-            Some("trial_1"),
-            Some(&control),
-        );
-
-        let ack_thread = spawn_pause_ack_writer(control_path.clone(), events_path);
-        let paused = pause_run(&run_dir, None, Some("manual_pause"), 2).expect("pause success");
-        ack_thread.join().expect("ack writer thread");
-
-        assert_eq!(paused.run_id, "run_1");
-        assert_eq!(paused.trial_id, "trial_1");
-        assert_eq!(paused.label, "manual_pause");
-        assert!(paused.checkpoint_acked);
-        assert!(paused.stop_acked);
-
-        let run_control = load_json_file(&run_control_path(&run_dir)).expect("run control");
-        assert_eq!(
-            run_control
-                .pointer("/status")
-                .and_then(|v| v.as_str())
-                .unwrap_or(""),
-            "paused"
-        );
-        assert_eq!(
-            run_control
-                .pointer("/active_trials/trial_1/trial_id")
-                .and_then(|v| v.as_str())
-                .unwrap_or(""),
-            "trial_1"
-        );
-
-        let trial_state = load_json_file(&trial_dir.join("trial_state.json")).expect("trial state");
-        assert_eq!(
-            trial_state
-                .pointer("/status")
-                .and_then(|v| v.as_str())
-                .unwrap_or(""),
-            "paused"
-        );
-        assert_eq!(
-            trial_state
-                .pointer("/pause_label")
-                .and_then(|v| v.as_str())
-                .unwrap_or(""),
-            "manual_pause"
-        );
-        assert_eq!(
-            trial_state
-                .pointer("/checkpoint_selected")
-                .and_then(|v| v.as_str())
-                .unwrap_or(""),
-            "manual_pause"
-        );
-        assert_eq!(
-            trial_state
-                .pointer("/exit_reason")
-                .and_then(|v| v.as_str())
-                .unwrap_or(""),
-            "paused_by_user"
-        );
-    }
-
-    #[test]
     fn resume_run_requires_run_to_be_paused() {
         let (_root, run_dir) = create_run_dir("agentlab_resume_not_paused", "run_1");
         write_resolved_experiment(&run_dir, "sdk_full", true);
@@ -2433,8 +2305,7 @@ mod tests {
                 "task_sandbox": { "network": "none" }
             }
         });
-        validate_required_fields(&spec)
-            .expect("task_sandbox.profile should default");
+        validate_required_fields(&spec).expect("task_sandbox.profile should default");
     }
 
     #[test]
@@ -2454,8 +2325,7 @@ mod tests {
                 "task_sandbox": { "network": "none" }
             }
         });
-        let err =
-            validate_required_fields(&spec).expect_err("missing artifact should fail");
+        let err = validate_required_fields(&spec).expect_err("missing artifact should fail");
         assert!(
             err.to_string().contains("/runtime/agent_runtime/artifact"),
             "expected missing artifact error: {}",
@@ -2485,7 +2355,8 @@ mod tests {
         let err = validate_required_fields(&spec)
             .expect_err("runtime.agent_runtime.support_files should be rejected");
         assert!(
-            err.to_string().contains("/runtime/agent_runtime/support_files was removed"),
+            err.to_string()
+                .contains("/runtime/agent_runtime/support_files was removed"),
             "unexpected error: {}",
             err
         );
@@ -3077,40 +2948,10 @@ mod tests {
         );
     }
 
-    fn worker_dispatch_fixture(schedule_idx: usize, trial_id: &str) -> TrialDispatch {
-        TrialDispatch {
-            run_id: "run_fixture".to_string(),
-            trial_id: trial_id.to_string(),
-            schedule_idx,
-            slot: TrialSlot {
-                variant_idx: 0,
-                task_idx: schedule_idx,
-                repl_idx: 0,
-            },
-            variant_id: "baseline".to_string(),
-            task_id: format!("task_{}", schedule_idx),
-            repl_idx: 0,
-            runtime_profile: json!({ "runtime": { "sandbox": { "image": "img" } } }),
-            task_payload: json!({ "id": format!("task_{}", schedule_idx) }),
-            effective_policy: json!({ "timeout_ms": 1000 }),
-        }
-    }
-
-    fn worker_completion_fixture(
-        ticket: &WorkerTicket,
+    #[derive(Debug, Clone)]
+    struct DeterminismCompletion {
         schedule_idx: usize,
-        classification: &str,
-    ) -> TrialCompletion {
-        TrialCompletion {
-            ticket: ticket.clone(),
-            schedule_idx,
-            completion_seq: None,
-            terminal_status: "succeeded".to_string(),
-            classification: classification.to_string(),
-            artifacts: json!({ "result": "ok" }),
-            metrics: json!({ "latency_ms": 10 }),
-            runtime_summary: json!({ "engine": "fixture" }),
-        }
+        classification: String,
     }
 
     #[derive(Debug, Deserialize)]
@@ -3129,26 +2970,20 @@ mod tests {
     }
 
     struct OutOfOrderCompletionSimulator {
-        by_tick: BTreeMap<usize, Vec<TrialCompletion>>,
+        by_tick: BTreeMap<usize, Vec<DeterminismCompletion>>,
     }
 
     impl OutOfOrderCompletionSimulator {
         fn from_fixture(fixture: &P2EDeterminismFixture) -> Self {
-            let mut by_tick: BTreeMap<usize, Vec<TrialCompletion>> = BTreeMap::new();
+            let mut by_tick: BTreeMap<usize, Vec<DeterminismCompletion>> = BTreeMap::new();
             for row in fixture.arrivals.iter() {
-                let ticket = WorkerTicket {
-                    worker_id: format!("worker_{}", row.trial_id),
-                    ticket_id: format!("ticket_{}", row.trial_id),
-                    trial_id: row.trial_id.clone(),
-                };
                 by_tick
                     .entry(row.tick)
                     .or_default()
-                    .push(worker_completion_fixture(
-                        &ticket,
-                        row.schedule_idx,
-                        row.classification.as_str(),
-                    ));
+                    .push(DeterminismCompletion {
+                        schedule_idx: row.schedule_idx,
+                        classification: row.classification.clone(),
+                    });
             }
             Self { by_tick }
         }
@@ -3157,7 +2992,7 @@ mod tests {
             self.by_tick.keys().copied().max().unwrap_or(0)
         }
 
-        fn poll_tick(&mut self, tick: usize) -> Vec<TrialCompletion> {
+        fn poll_tick(&mut self, tick: usize) -> Vec<DeterminismCompletion> {
             self.by_tick.remove(&tick).unwrap_or_default()
         }
     }
@@ -3171,9 +3006,9 @@ mod tests {
     }
 
     fn drain_ready_completions_in_schedule_order(
-        pending: &mut BTreeMap<usize, TrialCompletion>,
+        pending: &mut BTreeMap<usize, DeterminismCompletion>,
         next_commit_idx: &mut usize,
-    ) -> Vec<TrialCompletion> {
+    ) -> Vec<DeterminismCompletion> {
         let mut ready = Vec::new();
         loop {
             let Some(completion) = pending.remove(next_commit_idx) else {
@@ -3183,58 +3018,6 @@ mod tests {
             ready.push(completion);
         }
         ready
-    }
-
-    #[test]
-    fn p2c_local_thread_worker_backend_enforces_capacity_and_polls_completions() {
-        let executor: Arc<LocalTrialExecutor> = Arc::new(|dispatch| {
-            thread::sleep(Duration::from_millis(80));
-            Ok(TrialCompletion {
-                ticket: WorkerTicket {
-                    worker_id: "ignored".to_string(),
-                    ticket_id: "ignored".to_string(),
-                    trial_id: dispatch.trial_id.clone(),
-                },
-                schedule_idx: usize::MAX,
-                completion_seq: None,
-                terminal_status: "succeeded".to_string(),
-                classification: format!("completed_{}", dispatch.trial_id),
-                artifacts: json!({}),
-                metrics: json!({}),
-                runtime_summary: json!({}),
-            })
-        });
-        let backend = LocalThreadWorkerBackend::new(1, executor).expect("backend");
-
-        let dispatch_a = worker_dispatch_fixture(0, "trial_alpha");
-        let dispatch_b = worker_dispatch_fixture(1, "trial_beta");
-        let ticket_a = backend.submit(dispatch_a.clone()).expect("submit A");
-        let err = backend
-            .submit(dispatch_b.clone())
-            .expect_err("capacity should block submit B while A is in-flight");
-        assert!(
-            err.to_string().contains("at capacity"),
-            "unexpected error: {}",
-            err
-        );
-
-        let completions = backend
-            .poll_completions(Duration::from_secs(2))
-            .expect("poll completions");
-        assert_eq!(completions.len(), 1);
-        assert_eq!(completions[0].ticket.ticket_id, ticket_a.ticket_id);
-        assert_eq!(completions[0].ticket.trial_id, dispatch_a.trial_id);
-        assert_eq!(completions[0].schedule_idx, dispatch_a.schedule_idx);
-
-        let ticket_b = backend
-            .submit(dispatch_b.clone())
-            .expect("submit B after drain");
-        let completions = backend
-            .poll_completions(Duration::from_secs(2))
-            .expect("poll completions");
-        assert_eq!(completions.len(), 1);
-        assert_eq!(completions[0].ticket.ticket_id, ticket_b.ticket_id);
-        assert_eq!(completions[0].schedule_idx, dispatch_b.schedule_idx);
     }
 
     #[test]
@@ -3253,239 +3036,6 @@ mod tests {
         let (effective_noop, warning_noop) = resolve_local_worker_max_in_flight(2, Some(4));
         assert_eq!(effective_noop, 2);
         assert!(warning_noop.is_none());
-    }
-
-    #[test]
-    fn p5b_submit_backpressure_classifies_capacity_as_retryable() {
-        let executor: Arc<LocalTrialExecutor> = Arc::new(|dispatch| {
-            thread::sleep(Duration::from_millis(80));
-            Ok(TrialCompletion {
-                ticket: WorkerTicket {
-                    worker_id: "ignored".to_string(),
-                    ticket_id: "ignored".to_string(),
-                    trial_id: dispatch.trial_id.clone(),
-                },
-                schedule_idx: dispatch.schedule_idx,
-                completion_seq: None,
-                terminal_status: "succeeded".to_string(),
-                classification: "ok".to_string(),
-                artifacts: json!({}),
-                metrics: json!({}),
-                runtime_summary: json!({}),
-            })
-        });
-        let backend =
-            LocalThreadWorkerBackend::new_with_ceiling(1, executor, None).expect("backend");
-        let dispatch_a = worker_dispatch_fixture(0, "trial_a");
-        let dispatch_b = worker_dispatch_fixture(1, "trial_b");
-
-        let ticket_a = submit_dispatch_with_backpressure(&backend, dispatch_a.clone())
-            .expect("submit A")
-            .expect("ticket A");
-        let blocked = submit_dispatch_with_backpressure(&backend, dispatch_b.clone())
-            .expect("submit B should be classified as backpressure");
-        assert!(
-            blocked.is_none(),
-            "capacity backpressure should return None instead of failing run"
-        );
-
-        let drained = backend
-            .poll_completions(Duration::from_secs(2))
-            .expect("drain completion");
-        assert_eq!(drained.len(), 1);
-        assert_eq!(drained[0].ticket.ticket_id, ticket_a.ticket_id);
-
-        let ticket_b = submit_dispatch_with_backpressure(&backend, dispatch_b.clone())
-            .expect("submit B after drain")
-            .expect("ticket B");
-        assert_eq!(ticket_b.trial_id, dispatch_b.trial_id);
-    }
-
-    #[test]
-    fn p5b_local_worker_backend_drains_burst_completions_without_loss() {
-        let executor: Arc<LocalTrialExecutor> = Arc::new(|dispatch| {
-            Ok(TrialCompletion {
-                ticket: WorkerTicket {
-                    worker_id: "ignored".to_string(),
-                    ticket_id: "ignored".to_string(),
-                    trial_id: dispatch.trial_id.clone(),
-                },
-                schedule_idx: dispatch.schedule_idx,
-                completion_seq: None,
-                terminal_status: "succeeded".to_string(),
-                classification: "ok".to_string(),
-                artifacts: json!({}),
-                metrics: json!({}),
-                runtime_summary: json!({}),
-            })
-        });
-        let backend =
-            LocalThreadWorkerBackend::new_with_ceiling(32, executor, None).expect("backend");
-
-        let mut expected_ticket_ids: HashSet<String> = HashSet::new();
-        for idx in 0..32usize {
-            let dispatch = worker_dispatch_fixture(idx, &format!("trial_{}", idx));
-            let ticket = backend.submit(dispatch).expect("submit burst dispatch");
-            expected_ticket_ids.insert(ticket.ticket_id);
-        }
-
-        let mut seen_ticket_ids: HashSet<String> = HashSet::new();
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while seen_ticket_ids.len() < expected_ticket_ids.len() {
-            assert!(
-                Instant::now() < deadline,
-                "timed out draining burst completions: seen={} expected={}",
-                seen_ticket_ids.len(),
-                expected_ticket_ids.len()
-            );
-            let completions = backend
-                .poll_completions(Duration::from_millis(250))
-                .expect("poll burst completions");
-            if completions.is_empty() {
-                continue;
-            }
-            for completion in completions {
-                assert!(
-                    expected_ticket_ids.contains(&completion.ticket.ticket_id),
-                    "unexpected completion ticket {}",
-                    completion.ticket.ticket_id
-                );
-                assert!(
-                    seen_ticket_ids.insert(completion.ticket.ticket_id.clone()),
-                    "duplicate completion ticket {}",
-                    completion.ticket.ticket_id
-                );
-            }
-        }
-
-        assert_eq!(seen_ticket_ids.len(), 32);
-        let trailing = backend
-            .poll_completions(Duration::from_millis(1))
-            .expect("trailing poll");
-        assert!(
-            trailing.is_empty(),
-            "completion queue should be fully drained"
-        );
-    }
-
-    #[test]
-    fn p5b_local_worker_high_churn_drains_in_flight_bookkeeping() {
-        let executor: Arc<LocalTrialExecutor> = Arc::new(|dispatch| {
-            Ok(TrialCompletion {
-                ticket: WorkerTicket {
-                    worker_id: "ignored".to_string(),
-                    ticket_id: "ignored".to_string(),
-                    trial_id: dispatch.trial_id.clone(),
-                },
-                schedule_idx: dispatch.schedule_idx,
-                completion_seq: None,
-                terminal_status: "succeeded".to_string(),
-                classification: "ok".to_string(),
-                artifacts: json!({}),
-                metrics: json!({}),
-                runtime_summary: json!({}),
-            })
-        });
-        let lanes = 8usize;
-        let batches = 25usize;
-        let backend = LocalThreadWorkerBackend::new_with_ceiling(lanes, executor, Some(lanes))
-            .expect("backend");
-
-        for batch_idx in 0..batches {
-            let mut expected_ticket_ids: HashSet<String> = HashSet::new();
-            for lane_idx in 0..lanes {
-                let schedule_idx = batch_idx * lanes + lane_idx;
-                let dispatch =
-                    worker_dispatch_fixture(schedule_idx, &format!("trial_churn_{}", schedule_idx));
-                let ticket = backend.submit(dispatch).expect("submit");
-                expected_ticket_ids.insert(ticket.ticket_id);
-            }
-
-            let mut seen = 0usize;
-            let deadline = Instant::now() + Duration::from_secs(3);
-            while seen < lanes {
-                assert!(
-                    Instant::now() < deadline,
-                    "timed out draining local churn batch {}",
-                    batch_idx
-                );
-                let completions = backend
-                    .poll_completions(Duration::from_millis(50))
-                    .expect("poll");
-                if completions.is_empty() {
-                    continue;
-                }
-                for completion in completions {
-                    assert!(
-                        expected_ticket_ids.remove(completion.ticket.ticket_id.as_str()),
-                        "unexpected completion ticket {}",
-                        completion.ticket.ticket_id
-                    );
-                    seen += 1;
-                }
-            }
-
-            let state = backend.inner.state.lock().expect("state lock");
-            assert!(
-                state.in_flight_by_ticket.is_empty(),
-                "local in-flight ticket state should drain after each churn batch"
-            );
-        }
-    }
-
-    #[test]
-    fn p2c_local_thread_worker_backend_rejects_fake_pause_and_stop() {
-        let executor: Arc<LocalTrialExecutor> = Arc::new(|dispatch| {
-            thread::sleep(Duration::from_millis(120));
-            Ok(TrialCompletion {
-                ticket: WorkerTicket {
-                    worker_id: "ignored".to_string(),
-                    ticket_id: "ignored".to_string(),
-                    trial_id: dispatch.trial_id.clone(),
-                },
-                schedule_idx: 0,
-                completion_seq: None,
-                terminal_status: "succeeded".to_string(),
-                classification: "ok".to_string(),
-                artifacts: json!({}),
-                metrics: json!({}),
-                runtime_summary: json!({}),
-            })
-        });
-        let backend = LocalThreadWorkerBackend::new(2, executor).expect("backend");
-        let dispatch = worker_dispatch_fixture(2, "trial_pause");
-        let ticket = backend.submit(dispatch.clone()).expect("submit");
-
-        let pause_err = backend
-            .request_pause(&ticket.worker_id, "checkpoint_now")
-            .expect_err("pause should fail honestly");
-        assert!(
-            pause_err.to_string().contains("does not support pause"),
-            "unexpected pause error: {}",
-            pause_err
-        );
-
-        let stop_err = backend
-            .request_stop(&ticket.worker_id, "unit test stop")
-            .expect_err("stop should fail honestly");
-        assert!(
-            stop_err.to_string().contains("does not support stop"),
-            "unexpected stop error: {}",
-            stop_err
-        );
-
-        let err = backend
-            .request_pause("unknown.worker", "x")
-            .expect_err("unknown worker should fail");
-        assert!(
-            err.to_string().contains("unknown active worker"),
-            "unexpected error: {}",
-            err
-        );
-
-        let _ = backend
-            .poll_completions(Duration::from_secs(2))
-            .expect("drain completion");
     }
 
     #[test]
@@ -3517,7 +3067,7 @@ mod tests {
         let mut simulator = OutOfOrderCompletionSimulator::from_fixture(&fixture);
         let max_tick = simulator.max_tick();
 
-        let mut pending: BTreeMap<usize, TrialCompletion> = BTreeMap::new();
+        let mut pending: BTreeMap<usize, DeterminismCompletion> = BTreeMap::new();
         let mut next_commit_idx = 0usize;
         let mut committed_schedule_idx = Vec::new();
         for tick in 0..=max_tick {
@@ -3655,7 +3205,7 @@ mod tests {
             consecutive_failures: BTreeMap::new(),
             updated_at: Utc::now().to_rfc3339(),
         };
-        let mut run_sink = SqliteRunStore::new(&run_dir).expect("sink");
+        let mut run_sink = SqliteRunJournal::new(&run_dir).expect("sink");
         let mut committer = DeterministicCommitter::from_progress(&schedule_progress, &[]);
         let policy_config = PolicyConfig::default();
         let evidence_records_path = run_dir.join("runtime").join("p3a_evidence.jsonl");
@@ -3766,8 +3316,7 @@ mod tests {
             4,
             "candidate",
             &json!({
-                "id": "task_9",
-                "grading": { "enabled": false }
+                "id": "task_9"
             }),
             Some("ghcr.io/acme/task:20260222"),
             &trial_input_path,
@@ -3787,8 +3336,8 @@ mod tests {
             preflight
                 .pointer("/grading/enabled")
                 .and_then(|v| v.as_bool())
-                .unwrap_or(true),
-            false
+                .unwrap_or(false),
+            true
         );
         assert!(
             trial_dir
@@ -3797,6 +3346,51 @@ mod tests {
                 .join("trial_input.json")
                 .exists(),
             "frozen trial_input must be staged for grading/replay"
+        );
+    }
+
+    #[test]
+    fn p3b_benchmark_preflight_rejects_grading_opt_out_for_benchmarks() {
+        let root = TempDirGuard::new("agentlab_p3b_preflight_grading_gate");
+        let trial_dir = root.path.join("trial_1");
+        ensure_dir(&trial_dir).expect("trial dir");
+        let trial_input_path = trial_dir.join("trial_input.json");
+        atomic_write_json_pretty(
+            &trial_input_path,
+            &json!({
+                "schema_version": "agent_task_v1",
+                "ids": { "trial_id": "trial_1" }
+            }),
+        )
+        .expect("trial input");
+
+        let benchmark = BenchmarkConfig {
+            policy: BenchmarkPolicyConfig::default(),
+            grader: Some(BenchmarkGraderConfig::in_task_image(vec![
+                "echo".to_string(),
+                "ok".to_string(),
+            ])),
+            adapter: None,
+        };
+        let err = stage_benchmark_trial_preflight(
+            &benchmark,
+            &trial_dir,
+            "run_1",
+            "trial_1",
+            4,
+            "candidate",
+            &json!({
+                "id": "task_9",
+                "grading": { "enabled": false }
+            }),
+            Some("ghcr.io/acme/task:20260222"),
+            &trial_input_path,
+        )
+        .expect_err("benchmark grading opt-out should be rejected");
+        assert!(
+            err.to_string().contains("grading.enabled=false"),
+            "unexpected error: {}",
+            err
         );
     }
 
@@ -3876,7 +3470,7 @@ mod tests {
         let mut trial_index = 0_usize;
         let mut consecutive_failures: BTreeMap<usize, usize> = BTreeMap::new();
         let mut pruned_variants: HashSet<usize> = HashSet::new();
-        let mut run_sink = SqliteRunStore::new(&run_dir).expect("sink");
+        let mut run_sink = SqliteRunJournal::new(&run_dir).expect("sink");
         execute_schedule_engine(
             ScheduleEngineMode::ContinueRun,
             &run_dir,
@@ -3975,7 +3569,7 @@ mod tests {
         let mut trial_index = 0_usize;
         let mut consecutive_failures: BTreeMap<usize, usize> = BTreeMap::new();
         let mut pruned_variants: HashSet<usize> = HashSet::new();
-        let mut run_sink = SqliteRunStore::new(&run_dir).expect("sink");
+        let mut run_sink = SqliteRunJournal::new(&run_dir).expect("sink");
         let policy_config = PolicyConfig {
             pruning_max_consecutive_failures: Some(1),
             ..PolicyConfig::default()
@@ -4024,166 +3618,9 @@ mod tests {
     }
 
     #[test]
-    fn p5a_pause_run_fans_out_to_all_active_trials() {
-        let (_root, run_dir) = create_run_dir("agentlab_p5a_pause_fanout", "run_1");
-        write_resolved_experiment(&run_dir, "cli_events", true);
-        let trial_a_dir = seed_parent_trial(&run_dir, "trial_1", json!([]), "running", None);
-        let trial_b_dir = seed_parent_trial(&run_dir, "trial_2", json!([]), "running", None);
-        let control_a = active_control_for_trial(&trial_a_dir);
-        let control_b = active_control_for_trial(&trial_b_dir);
-
-        let active_trials = vec![
-            RunControlActiveTrial {
-                trial_id: "trial_1".to_string(),
-                worker_id: "worker_a".to_string(),
-                schedule_idx: Some(1),
-                variant_id: Some("base".to_string()),
-                started_at: Some(Utc::now().to_rfc3339()),
-                control: Some(control_a.clone()),
-            },
-            RunControlActiveTrial {
-                trial_id: "trial_2".to_string(),
-                worker_id: "worker_b".to_string(),
-                schedule_idx: Some(2),
-                variant_id: Some("base".to_string()),
-                started_at: Some(Utc::now().to_rfc3339()),
-                control: Some(control_b.clone()),
-            },
-        ];
-        write_run_control_v2(&run_dir, "run_1", "running", &active_trials, None).expect("control");
-
-        let ack_a = spawn_pause_ack_writer(
-            trial_a_dir.join("state").join("lab_control.json"),
-            trial_a_dir.join("state").join("events.jsonl"),
-        );
-        let ack_b = spawn_pause_ack_writer(
-            trial_b_dir.join("state").join("lab_control.json"),
-            trial_b_dir.join("state").join("events.jsonl"),
-        );
-        let paused = pause_run(&run_dir, None, Some("fanout_pause"), 2).expect("pause fanout");
-        ack_a.join().expect("ack a");
-        ack_b.join().expect("ack b");
-
-        assert_eq!(paused.run_id, "run_1");
-        assert_eq!(paused.trial_id, "multi");
-        assert_eq!(paused.label, "fanout_pause");
-        assert!(paused.checkpoint_acked);
-        assert!(paused.stop_acked);
-
-        let run_control = load_json_file(&run_control_path(&run_dir)).expect("run control");
-        assert_eq!(
-            run_control
-                .pointer("/status")
-                .and_then(|v| v.as_str())
-                .unwrap_or(""),
-            "paused"
-        );
-        let active = run_control
-            .pointer("/active_trials")
-            .and_then(|v| v.as_object())
-            .cloned()
-            .unwrap_or_default();
-        assert_eq!(active.len(), 2);
-
-        let trial_a_state = load_json_file(&trial_a_dir.join("trial_state.json")).expect("a state");
-        assert_eq!(
-            trial_a_state
-                .pointer("/status")
-                .and_then(|v| v.as_str())
-                .unwrap_or(""),
-            "paused"
-        );
-        let trial_b_state = load_json_file(&trial_b_dir.join("trial_state.json")).expect("b state");
-        assert_eq!(
-            trial_b_state
-                .pointer("/status")
-                .and_then(|v| v.as_str())
-                .unwrap_or(""),
-            "paused"
-        );
-    }
-
-    #[test]
-    fn p5a_pause_run_partial_fanout_sets_interrupted_and_keeps_survivor_active() {
-        let (_root, run_dir) = create_run_dir("agentlab_p5a_pause_partial", "run_1");
-        write_resolved_experiment(&run_dir, "cli_events", true);
-        let trial_a_dir = seed_parent_trial(&run_dir, "trial_1", json!([]), "running", None);
-        let trial_b_dir = seed_parent_trial(&run_dir, "trial_2", json!([]), "running", None);
-        let control_a = active_control_for_trial(&trial_a_dir);
-        let control_b = active_control_for_trial(&trial_b_dir);
-
-        let active_trials = vec![
-            RunControlActiveTrial {
-                trial_id: "trial_1".to_string(),
-                worker_id: "worker_a".to_string(),
-                schedule_idx: Some(1),
-                variant_id: Some("base".to_string()),
-                started_at: Some(Utc::now().to_rfc3339()),
-                control: Some(control_a.clone()),
-            },
-            RunControlActiveTrial {
-                trial_id: "trial_2".to_string(),
-                worker_id: "worker_b".to_string(),
-                schedule_idx: Some(2),
-                variant_id: Some("base".to_string()),
-                started_at: Some(Utc::now().to_rfc3339()),
-                control: Some(control_b.clone()),
-            },
-        ];
-        write_run_control_v2(&run_dir, "run_1", "running", &active_trials, None).expect("control");
-
-        let ack_a = spawn_pause_ack_writer(
-            trial_a_dir.join("state").join("lab_control.json"),
-            trial_a_dir.join("state").join("events.jsonl"),
-        );
-        let err = match pause_run(&run_dir, None, Some("fanout_pause"), 1) {
-            Ok(_) => panic!("partial pause should fail"),
-            Err(err) => err,
-        };
-        ack_a.join().expect("ack a");
-        assert!(
-            err.to_string().contains("pause_partial_failure"),
-            "unexpected error: {}",
-            err
-        );
-
-        let run_control = load_json_file(&run_control_path(&run_dir)).expect("run control");
-        assert_eq!(
-            run_control
-                .pointer("/status")
-                .and_then(|v| v.as_str())
-                .unwrap_or(""),
-            "interrupted"
-        );
-        let active = run_control
-            .pointer("/active_trials")
-            .and_then(|v| v.as_object())
-            .cloned()
-            .unwrap_or_default();
-        assert_eq!(active.len(), 1);
-        assert!(active.contains_key("trial_2"));
-
-        let trial_a_state = load_json_file(&trial_a_dir.join("trial_state.json")).expect("a state");
-        assert_eq!(
-            trial_a_state
-                .pointer("/status")
-                .and_then(|v| v.as_str())
-                .unwrap_or(""),
-            "paused"
-        );
-        let trial_b_state = load_json_file(&trial_b_dir.join("trial_state.json")).expect("b state");
-        assert_eq!(
-            trial_b_state
-                .pointer("/status")
-                .and_then(|v| v.as_str())
-                .unwrap_or(""),
-            "running"
-        );
-    }
-
-    #[test]
-    fn p7_pause_run_routes_worker_control_when_active_adapter_is_absent() {
-        let (_root, run_dir) = create_run_dir("agentlab_p7_pause_worker_control", "run_1");
+    fn p7_pause_run_rejects_active_trial_without_runtime_container_state() {
+        let (_root, run_dir) = create_run_dir("agentlab_p7_pause_legacy_active_trial", "run_1");
+        let _trial_dir = seed_parent_trial(&run_dir, "trial_1", json!([]), "running", None);
         let active_trials = vec![RunControlActiveTrial {
             trial_id: "trial_1".to_string(),
             worker_id: "worker_parallel_1".to_string(),
@@ -4194,51 +3631,326 @@ mod tests {
         }];
         write_run_control_v2(&run_dir, "run_1", "running", &active_trials, None).expect("control");
 
-        let responder_run_dir = run_dir.clone();
-        let responder = thread::spawn(move || {
-            let deadline = Instant::now() + Duration::from_secs(5);
-            while Instant::now() < deadline {
-                let Some(state) =
-                    load_parallel_worker_control_state(&responder_run_dir).expect("load state")
-                else {
-                    thread::sleep(Duration::from_millis(20));
-                    continue;
-                };
-                let Some(request) = state.request else {
-                    thread::sleep(Duration::from_millis(20));
-                    continue;
-                };
-                if request.action != ParallelWorkerControlAction::Pause {
-                    thread::sleep(Duration::from_millis(20));
-                    continue;
-                }
-                write_parallel_worker_control_response(
-                    &responder_run_dir,
-                    ParallelWorkerControlResponse {
-                        request_id: request.request_id,
-                        action: ParallelWorkerControlAction::Pause,
-                        status: PARALLEL_WORKER_CONTROL_RESPONSE_COMPLETED.to_string(),
-                        processed_at: Utc::now().to_rfc3339(),
-                        processed_trial_ids: vec!["trial_1".to_string()],
-                        failed_trials: Vec::new(),
-                        checkpoint_acked: Some(true),
-                        stop_acked: Some(true),
-                        message: None,
-                    },
-                )
-                .expect("write response");
-                return;
-            }
-            panic!("timed out waiting for pause control request");
-        });
+        let err =
+            pause_run(&run_dir, None, Some("worker_pause"), 2).expect_err("pause should fail");
+        assert!(
+            err.to_string().contains("pause_missing_runtime_container"),
+            "unexpected error: {}",
+            err
+        );
+    }
 
-        let paused = pause_run(&run_dir, None, Some("worker_pause"), 2).expect("pause");
-        responder.join().expect("responder");
-        assert_eq!(paused.run_id, "run_1");
+    #[test]
+    fn p7_pause_run_uses_persisted_runtime_container_when_adapter_control_missing() {
+        if !docker_runtime_available() {
+            return;
+        }
+        ensure_docker_test_image("python:3.11-slim");
+
+        let (_root, run_dir) = create_run_dir("agentlab_p7_pause_runtime_state", "run_1");
+        write_resolved_experiment(&run_dir, "cli_events", true);
+        let trial_dir = seed_parent_trial(&run_dir, "trial_1", json!([]), "running", None);
+
+        let docker = crate::backend::docker::DockerRuntime::connect().expect("docker runtime");
+        let handle = docker
+            .create_container(&crate::backend::docker::ContainerSpec::idle(
+                "python:3.11-slim",
+            ))
+            .expect("create idle container");
+        docker
+            .start_container(&handle)
+            .expect("start idle container");
+
+        trial::state::write_trial_attempt_state(
+            &trial_dir,
+            &runtime_trial_attempt_state_with_task_container(
+                TrialPhase::AgentRunning,
+                &handle.container_id,
+            ),
+        )
+        .expect("write runtime state");
+
+        let active_trials = vec![RunControlActiveTrial {
+            trial_id: "trial_1".to_string(),
+            worker_id: "worker_parallel_1".to_string(),
+            schedule_idx: Some(0),
+            variant_id: Some("base".to_string()),
+            started_at: Some(Utc::now().to_rfc3339()),
+            control: None,
+        }];
+        write_run_control_v2(&run_dir, "run_1", "running", &active_trials, None).expect("control");
+
+        let paused =
+            pause_run(&run_dir, None, Some("docker_pause"), 2).expect("pause should succeed");
         assert_eq!(paused.trial_id, "trial_1");
-        assert_eq!(paused.label, "worker_pause");
         assert!(paused.checkpoint_acked);
         assert!(paused.stop_acked);
+
+        let run_control = load_json_file(&run_control_path(&run_dir)).expect("run control");
+        assert_eq!(
+            run_control.pointer("/status").and_then(Value::as_str),
+            Some("paused")
+        );
+
+        let trial_state = load_json_file(&trial_dir.join("trial_state.json")).expect("trial state");
+        assert_eq!(
+            trial_state.pointer("/status").and_then(Value::as_str),
+            Some("paused")
+        );
+
+        let runtime_state =
+            trial::state::load_trial_attempt_state(&trial_dir).expect("runtime state");
+        assert_eq!(runtime_state.state.phase, TrialPhase::Paused);
+
+        let inspected = docker
+            .inspect_container(&handle)
+            .expect("inspect paused container");
+        assert_eq!(inspected.status.as_deref(), Some("paused"));
+
+        let _ = docker.remove_container(&handle, true);
+    }
+
+    #[test]
+    fn p7_kill_run_uses_persisted_runtime_container_when_adapter_control_missing() {
+        if !docker_runtime_available() {
+            return;
+        }
+        ensure_docker_test_image("python:3.11-slim");
+
+        let (_root, run_dir) = create_run_dir("agentlab_p7_kill_runtime_state", "run_1");
+        write_resolved_experiment(&run_dir, "cli_events", true);
+        let trial_dir = seed_parent_trial(&run_dir, "trial_1", json!([]), "running", None);
+
+        let docker = crate::backend::docker::DockerRuntime::connect().expect("docker runtime");
+        let handle = docker
+            .create_container(&crate::backend::docker::ContainerSpec::idle(
+                "python:3.11-slim",
+            ))
+            .expect("create idle container");
+        docker
+            .start_container(&handle)
+            .expect("start idle container");
+
+        trial::state::write_trial_attempt_state(
+            &trial_dir,
+            &runtime_trial_attempt_state_with_task_container(
+                TrialPhase::AgentRunning,
+                &handle.container_id,
+            ),
+        )
+        .expect("write runtime state");
+
+        let active_trials = vec![RunControlActiveTrial {
+            trial_id: "trial_1".to_string(),
+            worker_id: "worker_parallel_1".to_string(),
+            schedule_idx: Some(0),
+            variant_id: Some("base".to_string()),
+            started_at: Some(Utc::now().to_rfc3339()),
+            control: None,
+        }];
+        write_run_control_v2(&run_dir, "run_1", "running", &active_trials, None).expect("control");
+
+        let killed = kill_run(&run_dir).expect("kill should succeed");
+        assert_eq!(killed.killed_trials, vec!["trial_1".to_string()]);
+
+        let run_control = load_json_file(&run_control_path(&run_dir)).expect("run control");
+        assert_eq!(
+            run_control.pointer("/status").and_then(Value::as_str),
+            Some("killed")
+        );
+
+        let trial_state = load_json_file(&trial_dir.join("trial_state.json")).expect("trial state");
+        assert_eq!(
+            trial_state.pointer("/status").and_then(Value::as_str),
+            Some("killed")
+        );
+
+        let runtime_state =
+            trial::state::load_trial_attempt_state(&trial_dir).expect("runtime state");
+        assert_eq!(runtime_state.state.phase, TrialPhase::Killed);
+
+        let inspect_err = docker
+            .inspect_container(&handle)
+            .expect_err("killed container should be removed");
+        assert!(
+            inspect_err.to_string().contains("not found")
+                || inspect_err.to_string().contains("404"),
+            "unexpected inspect error: {}",
+            inspect_err
+        );
+    }
+
+    #[test]
+    fn p7_kill_run_does_not_fallback_to_adapter_when_runtime_state_lacks_container_ids() {
+        let (_root, run_dir) =
+            create_run_dir("agentlab_p7_kill_runtime_missing_container", "run_1");
+        write_resolved_experiment(&run_dir, "cli_events", true);
+        let trial_dir = seed_parent_trial(&run_dir, "trial_1", json!([]), "running", None);
+
+        trial::state::write_trial_attempt_state(
+            &trial_dir,
+            &runtime_trial_attempt_state_fixture(TrialPhase::AgentRunning),
+        )
+        .expect("write runtime state");
+
+        let active_trials = vec![RunControlActiveTrial {
+            trial_id: "trial_1".to_string(),
+            worker_id: "worker_parallel_1".to_string(),
+            schedule_idx: Some(0),
+            variant_id: Some("base".to_string()),
+            started_at: Some(Utc::now().to_rfc3339()),
+            control: None,
+        }];
+        write_run_control_v2(&run_dir, "run_1", "running", &active_trials, None).expect("control");
+
+        let err = kill_run(&run_dir).expect_err("kill should fail");
+        assert!(
+            err.to_string().contains("kill_missing_runtime_container"),
+            "unexpected error: {}",
+            err
+        );
+
+        let run_control = load_json_file(&run_control_path(&run_dir)).expect("run control");
+        assert_eq!(
+            run_control.pointer("/status").and_then(Value::as_str),
+            Some("interrupted")
+        );
+        let active = run_control
+            .pointer("/active_trials")
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        assert_eq!(active.len(), 1);
+        assert!(active.contains_key("trial_1"));
+
+        let trial_state = load_json_file(&trial_dir.join("trial_state.json")).expect("trial state");
+        assert_eq!(
+            trial_state.pointer("/status").and_then(Value::as_str),
+            Some("running")
+        );
+    }
+
+    #[test]
+    fn p7_kill_run_partial_runtime_failure_sets_interrupted_and_keeps_active_trial() {
+        let (_root, run_dir) = create_run_dir("agentlab_p7_kill_partial_runtime_failure", "run_1");
+        write_resolved_experiment(&run_dir, "cli_events", true);
+        let trial_dir = seed_parent_trial(&run_dir, "trial_1", json!([]), "running", None);
+
+        let active_trials = vec![RunControlActiveTrial {
+            trial_id: "trial_1".to_string(),
+            worker_id: "worker_parallel_1".to_string(),
+            schedule_idx: Some(0),
+            variant_id: Some("base".to_string()),
+            started_at: Some(Utc::now().to_rfc3339()),
+            control: None,
+        }];
+        write_run_control_v2(&run_dir, "run_1", "running", &active_trials, None).expect("control");
+
+        let err = kill_run(&run_dir).expect_err("kill should fail");
+        assert!(
+            err.to_string().contains("kill_partial_failure"),
+            "unexpected error: {}",
+            err
+        );
+
+        let run_control = load_json_file(&run_control_path(&run_dir)).expect("run control");
+        assert_eq!(
+            run_control.pointer("/status").and_then(Value::as_str),
+            Some("interrupted")
+        );
+        let active = run_control
+            .pointer("/active_trials")
+            .and_then(Value::as_object)
+            .cloned()
+            .unwrap_or_default();
+        assert_eq!(active.len(), 1);
+        assert!(active.contains_key("trial_1"));
+
+        let trial_state = load_json_file(&trial_dir.join("trial_state.json")).expect("trial state");
+        assert_eq!(
+            trial_state.pointer("/status").and_then(Value::as_str),
+            Some("running")
+        );
+    }
+
+    #[test]
+    fn p7_resume_trial_unpauses_persisted_runtime_container_without_forking() {
+        if !docker_runtime_available() {
+            return;
+        }
+        ensure_docker_test_image("python:3.11-slim");
+
+        let (_root, run_dir) = create_run_dir("agentlab_p7_resume_runtime_state", "run_1");
+        write_resolved_experiment(&run_dir, "cli_events", true);
+        let trial_dir = seed_parent_trial(
+            &run_dir,
+            "trial_1",
+            json!([]),
+            "paused",
+            Some("docker_pause"),
+        );
+
+        let docker = crate::backend::docker::DockerRuntime::connect().expect("docker runtime");
+        let handle = docker
+            .create_container(&crate::backend::docker::ContainerSpec::idle(
+                "python:3.11-slim",
+            ))
+            .expect("create idle container");
+        docker
+            .start_container(&handle)
+            .expect("start idle container");
+        docker
+            .pause_container(&handle)
+            .expect("pause idle container");
+
+        let mut runtime_state = runtime_trial_attempt_state_with_task_container(
+            TrialPhase::Paused,
+            &handle.container_id,
+        );
+        runtime_state.paused_from_phase = Some(TrialPhase::AgentRunning);
+        trial::state::write_trial_attempt_state(&trial_dir, &runtime_state)
+            .expect("write runtime state");
+
+        let active_trials = vec![RunControlActiveTrial {
+            trial_id: "trial_1".to_string(),
+            worker_id: "worker_parallel_1".to_string(),
+            schedule_idx: Some(0),
+            variant_id: Some("base".to_string()),
+            started_at: Some(Utc::now().to_rfc3339()),
+            control: None,
+        }];
+        write_run_control_v2(&run_dir, "run_1", "paused", &active_trials, None).expect("control");
+
+        let resumed = resume_trial(&run_dir, None, None, &BTreeMap::new(), false)
+            .expect("resume should succeed");
+        assert_eq!(resumed.trial_id, "trial_1");
+        assert!(matches!(resumed.mode, ResumeMode::RuntimeUnpause));
+        assert!(resumed.selector.is_none());
+        assert!(resumed.fork.is_none());
+
+        let run_control = load_json_file(&run_control_path(&run_dir)).expect("run control");
+        assert_eq!(
+            run_control.pointer("/status").and_then(Value::as_str),
+            Some("running")
+        );
+
+        let trial_state = load_json_file(&trial_dir.join("trial_state.json")).expect("trial state");
+        assert_eq!(
+            trial_state.pointer("/status").and_then(Value::as_str),
+            Some("running")
+        );
+
+        let runtime_state =
+            trial::state::load_trial_attempt_state(&trial_dir).expect("runtime state");
+        assert_eq!(runtime_state.state.phase, TrialPhase::AgentRunning);
+        assert_eq!(runtime_state.state.paused_from_phase, None);
+
+        let inspected = docker
+            .inspect_container(&handle)
+            .expect("inspect resumed container");
+        assert_eq!(inspected.status.as_deref(), Some("running"));
+
+        let _ = docker.remove_container(&handle, true);
     }
 
     fn p7_trial_result_with_trial_record(schedule_idx: usize) -> TrialExecutionResult {
@@ -4449,12 +4161,75 @@ mod tests {
         assert_eq!(row.pointer("/attempt").and_then(Value::as_u64), Some(1));
         assert_eq!(row.pointer("/row_seq").and_then(Value::as_u64), Some(0));
         assert!(
-            row
-                .pointer("/slot_commit_id")
+            row.pointer("/slot_commit_id")
                 .and_then(Value::as_str)
                 .is_some_and(|value| !value.trim().is_empty()),
             "slot_commit_id should be annotated onto persisted conclusion rows"
         );
+    }
+
+    #[test]
+    fn p7_commit_trial_slot_marks_runtime_state_committed() {
+        let (_root, run_dir) = create_run_dir("agentlab_p7_commit_runtime_state", "run_1");
+        ensure_dir(&run_dir.join("runtime")).expect("runtime dir");
+        let evidence_records_path = run_dir.join("runtime").join("p7_evidence.jsonl");
+        let chain_state_path = run_dir.join("runtime").join("p7_chain_state.jsonl");
+        let benchmark_conclusions_path = run_dir.join("runtime").join("p7_conclusions.jsonl");
+        fs::write(&evidence_records_path, "").expect("evidence rows");
+        fs::write(&chain_state_path, "").expect("chain rows");
+        fs::write(&benchmark_conclusions_path, "").expect("conclusion rows");
+
+        let trial_dir = run_dir.join("trials").join("trial_1");
+        ensure_dir(&trial_dir).expect("trial dir");
+        trial::state::write_trial_attempt_state(
+            &trial_dir,
+            &runtime_trial_attempt_state_fixture(TrialPhase::CommitPending),
+        )
+        .expect("write runtime state");
+
+        let mut schedule_progress = ScheduleProgress {
+            schema_version: "schedule_progress_v2".to_string(),
+            run_id: "run_1".to_string(),
+            total_slots: 1,
+            next_schedule_index: 0,
+            next_trial_index: 0,
+            schedule: vec![TrialSlot {
+                variant_idx: 0,
+                task_idx: 0,
+                repl_idx: 0,
+            }],
+            completed_slots: Vec::new(),
+            pruned_variants: Vec::new(),
+            consecutive_failures: BTreeMap::new(),
+            updated_at: "2026-02-22T00:00:00Z".to_string(),
+        };
+        write_schedule_progress(&run_dir, &schedule_progress).expect("progress");
+
+        let mut pruned_variants: HashSet<usize> = HashSet::new();
+        let mut consecutive_failures: BTreeMap<usize, usize> = BTreeMap::new();
+        let mut slot_attempts: HashMap<usize, usize> = HashMap::new();
+        let trial_result =
+            TrialExecutionResult::minimal("trial_1".to_string(), "completed", Some(0));
+        let mut run_sink = BufferedRunSink::default();
+        RunCoordinator::commit_trial_slot(
+            &run_dir,
+            &PolicyConfig::default(),
+            &evidence_records_path,
+            &chain_state_path,
+            &benchmark_conclusions_path,
+            &mut schedule_progress,
+            0,
+            1,
+            &mut pruned_variants,
+            &mut consecutive_failures,
+            &trial_result,
+            &mut run_sink,
+            &mut slot_attempts,
+        )
+        .expect("commit trial slot");
+
+        let persisted = trial::state::load_trial_attempt_state(&trial_dir).expect("load state");
+        assert_eq!(persisted.state.phase, TrialPhase::Committed);
     }
 
     fn p7_commit_trial_rows_for_arrival_order(
@@ -4542,92 +4317,6 @@ mod tests {
     }
 
     #[test]
-    fn p7_concurrency_cap_honors_max_in_flight_four() {
-        let current_in_flight = Arc::new(AtomicUsize::new(0));
-        let peak_in_flight = Arc::new(AtomicUsize::new(0));
-        let current_in_flight_for_worker = current_in_flight.clone();
-        let peak_in_flight_for_worker = peak_in_flight.clone();
-        let executor: Arc<LocalTrialExecutor> = Arc::new(move |dispatch| {
-            let running_now = current_in_flight_for_worker.fetch_add(1, Ordering::SeqCst) + 1;
-            let _ = peak_in_flight_for_worker.fetch_max(running_now, Ordering::SeqCst);
-            thread::sleep(Duration::from_millis(120));
-            current_in_flight_for_worker.fetch_sub(1, Ordering::SeqCst);
-            Ok(TrialCompletion {
-                ticket: WorkerTicket {
-                    worker_id: "ignored".to_string(),
-                    ticket_id: "ignored".to_string(),
-                    trial_id: dispatch.trial_id.clone(),
-                },
-                schedule_idx: dispatch.schedule_idx,
-                completion_seq: None,
-                terminal_status: "succeeded".to_string(),
-                classification: "ok".to_string(),
-                artifacts: json!({}),
-                metrics: json!({}),
-                runtime_summary: json!({}),
-            })
-        });
-        let backend =
-            LocalThreadWorkerBackend::new_with_ceiling(4, executor, Some(4)).expect("backend");
-        assert_eq!(backend.effective_max_in_flight(), 4);
-
-        let total_slots = 16usize;
-        let mut next_schedule_idx = 0usize;
-        let mut completed = 0usize;
-        let mut in_flight_ticket_ids: HashSet<String> = HashSet::new();
-        let mut peak_scheduler_in_flight = 0usize;
-        let deadline = Instant::now() + Duration::from_secs(10);
-
-        while completed < total_slots {
-            assert!(
-                Instant::now() < deadline,
-                "timed out waiting for p7 concurrency test to drain: completed={} total={}",
-                completed,
-                total_slots
-            );
-            while next_schedule_idx < total_slots && in_flight_ticket_ids.len() < 4 {
-                let dispatch = worker_dispatch_fixture(
-                    next_schedule_idx,
-                    &format!("trial_{}", next_schedule_idx + 1),
-                );
-                let ticket = backend.submit(dispatch).expect("submit under cap");
-                assert!(
-                    in_flight_ticket_ids.insert(ticket.ticket_id.clone()),
-                    "duplicate ticket id {}",
-                    ticket.ticket_id
-                );
-                next_schedule_idx += 1;
-            }
-            peak_scheduler_in_flight = peak_scheduler_in_flight.max(in_flight_ticket_ids.len());
-
-            let completions = backend
-                .poll_completions(Duration::from_millis(250))
-                .expect("poll completions");
-            if completions.is_empty() {
-                continue;
-            }
-            for completion in completions {
-                assert!(
-                    in_flight_ticket_ids.remove(completion.ticket.ticket_id.as_str()),
-                    "completion for unknown ticket {}",
-                    completion.ticket.ticket_id
-                );
-                completed += 1;
-            }
-        }
-
-        assert_eq!(peak_scheduler_in_flight, 4);
-        assert!(
-            peak_in_flight.load(Ordering::SeqCst) <= 4,
-            "executor observed in-flight count above cap"
-        );
-        assert!(
-            peak_in_flight.load(Ordering::SeqCst) >= 2,
-            "expected at least some parallel overlap at max_concurrency=4"
-        );
-    }
-
-    #[test]
     fn p7_parallel_and_serial_equivalent_final_aggregates_ordering_normalized() {
         let serial_arrivals = [0usize, 1, 2, 3];
         let parallel_arrivals = [2usize, 0, 3, 1];
@@ -4699,7 +4388,8 @@ mod tests {
             .expect("drain should buffer slot 1");
         assert_eq!(committed, 0, "slot 1 cannot commit before slot 0");
         assert_eq!(schedule_progress.next_schedule_index, 0);
-        persist_pending_trial_completions(&run_dir, &committer).expect("persist pending");
+        let pending_records = committer.pending_trial_completion_records();
+        persist_pending_trial_completions(&run_dir, &pending_records).expect("persist pending");
 
         // Simulate restart: reload persisted pending completion, then recover slot 0 as worker_lost.
         let journal_records = load_slot_commit_records(&run_dir).expect("load journal");
@@ -4790,7 +4480,7 @@ mod tests {
         let mut trial_index = 0_usize;
         let mut consecutive_failures: BTreeMap<usize, usize> = BTreeMap::new();
         let mut pruned_variants: HashSet<usize> = HashSet::new();
-        let mut run_sink = SqliteRunStore::new(&run_dir).expect("sink");
+        let mut run_sink = SqliteRunJournal::new(&run_dir).expect("sink");
         let policy_config = PolicyConfig {
             state: StatePolicy::PersistPerTask,
             ..PolicyConfig::default()
@@ -4917,191 +4607,6 @@ mod tests {
     }
 
     #[test]
-    fn task_boundary_workspace_materialization_requires_patch_base() {
-        let scratch_boundary = task_boundary_with_workspace(
-            json!({
-                "id": "swebench_like_id",
-                "swebench": { "repo": "x/y" }
-            }),
-            "python:3.11-slim",
-            AGENTLAB_CONTRACT_WORKSPACE_DIR,
-            scratch_workspace(),
-            json!({}),
-            None,
-            TaskMaterializationSpec {
-                kind: TaskMaterializationKind::TaskImage,
-                task_bundle_ref: None,
-            },
-        );
-        validate_task_boundary_workspace_materialization(&scratch_boundary)
-            .expect("scratch mode can use an empty base");
-
-        let err = validate_task_boundary_workspace_materialization(&task_boundary_with_workspace(
-            json!({
-                "id": "swebench_like_id",
-                "swebench": { "repo": "x/y" }
-            }),
-            "python:3.11-slim",
-            AGENTLAB_CONTRACT_WORKSPACE_DIR,
-            WorkspaceSpec {
-                mode: WorkspaceMode::Patch,
-                base: workspace_base_empty(),
-                overlays: Vec::new(),
-                aux_mounts: Vec::new(),
-            },
-            json!({}),
-            None,
-            TaskMaterializationSpec {
-                kind: TaskMaterializationKind::TaskImage,
-                task_bundle_ref: None,
-            },
-        ))
-        .expect_err("patch tasks with an empty base should fail");
-        assert!(
-            err.to_string().contains("patch tasks require a real base"),
-            "unexpected error: {}",
-            err
-        );
-
-        validate_task_boundary_workspace_materialization(&task_boundary_with_workspace(
-            json!({ "id": "patch_with_base" }),
-            "python:3.11-slim",
-            AGENTLAB_CONTRACT_WORKSPACE_DIR,
-            WorkspaceSpec {
-                mode: WorkspaceMode::Patch,
-                base: workspace_base_dataset_pack(&format!("sha256:{}", "c".repeat(64))),
-                overlays: Vec::new(),
-                aux_mounts: Vec::new(),
-            },
-            json!({}),
-            None,
-            TaskMaterializationSpec {
-                kind: TaskMaterializationKind::TaskImage,
-                task_bundle_ref: None,
-            },
-        ))
-        .expect("patch mode with a real base should pass");
-    }
-
-    #[test]
-    fn materialize_workspace_overlays_writes_utf8_and_base64() {
-        let root = TempDirGuard::new("agentlab_task_boundary_workspace_overlays");
-        let exp_dir = root.path.join("exp");
-        ensure_dir(&exp_dir).expect("exp dir");
-        fs::write(exp_dir.join("README.md"), "fixture").expect("exp fixture");
-        let trial_dir = root.path.join("trial_1");
-        ensure_dir(&trial_dir).expect("trial");
-        let paths = TrialPaths::new(&trial_dir, &exp_dir).expect("trial paths");
-        paths.prepare(true).expect("prepare");
-
-        let files = vec![
-            workspace_overlay("notes/plain.txt", "hello world", Some("utf8")),
-            workspace_overlay("notes/decoded.txt", "aGVsbG8gYmFzZTY0", Some("base64")),
-        ];
-
-        materialize_workspace_overlays(&paths, &files).expect("materialize");
-        assert_eq!(
-            fs::read_to_string(paths.workspace.join("notes/plain.txt")).expect("plain"),
-            "hello world"
-        );
-        assert_eq!(
-            fs::read_to_string(paths.workspace.join("notes/decoded.txt")).expect("decoded"),
-            "hello base64"
-        );
-    }
-
-    #[test]
-    fn resolve_workspace_aux_mounts_resolves_existing_pack() {
-        let root = TempDirGuard::new("agentlab_task_boundary_mounts");
-        let digest = "b".repeat(64);
-        let pack_dir = root.path.join(".lab").join("dataset_packs").join("sha256");
-        ensure_dir(&pack_dir).expect("pack dir");
-        fs::write(pack_dir.join(&digest), "pack bytes").expect("pack file");
-
-        let refs = vec![workspace_aux_mount(
-            &format!("sha256:{}", digest),
-            &format!("{}/dataset_pack", AGENTLAB_CONTRACT_WORKSPACE_DIR),
-        )];
-        let resolved = resolve_workspace_aux_mounts(&root.path, &refs).expect("resolve mounts");
-        assert_eq!(resolved.len(), 1);
-        assert!(
-            resolved[0].host_path.ends_with(Path::new(&digest)),
-            "unexpected host path: {}",
-            resolved[0].host_path.display()
-        );
-    }
-
-    #[test]
-    fn materialize_workspace_base_copies_dataset_pack_into_workspace() {
-        let root = TempDirGuard::new("agentlab_workspace_base_materialize");
-        let digest = "e".repeat(64);
-        let pack_root = root
-            .path
-            .join(".lab")
-            .join("dataset_packs")
-            .join("sha256")
-            .join(&digest);
-        ensure_dir(&pack_root).expect("pack root");
-        ensure_dir(&pack_root.join("src")).expect("pack src");
-        fs::write(pack_root.join("src/main.ts"), "export const value = 1;\n").expect("seed file");
-
-        let exp_dir = root.path.join("exp");
-        ensure_dir(&exp_dir).expect("exp");
-        fs::write(exp_dir.join("README.md"), "fixture").expect("exp fixture");
-        let trial_dir = root.path.join("trial_1");
-        ensure_dir(&trial_dir).expect("trial");
-        let paths = TrialPaths::new(&trial_dir, &exp_dir).expect("trial paths");
-        paths.prepare(true).expect("prepare");
-        fs::write(paths.workspace.join("stale.txt"), "stale").expect("stale workspace file");
-
-        let base = workspace_base_dataset_pack(&format!("sha256:{}", digest));
-        materialize_workspace_base(&root.path, &paths, &base).expect("materialize base");
-
-        assert!(
-            !paths.workspace.join("stale.txt").exists(),
-            "workspace base should replace existing workspace content"
-        );
-        assert_eq!(
-            fs::read_to_string(paths.workspace.join("src/main.ts")).expect("seeded file"),
-            "export const value = 1;\n"
-        );
-    }
-
-    #[test]
-    fn materialize_workspace_base_copies_git_checkout_into_workspace() {
-        let root = TempDirGuard::new("agentlab_workspace_base_git_materialize");
-        let (repo, commit) = create_file_git_origin(&root.path, "workspace_git_materialize");
-
-        let exp_dir = root.path.join("exp");
-        ensure_dir(&exp_dir).expect("exp");
-        let trial_dir = root.path.join("trial_1");
-        ensure_dir(&trial_dir).expect("trial");
-        let paths = TrialPaths::new(&trial_dir, &exp_dir).expect("trial paths");
-        paths.prepare(true).expect("prepare");
-        fs::write(paths.workspace.join("stale.txt"), "stale").expect("stale workspace file");
-
-        let base = workspace_base_git_checkout(&repo, &commit);
-        materialize_workspace_base(&root.path, &paths, &base).expect("materialize git base");
-
-        assert!(
-            !paths.workspace.join("stale.txt").exists(),
-            "workspace base should replace existing workspace content"
-        );
-        assert_eq!(
-            fs::read_to_string(paths.workspace.join("README.md")).expect("git readme"),
-            "hello from origin\n"
-        );
-        assert_eq!(
-            fs::read_to_string(paths.workspace.join("src/lib.txt")).expect("git file"),
-            "seeded from origin\n"
-        );
-        assert!(
-            !paths.workspace.join(".git").exists(),
-            "materialized workspace should not expose git metadata"
-        );
-    }
-
-    #[test]
     fn prepare_task_environment_materializes_base_image_bundle_into_workspace() {
         let root = TempDirGuard::new("agentlab_base_image_bundle_prepare");
         let bundle_dir = root
@@ -5143,7 +4648,6 @@ mod tests {
             0,
             &task_boundary,
             &runtime,
-            None,
         )
         .expect("prepare task environment");
 
@@ -5168,7 +4672,10 @@ mod tests {
             TaskMaterializationKind::BaseImageBundle
         );
         assert_eq!(task_sandbox_plan.io_mounts.in_dir, AGENTLAB_CONTRACT_IN_DIR);
-        assert_eq!(task_sandbox_plan.io_mounts.out_dir, AGENTLAB_CONTRACT_OUT_DIR);
+        assert_eq!(
+            task_sandbox_plan.io_mounts.out_dir,
+            AGENTLAB_CONTRACT_OUT_DIR
+        );
         assert_eq!(
             task_sandbox_plan.artifact_mount.container_artifact_dir,
             "/opt/agent"
@@ -5215,25 +4722,11 @@ mod tests {
             image: None,
             runtime_overrides: None,
         };
-        let task_boundary = task_boundary_with_workspace(
+        let task_boundary = runtime_task_boundary(
             json!({ "id": "task_1", "prompt": "x" }),
             "python:3.11-slim",
             AGENTLAB_CONTRACT_WORKSPACE_DIR,
-            WorkspaceSpec {
-                mode: WorkspaceMode::Patch,
-                base: workspace_base_dataset_pack(&format!("sha256:{}", "d".repeat(64))),
-                overlays: vec![workspace_overlay("input.txt", "hello", Some("utf8"))],
-                aux_mounts: vec![workspace_aux_mount(
-                    &format!("sha256:{}", "c".repeat(64)),
-                    &format!("{}/dataset_pack", AGENTLAB_CONTRACT_WORKSPACE_DIR),
-                )],
-            },
-            json!({}),
             Some(90_000),
-            TaskMaterializationSpec {
-                kind: TaskMaterializationKind::TaskImage,
-                task_bundle_ref: None,
-            },
         );
 
         let input = build_trial_input(
@@ -5541,6 +5034,66 @@ mod tests {
         assert_eq!(trial_conclusion_outcome_to_trial_outcome("unknown"), None);
     }
 
+    #[test]
+    fn benchmark_retry_inputs_ignore_agent_exit_when_mapped_output_is_valid() {
+        let (outcome, exit_status) = benchmark_retry_inputs(
+            true,
+            &json!({ "outcome": "error" }),
+            Some(&json!({
+                "schema_version": "trial_conclusion_v1",
+                "reported_outcome": "success"
+            })),
+            None,
+            "137",
+        );
+        assert_eq!(outcome, "success");
+        assert_eq!(exit_status, "0");
+    }
+
+    #[test]
+    fn benchmark_retry_inputs_treat_missing_mapped_output_as_error() {
+        let (outcome, exit_status) = benchmark_retry_inputs(
+            true,
+            &json!({ "outcome": "success" }),
+            None,
+            Some("mapped_grader_output_missing: /agentlab/out/mapped_grader_output.json"),
+            "0",
+        );
+        assert_eq!(outcome, "error");
+        assert_eq!(exit_status, "0");
+    }
+
+    #[test]
+    fn check_dataset_task_ids_rejects_benchmark_grading_opt_out() {
+        let benchmark = BenchmarkConfig {
+            policy: BenchmarkPolicyConfig::default(),
+            grader: Some(BenchmarkGraderConfig::in_task_image(vec![
+                "python3".to_string(),
+                "/opt/grader/run.py".to_string(),
+            ])),
+            adapter: None,
+        };
+        let mut task = task_row_value("task_1", "python:3.11-slim", "/workspace/task", None);
+        task.pointer_mut("/task")
+            .and_then(Value::as_object_mut)
+            .expect("task object")
+            .insert("grading".to_string(), json!({ "enabled": false }));
+        let checks = check_dataset_task_ids(&[task], &benchmark, &[]);
+        let grading_gate = checks
+            .iter()
+            .find(|check| {
+                check
+                    .message
+                    .contains("Milestone 4 requires mapped grading output")
+            })
+            .expect("grading opt-out check");
+        assert!(
+            !grading_gate.passed,
+            "grading opt-out should fail validation"
+        );
+        assert_eq!(grading_gate.severity, PreflightSeverity::Error);
+    }
+
     // -----------------------------------------------------------------------
     // parse_policies tests
     // -----------------------------------------------------------------------
@@ -5784,7 +5337,9 @@ mod tests {
         assert_eq!(checks.len(), 1);
         assert!(!checks[0].passed, "{:?}", checks[0]);
         assert!(
-            checks[0].message.contains("runtime.agent_runtime.image is required"),
+            checks[0]
+                .message
+                .contains("runtime.agent_runtime.image is required"),
             "unexpected message: {}",
             checks[0].message
         );
@@ -5945,13 +5500,8 @@ mod tests {
         profile.agent_runtime.env_from_host = vec!["OPENAI_API_KEY".to_string()];
         profile.agent_runtime_env.clear();
 
-        let check = check_agent_runtime_reachable_with_scan(
-            &profile,
-            &variant,
-            &[],
-            None,
-            &root.path,
-        );
+        let check =
+            check_agent_runtime_reachable_with_scan(&profile, &variant, &[], None, &root.path);
 
         assert_eq!(check.name, "agent_runtime_reachable");
         assert!(!check.passed, "{:?}", check);
@@ -6133,13 +5683,13 @@ mod tests {
             &exp_dir,
             &RunBehavior::default(),
             &RunExecutionOptions::default(),
-        )
-        {
+        ) {
             Ok(_) => panic!("missing runtime env should fail"),
             Err(err) => err,
         };
         assert!(
-            err.to_string().contains("missing runtime binding $OPENAI_API_KEY"),
+            err.to_string()
+                .contains("missing runtime binding $OPENAI_API_KEY"),
             "unexpected error: {}",
             err
         );
@@ -6250,6 +5800,120 @@ mod tests {
     }
 
     #[test]
+    fn recover_run_releases_untracked_runtime_active_trial() {
+        let (_root, run_dir) = create_run_dir("agentlab_recover_runtime_only_active", "run_1");
+        let dataset_path = run_dir.join("tasks.jsonl");
+        fs::write(&dataset_path, "{\"id\":\"task_1\"}\n").expect("dataset");
+        inv06_write_resolved_experiment(&run_dir, "tasks.jsonl", "run_1", "running");
+
+        let trial_dir = seed_parent_trial(&run_dir, "trial_1", json!([]), "running", None);
+        trial::state::write_trial_attempt_state(
+            &trial_dir,
+            &runtime_trial_attempt_state_fixture(TrialPhase::AgentRunning),
+        )
+        .expect("write runtime state");
+        write_run_control_v2(&run_dir, "run_1", "running", &[], None).expect("run control");
+
+        let recovered = recover_run(&run_dir, true).expect("recover");
+        assert_eq!(recovered.active_trials_released, 1);
+
+        let runtime_state = trial::state::load_trial_attempt_state(&trial_dir).expect("runtime");
+        assert_eq!(runtime_state.state.phase, TrialPhase::Abandoned);
+        let trial_state = load_json_file(&trial_dir.join("trial_state.json")).expect("trial state");
+        assert_eq!(trial_state["status"], "failed");
+        assert_eq!(trial_state["exit_reason"], "worker_lost_recovered");
+    }
+
+    #[test]
+    fn recover_run_prefers_durable_paused_runtime_state_over_stale_run_control() {
+        let (_root, run_dir) = create_run_dir("agentlab_recover_runtime_paused", "run_1");
+        let dataset_path = run_dir.join("tasks.jsonl");
+        fs::write(&dataset_path, "{\"id\":\"task_1\"}\n").expect("dataset");
+        inv06_write_resolved_experiment(&run_dir, "tasks.jsonl", "run_1", "running");
+
+        let trial_dir = seed_parent_trial(&run_dir, "trial_1", json!([]), "paused", Some("cp1"));
+        let mut runtime_state = runtime_trial_attempt_state_fixture(TrialPhase::Paused);
+        runtime_state.paused_from_phase = Some(TrialPhase::AgentRunning);
+        trial::state::write_trial_attempt_state(&trial_dir, &runtime_state)
+            .expect("write runtime state");
+
+        let active = vec![RunControlActiveTrial {
+            trial_id: "trial_1".to_string(),
+            worker_id: "worker_1".to_string(),
+            schedule_idx: Some(0),
+            variant_id: Some("base".to_string()),
+            started_at: Some(Utc::now().to_rfc3339()),
+            control: Some(active_control_for_trial(&trial_dir)),
+        }];
+        write_run_control_v2(&run_dir, "run_1", "running", &active, None).expect("run control");
+
+        let recovered = recover_run(&run_dir, true).expect("recover");
+        assert_eq!(recovered.active_trials_released, 0);
+
+        let persisted = trial::state::load_trial_attempt_state(&trial_dir).expect("runtime");
+        assert_eq!(persisted.state.phase, TrialPhase::Paused);
+        assert_eq!(
+            persisted.state.paused_from_phase,
+            Some(TrialPhase::AgentRunning)
+        );
+        let trial_state = load_json_file(&trial_dir.join("trial_state.json")).expect("trial state");
+        assert_eq!(trial_state["status"], "paused");
+    }
+
+    #[test]
+    fn recover_run_reconciles_commit_pending_runtime_state_from_committed_slot() {
+        let (_root, run_dir) = create_run_dir("agentlab_recover_commit_pending", "run_1");
+        let dataset_path = run_dir.join("tasks.jsonl");
+        fs::write(&dataset_path, "{\"id\":\"task_1\"}\n").expect("dataset");
+        inv06_write_resolved_experiment(&run_dir, "tasks.jsonl", "run_1", "running");
+
+        let trial_dir = seed_parent_trial(&run_dir, "trial_1", json!([]), "running", None);
+        ensure_dir(&run_dir.join("runtime")).expect("runtime dir");
+        let evidence_records_path = run_dir.join("runtime").join("recover_evidence.jsonl");
+        let chain_state_path = run_dir.join("runtime").join("recover_chain_state.jsonl");
+        let benchmark_conclusions_path = run_dir.join("runtime").join("recover_conclusions.jsonl");
+        fs::write(&evidence_records_path, "").expect("evidence rows");
+        fs::write(&chain_state_path, "").expect("chain rows");
+        fs::write(&benchmark_conclusions_path, "").expect("conclusion rows");
+
+        let mut schedule_progress = load_schedule_progress(&run_dir).expect("schedule progress");
+        let mut pruned_variants: HashSet<usize> = HashSet::new();
+        let mut consecutive_failures: BTreeMap<usize, usize> = BTreeMap::new();
+        let mut slot_attempts: HashMap<usize, usize> = HashMap::new();
+        let trial_result =
+            TrialExecutionResult::minimal("trial_1".to_string(), "completed", Some(0));
+        let mut run_sink = BufferedRunSink::default();
+        RunCoordinator::commit_trial_slot(
+            &run_dir,
+            &PolicyConfig::default(),
+            &evidence_records_path,
+            &chain_state_path,
+            &benchmark_conclusions_path,
+            &mut schedule_progress,
+            0,
+            1,
+            &mut pruned_variants,
+            &mut consecutive_failures,
+            &trial_result,
+            &mut run_sink,
+            &mut slot_attempts,
+        )
+        .expect("commit trial slot");
+
+        trial::state::write_trial_attempt_state(
+            &trial_dir,
+            &runtime_trial_attempt_state_fixture(TrialPhase::CommitPending),
+        )
+        .expect("write runtime state");
+
+        let recovered = recover_run(&run_dir, true).expect("recover");
+        assert_eq!(recovered.active_trials_released, 0);
+
+        let persisted = trial::state::load_trial_attempt_state(&trial_dir).expect("runtime");
+        assert_eq!(persisted.state.phase, TrialPhase::Committed);
+    }
+
+    #[test]
     fn inv06_continue_handles_relative_and_absolute_dataset_paths() {
         let root = TempDirGuard::new("agentlab_inv06_dataset_paths");
         let exp_dir = root.path.join("exp");
@@ -6337,9 +6001,7 @@ mod tests {
             Some("task_row_v1")
         );
         assert_eq!(
-            tasks[0]
-                .pointer("/id")
-                .and_then(Value::as_str),
+            tasks[0].pointer("/id").and_then(Value::as_str),
             Some("task_1")
         );
     }
@@ -6357,8 +6019,8 @@ mod tests {
             "dataset": { "limit": 1 }
         });
 
-        let err =
-            load_task_rows_for_build(&dataset_path, &spec).expect_err("build should reject task spec");
+        let err = load_task_rows_for_build(&dataset_path, &spec)
+            .expect_err("build should reject task spec");
         assert!(
             err.to_string().contains("task_row_v1"),
             "unexpected runtime error: {}",
@@ -6386,113 +6048,6 @@ mod tests {
             "unexpected runtime error: {}",
             err
         );
-    }
-
-    #[test]
-    fn inv05_workspace_diff_empty_detector_matches_snapshot_diff() {
-        let snapshot_a = json!({
-            "files": [
-                { "path": "a.txt", "digest": "1111", "size_bytes": 1 }
-            ]
-        });
-        let snapshot_b = json!({
-            "files": [
-                { "path": "a.txt", "digest": "1111", "size_bytes": 1 }
-            ]
-        });
-        let snapshot_c = json!({
-            "files": [
-                { "path": "a.txt", "digest": "2222", "size_bytes": 1 }
-            ]
-        });
-
-        let unchanged = diff_workspace_snapshots(&snapshot_a, &snapshot_b);
-        assert!(
-            workspace_diff_is_empty(&unchanged),
-            "diff should be empty for identical snapshots"
-        );
-
-        let changed = diff_workspace_snapshots(&snapshot_a, &snapshot_c);
-        assert!(
-            !workspace_diff_is_empty(&changed),
-            "diff should be non-empty when file digests change"
-        );
-    }
-
-    #[test]
-    fn inv05_workspace_evidence_exclusions_apply_to_snapshot_and_copy() {
-        let root = TempDirGuard::new("agentlab_inv05_workspace_exclusions");
-        let workspace = root.path.join("workspace");
-        ensure_dir(&workspace).expect("workspace");
-        ensure_dir(&workspace.join("node_modules").join("pkg")).expect("node_modules");
-        ensure_dir(&workspace.join("src")).expect("src");
-        fs::write(workspace.join("src").join("keep.txt"), "keep").expect("keep file");
-        fs::write(
-            workspace.join("node_modules").join("pkg").join("drop.txt"),
-            "drop",
-        )
-        .expect("excluded file");
-        fs::write(workspace.join(".DS_Store"), "junk").expect("metadata");
-
-        let snapshot = collect_workspace_snapshot_manifest(&workspace).expect("snapshot");
-        let files = snapshot
-            .pointer("/files")
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default();
-        let file_paths = files
-            .iter()
-            .filter_map(|row| row.get("path").and_then(Value::as_str))
-            .collect::<Vec<_>>();
-        assert!(
-            file_paths.iter().any(|path| *path == "src/keep.txt"),
-            "included file should be present in snapshot"
-        );
-        assert!(
-            file_paths.iter().all(|path| !path.contains("node_modules")),
-            "excluded directories should not appear in snapshot"
-        );
-
-        let copied = root.path.join("copied");
-        copy_dir_filtered(&workspace, &copied, &[]).expect("copy workspace");
-        assert!(copied.join("src").join("keep.txt").exists());
-        assert!(!copied.join("node_modules").exists());
-    }
-
-    #[test]
-    fn inv05_large_workspace_exclusion_guard_completes_within_budget() {
-        let root = TempDirGuard::new("agentlab_inv05_workspace_budget");
-        let workspace = root.path.join("workspace");
-        ensure_dir(&workspace).expect("workspace");
-        ensure_dir(&workspace.join("src")).expect("src");
-        ensure_dir(&workspace.join("node_modules").join("pkg")).expect("node_modules");
-        fs::write(workspace.join("src").join("keep.txt"), "keep").expect("keep");
-        for idx in 0..3000 {
-            fs::write(
-                workspace
-                    .join("node_modules")
-                    .join("pkg")
-                    .join(format!("file_{}.txt", idx)),
-                "x",
-            )
-            .expect("excluded file");
-        }
-
-        let started = Instant::now();
-        let snapshot = collect_workspace_snapshot_manifest(&workspace).expect("snapshot");
-        let copied = root.path.join("copied");
-        copy_dir_filtered(&workspace, &copied, &[]).expect("copy");
-        let elapsed = started.elapsed();
-        assert!(
-            elapsed < Duration::from_secs(20),
-            "workspace exclusion guard exceeded budget: {:?}",
-            elapsed
-        );
-        let file_count = snapshot
-            .pointer("/file_count")
-            .and_then(Value::as_u64)
-            .unwrap_or(0);
-        assert_eq!(file_count, 1, "excluded files should not bloat snapshot");
     }
 
     #[test]
@@ -6732,20 +6287,6 @@ mod tests {
     }
 
     #[test]
-    fn resolve_local_image_alias_maps_swebench_legacy_local_tag() {
-        assert_eq!(
-            resolve_local_image_alias("swebench/sweb.eval.x86_64.astropy__astropy-12907:latest")
-                .as_deref(),
-            Some("sweb.eval.x86_64.astropy__astropy-12907:latest")
-        );
-        assert_eq!(resolve_local_image_alias("python:3.11-slim"), None);
-        assert_eq!(
-            resolve_local_image_alias("ghcr.io/acme/swebench-task:latest"),
-            None
-        );
-    }
-
-    #[test]
     fn resolve_container_platform_maps_swebench_architecture_tags() {
         assert_eq!(
             resolve_container_platform("swebench/sweb.eval.x86_64.astropy__astropy-12907:latest"),
@@ -6774,11 +6315,8 @@ mod tests {
         let bench_v0_row =
             r#"{"schema_version":"task_row_v1","id":"TASK001","image":"python:3.11-slim","workdir":"/workspace/task","time_limit_ms":600000,"task":{"id":"TASK001"},"materialization":{"kind":"task_image"}}"#
                 .to_string();
-        fs::write(
-            dataset_dir.join("bench_v0.task_spec.jsonl"),
-            &bench_v0_row,
-        )
-        .expect("dataset row");
+        fs::write(dataset_dir.join("bench_v0.task_spec.jsonl"), &bench_v0_row)
+            .expect("dataset row");
         let swebench_row = concat!(
             r#"{"schema_version":"task_row_v1","id":"swebench_astropy_astropy_12907","image":"swebench/sweb.eval.x86_64.astropy__astropy-12907:latest","workdir":"/testbed","task":{"id":"swebench_astropy_astropy_12907","benchmark":{"adapter_id":"swebench_task_container_grader","name":"swebench_lite_curated","split":"test"},"swebench":{"input":{"repo":"astropy/astropy","instance_id":"astropy__astropy-12907","base_commit":"deadbeef"}}},"materialization":{"kind":"task_image"}}"#
         );
@@ -7162,13 +6700,14 @@ mod tests {
             normalize_experiment_authoring(spec, &root.path, &root.path).expect("normalize");
 
         let command = resolved
-                .pointer("/runtime/agent_runtime/command")
-                .and_then(Value::as_array)
-                .expect("runtime command array");
+            .pointer("/runtime/agent_runtime/command")
+            .and_then(Value::as_array)
+            .expect("runtime command array");
         let command_tokens = command.iter().filter_map(Value::as_str).collect::<Vec<_>>();
         assert!(
-            command_tokens.windows(2).any(|w| w[0] == "--config"
-                && w[1] == "defaults.bench-lmstudio-headless.json"),
+            command_tokens
+                .windows(2)
+                .any(|w| w[0] == "--config" && w[1] == "defaults.bench-lmstudio-headless.json"),
             "command should keep public --config token as-authored: {:?}",
             command_tokens
         );
@@ -7214,7 +6753,10 @@ mod tests {
         .expect("patch source");
         ensure_dir(&root.path.join("bench").join("agentlab")).expect("local bench dir");
         fs::write(
-            root.path.join("bench").join("agentlab").join("placeholder.txt"),
+            root.path
+                .join("bench")
+                .join("agentlab")
+                .join("placeholder.txt"),
             "local bench placeholder",
         )
         .expect("local bench file");
@@ -7353,9 +6895,9 @@ mod tests {
             .filter_map(Value::as_str)
             .collect::<Vec<_>>();
         assert!(
-            baseline_tokens.windows(2).any(|w| {
-                w[0] == "--config" && w[1] == "defaults.bench-lmstudio-headless.json"
-            }),
+            baseline_tokens
+                .windows(2)
+                .any(|w| { w[0] == "--config" && w[1] == "defaults.bench-lmstudio-headless.json" }),
             "baseline command should keep authored relative config path: {:?}",
             baseline_tokens
         );
@@ -7389,9 +6931,9 @@ mod tests {
             .filter_map(Value::as_str)
             .collect::<Vec<_>>();
         assert!(
-            override_tokens.windows(2).any(|w| {
-                w[0] == "--config" && w[1] == "defaults.bench-lmstudio-headless.json"
-            }),
+            override_tokens
+                .windows(2)
+                .any(|w| { w[0] == "--config" && w[1] == "defaults.bench-lmstudio-headless.json" }),
             "variant override command should keep authored relative config path: {:?}",
             override_tokens
         );
@@ -7509,14 +7051,15 @@ mod tests {
             "__AGENTLAB_TASK_WORKDIR__/.agentlab/support/defaults.bench-lmstudio-headless.json"
         );
         assert!(
-            build.package_dir
+            build
+                .package_dir
                 .join(PACKAGED_RUNTIME_ASSETS_DIR)
                 .join("defaults.bench-lmstudio-headless.json")
                 .exists(),
             "relative command path should be copied into packaged runtime assets"
         );
-        let staging_manifest =
-            load_json_file(&build.package_dir.join(STAGING_MANIFEST_FILE)).expect("staging manifest");
+        let staging_manifest = load_json_file(&build.package_dir.join(STAGING_MANIFEST_FILE))
+            .expect("staging manifest");
         assert_eq!(
             staging_manifest
                 .pointer("/schema_version")
@@ -7529,8 +7072,7 @@ mod tests {
                 .pointer("/variants/qwen")
                 .and_then(Value::as_array)
                 .is_some_and(|entries| entries.iter().any(|entry| {
-                    entry.pointer("/runtime_path")
-                        .and_then(Value::as_str)
+                    entry.pointer("/runtime_path").and_then(Value::as_str)
                         == Some("__AGENTLAB_TASK_WORKDIR__/.agentlab/support/bench")
                 })),
             "qwen variant should include benchmark support directory staging entry"
@@ -7549,7 +7091,8 @@ mod tests {
             "qwen variant should include rewritten runtime config staging entry"
         );
         assert!(
-            build.package_dir
+            build
+                .package_dir
                 .join(bundle_ref)
                 .join("README.md")
                 .exists(),
@@ -7580,8 +7123,8 @@ mod tests {
                 .unwrap_or(""),
             "__AGENTLAB_TASK_WORKDIR__/.agentlab/support/bench/integration/agentlab/bench_benchmark_adapter.py"
         );
-        let staging_manifest =
-            load_json_file(&build.package_dir.join(STAGING_MANIFEST_FILE)).expect("staging manifest");
+        let staging_manifest = load_json_file(&build.package_dir.join(STAGING_MANIFEST_FILE))
+            .expect("staging manifest");
         assert!(
             staging_manifest
                 .pointer("/variants/qwen_35b_a3b")
@@ -7603,8 +7146,11 @@ mod tests {
         ensure_dir(&package_dir).expect("package dir");
         ensure_dir(&exp_dir.join("scripts")).expect("scripts dir");
         ensure_dir(&exp_dir.join("mappers")).expect("mappers dir");
-        fs::write(exp_dir.join("scripts").join("grader.py"), "#!/usr/bin/env python3\n")
-            .expect("grader script");
+        fs::write(
+            exp_dir.join("scripts").join("grader.py"),
+            "#!/usr/bin/env python3\n",
+        )
+        .expect("grader script");
         fs::write(
             exp_dir.join("mappers").join("normalize.py"),
             "#!/usr/bin/env python3\n",
@@ -7652,7 +7198,8 @@ mod tests {
         );
         assert!(
             staging_manifest_entries.iter().any(|entry| {
-                entry.runtime_path == "__AGENTLAB_TASK_WORKDIR__/.agentlab/support/mappers/normalize.py"
+                entry.runtime_path
+                    == "__AGENTLAB_TASK_WORKDIR__/.agentlab/support/mappers/normalize.py"
                     && entry.packaged_path == "runtime_assets/mappers/normalize.py"
             }),
             "staging manifest should include mapper contract path"
@@ -7690,10 +7237,7 @@ mod tests {
                 .expect("packaged tasks");
         assert_eq!(packaged_tasks.len(), 1);
         let packaged_task_row = parse_task_row(&packaged_tasks[0]).expect("packaged task row");
-        assert_eq!(
-            packaged_task_row.id.as_str(),
-            "TASK_OVERRIDE"
-        );
+        assert_eq!(packaged_task_row.id.as_str(), "TASK_OVERRIDE");
     }
 
     #[test]
@@ -7774,8 +7318,8 @@ mod tests {
                             .expect("dataset bundle ref")
                     )
                     .join("README.md")
-        )
-        .expect("packaged dataset bundle"),
+            )
+            .expect("packaged dataset bundle"),
             "dataset pack\n"
         );
 
@@ -7955,18 +7499,11 @@ mod tests {
 
     #[test]
     fn p0_i06_preflight_grader_reachability_rejects_forbidden_opt_bench_path() {
-        let docker_ok = Command::new("docker")
-            .arg("info")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .map(|status| status.success())
-            .unwrap_or(false);
-        if !docker_ok {
+        if !docker_runtime_available() {
             eprintln!("skipping p0_i06 test: docker daemon unavailable");
             return;
         }
-        ensure_container_image_ready("python:3.11-slim").expect("python image");
+        ensure_docker_test_image("python:3.11-slim");
 
         let benchmark_config = BenchmarkConfig {
             policy: BenchmarkPolicyConfig::default(),
@@ -8013,18 +7550,11 @@ mod tests {
 
     #[test]
     fn p0_i06_preflight_grader_reachability_allows_runner_staged_deps_script_path() {
-        let docker_ok = Command::new("docker")
-            .arg("info")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .map(|status| status.success())
-            .unwrap_or(false);
-        if !docker_ok {
+        if !docker_runtime_available() {
             eprintln!("skipping p0_i06 staged-script test: docker daemon unavailable");
             return;
         }
-        ensure_container_image_ready("python:3.11-slim").expect("python image");
+        ensure_docker_test_image("python:3.11-slim");
 
         let benchmark_config = BenchmarkConfig {
             policy: BenchmarkPolicyConfig::default(),
@@ -8055,7 +7585,9 @@ mod tests {
             },
             DependencyFileStagingSpec {
                 source_from_host: staged_grader,
-                destination_path: task_workdir_support_destination_path("bench_benchmark_adapter.py"),
+                destination_path: task_workdir_support_destination_path(
+                    "bench_benchmark_adapter.py",
+                ),
                 required: true,
                 read_only: true,
             },
@@ -8076,18 +7608,11 @@ mod tests {
 
     #[test]
     fn p0_i06_preflight_grader_reachability_supports_swebench_grader_probe_contract() {
-        let docker_ok = Command::new("docker")
-            .arg("info")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .map(|status| status.success())
-            .unwrap_or(false);
-        if !docker_ok {
+        if !docker_runtime_available() {
             eprintln!("skipping p0_i06 swebench grader probe test: docker daemon unavailable");
             return;
         }
-        ensure_container_image_ready("python:3.11-slim").expect("python image");
+        ensure_docker_test_image("python:3.11-slim");
 
         let benchmark_config = BenchmarkConfig {
             policy: BenchmarkPolicyConfig::default(),
@@ -8120,7 +7645,7 @@ mod tests {
                     "/adapters/swebench/swebench_task_container_grader.py",
                 )),
                 destination_path: task_workdir_support_destination_path(
-                    "swebench_task_container_grader.py"
+                    "swebench_task_container_grader.py",
                 ),
                 required: true,
                 read_only: true,
@@ -8174,13 +7699,15 @@ mod tests {
     }
 
     #[test]
-    fn p0_container_mount_args_exclude_legacy_dataset_mount() {
+    fn p0_container_mount_args_use_contract_io_mounts_without_host_workspace_bind() {
         let (root, paths) = create_trial_paths_fixture("agentlab_p0_no_dataset_mount");
         let runtime = legacy_contract_runtime_fixture();
         let runtime_env = BTreeMap::new();
         let overrides = BTreeMap::new();
-        let io_paths =
-            prepared_trial_io_fixture(paths.out.join("result.json"), paths.state.join("events.jsonl"));
+        let io_paths = prepared_trial_io_fixture(
+            paths.out.join("result.json"),
+            paths.state.join("events.jsonl"),
+        );
         let runtime_experiment = json!({
             "runtime": {
                 "policy": {
@@ -8216,59 +7743,55 @@ mod tests {
             task_materialization_kind: TaskMaterializationKind::TaskImage,
             agent_artifact: None,
         };
-        let mut cmd = Command::new("docker");
-        append_container_sandbox_args(
-            &mut cmd,
+        let spec = crate::trial::execution::build_container_spec(
             &request,
-            ContainerPlane::TaskSandbox,
+            request.task_image,
             "/workspace/task",
-        )
-        .expect("append sandbox args");
-        let args = cmd
-            .get_args()
-            .map(|value| value.to_string_lossy().to_string())
-            .collect::<Vec<_>>();
-        let mounts = args
-            .windows(2)
-            .filter(|pair| pair[0] == "-v")
-            .map(|pair| pair[1].to_string())
-            .collect::<Vec<_>>();
+            request.network_mode,
+            false,
+            &[],
+        );
+        let mounts = &spec.mounts;
         assert!(
             mounts
                 .iter()
-                .any(|mount| mount.contains(&format!(":{}:ro", AGENTLAB_CONTRACT_IN_DIR))),
+                .any(|mount| mount.container_path == AGENTLAB_CONTRACT_IN_DIR && mount.read_only),
             "missing in-dir mount: {:?}",
             mounts
         );
         assert!(
-            mounts
+            !mounts
                 .iter()
-                .any(|mount| mount.contains(":/workspace/task")),
-            "missing workspace mount: {:?}",
+                .any(|mount| mount.container_path == "/workspace/task"),
+            "task container should not bind the host workspace into the task workdir: {:?}",
             mounts
         );
         assert!(
             mounts
                 .iter()
-                .any(|mount| mount.contains(&format!(":{}", AGENTLAB_CONTRACT_STATE_DIR))),
-            "missing state mount: {:?}",
+                .any(|mount| mount.container_path == AGENTLAB_CONTRACT_OUT_DIR && !mount.read_only),
+            "missing out-dir mount: {:?}",
             mounts
         );
         assert!(
-            !mounts.iter().any(|mount| mount.contains(":/dataset:")),
+            !mounts
+                .iter()
+                .any(|mount| mount.container_path == "/dataset"),
             "legacy /dataset mount should not be present: {:?}",
             mounts
         );
     }
 
     #[test]
-    fn p0_base_image_bundle_mounts_workspace_at_declared_workdir() {
+    fn p0_base_image_bundle_avoids_host_workspace_bind_mount() {
         let (_root, paths) = create_trial_paths_fixture("agentlab_p0_base_image_bundle_mount");
         let runtime = legacy_contract_runtime_fixture();
         let runtime_env = BTreeMap::new();
         let overrides = BTreeMap::new();
-        let io_paths =
-            prepared_trial_io_fixture(paths.out.join("result.json"), paths.state.join("events.jsonl"));
+        let io_paths = prepared_trial_io_fixture(
+            paths.out.join("result.json"),
+            paths.state.join("events.jsonl"),
+        );
         let runtime_experiment = json!({});
         let request = AdapterRunRequest {
             runtime_experiment: &runtime_experiment,
@@ -8288,35 +7811,21 @@ mod tests {
             task_materialization_kind: TaskMaterializationKind::BaseImageBundle,
             agent_artifact: None,
         };
-        let mut cmd = Command::new("docker");
-        append_container_sandbox_args(
-            &mut cmd,
+        let spec = crate::trial::execution::build_container_spec(
             &request,
-            ContainerPlane::TaskSandbox,
+            request.task_image,
             "/workspace/task",
-        )
-        .expect("append sandbox args");
-        let args = cmd
-            .get_args()
-            .map(|value| value.to_string_lossy().to_string())
-            .collect::<Vec<_>>();
-        let mounts = args
-            .windows(2)
-            .filter(|pair| pair[0] == "-v")
-            .map(|pair| pair[1].to_string())
-            .collect::<Vec<_>>();
-        assert!(
-            mounts
-                .iter()
-                .any(|mount| mount.ends_with(":/workspace/task")),
-            "base_image_bundle workspace mount should target the declared workdir: {:?}",
-            mounts
+            request.network_mode,
+            false,
+            &[],
         );
+        let mounts = &spec.mounts;
         assert!(
             !mounts
                 .iter()
-                .any(|mount| mount.ends_with(&format!(":{}", AGENTLAB_CONTRACT_WORKSPACE_DIR))),
-            "base_image_bundle should not keep a compatibility /agentlab/workspace mount: {:?}",
+                .any(|mount| mount.container_path == "/workspace/task"
+                    || mount.container_path == AGENTLAB_CONTRACT_WORKSPACE_DIR),
+            "base_image_bundle should copy into the task workdir instead of keeping host workspace binds: {:?}",
             mounts
         );
     }
@@ -8332,8 +7841,10 @@ mod tests {
         runtime.agent_artifact = PathBuf::from("/tmp/agent-artifact");
         let runtime_env = BTreeMap::new();
         let overrides = BTreeMap::new();
-        let io_paths =
-            prepared_trial_io_fixture(paths.out.join("result.json"), paths.state.join("events.jsonl"));
+        let io_paths = prepared_trial_io_fixture(
+            paths.out.join("result.json"),
+            paths.state.join("events.jsonl"),
+        );
         let empty_json = json!({});
         let request = AdapterRunRequest {
             runtime_experiment: &empty_json,
@@ -8353,14 +7864,15 @@ mod tests {
             task_materialization_kind: TaskMaterializationKind::TaskImage,
             agent_artifact: Some(runtime.agent_artifact.as_path()),
         };
-        let mut cmd = Command::new("docker");
-        append_container_env_args(&mut cmd, &request, "/workspace/task");
-        let args = cmd
-            .get_args()
-            .map(|value| value.to_string_lossy().to_string())
-            .collect::<Vec<_>>();
+        let args = build_exec_env(&request, "/workspace/task", None, true);
         assert!(
-            args.iter().any(|arg| arg == AGENT_ARTIFACT_PATH_ENV_VALUE),
+            args.get("PATH").is_some_and(|value| {
+                value
+                    == AGENT_ARTIFACT_PATH_ENV_VALUE
+                        .split_once('=')
+                        .map(|(_, value)| value)
+                        .unwrap_or_default()
+            }),
             "PATH injection env missing: {:?}",
             args
         );
@@ -8379,8 +7891,10 @@ mod tests {
         let (_root, paths) = create_trial_paths_fixture("agentlab_runtime_workspace_binding");
         let mut runtime = legacy_contract_runtime_fixture();
         runtime.command_raw = rendered;
-        let io_paths =
-            prepared_trial_io_fixture(paths.out.join("result.json"), paths.state.join("events.jsonl"));
+        let io_paths = prepared_trial_io_fixture(
+            paths.out.join("result.json"),
+            paths.state.join("events.jsonl"),
+        );
         let empty_json = json!({});
         let request = AdapterRunRequest {
             runtime_experiment: &empty_json,
@@ -8401,11 +7915,14 @@ mod tests {
             agent_artifact: None,
         };
         let resolved = resolve_runtime_agent_command(&request).expect("resolve runtime command");
-        assert_eq!(resolved, vec!["agent".to_string(), "/workspace/task".to_string()]);
+        assert_eq!(
+            resolved,
+            vec!["agent".to_string(), "/workspace/task".to_string()]
+        );
     }
 
     #[test]
-    fn append_container_env_args_replaces_workspace_placeholder() {
+    fn build_exec_env_replaces_workspace_placeholder() {
         let (_root, paths) = create_trial_paths_fixture("agentlab_workspace_env_placeholder");
         let runtime = legacy_contract_runtime_fixture();
         let mut runtime_env = BTreeMap::new();
@@ -8413,8 +7930,10 @@ mod tests {
             "CONFIG_DIR".to_string(),
             format!("{}/config", TASK_WORKDIR_TEMPLATE_PLACEHOLDER),
         );
-        let io_paths =
-            prepared_trial_io_fixture(paths.out.join("result.json"), paths.state.join("events.jsonl"));
+        let io_paths = prepared_trial_io_fixture(
+            paths.out.join("result.json"),
+            paths.state.join("events.jsonl"),
+        );
         let empty_json = json!({});
         let request = AdapterRunRequest {
             runtime_experiment: &empty_json,
@@ -8434,179 +7953,16 @@ mod tests {
             task_materialization_kind: TaskMaterializationKind::TaskImage,
             agent_artifact: None,
         };
-        let mut cmd = Command::new("docker");
-        append_container_env_args(&mut cmd, &request, "/workspace/task");
-        let args = cmd
-            .get_args()
-            .map(|value| value.to_string_lossy().to_string())
-            .collect::<Vec<_>>();
+        let args = build_exec_env(&request, "/workspace/task", None, true);
         assert!(
-            args.iter()
-                .any(|arg| arg == "CONFIG_DIR=/workspace/task/config"),
+            args.get("CONFIG_DIR") == Some(&"/workspace/task/config".to_string()),
             "workspace placeholder should resolve in container env: {:?}",
             args
         );
         assert!(
-            args.iter().any(|arg| arg == "WORKSPACE=/workspace/task"),
+            args.get("WORKSPACE") == Some(&"/workspace/task".to_string()),
             "WORKSPACE env should match the declared task workdir: {:?}",
             args
-        );
-    }
-
-    #[test]
-    fn p0_i03_injected_container_grader_wrapper_exports_agent_path() {
-        let (_root, paths) = create_trial_paths_fixture("agentlab_p0_path_wrapper");
-        let mut runtime = legacy_contract_runtime_fixture();
-        runtime.command_raw = vec!["rex".to_string(), "run".to_string()];
-        runtime.image = "image:latest".to_string();
-        runtime.sandbox_image = Some("image:latest".to_string());
-        runtime.execution = agent_execution_fixture(Some("image:latest"));
-        runtime.agent_artifact = PathBuf::from("/tmp/agent-artifact");
-        let runtime_env = BTreeMap::new();
-        let overrides = BTreeMap::new();
-        let io_paths =
-            prepared_trial_io_fixture(paths.out.join("result.json"), paths.state.join("events.jsonl"));
-        let empty_json = json!({});
-        let request = AdapterRunRequest {
-            runtime_experiment: &empty_json,
-            runtime: &runtime,
-            variant_args: &[],
-            runtime_env: &runtime_env,
-            runtime_overrides_env: &overrides,
-            trial_paths: &paths,
-            dynamic_mounts: &[],
-            io_paths: &io_paths,
-            network_mode: "none",
-            benchmark_grader: None,
-            benchmark_grading_enabled: true,
-            run_id: "run_1",
-            task_image: "image:latest",
-            task_workdir: "/workspace/task",
-            task_materialization_kind: TaskMaterializationKind::TaskImage,
-            agent_artifact: Some(runtime.agent_artifact.as_path()),
-        };
-        let mut cmd = Command::new("docker");
-        append_container_entrypoint(
-            &mut cmd,
-            &request,
-            &["rex".to_string(), "run".to_string()],
-            Some(vec![
-                "python3".to_string(),
-                task_workdir_support_destination_path("grader.py"),
-            ]),
-        );
-        let args = cmd
-            .get_args()
-            .map(|value| value.to_string_lossy().to_string())
-            .collect::<Vec<_>>();
-        let wrapper = args
-            .iter()
-            .position(|arg| arg == "-lc")
-            .and_then(|idx| args.get(idx + 1))
-            .cloned()
-            .unwrap_or_default();
-        assert!(
-            wrapper.contains(AGENT_ARTIFACT_PATH_ENV_VALUE),
-            "grader wrapper missing PATH export for artifact command lookup: {:?}",
-            wrapper
-        );
-        assert!(
-            wrapper.contains("if [ ! -s /agentlab/out/result.json ]; then"),
-            "grader wrapper missing missing-result guard before invoking grader: {:?}",
-            wrapper
-        );
-        assert!(
-            wrapper.contains("printf '%s\\n' \"result_missing\" >"),
-            "grader wrapper missing explicit result_missing marker: {:?}",
-            wrapper
-        );
-        assert!(
-            wrapper.contains("if [ \"$agent_status\" -ne 0 ]; then"),
-            "grader wrapper missing agent status passthrough inside result-missing guard: {:?}",
-            wrapper
-        );
-    }
-
-    #[test]
-    fn p0_i03_mapper_mode_grader_wrapper_requires_raw_output() {
-        let (_root, paths) = create_trial_paths_fixture("agentlab_p0_mapper_wrapper");
-        let mut runtime = legacy_contract_runtime_fixture();
-        runtime.command_raw = vec!["rex".to_string(), "run".to_string()];
-        runtime.image = "image:latest".to_string();
-        runtime.sandbox_image = Some("image:latest".to_string());
-        runtime.execution = agent_execution_fixture(Some("image:latest"));
-        runtime.agent_artifact = PathBuf::from("/tmp/agent-artifact");
-        let runtime_env = BTreeMap::new();
-        let overrides = BTreeMap::new();
-        let io_paths =
-            prepared_trial_io_fixture(paths.out.join("result.json"), paths.state.join("events.jsonl"));
-        let empty_json = json!({});
-        let grader = BenchmarkGraderConfig {
-            strategy: GradingStrategy::InTaskImage,
-            command: vec![
-                "python3".to_string(),
-                task_workdir_support_destination_path("grader.py"),
-            ],
-            conclusion: GraderConclusionConfig {
-                mode: GraderConclusionMode::Mapper,
-                mapper: Some(task_workdir_support_destination_path("normalize.py")),
-            },
-            in_task_image: Some(InTaskImageGradingConfig::default()),
-            injected: None,
-            separate: None,
-        };
-        let request = AdapterRunRequest {
-            runtime_experiment: &empty_json,
-            runtime: &runtime,
-            variant_args: &[],
-            runtime_env: &runtime_env,
-            runtime_overrides_env: &overrides,
-            trial_paths: &paths,
-            dynamic_mounts: &[],
-            io_paths: &io_paths,
-            network_mode: "none",
-            benchmark_grader: Some(&grader),
-            benchmark_grading_enabled: true,
-            run_id: "run_1",
-            task_image: "image:latest",
-            task_workdir: "/workspace/task",
-            task_materialization_kind: TaskMaterializationKind::TaskImage,
-            agent_artifact: Some(runtime.agent_artifact.as_path()),
-        };
-        let mut cmd = Command::new("docker");
-        append_container_entrypoint(
-            &mut cmd,
-            &request,
-            &["rex".to_string(), "run".to_string()],
-            Some(vec![
-                "python3".to_string(),
-                task_workdir_support_destination_path("grader.py"),
-            ]),
-        );
-        let args = cmd
-            .get_args()
-            .map(|value| value.to_string_lossy().to_string())
-            .collect::<Vec<_>>();
-        let wrapper = args
-            .iter()
-            .position(|arg| arg == "-lc")
-            .and_then(|idx| args.get(idx + 1))
-            .cloned()
-            .unwrap_or_default();
-        assert!(
-            wrapper.contains("/agentlab/out/raw_grader_output.json"),
-            "mapper-mode wrapper should require raw grader output: {:?}",
-            wrapper
-        );
-        assert!(
-            wrapper.contains("raw_grader_output_missing"),
-            "mapper-mode wrapper should emit raw output failure marker: {:?}",
-            wrapper
-        );
-        assert!(
-            !wrapper.contains("mapped_grader_output_missing"),
-            "mapper-mode wrapper should not require mapped output before mapper phase: {:?}",
-            wrapper
         );
     }
 
@@ -8632,8 +7988,10 @@ mod tests {
         let runtime = legacy_contract_runtime_fixture();
         let runtime_env = BTreeMap::new();
         let overrides = BTreeMap::new();
-        let io_paths =
-            prepared_trial_io_fixture(paths.out.join("result.json"), paths.state.join("events.jsonl"));
+        let io_paths = prepared_trial_io_fixture(
+            paths.out.join("result.json"),
+            paths.state.join("events.jsonl"),
+        );
         let empty_json = json!({});
         let grader = BenchmarkGraderConfig::in_task_image(vec![
             "python3".to_string(),
@@ -8657,12 +8015,491 @@ mod tests {
             task_materialization_kind: TaskMaterializationKind::TaskImage,
             agent_artifact: None,
         };
-        let failures =
-            validate_preflight_benchmark_smoke_outputs(&request, &BENCHMARK_GRADING_POLICY_EXIT_CODE.to_string());
+        let failures = validate_preflight_benchmark_smoke_outputs(
+            &request,
+            &BENCHMARK_GRADING_POLICY_EXIT_CODE.to_string(),
+        );
         assert!(
             failures.is_empty(),
             "valid mapped output should suppress grade-error marker failures: {:?}",
             failures
+        );
+    }
+
+    #[test]
+    fn validate_benchmark_grading_contract_accepts_hidden_asset_isolation_plan() {
+        let (_root, paths) = create_trial_paths_fixture("agentlab_hidden_asset_guard");
+        let runtime = legacy_contract_runtime_fixture();
+        let runtime_env = BTreeMap::new();
+        let overrides = BTreeMap::new();
+        let io_paths = prepared_trial_io_fixture(
+            paths.out.join("result.json"),
+            paths.state.join("events.jsonl"),
+        );
+        let empty_json = json!({});
+        let grader = BenchmarkGraderConfig {
+            strategy: GradingStrategy::InTaskImage,
+            command: vec![
+                "python3".to_string(),
+                task_workdir_support_destination_path("grader.py"),
+            ],
+            conclusion: GraderConclusionConfig::default(),
+            in_task_image: Some(InTaskImageGradingConfig {
+                hidden_paths: vec!["/testbed/.hidden".to_string()],
+                revealed_paths: vec!["/testbed/.hidden".to_string()],
+            }),
+            injected: None,
+            separate: None,
+        };
+        let request = AdapterRunRequest {
+            runtime_experiment: &empty_json,
+            runtime: &runtime,
+            variant_args: &[],
+            runtime_env: &runtime_env,
+            runtime_overrides_env: &overrides,
+            trial_paths: &paths,
+            dynamic_mounts: &[],
+            io_paths: &io_paths,
+            network_mode: "none",
+            benchmark_grader: Some(&grader),
+            benchmark_grading_enabled: true,
+            run_id: "run_1",
+            task_image: "python:3.11-slim",
+            task_workdir: "/testbed",
+            task_materialization_kind: TaskMaterializationKind::TaskImage,
+            agent_artifact: None,
+        };
+
+        crate::trial::grade::validate_benchmark_grading_contract(&request)
+            .expect("hidden asset isolation should now be supported");
+    }
+
+    #[test]
+    fn validate_benchmark_grading_contract_rejects_mismatched_hidden_asset_visibility_lists() {
+        let (_root, paths) = create_trial_paths_fixture("agentlab_hidden_asset_guard_lengths");
+        let runtime = legacy_contract_runtime_fixture();
+        let runtime_env = BTreeMap::new();
+        let overrides = BTreeMap::new();
+        let io_paths = prepared_trial_io_fixture(
+            paths.out.join("result.json"),
+            paths.state.join("events.jsonl"),
+        );
+        let empty_json = json!({});
+        let grader = BenchmarkGraderConfig {
+            strategy: GradingStrategy::InTaskImage,
+            command: vec![
+                "python3".to_string(),
+                task_workdir_support_destination_path("grader.py"),
+            ],
+            conclusion: GraderConclusionConfig::default(),
+            in_task_image: Some(InTaskImageGradingConfig {
+                hidden_paths: vec!["/testbed/.hidden".to_string()],
+                revealed_paths: vec![
+                    "/testbed/.hidden".to_string(),
+                    "/testbed/.hidden_extra".to_string(),
+                ],
+            }),
+            injected: None,
+            separate: None,
+        };
+        let request = AdapterRunRequest {
+            runtime_experiment: &empty_json,
+            runtime: &runtime,
+            variant_args: &[],
+            runtime_env: &runtime_env,
+            runtime_overrides_env: &overrides,
+            trial_paths: &paths,
+            dynamic_mounts: &[],
+            io_paths: &io_paths,
+            network_mode: "none",
+            benchmark_grader: Some(&grader),
+            benchmark_grading_enabled: true,
+            run_id: "run_1",
+            task_image: "python:3.11-slim",
+            task_workdir: "/testbed",
+            task_materialization_kind: TaskMaterializationKind::TaskImage,
+            agent_artifact: None,
+        };
+
+        let err = crate::trial::grade::validate_benchmark_grading_contract(&request)
+            .expect_err("mismatched hidden/revealed lengths should fail");
+        assert!(
+            err.to_string().contains("matching lengths"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn p7_execute_trial_runtime_base_image_bundle_copies_workspace_in_and_out() {
+        if !docker_runtime_available() {
+            eprintln!("skipping base-image-bundle runtime test: docker daemon unavailable");
+            return;
+        }
+        ensure_docker_test_image("python:3.11-slim");
+
+        let root = TempDirGuard::new("agentlab_p7_base_image_bundle_runtime");
+        let bundle_dir = root.path.join("task_bundle");
+        ensure_dir(&bundle_dir.join("src")).expect("bundle src");
+        fs::write(bundle_dir.join("src/main.py"), "print('ok')\n").expect("bundle source");
+
+        let agent_bundle = ensure_test_agent_bundle(&root.path, "base-image-bundle-agent");
+        write_executable_script(
+            &agent_bundle.join("bin/agent.sh"),
+            concat!(
+                "#!/bin/sh\n",
+                "set -e\n",
+                "find \"$WORKSPACE\" -maxdepth 2 -print >&2 || true\n",
+                "test -f \"$WORKSPACE/src/main.py\"\n",
+                "printf 'generated\\n' > \"$WORKSPACE/generated.txt\"\n",
+                "printf '%s' '{\"schema_version\":\"agent_result_v1\",\"outcome\":\"success\",\"checkpoints\":[]}' > /agentlab/out/result.json\n",
+            ),
+        );
+
+        let mut runtime = legacy_contract_runtime_fixture();
+        runtime.command_raw = vec!["/bin/sh".to_string(), "/opt/agent/bin/agent.sh".to_string()];
+        runtime.image = "python:3.11-slim".to_string();
+        runtime.sandbox_image = Some("python:3.11-slim".to_string());
+        runtime.execution = agent_execution_fixture(Some("python:3.11-slim"));
+        runtime.agent_artifact = agent_bundle.clone();
+
+        let task = base_image_bundle_task_row(
+            "task_1",
+            "python:3.11-slim",
+            "/workspace/task",
+            bundle_dir.to_string_lossy().as_ref(),
+        );
+        let task_boundary = parse_task_boundary_from_packaged_task(&task).expect("task boundary");
+        let variant = preflight_test_variant();
+        let trial_dir = root.path.join("trial_1");
+        ensure_dir(&trial_dir).expect("trial dir");
+        let runtime_experiment = json!({
+            "policy": {
+                "task_sandbox": {
+                    "hardening": {
+                        "no_new_privileges": true,
+                        "drop_all_caps": true
+                    }
+                }
+            }
+        });
+
+        let prepared = prepare_task_environment(
+            &root.path,
+            &trial_dir,
+            "run_1",
+            "trial_1",
+            &runtime_experiment,
+            &variant,
+            0,
+            0,
+            &task_boundary,
+            &runtime,
+        )
+        .expect("prepare task environment");
+        let task_sandbox_plan = prepared
+            .manifest
+            .task_sandbox_plan
+            .clone()
+            .expect("task sandbox plan");
+        let runtime_env = BTreeMap::new();
+        let overrides = BTreeMap::new();
+        let request = AdapterRunRequest {
+            runtime_experiment: &runtime_experiment,
+            runtime: &runtime,
+            variant_args: &[],
+            runtime_env: &runtime_env,
+            runtime_overrides_env: &overrides,
+            trial_paths: &prepared.trial_paths,
+            dynamic_mounts: &prepared.dynamic_mounts,
+            io_paths: &prepared.io_paths,
+            network_mode: "none",
+            benchmark_grader: None,
+            benchmark_grading_enabled: false,
+            run_id: "run_1",
+            task_image: &task_boundary.task_image,
+            task_workdir: &task_boundary.task_workdir,
+            task_materialization_kind: task_boundary.materialization.kind.clone(),
+            agent_artifact: Some(runtime.agent_artifact.as_path()),
+        };
+
+        let outcome = crate::trial::execution::execute_trial_runtime(
+            &trial_dir,
+            0,
+            1,
+            &request,
+            &task_boundary.task_id,
+            &variant.id,
+            0,
+            &task_sandbox_plan,
+        )
+        .expect("execute trial runtime");
+
+        assert_eq!(
+            outcome.agent_exit_status,
+            "0",
+            "agent stdout:\n{}\nagent stderr:\n{}",
+            fs::read_to_string(trial_dir.join("harness_stdout.log")).unwrap_or_default(),
+            fs::read_to_string(trial_dir.join("harness_stderr.log")).unwrap_or_default()
+        );
+        assert_eq!(
+            fs::read_to_string(prepared.trial_paths.workspace.join("generated.txt"))
+                .expect("generated workspace file"),
+            "generated\n"
+        );
+    }
+
+    #[test]
+    fn p7_execute_trial_runtime_hides_in_task_image_assets_until_grading() {
+        if !docker_runtime_available() {
+            eprintln!("skipping in-task-image hidden asset test: docker daemon unavailable");
+            return;
+        }
+
+        let root = TempDirGuard::new("agentlab_p7_hidden_asset_runtime");
+        let image = build_docker_test_image(
+            &root.path,
+            "hidden-assets",
+            concat!(
+                "FROM python:3.11-slim\n",
+                "RUN mkdir -p /workspace/task/.hidden\n",
+                "RUN python3 - <<'PY'\n",
+                "from pathlib import Path\n",
+                "Path('/workspace/task/.hidden/grader.py').write_text(",
+                "\"from pathlib import Path\\n\"",
+                "\"agent_file = Path('/workspace/task/agent_visible.txt')\\n\"",
+                "\"if not agent_file.exists():\\n    raise SystemExit('missing agent output')\\n\"",
+                "\"Path('/agentlab/out/mapped_grader_output.json').write_text('{\\\"schema_version\\\":\\\"trial_conclusion_v1\\\",\\\"payload\\\":{\\\"resolved\\\":1.0},\\\"reported_outcome\\\":\\\"success\\\",\\\"primary_metric\\\":{\\\"name\\\":\\\"resolved\\\",\\\"value\\\":1.0},\\\"grader\\\":{\\\"name\\\":\\\"test_grader\\\",\\\"strategy\\\":\\\"in_task_image\\\"}}')\\n\"",
+                ")\n",
+                "PY\n",
+                "WORKDIR /workspace/task\n",
+            ),
+        );
+
+        let agent_bundle = ensure_test_agent_bundle(&root.path, "hidden-assets-agent");
+        write_executable_script(
+            &agent_bundle.join("bin/agent.sh"),
+            concat!(
+                "#!/bin/sh\n",
+                "set -e\n",
+                "if [ -e \"$WORKSPACE/.hidden/grader.py\" ]; then\n",
+                "  echo 'hidden grader asset leaked into agent step' >&2\n",
+                "  exit 17\n",
+                "fi\n",
+                "printf 'agent-visible\\n' > \"$WORKSPACE/agent_visible.txt\"\n",
+                "printf '%s' '{\"schema_version\":\"agent_result_v1\",\"outcome\":\"success\",\"checkpoints\":[]}' > /agentlab/out/result.json\n",
+            ),
+        );
+
+        let mut runtime = legacy_contract_runtime_fixture();
+        runtime.command_raw = vec!["/bin/sh".to_string(), "/opt/agent/bin/agent.sh".to_string()];
+        runtime.image = image.clone();
+        runtime.sandbox_image = Some(image.clone());
+        runtime.execution = agent_execution_fixture(Some(&image));
+        runtime.agent_artifact = agent_bundle.clone();
+
+        let grader = BenchmarkGraderConfig {
+            strategy: GradingStrategy::InTaskImage,
+            command: vec![
+                "python3".to_string(),
+                "/workspace/task/.hidden/grader.py".to_string(),
+            ],
+            conclusion: GraderConclusionConfig::default(),
+            in_task_image: Some(InTaskImageGradingConfig {
+                hidden_paths: vec!["/workspace/task/.hidden/grader.py".to_string()],
+                revealed_paths: vec!["/workspace/task/.hidden/grader.py".to_string()],
+            }),
+            injected: None,
+            separate: None,
+        };
+        let task = task_row_value("task_hidden", &image, "/workspace/task", Some(30_000));
+        let task_boundary = parse_task_boundary_from_packaged_task(&task).expect("task boundary");
+        let variant = preflight_test_variant();
+        let trial_dir = root.path.join("trial_1");
+        ensure_dir(&trial_dir).expect("trial dir");
+        let runtime_experiment = json!({
+            "policy": {
+                "task_sandbox": {
+                    "hardening": {
+                        "no_new_privileges": true,
+                        "drop_all_caps": true
+                    }
+                }
+            }
+        });
+
+        let prepared = prepare_task_environment(
+            &root.path,
+            &trial_dir,
+            "run_1",
+            "trial_1",
+            &runtime_experiment,
+            &variant,
+            0,
+            0,
+            &task_boundary,
+            &runtime,
+        )
+        .expect("prepare task environment");
+        let task_sandbox_plan = prepared
+            .manifest
+            .task_sandbox_plan
+            .clone()
+            .expect("task sandbox plan");
+        let runtime_env = BTreeMap::new();
+        let overrides = BTreeMap::new();
+        let request = AdapterRunRequest {
+            runtime_experiment: &runtime_experiment,
+            runtime: &runtime,
+            variant_args: &[],
+            runtime_env: &runtime_env,
+            runtime_overrides_env: &overrides,
+            trial_paths: &prepared.trial_paths,
+            dynamic_mounts: &prepared.dynamic_mounts,
+            io_paths: &prepared.io_paths,
+            network_mode: "none",
+            benchmark_grader: Some(&grader),
+            benchmark_grading_enabled: true,
+            run_id: "run_1",
+            task_image: &task_boundary.task_image,
+            task_workdir: &task_boundary.task_workdir,
+            task_materialization_kind: task_boundary.materialization.kind.clone(),
+            agent_artifact: Some(runtime.agent_artifact.as_path()),
+        };
+
+        let outcome = crate::trial::execution::execute_trial_runtime(
+            &trial_dir,
+            0,
+            1,
+            &request,
+            &task_boundary.task_id,
+            &variant.id,
+            0,
+            &task_sandbox_plan,
+        )
+        .expect("execute trial runtime");
+
+        assert_eq!(
+            outcome.agent_exit_status,
+            "0",
+            "agent stdout:\n{}\nagent stderr:\n{}",
+            fs::read_to_string(trial_dir.join("harness_stdout.log")).unwrap_or_default(),
+            fs::read_to_string(trial_dir.join("harness_stderr.log")).unwrap_or_default()
+        );
+        assert!(
+            outcome.trial_conclusion_row.is_some(),
+            "grader should produce a mapped conclusion; grader stdout:\n{}\ngrader stderr:\n{}\nmapper stdout:\n{}\nmapper stderr:\n{}\ngrade_error_reason={:?}",
+            fs::read_to_string(trial_dir.join("grader_stdout.log")).unwrap_or_default(),
+            fs::read_to_string(trial_dir.join("grader_stderr.log")).unwrap_or_default(),
+            fs::read_to_string(trial_dir.join("mapper_stdout.log")).unwrap_or_default(),
+            fs::read_to_string(trial_dir.join("mapper_stderr.log")).unwrap_or_default(),
+            outcome.grade_error_reason
+        );
+        assert_eq!(
+            fs::read_to_string(prepared.trial_paths.workspace.join("agent_visible.txt"))
+                .expect("agent-visible workspace file"),
+            "agent-visible\n"
+        );
+    }
+
+    #[test]
+    fn validate_benchmark_grading_contract_rejects_missing_grader_command() {
+        let (_root, paths) = create_trial_paths_fixture("agentlab_missing_grader_command");
+        let runtime = legacy_contract_runtime_fixture();
+        let runtime_env = BTreeMap::new();
+        let overrides = BTreeMap::new();
+        let io_paths = prepared_trial_io_fixture(
+            paths.out.join("result.json"),
+            paths.state.join("events.jsonl"),
+        );
+        let empty_json = json!({});
+        let grader = BenchmarkGraderConfig {
+            strategy: GradingStrategy::InTaskImage,
+            command: Vec::new(),
+            conclusion: GraderConclusionConfig::default(),
+            in_task_image: Some(InTaskImageGradingConfig::default()),
+            injected: None,
+            separate: None,
+        };
+        let request = AdapterRunRequest {
+            runtime_experiment: &empty_json,
+            runtime: &runtime,
+            variant_args: &[],
+            runtime_env: &runtime_env,
+            runtime_overrides_env: &overrides,
+            trial_paths: &paths,
+            dynamic_mounts: &[],
+            io_paths: &io_paths,
+            network_mode: "none",
+            benchmark_grader: Some(&grader),
+            benchmark_grading_enabled: true,
+            run_id: "run_1",
+            task_image: "python:3.11-slim",
+            task_workdir: "/workspace/task",
+            task_materialization_kind: TaskMaterializationKind::TaskImage,
+            agent_artifact: None,
+        };
+
+        let err = crate::trial::grade::validate_benchmark_grading_contract(&request)
+            .expect_err("missing grader command should be rejected");
+        assert!(
+            err.to_string().contains("no grader command resolved"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn validate_benchmark_grading_contract_rejects_missing_mapper_command() {
+        let (_root, paths) = create_trial_paths_fixture("agentlab_missing_mapper_command");
+        let runtime = legacy_contract_runtime_fixture();
+        let runtime_env = BTreeMap::new();
+        let overrides = BTreeMap::new();
+        let io_paths = prepared_trial_io_fixture(
+            paths.out.join("result.json"),
+            paths.state.join("events.jsonl"),
+        );
+        let empty_json = json!({});
+        let grader = BenchmarkGraderConfig {
+            strategy: GradingStrategy::InTaskImage,
+            command: vec![
+                "python3".to_string(),
+                task_workdir_support_destination_path("grader.py"),
+            ],
+            conclusion: GraderConclusionConfig {
+                mode: GraderConclusionMode::Mapper,
+                mapper: None,
+            },
+            in_task_image: Some(InTaskImageGradingConfig::default()),
+            injected: None,
+            separate: None,
+        };
+        let request = AdapterRunRequest {
+            runtime_experiment: &empty_json,
+            runtime: &runtime,
+            variant_args: &[],
+            runtime_env: &runtime_env,
+            runtime_overrides_env: &overrides,
+            trial_paths: &paths,
+            dynamic_mounts: &[],
+            io_paths: &io_paths,
+            network_mode: "none",
+            benchmark_grader: Some(&grader),
+            benchmark_grading_enabled: true,
+            run_id: "run_1",
+            task_image: "python:3.11-slim",
+            task_workdir: "/workspace/task",
+            task_materialization_kind: TaskMaterializationKind::TaskImage,
+            agent_artifact: None,
+        };
+
+        let err = crate::trial::grade::validate_benchmark_grading_contract(&request)
+            .expect_err("missing mapper command should be rejected");
+        assert!(
+            err.to_string()
+                .contains("benchmark.grader.conclusion.mapper is required"),
+            "unexpected error: {}",
+            err
         );
     }
 
@@ -8672,17 +8509,18 @@ mod tests {
         let mut runtime = legacy_contract_runtime_fixture();
         runtime.command_raw = vec!["rex".to_string(), "run".to_string()];
         runtime.image = "swebench/sweb.eval.x86_64.astropy__astropy-12907:latest".to_string();
-        runtime.sandbox_image = Some(
-            "swebench/sweb.eval.x86_64.astropy__astropy-12907:latest".to_string(),
-        );
+        runtime.sandbox_image =
+            Some("swebench/sweb.eval.x86_64.astropy__astropy-12907:latest".to_string());
         runtime.execution = agent_execution_fixture(Some(
             "swebench/sweb.eval.x86_64.astropy__astropy-12907:latest",
         ));
         runtime.agent_artifact = PathBuf::from("/tmp/agent-artifact");
         let runtime_env = BTreeMap::new();
         let overrides = BTreeMap::new();
-        let io_paths =
-            prepared_trial_io_fixture(paths.out.join("result.json"), paths.state.join("events.jsonl"));
+        let io_paths = prepared_trial_io_fixture(
+            paths.out.join("result.json"),
+            paths.state.join("events.jsonl"),
+        );
         let empty_json = json!({});
         let request = AdapterRunRequest {
             runtime_experiment: &empty_json,
@@ -8702,31 +8540,28 @@ mod tests {
             task_materialization_kind: TaskMaterializationKind::TaskImage,
             agent_artifact: Some(runtime.agent_artifact.as_path()),
         };
-        let baked_args = build_baked_container_command(
+        let mut spec = crate::trial::execution::build_container_spec(
             &request,
-            ContainerPlane::TaskSandbox,
             "swebench/sweb.eval.x86_64.astropy__astropy-12907:latest",
             "/testbed",
-            &["rex".to_string(), "run".to_string()],
-            None,
-        )
-        .get_args()
-        .map(|value| value.to_string_lossy().to_string())
-        .collect::<Vec<_>>();
+            request.network_mode,
+            false,
+            &[],
+        );
+        spec.platform = resolve_container_platform(request.task_image).map(str::to_string);
         assert!(
-            baked_args
-                .windows(2)
-                .any(|pair| pair == ["--platform", "linux/amd64"]),
-            "baked task container command missing explicit platform: {:?}",
-            baked_args
+            spec.platform.as_deref() == Some("linux/amd64"),
+            "task sandbox spec missing explicit platform: {:?}",
+            spec.platform
         );
 
         assert!(
-            !baked_args
-                .windows(2)
-                .any(|pair| pair[0] == "-v" && pair[1].contains(":/opt/agent")),
-            "task sandbox command must not mount the agent bundle: {:?}",
-            baked_args
+            !spec
+                .mounts
+                .iter()
+                .any(|mount| mount.container_path == "/opt/agent"),
+            "task sandbox spec must not mount the agent bundle: {:?}",
+            spec.mounts
         );
     }
 
@@ -8752,56 +8587,6 @@ mod tests {
             "unexpected error: {}",
             err
         );
-    }
-
-    #[test]
-    fn p1_i04_workspace_patch_path_rejection() {
-        let (_root, paths) = create_trial_paths_fixture("agentlab_p1_workspace_patch_path_rejection");
-        let source = paths.trial_dir.join("input.txt");
-        fs::write(&source, "fixture").expect("source fixture");
-        let mut runtime = legacy_contract_runtime_fixture();
-        runtime.workspace_patches = vec![WorkspacePatchSpec {
-            source_from_host: source,
-            target_path: "../escape.txt".to_string(),
-        }];
-        let err = stage_workspace_patches_for_trial(&runtime, &paths)
-            .expect_err("path traversal must be rejected");
-        assert!(
-            err.to_string().contains("invalid"),
-            "unexpected error: {}",
-            err
-        );
-    }
-
-    #[test]
-    fn p1_i05_workspace_patch_ordering_overwrites_deterministically() {
-        let (_root, paths) = create_trial_paths_fixture("agentlab_p1_workspace_patch_order");
-        let source_a = paths.trial_dir.join("source_a.txt");
-        let source_b = paths.trial_dir.join("source_b.txt");
-        fs::write(&source_a, "A").expect("source A");
-        fs::write(&source_b, "B").expect("source B");
-
-        let mut runtime = legacy_contract_runtime_fixture();
-        runtime.command_raw = vec!["rex".to_string()];
-        runtime.image.clear();
-        runtime.sandbox_image = None;
-        runtime.execution = agent_execution_fixture(None);
-        runtime.force_container = false;
-        runtime.workspace_patches = vec![
-            WorkspacePatchSpec {
-                source_from_host: source_a,
-                target_path: "patched/provider.ts".to_string(),
-            },
-            WorkspacePatchSpec {
-                source_from_host: source_b,
-                target_path: "patched/provider.ts".to_string(),
-            },
-        ];
-
-        stage_workspace_patches_for_trial(&runtime, &paths).expect("stage patches");
-        let patched = fs::read_to_string(paths.workspace.join("patched").join("provider.ts"))
-            .expect("patched file");
-        assert_eq!(patched, "B");
     }
 
     #[test]
@@ -8897,7 +8682,9 @@ mod tests {
     fn experiment_workload_type_empty_string_fails() {
         let spec = json!({"experiment": {"workload_type": "  "}});
         let err = experiment_workload_type(&spec).unwrap_err();
-        assert!(err.to_string().contains("missing /experiment/workload_type"));
+        assert!(err
+            .to_string()
+            .contains("missing /experiment/workload_type"));
     }
 
     #[test]
@@ -9402,182 +9189,6 @@ mod tests {
     }
 
     #[test]
-    fn workspace_evidence_excluded_logs_prefix() {
-        assert!(is_workspace_evidence_excluded(Path::new("logs/app.log")));
-    }
-
-    #[test]
-    fn workspace_evidence_excluded_node_modules() {
-        assert!(is_workspace_evidence_excluded(Path::new(
-            "node_modules/pkg"
-        )));
-    }
-
-    #[test]
-    fn workspace_evidence_excluded_git_dir() {
-        assert!(is_workspace_evidence_excluded(Path::new(".git/config")));
-    }
-
-    #[test]
-    fn workspace_evidence_excluded_ds_store() {
-        assert!(is_workspace_evidence_excluded(Path::new(".DS_Store")));
-    }
-
-    #[test]
-    fn workspace_evidence_excluded_pycache() {
-        assert!(is_workspace_evidence_excluded(Path::new(
-            "__pycache__/mod.pyc"
-        )));
-    }
-
-    #[test]
-    fn workspace_evidence_not_excluded_source_file() {
-        assert!(!is_workspace_evidence_excluded(Path::new("src/main.py")));
-    }
-
-    #[test]
-    fn workspace_evidence_excluded_nested_node_modules() {
-        assert!(is_workspace_evidence_excluded(Path::new(
-            "deep/nested/node_modules/x"
-        )));
-    }
-
-    #[test]
-    fn workspace_evidence_excluded_dot_claude() {
-        assert!(is_workspace_evidence_excluded(Path::new(
-            ".claude/settings"
-        )));
-    }
-
-    #[test]
-    fn workspace_evidence_excluded_target_dir() {
-        assert!(is_workspace_evidence_excluded(Path::new(
-            "target/debug/bin"
-        )));
-    }
-
-    #[test]
-    fn workspace_evidence_excluded_underscore_dot_prefix() {
-        assert!(is_workspace_evidence_excluded(Path::new("._hidden")));
-    }
-
-    #[test]
-    fn workspace_evidence_not_excluded_readme() {
-        assert!(!is_workspace_evidence_excluded(Path::new("README.md")));
-    }
-
-    #[test]
-    fn workspace_evidence_not_excluded_nested_source() {
-        assert!(!is_workspace_evidence_excluded(Path::new(
-            "src/components/App.tsx"
-        )));
-    }
-
-    #[test]
-    fn workspace_evidence_excluded_pytest_cache() {
-        assert!(is_workspace_evidence_excluded(Path::new(
-            ".pytest_cache/v/cache"
-        )));
-    }
-
-    #[test]
-    fn workspace_evidence_excluded_mypy_cache() {
-        assert!(is_workspace_evidence_excluded(Path::new(
-            ".mypy_cache/3.9/module"
-        )));
-    }
-
-    #[test]
-    fn workspace_evidence_excluded_ruff_cache() {
-        assert!(is_workspace_evidence_excluded(Path::new(
-            ".ruff_cache/0.1.0"
-        )));
-    }
-
-    #[test]
-    fn workspace_evidence_excluded_pnpm_store() {
-        assert!(is_workspace_evidence_excluded(Path::new(".pnpm-store/v3")));
-    }
-
-    #[test]
-    fn workspace_evidence_excluded_yarn_dir() {
-        assert!(is_workspace_evidence_excluded(Path::new(".yarn/cache")));
-    }
-
-    #[test]
-    fn workspace_evidence_excluded_haiku_prefix() {
-        assert!(is_workspace_evidence_excluded(Path::new(".haiku/settings")));
-    }
-
-    #[test]
-    fn workspace_evidence_excluded_graphd_prefix() {
-        assert!(is_workspace_evidence_excluded(Path::new(".graphd/data")));
-    }
-
-    #[test]
-    fn workspace_evidence_excluded_watcher_prefix() {
-        assert!(is_workspace_evidence_excluded(Path::new(".watcher/config")));
-    }
-
-    #[test]
-    fn workspace_evidence_excluded_agentlab_generated() {
-        assert!(is_workspace_evidence_excluded(Path::new(
-            ".agentlab_generated/output"
-        )));
-    }
-
-    #[test]
-    fn workspace_evidence_excluded_auth_states() {
-        assert!(is_workspace_evidence_excluded(Path::new(
-            "auth-states/token.json"
-        )));
-    }
-
-    #[test]
-    fn workspace_evidence_excluded_cockpit() {
-        assert!(is_workspace_evidence_excluded(Path::new(".cockpit/state")));
-    }
-
-    #[test]
-    fn validate_workspace_relative_path_rejects_dot_dot() {
-        let err = validate_workspace_relative_path("../escape").expect_err("should reject ..");
-        assert!(err.to_string().contains(".."), "unexpected error: {}", err);
-    }
-
-    #[test]
-    fn validate_workspace_relative_path_rejects_absolute() {
-        let err =
-            validate_workspace_relative_path("/absolute").expect_err("should reject absolute");
-        assert!(
-            err.to_string().contains("relative") || err.to_string().contains("absolute"),
-            "unexpected error: {}",
-            err
-        );
-    }
-
-    #[test]
-    fn validate_workspace_relative_path_accepts_normal() {
-        let result = validate_workspace_relative_path("src/main.py").unwrap();
-        assert_eq!(result, PathBuf::from("src/main.py"));
-    }
-
-    #[test]
-    fn validate_workspace_relative_path_dot_only_resolves_empty() {
-        let err = validate_workspace_relative_path(".").expect_err("dot-only should fail");
-        assert!(
-            err.to_string().contains("empty"),
-            "unexpected error: {}",
-            err
-        );
-    }
-
-    #[test]
-    fn validate_workspace_relative_path_normalizes_dot_segments() {
-        let result = validate_workspace_relative_path("./src/main.py").unwrap();
-        assert_eq!(result, PathBuf::from("src/main.py"));
-    }
-
-    #[test]
     fn validate_container_workspace_path_rejects_non_workspace_root() {
         let err = validate_container_workspace_path("/some/other/path").expect_err("should reject");
         assert!(
@@ -9645,7 +9256,8 @@ mod tests {
     fn validate_required_fields_legacy_empty_workload_type_fails() {
         let mut spec = legacy_experiment_base();
         spec["experiment"]["workload_type"] = json!("");
-        let err = validate_required_fields(&spec).expect_err("legacy runtime.agent should be rejected");
+        let err =
+            validate_required_fields(&spec).expect_err("legacy runtime.agent should be rejected");
         assert!(err.to_string().contains("/runtime/agent was removed"));
     }
 
@@ -9653,7 +9265,8 @@ mod tests {
     fn validate_required_fields_legacy_zero_timeout_fails() {
         let mut spec = legacy_experiment_base();
         spec["runtime"]["policy"]["timeout_ms"] = json!(0);
-        let err = validate_required_fields(&spec).expect_err("legacy runtime.agent should be rejected");
+        let err =
+            validate_required_fields(&spec).expect_err("legacy runtime.agent should be rejected");
         assert!(err.to_string().contains("/runtime/agent was removed"));
     }
 
@@ -9762,7 +9375,8 @@ mod tests {
             .as_object_mut()
             .unwrap()
             .remove("command");
-        let err = validate_required_fields(&spec).expect_err("legacy runtime.agent should be rejected");
+        let err =
+            validate_required_fields(&spec).expect_err("legacy runtime.agent should be rejected");
         assert!(err.to_string().contains("/runtime/agent was removed"));
     }
 
@@ -9773,7 +9387,8 @@ mod tests {
             .as_object_mut()
             .unwrap()
             .remove("replications");
-        let err = validate_required_fields(&spec).expect_err("legacy runtime.agent should be rejected");
+        let err =
+            validate_required_fields(&spec).expect_err("legacy runtime.agent should be rejected");
         assert!(err.to_string().contains("/runtime/agent was removed"));
     }
 
@@ -9784,7 +9399,8 @@ mod tests {
             .as_object_mut()
             .unwrap()
             .remove("network");
-        let err = validate_required_fields(&spec).expect_err("legacy runtime.agent should be rejected");
+        let err =
+            validate_required_fields(&spec).expect_err("legacy runtime.agent should be rejected");
         assert!(err.to_string().contains("/runtime/agent was removed"));
     }
 
@@ -10765,87 +10381,6 @@ mod tests {
         assert_eq!(default_slot_attempt(), 1);
     }
 
-    #[test]
-    fn active_trials_use_worker_control_plane_all_qualified() {
-        let mut active = HashMap::new();
-        active.insert(
-            "trial_1".to_string(),
-            RunControlActiveTrial {
-                trial_id: "trial_1".to_string(),
-                worker_id: "worker_a".to_string(),
-                schedule_idx: Some(0),
-                variant_id: None,
-                started_at: None,
-                control: None,
-            },
-        );
-        assert!(active_trials_use_worker_control_plane(
-            &active,
-            &["trial_1".to_string()]
-        ));
-    }
-
-    #[test]
-    fn active_trials_use_worker_control_plane_some_have_control() {
-        let mut active = HashMap::new();
-        active.insert(
-            "trial_1".to_string(),
-            RunControlActiveTrial {
-                trial_id: "trial_1".to_string(),
-                worker_id: "worker_a".to_string(),
-                schedule_idx: Some(0),
-                variant_id: None,
-                started_at: None,
-                control: Some(ActiveAdapterControl {
-                    adapter_id: BUILTIN_COMMAND_ADAPTER_ID.to_string(),
-                    adapter_version: BUILTIN_COMMAND_ADAPTER_VERSION.to_string(),
-                    command_path: "/tmp/control".to_string(),
-                    events_path: Some("/tmp/events".to_string()),
-                }),
-            },
-        );
-        assert!(!active_trials_use_worker_control_plane(
-            &active,
-            &["trial_1".to_string()]
-        ));
-    }
-
-    #[test]
-    fn active_trials_use_worker_control_plane_empty_targets() {
-        assert!(!active_trials_use_worker_control_plane(
-            &HashMap::new(),
-            &[]
-        ));
-    }
-
-    #[test]
-    fn active_trials_use_worker_control_plane_unknown_worker() {
-        let mut active = HashMap::new();
-        active.insert(
-            "trial_1".to_string(),
-            RunControlActiveTrial {
-                trial_id: "trial_1".to_string(),
-                worker_id: RUN_CONTROL_UNKNOWN_WORKER_ID.to_string(),
-                schedule_idx: Some(0),
-                variant_id: None,
-                started_at: None,
-                control: None,
-            },
-        );
-        assert!(!active_trials_use_worker_control_plane(
-            &active,
-            &["trial_1".to_string()]
-        ));
-    }
-
-    #[test]
-    fn active_trials_use_worker_control_plane_missing_from_map() {
-        assert!(!active_trials_use_worker_control_plane(
-            &HashMap::new(),
-            &["trial_1".to_string()]
-        ));
-    }
-
     // ───────────────────────────────────────────────────────────────────
     // Batch 6: Variant Resolution & Runtime Profiles
     // ───────────────────────────────────────────────────────────────────
@@ -11320,6 +10855,125 @@ mod tests {
         assert_eq!(loaded["trial_id"], "trial_1");
     }
 
+    fn runtime_trial_attempt_state_fixture(phase: TrialPhase) -> TrialAttemptState {
+        TrialAttemptState {
+            key: TrialAttemptKey {
+                schedule_idx: 0,
+                attempt: 1,
+            },
+            slot: AttemptSlotRef {
+                schedule_idx: 0,
+                variant_id: "variant_a".to_string(),
+                task_id: "task_a".to_string(),
+                repl_idx: 0,
+            },
+            phase,
+            paused_from_phase: None,
+            fs: AttemptFsLayout {
+                attempt_dir: "/tmp/attempt".to_string(),
+                in_dir: "/tmp/in".to_string(),
+                out_dir: "/tmp/out".to_string(),
+                telemetry_mounts: Vec::new(),
+                logs_dir: "/tmp/logs".to_string(),
+            },
+            task_sandbox: None,
+            grading_sandbox: None,
+            agent_phase: None,
+            grading_phase: None,
+            mapping_phase: None,
+            candidate_artifact: None,
+        }
+    }
+
+    fn runtime_trial_attempt_state_with_task_container(
+        phase: TrialPhase,
+        container_id: &str,
+    ) -> TrialAttemptState {
+        let mut state = runtime_trial_attempt_state_fixture(phase);
+        state.task_sandbox = Some(TaskSandboxState {
+            container_id: container_id.to_string(),
+            image: "python:3.11-slim".to_string(),
+            workdir: "/workspace/task".to_string(),
+            materialization: TaskMaterializationSpec {
+                kind: TaskMaterializationKind::TaskImage,
+                task_bundle_ref: None,
+            },
+        });
+        state
+    }
+
+    #[test]
+    fn trial_runtime_state_reconciles_abandoned_and_committed() {
+        let root = TempDirGuard::new("trial_runtime_state_reconcile");
+        trial::state::write_trial_attempt_state(
+            &root.path,
+            &runtime_trial_attempt_state_fixture(TrialPhase::AgentRunning),
+        )
+        .expect("write runtime state");
+
+        trial::state::reconcile_trial_attempt_as_abandoned(&root.path)
+            .expect("reconcile abandoned");
+        let abandoned = trial::state::load_trial_attempt_state(&root.path).expect("load abandoned");
+        assert_eq!(abandoned.state.phase, TrialPhase::Abandoned);
+
+        trial::state::reconcile_trial_attempt_as_committed(&root.path)
+            .expect("reconcile committed");
+        let committed = trial::state::load_trial_attempt_state(&root.path).expect("load committed");
+        assert_eq!(committed.state.phase, TrialPhase::Committed);
+
+        trial::state::reconcile_trial_attempt_as_abandoned(&root.path)
+            .expect("reconcile abandoned after commit");
+        let still_committed =
+            trial::state::load_trial_attempt_state(&root.path).expect("load after commit");
+        assert_eq!(still_committed.state.phase, TrialPhase::Committed);
+    }
+
+    #[test]
+    fn trial_runtime_state_preserves_paused_and_killed_from_abandon_reconcile() {
+        let root = TempDirGuard::new("trial_runtime_state_terminal_reconcile");
+
+        trial::state::write_trial_attempt_state(
+            &root.path,
+            &runtime_trial_attempt_state_fixture(TrialPhase::AgentRunning),
+        )
+        .expect("write runtime state");
+        trial::state::reconcile_trial_attempt_as_paused(&root.path).expect("pause reconcile");
+        trial::state::reconcile_trial_attempt_as_abandoned(&root.path)
+            .expect("abandon paused reconcile");
+        let paused = trial::state::load_trial_attempt_state(&root.path).expect("load paused");
+        assert_eq!(paused.state.phase, TrialPhase::Paused);
+
+        trial::state::reconcile_trial_attempt_as_killed(&root.path).expect("kill reconcile");
+        trial::state::reconcile_trial_attempt_as_abandoned(&root.path)
+            .expect("abandon killed reconcile");
+        let killed = trial::state::load_trial_attempt_state(&root.path).expect("load killed");
+        assert_eq!(killed.state.phase, TrialPhase::Killed);
+    }
+
+    #[test]
+    fn trial_runtime_state_restores_paused_phase_on_resume_reconcile() {
+        let root = TempDirGuard::new("trial_runtime_state_resume_reconcile");
+
+        trial::state::write_trial_attempt_state(
+            &root.path,
+            &runtime_trial_attempt_state_fixture(TrialPhase::GraderRunning),
+        )
+        .expect("write runtime state");
+        trial::state::reconcile_trial_attempt_as_paused(&root.path).expect("pause reconcile");
+
+        let paused = trial::state::load_trial_attempt_state(&root.path).expect("load paused");
+        assert_eq!(paused.state.phase, TrialPhase::Paused);
+        assert_eq!(
+            paused.state.paused_from_phase,
+            Some(TrialPhase::GraderRunning)
+        );
+
+        trial::state::reconcile_trial_attempt_as_resumed(&root.path).expect("resume reconcile");
+        let resumed = trial::state::load_trial_attempt_state(&root.path).expect("load resumed");
+        assert_eq!(resumed.state.phase, TrialPhase::GraderRunning);
+        assert_eq!(resumed.state.paused_from_phase, None);
+    }
+
     #[test]
     fn write_trial_state_paused_with_label() {
         let root = TempDirGuard::new("trial_state_paused");
@@ -11639,28 +11293,6 @@ mod tests {
     }
 
     #[test]
-    fn is_worker_backend_capacity_error_matches_prefix() {
-        assert!(is_worker_backend_capacity_error(&anyhow::anyhow!(
-            "{}in_flight=4, max=4",
-            LOCAL_WORKER_CAPACITY_ERROR_PREFIX
-        )));
-    }
-
-    #[test]
-    fn is_worker_backend_capacity_error_matches_at_capacity() {
-        assert!(is_worker_backend_capacity_error(&anyhow::anyhow!(
-            "worker at capacity"
-        )));
-    }
-
-    #[test]
-    fn is_worker_backend_capacity_error_rejects_other() {
-        assert!(!is_worker_backend_capacity_error(&anyhow::anyhow!(
-            "network timeout"
-        )));
-    }
-
-    #[test]
     fn copy_path_into_package_file() {
         let root = TempDirGuard::new("copy_pkg_file");
         let src = root.path.join("source.txt");
@@ -11817,77 +11449,6 @@ mod tests {
         let task = json!({"input": {"prompt": "hello"}, "metadata": "x"});
         let result = normalize_task_prompt_aliases(&task);
         assert_eq!(result["input"]["prompt"], "hello");
-    }
-
-    #[test]
-    fn materialize_workspace_overlays_utf8() {
-        let (_root, paths) = create_trial_paths_fixture("mat_utf8");
-        let files = vec![workspace_overlay("hello.txt", "hello world", None)];
-        materialize_workspace_overlays(&paths, &files).unwrap();
-        assert_eq!(
-            fs::read_to_string(paths.workspace.join("hello.txt")).unwrap(),
-            "hello world"
-        );
-    }
-
-    #[test]
-    fn materialize_workspace_overlays_base64() {
-        let (_root, paths) = create_trial_paths_fixture("mat_b64");
-        let encoded = BASE64_STANDARD.encode(b"binary content");
-        let files = vec![workspace_overlay("data.bin", &encoded, Some("base64"))];
-        materialize_workspace_overlays(&paths, &files).unwrap();
-        assert_eq!(
-            fs::read(paths.workspace.join("data.bin")).unwrap(),
-            b"binary content"
-        );
-    }
-
-    #[test]
-    fn materialize_workspace_overlays_create_parent_dirs() {
-        let (_root, paths) = create_trial_paths_fixture("mat_nested");
-        let files = vec![workspace_overlay(
-            "deep/nested/dir/file.txt",
-            "nested",
-            None,
-        )];
-        materialize_workspace_overlays(&paths, &files).unwrap();
-        assert_eq!(
-            fs::read_to_string(
-                paths
-                    .workspace
-                    .join("deep")
-                    .join("nested")
-                    .join("dir")
-                    .join("file.txt")
-            )
-            .unwrap(),
-            "nested"
-        );
-    }
-
-    #[test]
-    fn materialize_workspace_overlays_empty_list() {
-        let (_root, paths) = create_trial_paths_fixture("mat_empty");
-        materialize_workspace_overlays(&paths, &[]).unwrap();
-    }
-
-    #[test]
-    fn capture_workspace_object_ref_rejects_workspace_over_bundle_limit() {
-        let root = TempDirGuard::new("workspace_bundle_limit");
-        let workspace_dir = root.path.join("workspace");
-        ensure_dir(&workspace_dir).unwrap();
-        fs::write(workspace_dir.join("large.bin"), vec![b'x'; 8]).unwrap();
-
-        let artifact_store = ArtifactStore::new(root.path.join("artifacts"));
-        let err = capture_workspace_object_ref_with_limit(&artifact_store, &workspace_dir, 4)
-            .expect_err("workspace bundle should exceed test limit");
-        let msg = err.to_string();
-        assert!(
-            msg.contains("AGENTLAB_MAX_WORKSPACE_BUNDLE_BYTES"),
-            "unexpected error: {}",
-            msg
-        );
-        assert!(msg.contains("large.bin"), "unexpected error: {}", msg);
     }
 
     #[test]
@@ -12441,8 +12002,9 @@ mod tests {
         let err = load_staging_specs_from_package(&guard.path, "control")
             .expect_err("invalid destination path should fail");
         assert!(
-            err.to_string()
-                .contains("must be under __AGENTLAB_TASK_WORKDIR__/.agentlab/support or /agentlab/state"),
+            err.to_string().contains(
+                "must be under __AGENTLAB_TASK_WORKDIR__/.agentlab/support or /agentlab/state"
+            ),
             "{}",
             err
         );

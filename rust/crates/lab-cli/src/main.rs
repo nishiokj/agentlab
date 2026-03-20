@@ -1057,11 +1057,20 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
                 })));
             }
             println!("trial_id: {}", result.trial_id);
-            println!("selector: {}", result.selector);
-            println!("fork_id: {}", result.fork.fork_id);
-            println!("fork_dir: {}", result.fork.fork_dir.display());
-            println!("replay_grade: {}", result.fork.replay_grade);
-            println!("harness_status: {}", result.fork.harness_status);
+            let mode = match result.mode {
+                lab_runner::ResumeMode::RuntimeUnpause => "runtime_unpause",
+                lab_runner::ResumeMode::Fork => "fork",
+            };
+            println!("mode: {}", mode);
+            if let Some(selector) = result.selector.as_deref() {
+                println!("selector: {}", selector);
+            }
+            if let Some(fork) = result.fork.as_ref() {
+                println!("fork_id: {}", fork.fork_id);
+                println!("fork_dir: {}", fork.fork_dir.display());
+                println!("replay_grade: {}", fork.replay_grade);
+                println!("harness_status: {}", fork.harness_status);
+            }
         }
         Commands::Continue {
             run_dir,
@@ -1720,10 +1729,7 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
 
             let exp_yaml = init_profile_template(profile);
             std::fs::write(&exp_path, exp_yaml)?;
-            let tasks_path = exp_path
-                .parent()
-                .unwrap_or(&root)
-                .join("tasks.jsonl");
+            let tasks_path = exp_path.parent().unwrap_or(&root).join("tasks.jsonl");
             let wrote_tasks = force || !tasks_path.exists();
             if wrote_tasks {
                 std::fs::write(&tasks_path, init_task_rows_template())?;
@@ -2068,8 +2074,9 @@ fn pause_result_to_json(result: &lab_runner::PauseResult) -> Value {
 fn resume_result_to_json(result: &lab_runner::ResumeResult) -> Value {
     json!({
         "trial_id": result.trial_id,
+        "mode": result.mode,
         "selector": result.selector,
-        "fork": fork_result_to_json(&result.fork),
+        "fork": result.fork.as_ref().map(fork_result_to_json),
     })
 }
 

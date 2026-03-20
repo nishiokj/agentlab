@@ -1,3 +1,185 @@
+use anyhow::{anyhow, Result};
+use chrono::Utc;
+use lab_core::{
+    ensure_dir, AGENTLAB_CONTRACT_IN_DIR, AGENTLAB_CONTRACT_RUNTIME_AUX_DIR,
+    AGENTLAB_RUNNER_SUPPORT_REL_DIR, AGENTLAB_TASK_WORKDIR_PLACEHOLDER,
+};
+use serde_json::{json, Value};
+use std::collections::{BTreeMap, HashSet};
+use std::env;
+use std::fs;
+use std::io::{BufRead, BufReader, Write};
+use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Mutex, OnceLock};
+use std::thread;
+use std::time::Instant;
+
+use crate::config::*;
+use crate::trial::execution::AdapterRunRequest;
+use crate::experiment::commit::load_optional_json_record_with_schema;
+use crate::experiment::runtime::*;
+use crate::experiment::state::{RunBehavior, RunExecutionOptions};
+use crate::model::*;
+use crate::package::sealed::*;
+use crate::package::validate::*;
+use crate::trial::grade::task_grading_enabled;
+use crate::trial::prepare::{
+    build_runtime_contract_env, load_prepared_task_environment_manifest, prepare_io_paths,
+    prepare_task_environment, resolve_trial_timeout_ms, TrialPaths,
+};
+use crate::trial::spec::{
+    parse_task_boundary_from_packaged_task, TaskBoundaryMaterialization, TaskMaterializationKind,
+    TaskMaterializationSpec,
+};
+use crate::util::sanitize_for_fs;
+
+// ---------------------------------------------------------------------------
+// Logging helpers (also used by engine.rs / runtime.rs via re-export)
+// ---------------------------------------------------------------------------
+
+pub(crate) fn parse_bool_env(value: &str) -> Option<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Some(true),
+        "0" | "false" | "no" | "off" => Some(false),
+        _ => None,
+    }
+}
+
+pub(crate) fn progress_logs_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        if let Ok(value) = env::var(AGENTLAB_PROGRESS_LOG_ENV) {
+            if let Some(parsed) = parse_bool_env(&value) {
+                return parsed;
+            }
+        }
+        !cfg!(test)
+    })
+}
+
+pub(crate) fn emit_progress_log(scope: &str, message: impl AsRef<str>) {
+    if !progress_logs_enabled() {
+        return;
+    }
+    eprintln!("[{}] {}", scope, message.as_ref());
+    let _ = std::io::stderr().flush();
+}
+
+pub(crate) fn emit_preflight_log(message: impl AsRef<str>) {
+    emit_progress_log("preflight", message);
+}
+
+pub(crate) fn emit_run_log(run_id: &str, message: impl AsRef<str>) {
+    emit_progress_log("run", format!("{}: {}", run_id, message.as_ref()));
+}
+
+// ---------------------------------------------------------------------------
+// Image probe parallelism
+// ---------------------------------------------------------------------------
+
+pub(crate) fn should_emit_image_probe_progress(index: usize, total: usize) -> bool {
+    if total <= 5 {
+        return true;
+    }
+    index == 1 || index == total || index % 5 == 0
+}
+
+pub(crate) fn parse_parallelism(raw: &str) -> Option<usize> {
+    raw.trim().parse::<usize>().ok().and_then(|value| {
+        if value == 0 {
+            None
+        } else {
+            Some(value.min(MAX_PREFLIGHT_IMAGE_PROBE_PARALLELISM))
+        }
+    })
+}
+
+pub(crate) fn preflight_image_probe_parallelism() -> usize {
+    match env::var(AGENTLAB_PREFLIGHT_IMAGE_PROBE_PARALLELISM_ENV) {
+        Ok(raw) => parse_parallelism(&raw).unwrap_or(DEFAULT_PREFLIGHT_IMAGE_PROBE_PARALLELISM),
+        Err(_) => DEFAULT_PREFLIGHT_IMAGE_PROBE_PARALLELISM,
+    }
+}
+
+pub(crate) fn run_bounded_image_probes<T, F>(images: &[String], label: &str, probe: F) -> Vec<T>
+where
+    T: Send,
+    F: Fn(usize, &str) -> T + Sync,
+{
+    if images.is_empty() {
+        return Vec::new();
+    }
+    let configured = preflight_image_probe_parallelism();
+    let parallelism = configured.min(images.len()).max(1);
+    if parallelism <= 1 || images.len() <= 1 {
+        return images
+            .iter()
+            .enumerate()
+            .map(|(idx, image)| probe(idx, image))
+            .collect();
+    }
+    emit_preflight_log(format!(
+        "{}: bounded probe parallelism={}",
+        label, parallelism
+    ));
+    let next_index = AtomicUsize::new(0);
+    let results = Mutex::new(
+        std::iter::repeat_with(|| None)
+            .take(images.len())
+            .collect::<Vec<Option<T>>>(),
+    );
+    thread::scope(|scope| {
+        for _ in 0..parallelism {
+            let results_ref = &results;
+            let next_index_ref = &next_index;
+            let probe_ref = &probe;
+            scope.spawn(move || loop {
+                let idx = next_index_ref.fetch_add(1, Ordering::SeqCst);
+                if idx >= images.len() {
+                    break;
+                }
+                let result = probe_ref(idx, &images[idx]);
+                let mut guard = results_ref
+                    .lock()
+                    .expect("preflight image probe results lock poisoned");
+                guard[idx] = Some(result);
+            });
+        }
+    });
+    let collected = results
+        .into_inner()
+        .expect("preflight image probe results lock poisoned");
+    collected
+        .into_iter()
+        .map(|entry| entry.expect("preflight image probe result missing"))
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
+// Scientific bypass detection (from runtime.rs)
+// ---------------------------------------------------------------------------
+
+pub(crate) fn command_contains_scientific_bypass(command: &[String]) -> Option<String> {
+    for token in command {
+        let trimmed = token.trim();
+        if trimmed == "--dangerous" || trimmed.contains("dangerous_mode") {
+            return Some(trimmed.to_string());
+        }
+        for fragment in trimmed.split_whitespace() {
+            if fragment == "--dangerous" || fragment.contains("dangerous_mode") {
+                return Some(fragment.to_string());
+            }
+        }
+    }
+    None
+}
+
+// ---------------------------------------------------------------------------
+// Public API
+// ---------------------------------------------------------------------------
+
 pub fn preflight_experiment(path: &Path) -> Result<PreflightReport> {
     preflight_experiment_with_options(path, &RunExecutionOptions::default())
 }
@@ -77,14 +259,18 @@ pub fn preflight_experiment_with_options(
     Ok(PreflightReport { passed, checks })
 }
 
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
 #[derive(Debug, Default)]
-struct PerTaskImageScanResult {
-    unique_images: Vec<String>,
-    missing_task_ids: Vec<String>,
-    parse_errors: Vec<String>,
+pub(crate) struct PerTaskImageScanResult {
+    pub(crate) unique_images: Vec<String>,
+    pub(crate) missing_task_ids: Vec<String>,
+    pub(crate) parse_errors: Vec<String>,
 }
 
-fn format_preview(items: &[String], limit: usize) -> String {
+pub(crate) fn format_preview(items: &[String], limit: usize) -> String {
     if items.is_empty() {
         return "(none)".to_string();
     }
@@ -96,7 +282,11 @@ fn format_preview(items: &[String], limit: usize) -> String {
     }
 }
 
-fn check_agent_runtime_hermetic_for_variants(
+// ---------------------------------------------------------------------------
+// Check functions — Variant Validation
+// ---------------------------------------------------------------------------
+
+pub(crate) fn check_agent_runtime_hermetic_for_variants(
     variants: &[Variant],
     variant_runtime_profiles: &[VariantRuntimeProfile],
 ) -> Vec<PreflightCheck> {
@@ -120,7 +310,9 @@ fn check_agent_runtime_hermetic_for_variants(
         .collect()
 }
 
-fn check_agent_runtime_hermetic(runtime_profile: &VariantRuntimeProfile) -> PreflightCheck {
+pub(crate) fn check_agent_runtime_hermetic(
+    runtime_profile: &VariantRuntimeProfile,
+) -> PreflightCheck {
     let name = "agent_runtime_hermetic";
     if runtime_profile.agent_runtime.image.trim().is_empty() {
         return PreflightCheck {
@@ -138,7 +330,7 @@ fn check_agent_runtime_hermetic(runtime_profile: &VariantRuntimeProfile) -> Pref
     }
 }
 
-fn check_dangerous_mode_forbidden_for_variants(
+pub(crate) fn check_dangerous_mode_forbidden_for_variants(
     variants: &[Variant],
     variant_runtime_profiles: &[VariantRuntimeProfile],
 ) -> Vec<PreflightCheck> {
@@ -162,7 +354,9 @@ fn check_dangerous_mode_forbidden_for_variants(
         .collect()
 }
 
-fn check_dangerous_mode_forbidden(runtime_profile: &VariantRuntimeProfile) -> PreflightCheck {
+pub(crate) fn check_dangerous_mode_forbidden(
+    runtime_profile: &VariantRuntimeProfile,
+) -> PreflightCheck {
     let name = "dangerous_mode_forbidden";
     let command = preview_agent_command(runtime_profile);
     if let Some(token) = command_contains_scientific_bypass(&command) {
@@ -184,67 +378,7 @@ fn check_dangerous_mode_forbidden(runtime_profile: &VariantRuntimeProfile) -> Pr
     }
 }
 
-fn check_workspace_contract_not_host_path_for_variants(
-    variants: &[Variant],
-    variant_runtime_profiles: &[VariantRuntimeProfile],
-) -> Vec<PreflightCheck> {
-    if variants.len() != variant_runtime_profiles.len() {
-        return vec![PreflightCheck {
-            name: "workspace_contract_not_host_path",
-            passed: false,
-            severity: PreflightSeverity::Error,
-            message: "internal error: variant/runtime profile count mismatch".to_string(),
-        }];
-    }
-
-    variants
-        .iter()
-        .zip(variant_runtime_profiles.iter())
-        .map(|(variant, profile)| {
-            let mut check = check_workspace_contract_not_host_path(profile);
-            check.message = format!("variant '{}': {}", variant.id, check.message);
-            check
-        })
-        .collect()
-}
-
-fn check_workspace_contract_not_host_path(
-    runtime_profile: &VariantRuntimeProfile,
-) -> PreflightCheck {
-    let name = "workspace_contract_not_host_path";
-    let command = preview_agent_command(runtime_profile);
-    if command
-        .iter()
-        .any(|value| value_contains_host_scratch_path(value))
-    {
-        return PreflightCheck {
-            name,
-            passed: false,
-            severity: PreflightSeverity::Error,
-            message: "agent argv contains runner scratch host paths".to_string(),
-        };
-    }
-    if runtime_profile
-        .agent_runtime_env
-        .values()
-        .any(|value| value_contains_host_scratch_path(value))
-    {
-        return PreflightCheck {
-            name,
-            passed: false,
-            severity: PreflightSeverity::Error,
-            message: "agent env contains runner scratch host paths".to_string(),
-        };
-    }
-    PreflightCheck {
-        name,
-        passed: true,
-        severity: PreflightSeverity::Error,
-        message: "agent-visible argv/env do not expose runner scratch host paths".to_string(),
-    }
-}
-
-fn check_agent_bundle_container_compatible_for_variants(
+pub(crate) fn check_agent_bundle_container_compatible_for_variants(
     variants: &[Variant],
     variant_runtime_profiles: &[VariantRuntimeProfile],
 ) -> Vec<PreflightCheck> {
@@ -268,7 +402,7 @@ fn check_agent_bundle_container_compatible_for_variants(
         .collect()
 }
 
-fn check_agent_bundle_container_compatible(
+pub(crate) fn check_agent_bundle_container_compatible(
     runtime_profile: &VariantRuntimeProfile,
 ) -> PreflightCheck {
     let name = "agent_bundle_container_compatible";
@@ -298,41 +432,11 @@ fn check_agent_bundle_container_compatible(
     }
 }
 
-fn check_task_sandbox_bash_plane_for_variants(
-    variants: &[Variant],
-    variant_runtime_profiles: &[VariantRuntimeProfile],
-) -> Vec<PreflightCheck> {
-    if variants.len() != variant_runtime_profiles.len() {
-        return vec![PreflightCheck {
-            name: "task_sandbox_bash_plane",
-            passed: false,
-            severity: PreflightSeverity::Error,
-            message: "internal error: variant/runtime profile count mismatch".to_string(),
-        }];
-    }
+// ---------------------------------------------------------------------------
+// Check functions — Container & Runtime Reachability
+// ---------------------------------------------------------------------------
 
-    variants
-        .iter()
-        .zip(variant_runtime_profiles.iter())
-        .map(|(variant, profile)| {
-            let mut check = check_task_sandbox_bash_plane(profile);
-            check.message = format!("variant '{}': {}", variant.id, check.message);
-            check
-        })
-        .collect()
-}
-
-fn check_task_sandbox_bash_plane(_runtime_profile: &VariantRuntimeProfile) -> PreflightCheck {
-    let name = "task_sandbox_bash_plane";
-    PreflightCheck {
-        name,
-        passed: true,
-        severity: PreflightSeverity::Error,
-        message: "task-sandbox shell operations are constrained to docker execution".to_string(),
-    }
-}
-
-fn check_benchmark_grader_reachable_for_variants(
+pub(crate) fn check_benchmark_grader_reachable_for_variants(
     benchmark_config: &BenchmarkConfig,
     variants: &[Variant],
     variant_runtime_profiles: &[VariantRuntimeProfile],
@@ -366,7 +470,7 @@ fn check_benchmark_grader_reachable_for_variants(
         .collect()
 }
 
-fn check_container_ready_for_variants(
+pub(crate) fn check_container_ready_for_variants(
     variants: &[Variant],
     variant_runtime_profiles: &[VariantRuntimeProfile],
     tasks: &[Value],
@@ -388,7 +492,7 @@ fn check_container_ready_for_variants(
     checks
 }
 
-fn collect_per_task_images_for_preflight(tasks: &[Value]) -> PerTaskImageScanResult {
+pub(crate) fn collect_per_task_images_for_preflight(tasks: &[Value]) -> PerTaskImageScanResult {
     let mut unique_images = HashSet::new();
     let mut result = PerTaskImageScanResult::default();
     for (idx, task) in tasks.iter().enumerate() {
@@ -420,12 +524,12 @@ fn collect_per_task_images_for_preflight(tasks: &[Value]) -> PerTaskImageScanRes
     result
 }
 
-fn resolve_preflight_images(
+pub(crate) fn resolve_preflight_images(
     check_name: &'static str,
-    _runtime_profile: &VariantRuntimeProfile,
+    runtime_profile: &VariantRuntimeProfile,
     tasks: &[Value],
     per_task_scan: Option<&PerTaskImageScanResult>,
-    _missing_global_image_message: &'static str,
+    missing_global_image_message: &'static str,
 ) -> Result<Vec<String>, PreflightCheck> {
     let owned_scan;
     let scan = if let Some(scan) = per_task_scan {
@@ -457,23 +561,31 @@ fn resolve_preflight_images(
         });
     }
     if scan.unique_images.is_empty() {
+        let fallback_image = runtime_profile.agent_runtime.image.trim();
+        if !fallback_image.is_empty() {
+            return Ok(vec![fallback_image.to_string()]);
+        }
         return Err(PreflightCheck {
             name: check_name,
             passed: false,
             severity: PreflightSeverity::Error,
-            message: "no task images found in dataset".to_string(),
+            message: missing_global_image_message.to_string(),
         });
     }
     Ok(scan.unique_images.clone())
 }
 
-fn has_blocking_preflight_error(checks: &[PreflightCheck], name: &str) -> bool {
+pub(crate) fn has_blocking_preflight_error(checks: &[PreflightCheck], name: &str) -> bool {
     checks.iter().any(|check| {
         check.name == name && !check.passed && matches!(check.severity, PreflightSeverity::Error)
     })
 }
 
-fn resolve_min_free_bytes() -> Result<u64> {
+// ---------------------------------------------------------------------------
+// Disk & Budget Enforcement
+// ---------------------------------------------------------------------------
+
+pub(crate) fn resolve_min_free_bytes() -> Result<u64> {
     match env::var(AGENTLAB_MIN_FREE_BYTES_ENV) {
         Ok(raw) => {
             let trimmed = raw.trim();
@@ -507,14 +619,14 @@ fn resolve_min_free_bytes() -> Result<u64> {
     }
 }
 
-fn free_bytes_for_path(path: &Path) -> Result<u64> {
+pub(crate) fn free_bytes_for_path(path: &Path) -> Result<u64> {
     let probe = path.to_string_lossy().to_string();
     let out = Command::new("df").args(["-Pk", probe.as_str()]).output()?;
     if !out.status.success() {
         return Err(anyhow!(
             "df -Pk {} failed: {}",
             probe,
-            output_error_detail(&out)
+            crate::util::output_error_detail(&out)
         ));
     }
     let stdout = String::from_utf8_lossy(&out.stdout);
@@ -544,7 +656,7 @@ fn free_bytes_for_path(path: &Path) -> Result<u64> {
     Ok(available_kb.saturating_mul(1024))
 }
 
-fn dir_size_bytes(path: &Path) -> Result<u64> {
+pub(crate) fn dir_size_bytes(path: &Path) -> Result<u64> {
     if !path.exists() {
         return Ok(0);
     }
@@ -560,7 +672,7 @@ fn dir_size_bytes(path: &Path) -> Result<u64> {
     Ok(total)
 }
 
-fn enforce_runtime_disk_headroom(probe_path: &Path, min_free_bytes: u64) -> Result<()> {
+pub(crate) fn enforce_runtime_disk_headroom(probe_path: &Path, min_free_bytes: u64) -> Result<()> {
     let available = free_bytes_for_path(probe_path)?;
     if available < min_free_bytes {
         return Err(anyhow!(
@@ -573,7 +685,7 @@ fn enforce_runtime_disk_headroom(probe_path: &Path, min_free_bytes: u64) -> Resu
     Ok(())
 }
 
-fn enforce_runtime_run_size_budget(run_dir: &Path, max_run_bytes: u64) -> Result<()> {
+pub(crate) fn enforce_runtime_run_size_budget(run_dir: &Path, max_run_bytes: u64) -> Result<()> {
     let used = dir_size_bytes(run_dir)?;
     if used > max_run_bytes {
         return Err(anyhow!(
@@ -586,7 +698,10 @@ fn enforce_runtime_run_size_budget(run_dir: &Path, max_run_bytes: u64) -> Result
     Ok(())
 }
 
-fn check_disk_headroom_with_threshold(probe_path: &Path, min_free_bytes: u64) -> PreflightCheck {
+pub(crate) fn check_disk_headroom_with_threshold(
+    probe_path: &Path,
+    min_free_bytes: u64,
+) -> PreflightCheck {
     let name = "disk_headroom";
     let available = match free_bytes_for_path(probe_path) {
         Ok(bytes) => bytes,
@@ -629,7 +744,7 @@ fn check_disk_headroom_with_threshold(probe_path: &Path, min_free_bytes: u64) ->
     }
 }
 
-fn check_disk_headroom(probe_path: &Path) -> PreflightCheck {
+pub(crate) fn check_disk_headroom(probe_path: &Path) -> PreflightCheck {
     let name = "disk_headroom";
     match resolve_min_free_bytes() {
         Ok(min_free_bytes) => check_disk_headroom_with_threshold(probe_path, min_free_bytes),
@@ -642,9 +757,13 @@ fn check_disk_headroom(probe_path: &Path) -> PreflightCheck {
     }
 }
 
-fn collect_preflight_checks(
+// ---------------------------------------------------------------------------
+// Check Orchestration
+// ---------------------------------------------------------------------------
+
+pub(crate) fn collect_preflight_checks(
     json_value: &Value,
-    exp_dir: &Path,
+    _exp_dir: &Path,
     disk_probe_path: &Path,
     project_root: &Path,
     tasks: &[Value],
@@ -678,16 +797,12 @@ fn collect_preflight_checks(
     };
     let skip_container_shell_probe = benchmark_config.grader.is_some();
 
-    // Structural checks (probe_trial_input, dataset_task_ids) are now
-    // validated at build time in build_swebench_curated_ab_experiment.mjs.
-    // Only machine-state-dependent checks remain here.
     checks.extend(check_dataset_task_ids(
         tasks,
         benchmark_config,
         variant_runtime_profiles,
     ));
 
-    // PROFILING: throwaway stage timing
     macro_rules! timed_check {
         ($label:expr, $body:expr) => {{
             let _t = Instant::now();
@@ -718,22 +833,6 @@ fn collect_preflight_checks(
     timed_check!(
         "dangerous_mode_forbidden",
         checks.extend(check_dangerous_mode_forbidden_for_variants(
-            variants,
-            variant_runtime_profiles,
-        ))
-    );
-    emit_preflight_log("running check: workspace_contract_not_host_path");
-    timed_check!(
-        "workspace_contract_not_host_path",
-        checks.extend(check_workspace_contract_not_host_path_for_variants(
-            variants,
-            variant_runtime_profiles,
-        ))
-    );
-    emit_preflight_log("running check: task_sandbox_bash_plane");
-    timed_check!(
-        "task_sandbox_bash_plane",
-        checks.extend(check_task_sandbox_bash_plane_for_variants(
             variants,
             variant_runtime_profiles,
         ))
@@ -805,23 +904,14 @@ fn collect_preflight_checks(
             );
         }
     }
-    emit_preflight_log("running check: dependency_files_exist");
-    timed_check!(
-        "dependency_files_exist",
-        checks.extend(check_dependency_files_exist(json_value, exp_dir))
-    );
-    emit_preflight_log("running check: workspace_patch_sources_exist");
-    timed_check!(
-        "workspace_patch_sources_exist",
-        checks.extend(check_workspace_patch_sources_exist(
-            variants,
-            variant_runtime_profiles,
-        ))
-    );
     checks
 }
 
-fn check_dataset_task_ids(
+// ---------------------------------------------------------------------------
+// Check functions — Data Validation
+// ---------------------------------------------------------------------------
+
+pub(crate) fn check_dataset_task_ids(
     tasks: &[Value],
     benchmark_config: &BenchmarkConfig,
     _variant_runtime_profiles: &[VariantRuntimeProfile],
@@ -856,16 +946,8 @@ fn check_dataset_task_ids(
             }
         }
 
-        if has_benchmark {
-            if let Some(enabled) = parsed
-                .task_payload
-                .pointer("/grading/enabled")
-                .and_then(|v| v.as_bool())
-            {
-                if !enabled {
-                    grading_disabled_lines.push(line_num);
-                }
-            }
+        if has_benchmark && !task_grading_enabled(&parsed.task_payload) {
+            grading_disabled_lines.push(line_num);
         }
     }
 
@@ -918,10 +1000,10 @@ fn check_dataset_task_ids(
     if !grading_disabled_lines.is_empty() {
         checks.push(PreflightCheck {
             name: "dataset_task_ids",
-            passed: true,
-            severity: PreflightSeverity::Warning,
+            passed: false,
+            severity: PreflightSeverity::Error,
             message: format!(
-                "benchmark configured but grading.enabled=false at lines: {:?} — these tasks will not be scored",
+                "benchmark configured but grading.enabled=false at lines: {:?} — Milestone 4 requires mapped grading output for every benchmark task",
                 grading_disabled_lines
             ),
         });
@@ -930,7 +1012,7 @@ fn check_dataset_task_ids(
     checks
 }
 
-fn check_benchmark_grader_reachable(
+pub(crate) fn check_benchmark_grader_reachable(
     benchmark_config: &BenchmarkConfig,
     runtime_profile: &VariantRuntimeProfile,
     variant: &Variant,
@@ -947,7 +1029,7 @@ fn check_benchmark_grader_reachable(
     )
 }
 
-fn check_agent_runtime_reachable_for_variants(
+pub(crate) fn check_agent_runtime_reachable_for_variants(
     variants: &[Variant],
     variant_runtime_profiles: &[VariantRuntimeProfile],
     tasks: &[Value],
@@ -978,7 +1060,7 @@ fn check_agent_runtime_reachable_for_variants(
     checks
 }
 
-fn check_agent_runtime_reachable_with_scan(
+pub(crate) fn check_agent_runtime_reachable_with_scan(
     runtime_profile: &VariantRuntimeProfile,
     variant: &Variant,
     tasks: &[Value],
@@ -1087,7 +1169,7 @@ fn check_agent_runtime_reachable_with_scan(
     }
 }
 
-fn check_benchmark_grader_reachable_with_scan(
+pub(crate) fn check_benchmark_grader_reachable_with_scan(
     benchmark_config: &BenchmarkConfig,
     runtime_profile: &VariantRuntimeProfile,
     variant: &Variant,
@@ -1191,7 +1273,7 @@ fn check_benchmark_grader_reachable_with_scan(
     }
 }
 
-fn is_runner_staged_script_path(path: &str) -> bool {
+pub(crate) fn is_runner_staged_script_path(path: &str) -> bool {
     path == AGENTLAB_CONTRACT_IN_DIR
         || path.starts_with(&format!("{}/", AGENTLAB_CONTRACT_IN_DIR))
         || path
@@ -1207,7 +1289,7 @@ fn is_runner_staged_script_path(path: &str) -> bool {
         || path.starts_with(&format!("{}/", AGENTLAB_CONTRACT_RUNTIME_AUX_DIR))
 }
 
-fn check_container_ready(
+pub(crate) fn check_container_ready(
     runtime_profile: &VariantRuntimeProfile,
     tasks: &[Value],
     per_task_scan: Option<&PerTaskImageScanResult>,
@@ -1216,53 +1298,40 @@ fn check_container_ready(
     let name = "container_ready";
 
     let mut checks = Vec::new();
-    let active_container_context = Command::new("docker")
-        .args(["context", "show"])
-        .output()
-        .ok()
-        .and_then(|out| {
-            if out.status.success() {
-                let value = String::from_utf8_lossy(&out.stdout).trim().to_string();
-                if value.is_empty() {
-                    None
-                } else {
-                    Some(value)
-                }
-            } else {
-                None
-            }
-        });
-
-    // Check Docker daemon reachability
     let _docker_total = Instant::now();
     let _docker_daemon_t = Instant::now();
     emit_preflight_log("container_ready: checking Docker daemon reachability");
-    let docker_ok = match std::process::Command::new("docker")
-        .arg("info")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-    {
-        Ok(status) if status.success() => {
-            checks.push(PreflightCheck {
-                name,
-                passed: true,
-                severity: PreflightSeverity::Error,
-                message: if let Some(context) = active_container_context.as_deref() {
-                    format!("Docker daemon is reachable (context='{}')", context)
-                } else {
-                    "Docker daemon is reachable".to_string()
-                },
-            });
-            true
-        }
-        Ok(_) | Err(_) => {
+    let docker = match crate::backend::docker::DockerRuntime::connect() {
+        Ok(runtime) => runtime,
+        Err(err) => {
             checks.push(PreflightCheck {
                 name,
                 passed: false,
                 severity: PreflightSeverity::Error,
-                message: "Docker daemon is not reachable — container execution will fail"
-                    .to_string(),
+                message: format!("Docker backend could not initialize: {}", err),
+            });
+            return checks;
+        }
+    };
+    let docker_ok = match docker.ping() {
+        Ok(()) => {
+            checks.push(PreflightCheck {
+                name,
+                passed: true,
+                severity: PreflightSeverity::Error,
+                message: "Docker daemon is reachable".to_string(),
+            });
+            true
+        }
+        Err(err) => {
+            checks.push(PreflightCheck {
+                name,
+                passed: false,
+                severity: PreflightSeverity::Error,
+                message: format!(
+                    "Docker daemon is not reachable — container execution will fail: {}",
+                    err
+                ),
             });
             false
         }
@@ -1277,7 +1346,7 @@ fn check_container_ready(
         return checks;
     }
 
-    if let Err(err) = ensure_container_image_ready(runtime_profile.agent_runtime.image.as_str()) {
+    if let Err(err) = docker.ensure_image(runtime_profile.agent_runtime.image.as_str()) {
         checks.push(PreflightCheck {
             name,
             passed: false,
@@ -1328,7 +1397,7 @@ fn check_container_ready(
                 image
             ));
         }
-        if let Err(err) = ensure_container_image_ready(image) {
+        if let Err(err) = docker.ensure_image(image) {
             missing_images.push(format!("{} ({})", image, err));
         }
     }
@@ -1386,20 +1455,8 @@ fn check_container_ready(
                     image
                 ));
             }
-            match Command::new("docker")
-                .arg("run")
-                .arg("--rm")
-                .args(
-                    resolve_container_platform(image)
-                        .map(|platform| ["--platform", platform])
-                        .into_iter()
-                        .flatten(),
-                )
-                .args(["--entrypoint", "/bin/sh", image, "-c", "exit 0"])
-                .output()
-            {
-                Ok(out) if out.status.success() => None,
-                Ok(out) => Some(format!("{} ({})", image, output_error_detail(&out))),
+            match docker.probe_image_shell(image) {
+                Ok(()) => None,
                 Err(err) => Some(format!("{} ({})", image, err)),
             }
         });
@@ -1437,34 +1494,11 @@ fn check_container_ready(
     checks
 }
 
-fn check_dependency_files_exist(json_value: &Value, exp_dir: &Path) -> Vec<PreflightCheck> {
-    let name = "dependency_files_exist";
-    let _ = (json_value, exp_dir);
-    vec![PreflightCheck {
-        name,
-        passed: true,
-        severity: PreflightSeverity::Error,
-        message: "task dependencies are embedded in task specs; no host file staging is used"
-            .to_string(),
-    }]
-}
-
-fn check_workspace_patch_sources_exist(
-    variants: &[Variant],
-    variant_runtime_profiles: &[VariantRuntimeProfile],
-) -> Vec<PreflightCheck> {
-    let name = "workspace_patch_sources_exist";
-    let _ = (variants, variant_runtime_profiles);
-    vec![PreflightCheck {
-        name,
-        passed: true,
-        severity: PreflightSeverity::Error,
-        message: "runtime workspace patches are disabled in the hard cutover".to_string(),
-    }]
-}
-
 // ---------------------------------------------------------------------------
-fn resolve_dataset_path(json_value: &Value, exp_dir: &Path) -> Result<PathBuf> {
+// Helpers
+// ---------------------------------------------------------------------------
+
+pub(crate) fn resolve_dataset_path(json_value: &Value, exp_dir: &Path) -> Result<PathBuf> {
     let rel = json_value
         .pointer("/dataset/path")
         .and_then(|v| v.as_str())
@@ -1472,7 +1506,8 @@ fn resolve_dataset_path(json_value: &Value, exp_dir: &Path) -> Result<PathBuf> {
     let path = exp_dir.join(rel);
     Ok(path)
 }
-fn count_tasks(path: &Path, json_value: &Value) -> Result<usize> {
+
+pub(crate) fn count_tasks(path: &Path, json_value: &Value) -> Result<usize> {
     let limit = json_value
         .pointer("/dataset/limit")
         .and_then(|v| v.as_u64())
@@ -1494,4 +1529,430 @@ fn count_tasks(path: &Path, json_value: &Value) -> Result<usize> {
         count += 1;
     }
     Ok(count)
+}
+
+// ---------------------------------------------------------------------------
+// Preflight Probe Functions (from runtime.rs)
+// ---------------------------------------------------------------------------
+
+pub(crate) struct PreflightProbeRoot {
+    path: PathBuf,
+}
+
+impl Drop for PreflightProbeRoot {
+    fn drop(&mut self) {
+        let _ = fs::remove_dir_all(&self.path);
+    }
+}
+
+pub(crate) struct PreflightProbeContext {
+    _root: PreflightProbeRoot,
+    trial_paths: TrialPaths,
+    io_paths: PreparedTrialIo,
+    dynamic_mounts: Vec<ResolvedMountReference>,
+    runtime_env: BTreeMap<String, String>,
+    task_image: String,
+    task_workdir: String,
+    task_materialization_kind: TaskMaterializationKind,
+}
+
+pub(crate) fn create_preflight_probe_root(label: &str) -> Result<PreflightProbeRoot> {
+    let root = std::env::temp_dir().join(format!(
+        "agentlab_preflight_probe_{}_{}_{}",
+        sanitize_for_fs(label),
+        std::process::id(),
+        Utc::now().timestamp_micros()
+    ));
+    ensure_dir(&root)?;
+    Ok(PreflightProbeRoot { path: root })
+}
+
+pub(crate) fn select_preflight_probe_task(
+    tasks: &[Value],
+    image: &str,
+) -> Result<(usize, TaskBoundaryMaterialization)> {
+    let mut parse_errors = Vec::new();
+    for (idx, task) in tasks.iter().enumerate() {
+        let boundary = match parse_task_boundary_from_packaged_task(task) {
+            Ok(boundary) => boundary,
+            Err(err) => {
+                parse_errors.push(format!("line {}: {}", idx + 1, err));
+                continue;
+            }
+        };
+        if boundary.task_image.as_str() == image {
+            return Ok((idx, boundary));
+        }
+    }
+    if !parse_errors.is_empty() {
+        return Err(anyhow!(
+            "failed to parse representative task boundary rows: {}",
+            format_preview(&parse_errors, 3)
+        ));
+    }
+    Err(anyhow!(
+        "no representative task spec row found for image '{}'",
+        image
+    ))
+}
+
+pub(crate) fn build_preflight_probe_context(
+    runtime_profile: &VariantRuntimeProfile,
+    variant: &Variant,
+    tasks: &[Value],
+    image: &str,
+    project_root: &Path,
+) -> Result<PreflightProbeContext> {
+    let (task_idx, task_boundary) = match select_preflight_probe_task(tasks, image) {
+        Ok(selected) => selected,
+        Err(err) if tasks.is_empty() => (
+            0,
+            TaskBoundaryMaterialization {
+                declaration: json!({
+                    "schema_version": "task_row_v1",
+                    "id": "preflight_probe_task",
+                    "image": image,
+                    "workdir": "/workspace/task",
+                    "task": {},
+                    "materialization": { "kind": "task_image" }
+                }),
+                task_payload: json!({}),
+                workspace: WorkspaceSpec {
+                    mode: WorkspaceMode::Scratch,
+                    base: WorkspaceBaseSpec {
+                        kind: WorkspaceBaseKind::Empty,
+                        dataset_pack_ref: None,
+                        repo: None,
+                        commit: None,
+                    },
+                    overlays: Vec::new(),
+                    aux_mounts: Vec::new(),
+                },
+                dependencies: json!({}),
+                materialization: TaskMaterializationSpec {
+                    kind: TaskMaterializationKind::TaskImage,
+                    task_bundle_ref: None,
+                },
+                task_id: "preflight_probe_task".to_string(),
+                task_image: image.to_string(),
+                task_workdir: "/workspace/task".to_string(),
+                time_limit_ms: None,
+            },
+        ),
+        Err(err) => return Err(err),
+    };
+    let probe_root = create_preflight_probe_root(&format!("{}_{}", variant.id, image))?;
+    let trial_dir = probe_root.path.join("trial_1");
+    ensure_dir(&trial_dir)?;
+    let prepared = prepare_task_environment(
+        project_root,
+        &trial_dir,
+        "preflight_probe",
+        "trial_preflight",
+        &runtime_profile.experiment,
+        variant,
+        task_idx,
+        0,
+        &task_boundary,
+        &runtime_profile.agent_runtime,
+    )?;
+    let probe_task_image = prepared.manifest.task_sandbox_image().to_string();
+    let probe_task_workdir = prepared
+        .manifest
+        .task_sandbox_workdir()
+        .unwrap_or(task_boundary.task_workdir.as_str())
+        .to_string();
+    let mut input = prepared.trial_input.clone();
+    set_json_pointer_value(
+        &mut input,
+        "/runtime/control_plane/path",
+        json!(DEFAULT_CONTAINER_CONTROL_PATH),
+    )?;
+    set_json_pointer_value(&mut input, "/runtime/control_plane/mode", json!("file"))?;
+    let input_bytes = serde_json::to_vec_pretty(&input)?;
+    let io_paths = prepare_io_paths(&prepared.trial_paths, &input_bytes)?;
+    let smoke_timeout_ms = resolve_trial_timeout_ms(&input)
+        .map(|value| value.min(DEFAULT_PREFLIGHT_CONTRACT_SMOKE_TIMEOUT_MS));
+    let mut runtime_env = build_runtime_contract_env(
+        "preflight_probe",
+        &input,
+        &io_paths,
+        Some(probe_task_image.as_str()),
+        smoke_timeout_ms,
+    );
+    runtime_env.insert(AGENTLAB_ENV_PREFLIGHT_SMOKE.to_string(), "1".to_string());
+    Ok(PreflightProbeContext {
+        _root: probe_root,
+        trial_paths: prepared.trial_paths,
+        io_paths,
+        dynamic_mounts: prepared.dynamic_mounts,
+        runtime_env,
+        task_image: probe_task_image,
+        task_workdir: probe_task_workdir,
+        task_materialization_kind: task_boundary.materialization.kind.clone(),
+    })
+}
+
+pub(crate) fn build_preflight_probe_request<'a>(
+    context: &'a PreflightProbeContext,
+    runtime_profile: &'a VariantRuntimeProfile,
+    benchmark_grader: Option<&'a BenchmarkGraderConfig>,
+    benchmark_grading_enabled: bool,
+) -> AdapterRunRequest<'a> {
+    AdapterRunRequest {
+        runtime_experiment: &runtime_profile.experiment,
+        runtime: &runtime_profile.agent_runtime,
+        variant_args: &runtime_profile.variant_args,
+        runtime_env: &context.runtime_env,
+        runtime_overrides_env: &runtime_profile.agent_runtime_env,
+        trial_paths: &context.trial_paths,
+        dynamic_mounts: &context.dynamic_mounts,
+        io_paths: &context.io_paths,
+        network_mode: runtime_profile.effective_network_mode.as_str(),
+        benchmark_grader,
+        benchmark_grading_enabled,
+        run_id: "preflight_probe",
+        task_image: context.task_image.as_str(),
+        task_workdir: context.task_workdir.as_str(),
+        task_materialization_kind: context.task_materialization_kind.clone(),
+        agent_artifact: runtime_profile
+            .agent_runtime
+            .agent_artifact
+            .exists()
+            .then_some(runtime_profile.agent_runtime.agent_artifact.as_path()),
+    }
+}
+
+pub(crate) struct PreflightContractSmokeExecution {
+    status: String,
+    stdout: String,
+    stderr: String,
+}
+
+pub(crate) fn read_optional_text_file(path: &Path) -> Result<String> {
+    if !path.exists() {
+        return Ok(String::new());
+    }
+    Ok(fs::read_to_string(path)?)
+}
+
+pub(crate) fn run_preflight_contract_smoke(
+    request: &AdapterRunRequest<'_>,
+) -> Result<PreflightContractSmokeExecution> {
+    let prepared_manifest =
+        load_prepared_task_environment_manifest(&request.trial_paths.trial_dir)?;
+    let runtime_outcome = crate::trial::execution::execute_trial_runtime(
+        &request.trial_paths.trial_dir,
+        0,
+        1,
+        request,
+        &prepared_manifest.task_id,
+        &prepared_manifest.variant_id,
+        prepared_manifest.repl_idx,
+        prepared_manifest
+            .task_sandbox_plan
+            .as_ref()
+            .ok_or_else(|| anyhow!("preflight probe missing task sandbox plan"))?,
+    )?;
+    let stdout =
+        read_optional_text_file(&request.trial_paths.trial_dir.join("harness_stdout.log"))?;
+    let stderr =
+        read_optional_text_file(&request.trial_paths.trial_dir.join("harness_stderr.log"))?;
+    Ok(PreflightContractSmokeExecution {
+        status: runtime_outcome.agent_exit_status,
+        stdout,
+        stderr,
+    })
+}
+
+pub(crate) fn detect_known_probe_output_blockers(stdout: &str, stderr: &str) -> Vec<String> {
+    let mut blockers = Vec::new();
+    for line in stdout.lines().chain(stderr.lines()) {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let lower = trimmed.to_ascii_lowercase();
+        if lower.contains("cpu lacks avx support") {
+            blockers.push(trimmed.to_string());
+            continue;
+        }
+        if lower.contains("missing env var ") || lower.contains("fatal error: missing env var") {
+            blockers.push(trimmed.to_string());
+            continue;
+        }
+        if lower.contains("references tool") && lower.contains("which is not available") {
+            blockers.push(trimmed.to_string());
+        }
+    }
+    blockers.sort();
+    blockers.dedup();
+    blockers
+}
+
+pub(crate) fn summarize_preflight_failure_logs(stdout: &str, stderr: &str) -> Vec<String> {
+    let mut lines = Vec::new();
+    for line in stderr.lines().chain(stdout.lines()) {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        lines.push(trimmed.to_string());
+        if lines.len() >= 3 {
+            break;
+        }
+    }
+    lines
+}
+
+pub(crate) fn validate_preflight_result_payload(path: &Path) -> Vec<String> {
+    let mut failures = Vec::new();
+    if !path.exists() {
+        failures.push(format!(
+            "contract smoke did not write result payload: {}",
+            path.display()
+        ));
+        return failures;
+    }
+    if !path.is_file() {
+        failures.push(format!(
+            "contract smoke result payload path is not a file: {}",
+            path.display()
+        ));
+        return failures;
+    }
+    let raw = match fs::read_to_string(path) {
+        Ok(value) => value,
+        Err(err) => {
+            failures.push(format!(
+                "failed to read contract smoke result payload at {}: {}",
+                path.display(),
+                err
+            ));
+            return failures;
+        }
+    };
+    if raw.trim().is_empty() {
+        failures.push(format!(
+            "contract smoke wrote an empty result payload: {}",
+            path.display()
+        ));
+        return failures;
+    }
+    let value = match serde_json::from_str::<Value>(&raw) {
+        Ok(value) => value,
+        Err(err) => {
+            failures.push(format!(
+                "failed to parse agent result JSON at {}: {}",
+                path.display(),
+                err
+            ));
+            return failures;
+        }
+    };
+    match value.pointer("/schema_version").and_then(Value::as_str) {
+        Some("agent_result_v1") => {}
+        Some(other) => failures.push(format!(
+            "result payload schema_version was '{}', expected 'agent_result_v1' at {}",
+            other,
+            path.display()
+        )),
+        None => failures.push(format!(
+            "result payload missing schema_version 'agent_result_v1' at {}",
+            path.display()
+        )),
+    }
+    if value
+        .pointer("/outcome")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .is_none()
+    {
+        failures.push(format!(
+            "result payload missing non-empty outcome at {}",
+            path.display()
+        ));
+    }
+    failures
+}
+
+pub(crate) fn validate_preflight_benchmark_smoke_outputs(
+    request: &AdapterRunRequest<'_>,
+    status: &str,
+) -> Vec<String> {
+    let mut failures = Vec::new();
+    let mapped_grader_output_path = request.trial_paths.out.join(MAPPED_GRADER_OUTPUT_FILENAME);
+    let grade_error_path = request.trial_paths.out.join(BENCHMARK_GRADE_ERROR_FILENAME);
+
+    let mapped_output_valid = match load_optional_json_record_with_schema(
+        "trial_conclusion_v1.jsonschema",
+        &mapped_grader_output_path,
+    ) {
+        Ok(Some(_)) => true,
+        Ok(None) => {
+            failures.push(format!(
+                "contract smoke did not write mapped grader output: {}",
+                mapped_grader_output_path.display()
+            ));
+            false
+        }
+        Err(err) => {
+            failures.push(format!("mapped grader output invalid: {}", err));
+            false
+        }
+    };
+    if !mapped_output_valid && grade_error_path.exists() {
+        let marker_reason =
+            fs::read_to_string(&grade_error_path).unwrap_or_else(|_| "grade_error".to_string());
+        let reason = marker_reason.trim();
+        failures.push(format!(
+            "benchmark smoke recorded grade error: {}",
+            if reason.is_empty() {
+                "grade_error"
+            } else {
+                reason
+            }
+        ));
+    } else if !mapped_output_valid && status == BENCHMARK_GRADING_POLICY_EXIT_CODE.to_string() {
+        failures.push(format!(
+            "benchmark smoke exited with grading policy code {} without a grade error marker",
+            BENCHMARK_GRADING_POLICY_EXIT_CODE
+        ));
+    }
+    failures
+}
+
+pub(crate) fn collect_preflight_contract_smoke_failures(
+    request: &AdapterRunRequest<'_>,
+    execution: &PreflightContractSmokeExecution,
+) -> Vec<String> {
+    let mut failures = detect_known_probe_output_blockers(&execution.stdout, &execution.stderr);
+    let log_summaries = summarize_preflight_failure_logs(&execution.stdout, &execution.stderr);
+    let mut contract_failed = false;
+    if execution.status != "0" {
+        failures.push(format!(
+            "contract smoke exited with status {}",
+            execution.status
+        ));
+        contract_failed = true;
+    }
+    let result_failures = validate_preflight_result_payload(&request.io_paths.result_host);
+    if !result_failures.is_empty() {
+        contract_failed = true;
+    }
+    failures.extend(result_failures);
+    if contract_failed {
+        failures.extend(log_summaries.clone());
+    }
+    if request.benchmark_grading_enabled {
+        let benchmark_failures =
+            validate_preflight_benchmark_smoke_outputs(request, &execution.status);
+        failures.extend(benchmark_failures);
+    }
+    let mut seen = HashSet::new();
+    failures
+        .into_iter()
+        .filter(|failure| seen.insert(failure.clone()))
+        .collect()
 }

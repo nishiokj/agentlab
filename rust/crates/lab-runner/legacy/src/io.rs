@@ -1,22 +1,24 @@
-struct PreparedTaskEnvironment {
-    manifest: PreparedTaskEnvironmentManifest,
-    trial_paths: TrialPaths,
-    io_paths: PreparedTrialIo,
-    dynamic_mounts: Vec<ResolvedMountReference>,
-    trial_input: Value,
+use crate::*;
+
+pub(crate) struct PreparedTaskEnvironment {
+    pub(crate) manifest: PreparedTaskEnvironmentManifest,
+    pub(crate) trial_paths: TrialPaths,
+    pub(crate) io_paths: PreparedTrialIo,
+    pub(crate) dynamic_mounts: Vec<ResolvedMountReference>,
+    pub(crate) trial_input: Value,
 }
 
 #[derive(Debug, Clone)]
-struct TaskBoundaryMaterialization {
-    declaration: Value,
-    task_payload: Value,
-    workspace: WorkspaceSpec,
-    dependencies: Value,
-    materialization: TaskMaterializationSpec,
-    task_id: String,
-    task_image: String,
-    task_workdir: String,
-    time_limit_ms: Option<u64>,
+pub(crate) struct TaskBoundaryMaterialization {
+    pub(crate) declaration: Value,
+    pub(crate) task_payload: Value,
+    pub(crate) workspace: WorkspaceSpec,
+    pub(crate) dependencies: Value,
+    pub(crate) materialization: TaskMaterializationSpec,
+    pub(crate) task_id: String,
+    pub(crate) task_image: String,
+    pub(crate) task_workdir: String,
+    pub(crate) time_limit_ms: Option<u64>,
 }
 
 const DEFAULT_TASK_WORKDIR_FALLBACK: &str = "/workspace";
@@ -34,7 +36,7 @@ pub(crate) fn parse_task_row(task: &Value) -> Result<TaskRow> {
     Ok(task_row)
 }
 
-fn materialize_task_row(task_row: TaskRow) -> TaskBoundaryMaterialization {
+pub(crate) fn materialize_task_row(task_row: TaskRow) -> TaskBoundaryMaterialization {
     TaskBoundaryMaterialization {
         declaration: serde_json::to_value(&task_row).unwrap_or_else(|_| json!({})),
         task_payload: task_row.task.clone(),
@@ -58,7 +60,9 @@ fn materialize_task_row(task_row: TaskRow) -> TaskBoundaryMaterialization {
     }
 }
 
-fn materialize_packaged_task_boundary(task: &Value) -> Result<TaskBoundaryMaterialization> {
+pub(crate) fn materialize_packaged_task_boundary(
+    task: &Value,
+) -> Result<TaskBoundaryMaterialization> {
     match task.get("schema_version").and_then(Value::as_str) {
         Some("task_row_v1") => Ok(materialize_task_row(parse_task_row(task)?)),
         Some(other) => Err(anyhow!(
@@ -71,11 +75,13 @@ fn materialize_packaged_task_boundary(task: &Value) -> Result<TaskBoundaryMateri
     }
 }
 
-fn parse_task_boundary_from_packaged_task(task: &Value) -> Result<TaskBoundaryMaterialization> {
+pub(crate) fn parse_task_boundary_from_packaged_task(
+    task: &Value,
+) -> Result<TaskBoundaryMaterialization> {
     materialize_packaged_task_boundary(task)
 }
 
-fn validate_task_row(task_row: &TaskRow) -> Result<()> {
+pub(crate) fn validate_task_row(task_row: &TaskRow) -> Result<()> {
     if task_row.id.trim().is_empty() {
         return Err(anyhow!("task row field 'id' must be a non-empty string"));
     }
@@ -83,7 +89,9 @@ fn validate_task_row(task_row: &TaskRow) -> Result<()> {
         return Err(anyhow!("task row field 'image' must be a non-empty string"));
     }
     if task_row.workdir.trim().is_empty() {
-        return Err(anyhow!("task row field 'workdir' must be a non-empty string"));
+        return Err(anyhow!(
+            "task row field 'workdir' must be a non-empty string"
+        ));
     }
     if !Path::new(task_row.workdir.trim()).is_absolute() {
         return Err(anyhow!("task row field 'workdir' must be an absolute path"));
@@ -92,7 +100,9 @@ fn validate_task_row(task_row: &TaskRow) -> Result<()> {
         return Err(anyhow!("task row field 'task' must be an object"));
     }
     if task_row.time_limit_ms == Some(0) {
-        return Err(anyhow!("task row field 'time_limit_ms' must be > 0 when provided"));
+        return Err(anyhow!(
+            "task row field 'time_limit_ms' must be > 0 when provided"
+        ));
     }
     match task_row.materialization.kind {
         TaskMaterializationKind::TaskImage => {
@@ -119,7 +129,7 @@ fn validate_task_row(task_row: &TaskRow) -> Result<()> {
     Ok(())
 }
 
-fn validate_task_boundary_workspace_materialization(
+pub(crate) fn validate_task_boundary_workspace_materialization(
     task_boundary: &TaskBoundaryMaterialization,
 ) -> Result<()> {
     if task_boundary.workspace.mode != WorkspaceMode::Patch {
@@ -128,9 +138,7 @@ fn validate_task_boundary_workspace_materialization(
     if task_boundary.workspace.base.kind != WorkspaceBaseKind::Empty {
         return Ok(());
     }
-    let task_id = task_boundary
-        .task_id
-        .as_str();
+    let task_id = task_boundary.task_id.as_str();
     Err(anyhow!(
         "task '{}' uses workspace.mode='patch' but workspace.base.kind='empty'; patch tasks require a real base (dataset_pack or git_checkout)",
         task_id
@@ -177,7 +185,7 @@ pub(crate) fn validate_container_workspace_path(path: &str) -> Result<()> {
     Ok(())
 }
 
-fn parse_dataset_pack_ref_digest(dataset_pack_ref: &str) -> Result<String> {
+pub(crate) fn parse_dataset_pack_ref_digest(dataset_pack_ref: &str) -> Result<String> {
     let digest = dataset_pack_ref
         .strip_prefix("sha256:")
         .ok_or_else(|| anyhow!("dataset_pack_ref must start with 'sha256:'"))?;
@@ -187,7 +195,10 @@ fn parse_dataset_pack_ref_digest(dataset_pack_ref: &str) -> Result<String> {
     Ok(digest.to_ascii_lowercase())
 }
 
-pub(crate) fn resolve_dataset_pack_host_path(project_root: &Path, dataset_pack_ref: &str) -> Result<PathBuf> {
+pub(crate) fn resolve_dataset_pack_host_path(
+    project_root: &Path,
+    dataset_pack_ref: &str,
+) -> Result<PathBuf> {
     let digest = parse_dataset_pack_ref_digest(dataset_pack_ref)?;
     let path = project_root
         .join(".lab")
@@ -200,7 +211,7 @@ pub(crate) fn resolve_dataset_pack_host_path(project_root: &Path, dataset_pack_r
     Ok(path)
 }
 
-fn resolve_workspace_aux_mounts(
+pub(crate) fn resolve_workspace_aux_mounts(
     project_root: &Path,
     aux_mounts: &[WorkspaceAuxMountSpec],
 ) -> Result<Vec<ResolvedMountReference>> {
@@ -218,14 +229,14 @@ fn resolve_workspace_aux_mounts(
     Ok(mounts)
 }
 
-fn git_repo_cache_dir(project_root: &Path, repo: &str) -> PathBuf {
+pub(crate) fn git_repo_cache_dir(project_root: &Path, repo: &str) -> PathBuf {
     project_root
         .join(".lab")
         .join("git_checkouts")
         .join(sanitize_for_fs(repo))
 }
 
-fn git_checkout_clone_url(repo: &str) -> String {
+pub(crate) fn git_checkout_clone_url(repo: &str) -> String {
     if repo.contains("://") || repo.starts_with("git@") {
         repo.to_string()
     } else {
@@ -233,7 +244,7 @@ fn git_checkout_clone_url(repo: &str) -> String {
     }
 }
 
-fn git_commit_available(repo_dir: &Path, commit: &str) -> Result<bool> {
+pub(crate) fn git_commit_available(repo_dir: &Path, commit: &str) -> Result<bool> {
     let output = Command::new("git")
         .args([
             "-C",
@@ -246,7 +257,11 @@ fn git_commit_available(repo_dir: &Path, commit: &str) -> Result<bool> {
     Ok(output.status.success())
 }
 
-fn ensure_git_checkout_cache(project_root: &Path, repo: &str, commit: &str) -> Result<PathBuf> {
+pub(crate) fn ensure_git_checkout_cache(
+    project_root: &Path,
+    repo: &str,
+    commit: &str,
+) -> Result<PathBuf> {
     let cache_dir = git_repo_cache_dir(project_root, repo);
     if !cache_dir.exists() {
         if let Some(parent) = cache_dir.parent() {
@@ -288,7 +303,7 @@ fn ensure_git_checkout_cache(project_root: &Path, repo: &str, commit: &str) -> R
     Ok(cache_dir)
 }
 
-fn git_checkout_staging_dir(project_root: &Path, repo: &str, commit: &str) -> PathBuf {
+pub(crate) fn git_checkout_staging_dir(project_root: &Path, repo: &str, commit: &str) -> PathBuf {
     project_root
         .join(".lab")
         .join("git_checkout_staging")
@@ -300,7 +315,7 @@ fn git_checkout_staging_dir(project_root: &Path, repo: &str, commit: &str) -> Pa
         ))
 }
 
-fn prepare_git_checkout_worktree(
+pub(crate) fn prepare_git_checkout_worktree(
     project_root: &Path,
     repo: &str,
     commit: &str,
@@ -337,7 +352,7 @@ fn prepare_git_checkout_worktree(
     Ok((cache_dir, staging_dir))
 }
 
-fn cleanup_git_checkout_worktree(cache_dir: &Path, staging_dir: &Path) -> Result<()> {
+pub(crate) fn cleanup_git_checkout_worktree(cache_dir: &Path, staging_dir: &Path) -> Result<()> {
     let mut remove = Command::new("git");
     remove.args([
         "-C",
@@ -360,13 +375,17 @@ fn cleanup_git_checkout_worktree(cache_dir: &Path, staging_dir: &Path) -> Result
     Ok(())
 }
 
-fn hydrate_git_checkout_cache(project_root: &Path, repo: &str, commit: &str) -> Result<PathBuf> {
+pub(crate) fn hydrate_git_checkout_cache(
+    project_root: &Path,
+    repo: &str,
+    commit: &str,
+) -> Result<PathBuf> {
     let (cache_dir, staging_dir) = prepare_git_checkout_worktree(project_root, repo, commit)?;
     cleanup_git_checkout_worktree(&cache_dir, &staging_dir)?;
     Ok(cache_dir)
 }
 
-fn materialize_workspace_git_checkout(
+pub(crate) fn materialize_workspace_git_checkout(
     project_root: &Path,
     paths: &TrialPaths,
     repo: &str,
@@ -433,7 +452,7 @@ pub(crate) fn materialize_workspace_base_to_dir(
     }
 }
 
-fn materialize_workspace_base(
+pub(crate) fn materialize_workspace_base(
     project_root: &Path,
     paths: &TrialPaths,
     base: &WorkspaceBaseSpec,
@@ -479,14 +498,19 @@ pub(crate) fn materialize_workspace_overlays_to_dir(
     Ok(())
 }
 
-fn materialize_workspace_overlays(
+pub(crate) fn materialize_workspace_overlays(
     paths: &TrialPaths,
     workspace_overlays: &[WorkspaceOverlaySpec],
 ) -> Result<()> {
     materialize_workspace_overlays_to_dir(&paths.workspace, workspace_overlays)
 }
 
-fn copy_staged_host_path(src: &Path, dst: &Path, required: bool, label: &str) -> Result<bool> {
+pub(crate) fn copy_staged_host_path(
+    src: &Path,
+    dst: &Path,
+    required: bool,
+    label: &str,
+) -> Result<bool> {
     if !src.exists() {
         if required {
             return Err(anyhow!(
@@ -533,14 +557,21 @@ fn copy_staged_host_path(src: &Path, dst: &Path, required: bool, label: &str) ->
 }
 
 #[cfg(unix)]
-fn set_staged_path_read_only(dst: &Path) -> Result<()> {
+pub(crate) fn set_staged_path_read_only(dst: &Path) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
 
     if dst.is_dir() {
-        for entry in walkdir::WalkDir::new(dst).into_iter().filter_map(|entry| entry.ok()) {
+        for entry in walkdir::WalkDir::new(dst)
+            .into_iter()
+            .filter_map(|entry| entry.ok())
+        {
             let entry_path = entry.path();
             let mut perms = fs::metadata(entry_path)?.permissions();
-            perms.set_mode(if entry.file_type().is_dir() { 0o555 } else { 0o444 });
+            perms.set_mode(if entry.file_type().is_dir() {
+                0o555
+            } else {
+                0o444
+            });
             fs::set_permissions(entry_path, perms)?;
         }
         return Ok(());
@@ -553,12 +584,12 @@ fn set_staged_path_read_only(dst: &Path) -> Result<()> {
 }
 
 #[cfg(not(unix))]
-fn set_staged_path_read_only(_dst: &Path) -> Result<()> {
+pub(crate) fn set_staged_path_read_only(_dst: &Path) -> Result<()> {
     Ok(())
 }
 
 #[derive(Debug, Clone, Deserialize)]
-struct TaskDependencyFileSpec {
+pub(crate) struct TaskDependencyFileSpec {
     path: String,
     content: String,
     #[serde(default = "default_task_dependency_encoding")]
@@ -567,15 +598,14 @@ struct TaskDependencyFileSpec {
     executable: bool,
 }
 
-fn default_task_dependency_encoding() -> String {
+pub(crate) fn default_task_dependency_encoding() -> String {
     "utf8".to_string()
 }
 
-fn parse_task_dependency_files_value(dependencies: &Value) -> Result<Vec<TaskDependencyFileSpec>> {
-    let Some(files) = dependencies
-        .get("files")
-        .filter(|value| !value.is_null())
-    else {
+pub(crate) fn parse_task_dependency_files_value(
+    dependencies: &Value,
+) -> Result<Vec<TaskDependencyFileSpec>> {
+    let Some(files) = dependencies.get("files").filter(|value| !value.is_null()) else {
         return Ok(Vec::new());
     };
     serde_json::from_value(files.clone())
@@ -629,7 +659,7 @@ pub(crate) fn materialize_task_dependencies_to_dir(
     Ok(())
 }
 
-fn materialize_task_dependencies_for_trial(
+pub(crate) fn materialize_task_dependencies_for_trial(
     task_boundary: &TaskBoundaryMaterialization,
     paths: &TrialPaths,
 ) -> Result<()> {
@@ -639,7 +669,7 @@ fn materialize_task_dependencies_for_trial(
     )
 }
 
-fn container_workspace_rel_path(mount_path: &str) -> Result<PathBuf> {
+pub(crate) fn container_workspace_rel_path(mount_path: &str) -> Result<PathBuf> {
     validate_container_workspace_path(mount_path)?;
     if mount_path == "/" {
         return Ok(PathBuf::new());
@@ -668,7 +698,7 @@ pub(crate) fn materialize_workspace_aux_mounts_to_dir(
 }
 
 #[cfg(test)]
-fn parse_workspace_patches(
+pub(crate) fn parse_workspace_patches(
     value: Option<&Value>,
     exp_dir: &Path,
 ) -> Result<Vec<WorkspacePatchSpec>> {
@@ -699,7 +729,10 @@ fn parse_workspace_patches(
     Ok(patches)
 }
 
-fn stage_dependencies_for_trial(runtime: &AgentRuntimeConfig, paths: &TrialPaths) -> Result<()> {
+pub(crate) fn stage_dependencies_for_trial(
+    runtime: &AgentRuntimeConfig,
+    paths: &TrialPaths,
+) -> Result<()> {
     for entry in &runtime.dependency_file_staging {
         let dst = map_container_path_to_host(&entry.destination_path, paths)?;
         let copied = copy_staged_host_path(
@@ -716,7 +749,7 @@ fn stage_dependencies_for_trial(runtime: &AgentRuntimeConfig, paths: &TrialPaths
 }
 
 #[cfg(test)]
-fn stage_workspace_patches_for_trial(
+pub(crate) fn stage_workspace_patches_for_trial(
     runtime: &AgentRuntimeConfig,
     paths: &TrialPaths,
 ) -> Result<()> {
@@ -728,74 +761,74 @@ fn stage_workspace_patches_for_trial(
     Ok(())
 }
 
-const TASK_WORKDIR_TEMPLATE_PLACEHOLDER: &str = AGENTLAB_TASK_WORKDIR_PLACEHOLDER;
+pub(crate) const TASK_WORKDIR_TEMPLATE_PLACEHOLDER: &str = AGENTLAB_TASK_WORKDIR_PLACEHOLDER;
 
 #[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ImageSource {
+pub(crate) enum ImageSource {
     Global,
     PerTask,
 }
 
 #[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AgentExecutionExecutor {
+pub(crate) enum AgentExecutionExecutor {
     Docker,
 }
 
 #[cfg(test)]
 #[derive(Debug, Clone)]
-struct AgentExecutionConfig {
-    executor: Option<AgentExecutionExecutor>,
-    image: Option<String>,
-    network: String,
+pub(crate) struct AgentExecutionConfig {
+    pub(crate) executor: Option<AgentExecutionExecutor>,
+    pub(crate) image: Option<String>,
+    pub(crate) network: String,
 }
 
 #[cfg(test)]
 #[derive(Debug, Clone)]
-struct AgentRuntimeIoConfig {
-    input_arg: String,
-    output_arg: String,
+pub(crate) struct AgentRuntimeIoConfig {
+    pub(crate) input_arg: String,
+    pub(crate) output_arg: String,
 }
 
 #[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum AgentLaunchMode {
+pub(crate) enum AgentLaunchMode {
     File,
     Stdio,
 }
 
 #[cfg(test)]
 #[derive(Debug, Clone)]
-struct WorkspacePatchSpec {
-    source_from_host: PathBuf,
-    target_path: String,
+pub(crate) struct WorkspacePatchSpec {
+    pub(crate) source_from_host: PathBuf,
+    pub(crate) target_path: String,
 }
 
 #[derive(Debug, Clone)]
-struct DependencyFileStagingSpec {
-    source_from_host: PathBuf,
-    destination_path: String,
-    required: bool,
-    read_only: bool,
+pub(crate) struct DependencyFileStagingSpec {
+    pub(crate) source_from_host: PathBuf,
+    pub(crate) destination_path: String,
+    pub(crate) required: bool,
+    pub(crate) read_only: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-struct RuntimePathStagingManifestEntry {
-    original_relative_path: String,
-    packaged_path: String,
-    runtime_path: String,
-    required: bool,
-    read_only: bool,
+pub(crate) struct RuntimePathStagingManifestEntry {
+    pub(crate) original_relative_path: String,
+    pub(crate) packaged_path: String,
+    pub(crate) runtime_path: String,
+    pub(crate) required: bool,
+    pub(crate) read_only: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-struct RuntimePathStagingManifest {
-    schema_version: String,
-    variants: BTreeMap<String, Vec<RuntimePathStagingManifestEntry>>,
+pub(crate) struct RuntimePathStagingManifest {
+    pub(crate) schema_version: String,
+    pub(crate) variants: BTreeMap<String, Vec<RuntimePathStagingManifestEntry>>,
 }
 
-enum PathResolutionContext<'a> {
+pub(crate) enum PathResolutionContext<'a> {
     Build {
         exp_dir: &'a Path,
         project_root: &'a Path,
@@ -807,43 +840,46 @@ enum PathResolutionContext<'a> {
 }
 
 #[derive(Clone)]
-struct AgentRuntimeConfig {
-    adapter_ref: AgentAdapterRef,
-    command_raw: Vec<String>,
-    image: String,
-    network: String,
-    agent_artifact: PathBuf,
-    agent_artifact_digest: Option<String>,
-    agent_artifact_resolved_path: Option<PathBuf>,
-    integration_level: String,
-    env: BTreeMap<String, String>,
-    env_from_host: Vec<String>,
-    trajectory_path: Option<String>,
-    causal_extraction: Option<String>,
+pub(crate) struct AgentRuntimeConfig {
+    pub(crate) adapter_ref: AgentAdapterRef,
+    pub(crate) command_raw: Vec<String>,
+    pub(crate) image: String,
+    pub(crate) network: String,
+    pub(crate) agent_artifact: PathBuf,
+    pub(crate) agent_artifact_digest: Option<String>,
+    pub(crate) agent_artifact_resolved_path: Option<PathBuf>,
+    pub(crate) integration_level: String,
+    pub(crate) env: BTreeMap<String, String>,
+    pub(crate) env_from_host: Vec<String>,
+    pub(crate) trajectory_path: Option<String>,
+    pub(crate) causal_extraction: Option<String>,
     #[cfg(test)]
-    sandbox_image: Option<String>,
+    pub(crate) sandbox_image: Option<String>,
     #[cfg(test)]
-    image_source: ImageSource,
+    pub(crate) image_source: ImageSource,
     #[cfg(test)]
-    execution: AgentExecutionConfig,
+    pub(crate) execution: AgentExecutionConfig,
     #[cfg(test)]
-    io: AgentRuntimeIoConfig,
+    pub(crate) io: AgentRuntimeIoConfig,
     #[cfg(test)]
-    launch_mode: AgentLaunchMode,
+    pub(crate) launch_mode: AgentLaunchMode,
     #[cfg(test)]
-    workspace_patches: Vec<WorkspacePatchSpec>,
+    pub(crate) workspace_patches: Vec<WorkspacePatchSpec>,
     #[cfg(test)]
-    default_timeout_ms: Option<u64>,
+    pub(crate) default_timeout_ms: Option<u64>,
     #[cfg(test)]
-    tracing_mode: Option<String>,
+    pub(crate) tracing_mode: Option<String>,
     #[cfg(test)]
-    force_container: bool,
-    dependency_file_staging: Vec<DependencyFileStagingSpec>,
+    pub(crate) force_container: bool,
+    pub(crate) dependency_file_staging: Vec<DependencyFileStagingSpec>,
     #[cfg(test)]
-    dependency_services: Vec<Value>,
+    pub(crate) dependency_services: Vec<Value>,
 }
 
-fn parse_command_field(value: Option<&Value>, field: &str) -> Result<Option<Vec<String>>> {
+pub(crate) fn parse_command_field(
+    value: Option<&Value>,
+    field: &str,
+) -> Result<Option<Vec<String>>> {
     match value {
         None => Ok(None),
         Some(Value::String(s)) => {
@@ -864,7 +900,7 @@ fn parse_command_field(value: Option<&Value>, field: &str) -> Result<Option<Vec<
     }
 }
 
-fn task_workdir_support_relative_path(rel_path: &str) -> String {
+pub(crate) fn task_workdir_support_relative_path(rel_path: &str) -> String {
     let rel = rel_path.trim().trim_start_matches('/');
     if rel.is_empty() {
         AGENTLAB_RUNNER_SUPPORT_REL_DIR.to_string()
@@ -873,7 +909,7 @@ fn task_workdir_support_relative_path(rel_path: &str) -> String {
     }
 }
 
-fn task_workdir_support_destination_path(rel_path: &str) -> String {
+pub(crate) fn task_workdir_support_destination_path(rel_path: &str) -> String {
     format!(
         "{}/{}",
         AGENTLAB_TASK_WORKDIR_PLACEHOLDER,
@@ -881,7 +917,7 @@ fn task_workdir_support_destination_path(rel_path: &str) -> String {
     )
 }
 
-fn strip_task_workdir_support_destination_path(path: &str) -> Option<&str> {
+pub(crate) fn strip_task_workdir_support_destination_path(path: &str) -> Option<&str> {
     let prefix = format!(
         "{}/{}",
         AGENTLAB_TASK_WORKDIR_PLACEHOLDER, AGENTLAB_RUNNER_SUPPORT_REL_DIR
@@ -897,7 +933,7 @@ fn strip_task_workdir_support_destination_path(path: &str) -> Option<&str> {
     }
 }
 
-fn reject_packaged_public_path_references(
+pub(crate) fn reject_packaged_public_path_references(
     command: &[String],
     env: &BTreeMap<String, String>,
     package_dir: &Path,
@@ -930,7 +966,7 @@ fn reject_packaged_public_path_references(
     Ok(())
 }
 
-fn load_staging_specs_from_package(
+pub(crate) fn load_staging_specs_from_package(
     package_dir: &Path,
     variant_id: &str,
 ) -> Result<Vec<DependencyFileStagingSpec>> {
@@ -942,8 +978,8 @@ fn load_staging_specs_from_package(
             manifest_path.display()
         )
     })?;
-    let manifest: RuntimePathStagingManifest =
-        serde_json::from_slice(&manifest_bytes).with_context(|| {
+    let manifest: RuntimePathStagingManifest = serde_json::from_slice(&manifest_bytes)
+        .with_context(|| {
             format!(
                 "failed to parse runtime staging manifest JSON at {}",
                 manifest_path.display()
@@ -997,7 +1033,7 @@ fn load_staging_specs_from_package(
     Ok(specs)
 }
 
-fn derive_public_command_path_staging_specs(
+pub(crate) fn derive_public_command_path_staging_specs(
     command: &[String],
     exp_dir: &Path,
     field_name: &str,
@@ -1012,7 +1048,8 @@ fn derive_public_command_path_staging_specs(
             token,
             exp_dir,
             &format!("{}[{}]", field_name, idx),
-        )? else {
+        )?
+        else {
             continue;
         };
         let key = rel.to_string_lossy().to_string();
@@ -1039,7 +1076,7 @@ fn derive_public_command_path_staging_specs(
     Ok(specs)
 }
 
-fn derive_public_path_staging_specs(
+pub(crate) fn derive_public_path_staging_specs(
     command: &[String],
     env: &BTreeMap<String, String>,
     exp_dir: &Path,
@@ -1060,7 +1097,8 @@ fn derive_public_path_staging_specs(
             value,
             exp_dir,
             &format!("runtime.agent_runtime.env.{}", key_name),
-        )? else {
+        )?
+        else {
             continue;
         };
         let key = rel.to_string_lossy().to_string();
@@ -1086,7 +1124,7 @@ fn derive_public_path_staging_specs(
     Ok(specs)
 }
 
-fn normalize_staged_support_source_path(
+pub(crate) fn normalize_staged_support_source_path(
     raw: &str,
     exp_dir: &Path,
     project_root: &Path,
@@ -1121,7 +1159,10 @@ fn normalize_staged_support_source_path(
     Ok(resolved)
 }
 
-pub(crate) fn validate_runner_staged_destination_path(raw: &str, field_name: &str) -> Result<String> {
+pub(crate) fn validate_runner_staged_destination_path(
+    raw: &str,
+    field_name: &str,
+) -> Result<String> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         return Err(anyhow!("{} must not be empty", field_name));
@@ -1170,7 +1211,7 @@ pub(crate) fn validate_runner_staged_destination_path(raw: &str, field_name: &st
     Ok(trimmed.to_string())
 }
 
-fn parse_build_runtime_asset_specs(
+pub(crate) fn parse_build_runtime_asset_specs(
     value: Option<&Value>,
     field_name: &str,
     exp_dir: &Path,
@@ -1196,7 +1237,10 @@ fn parse_build_runtime_asset_specs(
             .and_then(Value::as_str)
             .ok_or_else(|| anyhow!("{}[{}].runtime_path is required", field_name, idx))?;
         let required = obj.get("required").and_then(Value::as_bool).unwrap_or(true);
-        let read_only = obj.get("read_only").and_then(Value::as_bool).unwrap_or(true);
+        let read_only = obj
+            .get("read_only")
+            .and_then(Value::as_bool)
+            .unwrap_or(true);
         specs.push(DependencyFileStagingSpec {
             source_from_host: normalize_staged_support_source_path(
                 source_from_host,
@@ -1215,7 +1259,7 @@ fn parse_build_runtime_asset_specs(
     Ok(specs)
 }
 
-fn merge_dependency_file_staging(
+pub(crate) fn merge_dependency_file_staging(
     base: &mut Vec<DependencyFileStagingSpec>,
     extra: Vec<DependencyFileStagingSpec>,
 ) {
@@ -1231,7 +1275,7 @@ fn merge_dependency_file_staging(
     }
 }
 
-fn binding_lookup<'a>(bindings: &'a Value, key: &str) -> Option<&'a Value> {
+pub(crate) fn binding_lookup<'a>(bindings: &'a Value, key: &str) -> Option<&'a Value> {
     if key.trim().is_empty() {
         return None;
     }
@@ -1239,7 +1283,11 @@ fn binding_lookup<'a>(bindings: &'a Value, key: &str) -> Option<&'a Value> {
     bindings.pointer(&pointer)
 }
 
-fn binding_lookup_string(bindings: &Value, key: &str, field_name: &str) -> Result<Option<String>> {
+pub(crate) fn binding_lookup_string(
+    bindings: &Value,
+    key: &str,
+    field_name: &str,
+) -> Result<Option<String>> {
     let Some(value) = binding_lookup(bindings, key) else {
         return Ok(None);
     };
@@ -1259,7 +1307,7 @@ fn binding_lookup_string(bindings: &Value, key: &str, field_name: &str) -> Resul
     Ok(Some(token))
 }
 
-fn resolve_runtime_binding_value(
+pub(crate) fn resolve_runtime_binding_value(
     name: &str,
     bindings: &Value,
     runtime_env_inputs: &BTreeMap<String, String>,
@@ -1284,7 +1332,7 @@ fn resolve_runtime_binding_value(
     ))
 }
 
-fn render_runtime_template(
+pub(crate) fn render_runtime_template(
     raw: &str,
     bindings: &Value,
     runtime_env_inputs: &BTreeMap<String, String>,
@@ -1338,7 +1386,7 @@ fn render_runtime_template(
     Ok(out)
 }
 
-fn resolve_command_templates(
+pub(crate) fn resolve_command_templates(
     command: &[String],
     bindings: &Value,
     runtime_env_inputs: &BTreeMap<String, String>,
@@ -1355,7 +1403,7 @@ fn resolve_command_templates(
     Ok(resolved)
 }
 
-fn resolve_env_templates(
+pub(crate) fn resolve_env_templates(
     env: &BTreeMap<String, String>,
     bindings: &Value,
     runtime_env_inputs: &BTreeMap<String, String>,
@@ -1376,7 +1424,7 @@ fn resolve_env_templates(
     Ok(resolved)
 }
 
-fn resolve_agent_runtime(
+pub(crate) fn resolve_agent_runtime(
     json_value: &Value,
     exp_dir: &Path,
     project_root: &Path,
@@ -1390,7 +1438,7 @@ fn resolve_agent_runtime(
     )
 }
 
-fn resolve_packaged_agent_runtime(
+pub(crate) fn resolve_packaged_agent_runtime(
     json_value: &Value,
     package_dir: &Path,
     variant_id: &str,
@@ -1404,7 +1452,7 @@ fn resolve_packaged_agent_runtime(
     )
 }
 
-fn resolve_agent_artifact_path_for_context(
+pub(crate) fn resolve_agent_artifact_path_for_context(
     raw: &str,
     field_name: &str,
     context: &PathResolutionContext<'_>,
@@ -1432,7 +1480,7 @@ fn resolve_agent_artifact_path_for_context(
     }
 }
 
-fn resolve_runtime_source_path_for_context(
+pub(crate) fn resolve_runtime_source_path_for_context(
     raw: &str,
     field_name: &str,
     context: &PathResolutionContext<'_>,
@@ -1454,7 +1502,7 @@ fn resolve_runtime_source_path_for_context(
     }
 }
 
-fn resolve_agent_runtime_with_context(
+pub(crate) fn resolve_agent_runtime_with_context(
     json_value: &Value,
     context: PathResolutionContext<'_>,
 ) -> Result<AgentRuntimeConfig> {
@@ -1665,7 +1713,7 @@ fn resolve_agent_runtime_with_context(
     })
 }
 
-fn parse_runtime_env_file(path: &Path) -> Result<BTreeMap<String, String>> {
+pub(crate) fn parse_runtime_env_file(path: &Path) -> Result<BTreeMap<String, String>> {
     let content = fs::read_to_string(path)
         .map_err(|err| anyhow!("failed to read env file {}: {}", path.display(), err))?;
     let mut values = BTreeMap::new();
@@ -1701,7 +1749,9 @@ fn parse_runtime_env_file(path: &Path) -> Result<BTreeMap<String, String>> {
     Ok(values)
 }
 
-fn resolve_runtime_env_inputs(execution: &RunExecutionOptions) -> Result<BTreeMap<String, String>> {
+pub(crate) fn resolve_runtime_env_inputs(
+    execution: &RunExecutionOptions,
+) -> Result<BTreeMap<String, String>> {
     let mut resolved = BTreeMap::new();
     let cwd =
         std::env::current_dir().map_err(|err| anyhow!("failed to resolve current dir: {}", err))?;
@@ -1722,7 +1772,7 @@ fn resolve_runtime_env_inputs(execution: &RunExecutionOptions) -> Result<BTreeMa
     Ok(resolved)
 }
 
-fn resolve_agent_runtime_env(
+pub(crate) fn resolve_agent_runtime_env(
     runtime_agent: &AgentRuntimeConfig,
     bindings: &Value,
     runtime_env_inputs: &BTreeMap<String, String>,
@@ -1735,7 +1785,7 @@ fn resolve_agent_runtime_env(
     )
 }
 
-fn ensure_required_runtime_env_present(
+pub(crate) fn ensure_required_runtime_env_present(
     runtime_agent: &AgentRuntimeConfig,
     resolved_env: &BTreeMap<String, String>,
 ) -> Result<()> {
@@ -1750,7 +1800,7 @@ fn ensure_required_runtime_env_present(
     Ok(())
 }
 
-fn validate_agent_artifact_pin(runtime_agent: &AgentRuntimeConfig) -> Result<()> {
+pub(crate) fn validate_agent_artifact_pin(runtime_agent: &AgentRuntimeConfig) -> Result<()> {
     let artifact = &runtime_agent.agent_artifact;
     if let Some(expected_path) = runtime_agent.agent_artifact_resolved_path.as_ref() {
         let normalized = normalize_path(artifact);
@@ -1784,7 +1834,7 @@ fn validate_agent_artifact_pin(runtime_agent: &AgentRuntimeConfig) -> Result<()>
     Ok(())
 }
 
-fn resolve_benchmark_runtime_assets(
+pub(crate) fn resolve_benchmark_runtime_assets(
     experiment: &Value,
     exp_dir: &Path,
     project_root: &Path,
@@ -1811,11 +1861,11 @@ fn resolve_benchmark_runtime_assets(
     merge_dependency_file_staging(
         &mut support_files,
         parse_build_runtime_asset_specs(
-        experiment.pointer("/benchmark/grader/_runtime_assets"),
-        "benchmark.grader._runtime_assets",
-        exp_dir,
-        project_root,
-    )?,
+            experiment.pointer("/benchmark/grader/_runtime_assets"),
+            "benchmark.grader._runtime_assets",
+            exp_dir,
+            project_root,
+        )?,
     );
     merge_dependency_file_staging(
         &mut support_files,
@@ -1845,31 +1895,34 @@ fn resolve_benchmark_runtime_assets(
                     source.display()
                 )
             })?;
-            merge_dependency_file_staging(&mut support_files, vec![DependencyFileStagingSpec {
-                source_from_host: source,
-                destination_path: task_workdir_support_destination_path(
-                    &rel.to_string_lossy().replace('\\', "/"),
-                ),
-                required: true,
-                read_only: true,
-            }]);
+            merge_dependency_file_staging(
+                &mut support_files,
+                vec![DependencyFileStagingSpec {
+                    source_from_host: source,
+                    destination_path: task_workdir_support_destination_path(
+                        &rel.to_string_lossy().replace('\\', "/"),
+                    ),
+                    required: true,
+                    read_only: true,
+                }],
+            );
         }
     }
     Ok(support_files)
 }
 
 #[derive(Clone)]
-struct VariantRuntimeProfile {
-    experiment: Value,
-    variant_args: Vec<String>,
-    agent_runtime: AgentRuntimeConfig,
-    agent_runtime_env: BTreeMap<String, String>,
-    invocation_source: String,
-    configured_network_mode: String,
-    effective_network_mode: String,
+pub(crate) struct VariantRuntimeProfile {
+    pub(crate) experiment: Value,
+    pub(crate) variant_args: Vec<String>,
+    pub(crate) agent_runtime: AgentRuntimeConfig,
+    pub(crate) agent_runtime_env: BTreeMap<String, String>,
+    pub(crate) invocation_source: String,
+    pub(crate) configured_network_mode: String,
+    pub(crate) effective_network_mode: String,
 }
 
-fn command_contains_scientific_bypass(command: &[String]) -> Option<String> {
+pub(crate) fn command_contains_scientific_bypass(command: &[String]) -> Option<String> {
     for token in command {
         let trimmed = token.trim();
         if trimmed == "--dangerous" || trimmed.contains("dangerous_mode") {
@@ -1884,18 +1937,18 @@ fn command_contains_scientific_bypass(command: &[String]) -> Option<String> {
     None
 }
 
-fn preview_agent_command(profile: &VariantRuntimeProfile) -> Vec<String> {
+pub(crate) fn preview_agent_command(profile: &VariantRuntimeProfile) -> Vec<String> {
     let mut command = profile.agent_runtime.command_raw.clone();
     command.extend(profile.variant_args.iter().cloned());
     command
 }
 
-fn value_contains_host_scratch_path(value: &str) -> bool {
+pub(crate) fn value_contains_host_scratch_path(value: &str) -> bool {
     let trimmed = value.trim();
     trimmed.contains("/.lab/runs/") || trimmed.contains("/.scratch/")
 }
 
-fn profile_is_hermetic(profile: &VariantRuntimeProfile) -> bool {
+pub(crate) fn profile_is_hermetic(profile: &VariantRuntimeProfile) -> bool {
     let command = preview_agent_command(profile);
     profile.agent_runtime.image.trim().is_empty() == false
         && command_contains_scientific_bypass(&command).is_none()
@@ -1908,7 +1961,7 @@ fn profile_is_hermetic(profile: &VariantRuntimeProfile) -> bool {
             .any(|value| value_contains_host_scratch_path(value))
 }
 
-fn resolve_run_isolation_grade(
+pub(crate) fn resolve_run_isolation_grade(
     variant_runtime_profiles: &[VariantRuntimeProfile],
     _behavior: &RunBehavior,
 ) -> &'static str {
@@ -1920,7 +1973,7 @@ fn resolve_run_isolation_grade(
     "invalid"
 }
 
-fn resolve_variant_runtime_profile_with_context(
+pub(crate) fn resolve_variant_runtime_profile_with_context(
     experiment: &Value,
     variant: &Variant,
     context: PathResolutionContext<'_>,
@@ -1977,8 +2030,12 @@ fn resolve_variant_runtime_profile_with_context(
     validate_agent_runtime_command(&agent_runtime.command_raw, validate_root)?;
     let mut agent_runtime_env =
         resolve_agent_runtime_env(&agent_runtime, &variant.bindings, &runtime_env_inputs)?;
-    let resolved_variant_env =
-        resolve_env_templates(&variant.env, &variant.bindings, &runtime_env_inputs, "variant.env")?;
+    let resolved_variant_env = resolve_env_templates(
+        &variant.env,
+        &variant.bindings,
+        &runtime_env_inputs,
+        "variant.env",
+    )?;
     for (key, value) in resolved_variant_env {
         agent_runtime_env.insert(key, value);
     }
@@ -1996,7 +2053,7 @@ fn resolve_variant_runtime_profile_with_context(
     })
 }
 
-fn resolve_variant_runtime_profile(
+pub(crate) fn resolve_variant_runtime_profile(
     experiment: &Value,
     variant: &Variant,
     root_dir: &Path,
@@ -2017,19 +2074,20 @@ fn resolve_variant_runtime_profile(
     resolve_variant_runtime_profile_with_context(experiment, variant, context, behavior, execution)
 }
 
-struct TrialPaths {
-    trial_dir: PathBuf,
-    scratch_dir: PathBuf,
-    in_dir: PathBuf,
-    workspace: PathBuf,
-    state: PathBuf,
-    out: PathBuf,
-    tmp: PathBuf,
-    runtime: RunnerRuntimeHostPaths,
-    exp_dir: PathBuf,
+#[derive(Debug)]
+pub(crate) struct TrialPaths {
+    pub(crate) trial_dir: PathBuf,
+    pub(crate) scratch_dir: PathBuf,
+    pub(crate) in_dir: PathBuf,
+    pub(crate) workspace: PathBuf,
+    pub(crate) state: PathBuf,
+    pub(crate) out: PathBuf,
+    pub(crate) tmp: PathBuf,
+    pub(crate) runtime: RunnerRuntimeHostPaths,
+    pub(crate) exp_dir: PathBuf,
 }
 
-fn trial_runtime_scratch_dir(trial_dir: &Path) -> PathBuf {
+pub(crate) fn trial_runtime_scratch_dir(trial_dir: &Path) -> PathBuf {
     let root = infer_run_dir_from_path(trial_dir).unwrap_or_else(|| trial_dir.to_path_buf());
     let trial_label = trial_dir
         .file_name()
@@ -2046,7 +2104,7 @@ fn trial_runtime_scratch_dir(trial_dir: &Path) -> PathBuf {
 }
 
 impl TrialPaths {
-    fn new(trial_dir: &Path, exp_dir: &Path) -> Result<Self> {
+    pub(crate) fn new(trial_dir: &Path, exp_dir: &Path) -> Result<Self> {
         let scratch_dir = trial_runtime_scratch_dir(trial_dir);
         let runtime = runner_runtime_host_paths(&scratch_dir);
         Ok(Self {
@@ -2062,7 +2120,7 @@ impl TrialPaths {
         })
     }
 
-    fn prepare(&self, seed_workspace_from_exp_dir: bool) -> Result<()> {
+    pub(crate) fn prepare(&self, seed_workspace_from_exp_dir: bool) -> Result<()> {
         ensure_dir(&self.in_dir)?;
         ensure_dir(&self.workspace)?;
         ensure_dir(&self.state)?;
@@ -2096,7 +2154,7 @@ impl TrialPaths {
         Ok(())
     }
 
-    fn cleanup_scratch(&self) -> Result<()> {
+    pub(crate) fn cleanup_scratch(&self) -> Result<()> {
         remove_path_if_exists(&self.scratch_dir)
     }
 }
@@ -2107,7 +2165,7 @@ impl Drop for TrialPaths {
     }
 }
 
-fn build_trial_input(
+pub(crate) fn build_trial_input(
     json_value: &Value,
     run_id: &str,
     trial_id: &str,
@@ -2168,7 +2226,7 @@ fn build_trial_input(
     input
 }
 
-fn build_task_sandbox_plan(
+pub(crate) fn build_task_sandbox_plan(
     task_boundary: &TaskBoundaryMaterialization,
     agent_runtime: &AgentRuntimeConfig,
     time_limit_ms: u64,
@@ -2191,13 +2249,13 @@ fn build_task_sandbox_plan(
     }
 }
 
-fn prepared_task_environment_manifest_path(trial_dir: &Path) -> PathBuf {
+pub(crate) fn prepared_task_environment_manifest_path(trial_dir: &Path) -> PathBuf {
     trial_dir
         .join("runtime")
         .join("prepared_task_environment.json")
 }
 
-fn write_prepared_task_environment_manifest(
+pub(crate) fn write_prepared_task_environment_manifest(
     trial_dir: &Path,
     manifest: &PreparedTaskEnvironmentManifest,
 ) -> Result<()> {
@@ -2206,7 +2264,7 @@ fn write_prepared_task_environment_manifest(
     Ok(())
 }
 
-fn load_prepared_task_environment_manifest(
+pub(crate) fn load_prepared_task_environment_manifest(
     trial_dir: &Path,
 ) -> Result<PreparedTaskEnvironmentManifest> {
     let manifest_path = prepared_task_environment_manifest_path(trial_dir);
@@ -2232,7 +2290,7 @@ fn load_prepared_task_environment_manifest(
     Ok(manifest)
 }
 
-fn resolve_task_bundle_host_path(
+pub(crate) fn resolve_task_bundle_host_path(
     project_root: &Path,
     trial_dir: &Path,
     task_bundle_ref: &str,
@@ -2261,7 +2319,7 @@ fn resolve_task_bundle_host_path(
     ))
 }
 
-fn materialize_task_bundle_for_trial(
+pub(crate) fn materialize_task_bundle_for_trial(
     project_root: &Path,
     trial_dir: &Path,
     paths: &TrialPaths,
@@ -2314,7 +2372,8 @@ fn materialize_task_bundle_for_trial(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn prepare_task_environment(
+pub(crate) fn prepare_task_environment_with_paths(
+    trial_paths: TrialPaths,
     project_root: &Path,
     trial_dir: &Path,
     run_id: &str,
@@ -2327,7 +2386,6 @@ fn prepare_task_environment(
     agent_runtime: &AgentRuntimeConfig,
     existing_workspace_ref: Option<&str>,
 ) -> Result<PreparedTaskEnvironment> {
-    let trial_paths = TrialPaths::new(trial_dir, project_root)?;
     trial_paths.prepare(false)?;
     if let Some(workspace_ref) = existing_workspace_ref {
         let artifact_store = ArtifactStore::new(
@@ -2339,19 +2397,34 @@ fn prepare_task_environment(
     } else {
         match task_boundary.materialization.kind {
             TaskMaterializationKind::TaskImage => {
-                materialize_workspace_base(project_root, &trial_paths, &task_boundary.workspace.base)?;
+                materialize_workspace_base(
+                    project_root,
+                    &trial_paths,
+                    &task_boundary.workspace.base,
+                )?;
                 materialize_workspace_overlays(&trial_paths, &task_boundary.workspace.overlays)?;
             }
             TaskMaterializationKind::BaseImageBundle => {
-                materialize_task_bundle_for_trial(project_root, trial_dir, &trial_paths, task_boundary)?;
+                materialize_task_bundle_for_trial(
+                    project_root,
+                    trial_dir,
+                    &trial_paths,
+                    task_boundary,
+                )?;
             }
         }
     }
-    if matches!(task_boundary.materialization.kind, TaskMaterializationKind::TaskImage) {
+    if matches!(
+        task_boundary.materialization.kind,
+        TaskMaterializationKind::TaskImage
+    ) {
         materialize_task_dependencies_for_trial(task_boundary, &trial_paths)?;
     }
     stage_dependencies_for_trial(agent_runtime, &trial_paths)?;
-    let dynamic_mounts = if matches!(task_boundary.materialization.kind, TaskMaterializationKind::TaskImage) {
+    let dynamic_mounts = if matches!(
+        task_boundary.materialization.kind,
+        TaskMaterializationKind::TaskImage
+    ) {
         resolve_workspace_aux_mounts(project_root, &task_boundary.workspace.aux_mounts)?
     } else {
         Vec::new()
@@ -2421,7 +2494,38 @@ fn prepare_task_environment(
     })
 }
 
-fn normalize_task_prompt_aliases(task_payload: &Value) -> Value {
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn prepare_task_environment(
+    project_root: &Path,
+    trial_dir: &Path,
+    run_id: &str,
+    trial_id: &str,
+    trial_experiment: &Value,
+    variant: &Variant,
+    task_idx: usize,
+    repl: usize,
+    task_boundary: &TaskBoundaryMaterialization,
+    agent_runtime: &AgentRuntimeConfig,
+    existing_workspace_ref: Option<&str>,
+) -> Result<PreparedTaskEnvironment> {
+    let trial_paths = TrialPaths::new(trial_dir, project_root)?;
+    prepare_task_environment_with_paths(
+        trial_paths,
+        project_root,
+        trial_dir,
+        run_id,
+        trial_id,
+        trial_experiment,
+        variant,
+        task_idx,
+        repl,
+        task_boundary,
+        agent_runtime,
+        existing_workspace_ref,
+    )
+}
+
+pub(crate) fn normalize_task_prompt_aliases(task_payload: &Value) -> Value {
     let mut normalized = task_payload.clone();
     let canonical_prompt = normalized
         .pointer("/input/prompt")
@@ -2489,7 +2593,7 @@ fn normalize_task_prompt_aliases(task_payload: &Value) -> Value {
     normalized
 }
 
-fn sanitize_for_fs(raw: &str) -> String {
+pub(crate) fn sanitize_for_fs(raw: &str) -> String {
     let mut out = String::with_capacity(raw.len());
     for ch in raw.chars() {
         if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
@@ -2505,50 +2609,7 @@ fn sanitize_for_fs(raw: &str) -> String {
     }
 }
 
-fn infer_run_dir_from_path(path: &Path) -> Option<PathBuf> {
-    for ancestor in path.ancestors() {
-        if run_sqlite_path(ancestor).exists() {
-            return Some(ancestor.to_path_buf());
-        }
-    }
-    None
-}
-
-fn json_row_table_from_path(path: &Path) -> Option<JsonRowTable> {
-    let name = path.file_name()?.to_string_lossy().to_ascii_lowercase();
-    if name.contains("evidence") {
-        return Some(JsonRowTable::Evidence);
-    }
-    if name.contains("task_chain") || name.contains("chain_state") {
-        return Some(JsonRowTable::ChainState);
-    }
-    if name.contains("conclusion") {
-        return Some(JsonRowTable::BenchmarkConclusion);
-    }
-    None
-}
-
-fn row_has_sqlite_identity_fields(row: &Value) -> bool {
-    row.pointer("/run_id")
-        .and_then(Value::as_str)
-        .is_some_and(|value| !value.trim().is_empty())
-        && row
-            .pointer("/schedule_idx")
-            .and_then(Value::as_u64)
-            .is_some()
-        && row.pointer("/attempt").and_then(Value::as_u64).is_some()
-        && row.pointer("/row_seq").and_then(Value::as_u64).is_some()
-        && row
-            .pointer("/slot_commit_id")
-            .and_then(Value::as_str)
-            .is_some_and(|value| !value.trim().is_empty())
-}
-
-fn path_uses_sqlite_json_row_ingest(run_dir: &Path, path: &Path) -> bool {
-    !path.starts_with(run_dir.join("runtime").join("worker_payload"))
-}
-
-fn append_jsonl_file(path: &Path, value: &Value) -> Result<()> {
+pub(crate) fn append_jsonl_file(path: &Path, value: &Value) -> Result<()> {
     if let Some(parent) = path.parent() {
         ensure_dir(parent)?;
     }
@@ -2561,7 +2622,7 @@ fn append_jsonl_file(path: &Path, value: &Value) -> Result<()> {
     Ok(())
 }
 
-fn append_jsonl(path: &Path, value: &Value) -> Result<()> {
+pub(crate) fn append_jsonl(path: &Path, value: &Value) -> Result<()> {
     let mut row = value.clone();
     if let (Some(run_dir), Some(table)) = (
         infer_run_dir_from_path(path),
@@ -2604,7 +2665,7 @@ fn append_jsonl(path: &Path, value: &Value) -> Result<()> {
     ))
 }
 
-fn is_workspace_evidence_excluded(rel: &Path) -> bool {
+pub(crate) fn is_workspace_evidence_excluded(rel: &Path) -> bool {
     if WORKSPACE_EVIDENCE_EXCLUDE_PREFIXES
         .iter()
         .any(|prefix| rel.starts_with(prefix))
@@ -2636,7 +2697,7 @@ fn is_workspace_evidence_excluded(rel: &Path) -> bool {
     false
 }
 
-fn collect_workspace_snapshot_manifest(workspace: &Path) -> Result<Value> {
+pub(crate) fn collect_workspace_snapshot_manifest(workspace: &Path) -> Result<Value> {
     let mut files: Vec<(String, String, u64)> = Vec::new();
     if workspace.exists() {
         let walker = walkdir::WalkDir::new(workspace).into_iter();
@@ -2676,7 +2737,7 @@ fn collect_workspace_snapshot_manifest(workspace: &Path) -> Result<Value> {
     }))
 }
 
-fn snapshot_file_map(snapshot_manifest: &Value) -> BTreeMap<String, String> {
+pub(crate) fn snapshot_file_map(snapshot_manifest: &Value) -> BTreeMap<String, String> {
     let mut map = BTreeMap::new();
     if let Some(arr) = snapshot_manifest.get("files").and_then(|v| v.as_array()) {
         for row in arr {
@@ -2690,7 +2751,7 @@ fn snapshot_file_map(snapshot_manifest: &Value) -> BTreeMap<String, String> {
     map
 }
 
-fn diff_workspace_snapshots(prev: &Value, post: &Value) -> Value {
+pub(crate) fn diff_workspace_snapshots(prev: &Value, post: &Value) -> Value {
     let prev_map = snapshot_file_map(prev);
     let post_map = snapshot_file_map(post);
 
@@ -2725,7 +2786,7 @@ fn diff_workspace_snapshots(prev: &Value, post: &Value) -> Value {
     })
 }
 
-fn derive_patch_from_diff(diff: &Value) -> Value {
+pub(crate) fn derive_patch_from_diff(diff: &Value) -> Value {
     json!({
         "schema_version": "workspace_patch_v1",
         "format": "file_digest_delta",
@@ -2736,7 +2797,7 @@ fn derive_patch_from_diff(diff: &Value) -> Value {
     })
 }
 
-fn workspace_diff_is_empty(diff: &Value) -> bool {
+pub(crate) fn workspace_diff_is_empty(diff: &Value) -> bool {
     ["added", "removed", "modified"].iter().all(|field| {
         diff.get(field)
             .and_then(Value::as_array)
@@ -2744,7 +2805,7 @@ fn workspace_diff_is_empty(diff: &Value) -> bool {
     })
 }
 
-fn capture_workspace_object_ref(
+pub(crate) fn capture_workspace_object_ref(
     artifact_store: &ArtifactStore,
     workspace_dir: &Path,
 ) -> Result<String> {
@@ -2752,7 +2813,7 @@ fn capture_workspace_object_ref(
     capture_workspace_object_ref_with_limit(artifact_store, workspace_dir, max_bundle_bytes)
 }
 
-fn capture_workspace_object_ref_with_limit(
+pub(crate) fn capture_workspace_object_ref_with_limit(
     artifact_store: &ArtifactStore,
     workspace_dir: &Path,
     max_bundle_bytes: u64,
@@ -2812,7 +2873,7 @@ fn capture_workspace_object_ref_with_limit(
     artifact_store.put_bytes(&bytes)
 }
 
-fn restore_workspace_from_object_ref(
+pub(crate) fn restore_workspace_from_object_ref(
     artifact_store: &ArtifactStore,
     object_ref: &str,
     workspace_dir: &Path,
@@ -2863,7 +2924,11 @@ fn restore_workspace_from_object_ref(
     Ok(())
 }
 
-fn resolve_chain_label(task_payload: &Value, task_id: &str, state_policy: StatePolicy) -> String {
+pub(crate) fn resolve_chain_label(
+    task_payload: &Value,
+    task_id: &str,
+    state_policy: StatePolicy,
+) -> String {
     let explicit = task_payload
         .get("chain_id")
         .and_then(|v| v.as_str())
@@ -2878,11 +2943,11 @@ fn resolve_chain_label(task_payload: &Value, task_id: &str, state_policy: StateP
     }
 }
 
-fn resolve_trial_timeout_ms(input: &Value) -> Option<u64> {
+pub(crate) fn resolve_trial_timeout_ms(input: &Value) -> Option<u64> {
     input.pointer("/policy/timeout_ms").and_then(|v| v.as_u64())
 }
 
-fn output_peer_path(output_path: &str, file_name: &str) -> String {
+pub(crate) fn output_peer_path(output_path: &str, file_name: &str) -> String {
     let output = Path::new(output_path);
     if let Some(parent) = output.parent() {
         return parent.join(file_name).to_string_lossy().to_string();
@@ -2890,7 +2955,7 @@ fn output_peer_path(output_path: &str, file_name: &str) -> String {
     file_name.to_string()
 }
 
-fn build_runtime_contract_env(
+pub(crate) fn build_runtime_contract_env(
     run_id: &str,
     input: &Value,
     io: &PreparedTrialIo,
@@ -2950,268 +3015,28 @@ fn build_runtime_contract_env(
     env
 }
 
-fn command_contract_capabilities() -> AgentAdapterCapabilities {
-    AgentAdapterCapabilities {
-        pause: true,
-        control_ack: true,
-        event_stream: true,
-        strict_replay: false,
-    }
+pub(crate) struct ResolvedGradingPhase {
+    pub(crate) image: String,
+    pub(crate) workdir: String,
+    pub(crate) command: Vec<String>,
+    pub(crate) extra_mounts: Vec<ResolvedMountReference>,
+    pub(crate) injected_bundle_host_path: Option<PathBuf>,
+    pub(crate) injected_copy_dest: Option<String>,
 }
 
-fn run_command_contract_trial(request: &AdapterRunRequest<'_>) -> Result<ProcessRunResult> {
-    write_adapter_continue_control(&request.trial_paths.runtime.control)?;
-    run_external_agent_runtime_trial(request)
-}
-
-fn pause_command_contract_trial(request: &AdapterPauseRequest<'_>) -> Result<AdapterPauseAck> {
-    let control_path = Path::new(&request.control.command_path);
-    let events_path =
-        request.control.events_path.as_deref().ok_or_else(|| {
-            anyhow!("pause_unsupported: active adapter control missing events path")
-        })?;
-    let events_path = Path::new(events_path);
-    let deadline = Instant::now() + request.timeout;
-
-    let seq_checkpoint = read_control_seq(control_path)? + 1;
-    let checkpoint_version = write_adapter_control_action(
-        control_path,
-        seq_checkpoint,
-        "checkpoint",
-        Some(request.label),
-        "lab_pause",
-    )?;
-    wait_for_adapter_control_ack(events_path, "checkpoint", &checkpoint_version, deadline)?;
-
-    let seq_stop = read_control_seq(control_path)? + 1;
-    let stop_version = write_adapter_control_action(
-        control_path,
-        seq_stop,
-        "stop",
-        Some(request.label),
-        "lab_pause",
-    )?;
-    wait_for_adapter_control_ack(events_path, "stop", &stop_version, deadline)?;
-
-    Ok(AdapterPauseAck {
-        checkpoint_acked: true,
-        stop_acked: true,
-    })
-}
-
-fn prebuilt_adapter_profile_value(flavor: PrebuiltAdapterFlavor) -> &'static str {
-    match flavor {
-        PrebuiltAdapterFlavor::CodexCli => "codex_cli",
-        PrebuiltAdapterFlavor::RexJesus => "rex_jesus",
-    }
-}
-
-impl AgentAdapter for BuiltinCommandAdapter {
-    fn capabilities(&self) -> AgentAdapterCapabilities {
-        command_contract_capabilities()
-    }
-
-    fn run_trial(&self, request: &AdapterRunRequest<'_>) -> Result<ProcessRunResult> {
-        run_command_contract_trial(request)
-    }
-
-    fn pause_trial(&self, request: &AdapterPauseRequest<'_>) -> Result<AdapterPauseAck> {
-        pause_command_contract_trial(request)
-    }
-}
-
-impl AgentAdapter for PrebuiltCommandAdapter {
-    fn capabilities(&self) -> AgentAdapterCapabilities {
-        command_contract_capabilities()
-    }
-
-    fn run_trial(&self, request: &AdapterRunRequest<'_>) -> Result<ProcessRunResult> {
-        let mut adapter_overrides = request.runtime_overrides_env.clone();
-        adapter_overrides.insert(
-            "AGENTLAB_PREBUILT_ADAPTER".to_string(),
-            prebuilt_adapter_profile_value(self.flavor).to_string(),
-        );
-        adapter_overrides.insert(
-            "AGENTLAB_PREBUILT_ADAPTER_ID".to_string(),
-            request.runtime.adapter_ref.id.clone(),
-        );
-        let prebuilt_request = AdapterRunRequest {
-            runtime_experiment: request.runtime_experiment,
-            runtime: request.runtime,
-            variant_args: request.variant_args,
-            runtime_env: request.runtime_env,
-            runtime_overrides_env: &adapter_overrides,
-            trial_paths: request.trial_paths,
-            dynamic_mounts: request.dynamic_mounts,
-            io_paths: request.io_paths,
-            network_mode: request.network_mode,
-            benchmark_grader: request.benchmark_grader,
-            benchmark_grading_enabled: request.benchmark_grading_enabled,
-            run_id: request.run_id,
-            task_image: request.task_image,
-            task_workdir: request.task_workdir,
-            task_materialization_kind: request.task_materialization_kind.clone(),
-            agent_artifact: request.agent_artifact,
-        };
-        run_command_contract_trial(&prebuilt_request)
-    }
-
-    fn pause_trial(&self, request: &AdapterPauseRequest<'_>) -> Result<AdapterPauseAck> {
-        pause_command_contract_trial(request)
-    }
-}
-
-fn run_container_sidecar_command(
-    request: &AdapterRunRequest<'_>,
-    image: &str,
-    workspace: &str,
-    command: &[String],
-    runtime_overrides_env: &BTreeMap<String, String>,
-    _label: &str,
-    extra_mounts: &[ResolvedMountReference],
-) -> Result<Output> {
-    let mut merged_mounts = request.dynamic_mounts.to_vec();
-    merged_mounts.extend(extra_mounts.iter().cloned());
-    let sidecar_request = AdapterRunRequest {
-        runtime_experiment: request.runtime_experiment,
-        runtime: request.runtime,
-        variant_args: &[],
-        runtime_env: request.runtime_env,
-        runtime_overrides_env,
-        trial_paths: request.trial_paths,
-        dynamic_mounts: &merged_mounts,
-        io_paths: request.io_paths,
-        network_mode: request.network_mode,
-        benchmark_grader: None,
-        benchmark_grading_enabled: false,
-        run_id: request.run_id,
-        task_image: request.task_image,
-        task_workdir: request.task_workdir,
-        task_materialization_kind: request.task_materialization_kind.clone(),
-        agent_artifact: None,
-    };
-    let mut cmd = build_baked_container_command(
-        &sidecar_request,
-        ContainerPlane::TaskSandbox,
-        image,
-        workspace,
-        command,
-        None,
-    );
-    cmd.output().map_err(Into::into)
-}
-
-fn run_external_agent_runtime_trial(request: &AdapterRunRequest<'_>) -> Result<ProcessRunResult> {
-    let command = resolve_runtime_agent_command(request)?;
-    if let Some(bundle) = request.agent_artifact {
-        validate_agent_artifact_pin(request.runtime)?;
-        if !bundle.exists() {
-            return Err(anyhow!(
-                "runtime.agent_runtime.artifact not found: {}",
-                bundle.display()
-            ));
-        }
-        let bundle_context = format!("runtime.agent_runtime.artifact {}", bundle.display());
-        validate_agent_artifact_path(bundle, &command, bundle_context.as_str())?;
-    }
-
-    let task_sandbox_image = resolve_task_sandbox_image(request)?;
-    ensure_container_image_ready(&task_sandbox_image)?;
-    let workspace = resolve_container_workspace(request)?;
-
-    let image = resolve_agent_execution_image(request)?;
-    ensure_container_image_ready(&image)?;
-    let agent_request = AdapterRunRequest {
-        runtime_experiment: request.runtime_experiment,
-        runtime: request.runtime,
-        variant_args: request.variant_args,
-        runtime_env: request.runtime_env,
-        runtime_overrides_env: request.runtime_overrides_env,
-        trial_paths: request.trial_paths,
-        dynamic_mounts: request.dynamic_mounts,
-        io_paths: request.io_paths,
-        network_mode: request.network_mode,
-        benchmark_grader: request.benchmark_grader,
-        benchmark_grading_enabled: request.benchmark_grading_enabled,
-        run_id: request.run_id,
-        task_image: request.task_image,
-        task_workdir: request.task_workdir,
-        task_materialization_kind: request.task_materialization_kind.clone(),
-        agent_artifact: request.agent_artifact,
-    };
-    let cmd = build_baked_container_command(
-        &agent_request,
-        ContainerPlane::AgentRuntime,
-        &image,
-        workspace,
-        &command,
-        None,
-    );
-    let stdout_log_path = request.trial_paths.trial_dir.join("harness_stdout.log");
-    let stderr_log_path = request.trial_paths.trial_dir.join("harness_stderr.log");
-    let agent_result = run_adapter_process(
-        cmd,
-        &request.io_paths.result_host,
-        None,
-        &stdout_log_path,
-        &stderr_log_path,
-    )?;
-
-    Ok(agent_result)
-}
-
-struct ResolvedGradingPhase {
-    image: String,
-    workdir: String,
-    command: Vec<String>,
-    extra_mounts: Vec<ResolvedMountReference>,
-}
-
-fn resolve_grading_bundle_host_path(
+pub(crate) fn resolve_grading_bundle_host_path(
     request: &AdapterRunRequest<'_>,
     raw_bundle: &str,
 ) -> Result<PathBuf> {
     let rendered = replace_task_workdir_placeholder(raw_bundle, request.task_workdir);
-    if rendered.starts_with("/agentlab/") || rendered.starts_with(AGENTLAB_TASK_WORKDIR_PLACEHOLDER) {
+    if rendered.starts_with("/agentlab/") || rendered.starts_with(AGENTLAB_TASK_WORKDIR_PLACEHOLDER)
+    {
         return map_container_path_to_host(&rendered, request.trial_paths);
     }
     Ok(PathBuf::from(rendered))
 }
 
-fn wrap_injected_grading_command(
-    copy_dest: &str,
-    mounted_source: &str,
-    host_path: &Path,
-    command: &[String],
-) -> Vec<String> {
-    let inject = if host_path.is_dir() {
-        format!(
-            "mkdir -p {copy_dest}\ncp -R {mounted_source}/. {copy_dest}/",
-            copy_dest = shell_quote(copy_dest),
-            mounted_source = shell_quote(mounted_source),
-        )
-    } else if let Some(tar_flag) = agent_artifact_archive_flag(host_path) {
-        format!(
-            "mkdir -p {copy_dest}\ntar {tar_flag} {mounted_source} -C {copy_dest}",
-            copy_dest = shell_quote(copy_dest),
-            tar_flag = tar_flag,
-            mounted_source = shell_quote(mounted_source),
-        )
-    } else {
-        format!(
-            "mkdir -p {copy_dest}\ncp {mounted_source} {copy_dest}/",
-            copy_dest = shell_quote(copy_dest),
-            mounted_source = shell_quote(mounted_source),
-        )
-    };
-    vec![
-        "/bin/sh".to_string(),
-        "-lc".to_string(),
-        format!("set -e\n{}\nexec {}", inject, shell_join(command)),
-    ]
-}
-
-fn resolve_grading_phase(
+pub(crate) fn resolve_grading_phase(
     request: &AdapterRunRequest<'_>,
     grader: &BenchmarkGraderConfig,
     base_command: &[String],
@@ -3224,24 +3049,26 @@ fn resolve_grading_phase(
             workdir: task_workdir.to_string(),
             command: base_command.to_vec(),
             extra_mounts: Vec::new(),
+            injected_bundle_host_path: None,
+            injected_copy_dest: None,
         }),
         GradingStrategy::Separate => {
-            let separate = grader
-                .separate
-                .as_ref()
-                .ok_or_else(|| anyhow!("benchmark.grader.separate is required when strategy='separate'"))?;
+            let separate = grader.separate.as_ref().ok_or_else(|| {
+                anyhow!("benchmark.grader.separate is required when strategy='separate'")
+            })?;
             Ok(ResolvedGradingPhase {
                 image: separate.image.clone(),
                 workdir: separate.workdir.clone(),
                 command: base_command.to_vec(),
                 extra_mounts: Vec::new(),
+                injected_bundle_host_path: None,
+                injected_copy_dest: None,
             })
         }
         GradingStrategy::Injected => {
-            let injected = grader
-                .injected
-                .as_ref()
-                .ok_or_else(|| anyhow!("benchmark.grader.injected is required when strategy='injected'"))?;
+            let injected = grader.injected.as_ref().ok_or_else(|| {
+                anyhow!("benchmark.grader.injected is required when strategy='injected'")
+            })?;
             let bundle_host_path = resolve_grading_bundle_host_path(request, &injected.bundle)?;
             if !bundle_host_path.exists() {
                 return Err(anyhow!(
@@ -3249,152 +3076,19 @@ fn resolve_grading_phase(
                     bundle_host_path.display()
                 ));
             }
-            let mount_name = bundle_host_path
-                .file_name()
-                .and_then(|value| value.to_str())
-                .map(sanitize_for_fs)
-                .filter(|value| !value.is_empty())
-                .unwrap_or_else(|| "grader_bundle".to_string());
-            let mounted_source = format!("{}/{}", AGENTLAB_CONTRACT_GRADER_AUX_DIR, mount_name);
-            let command = wrap_injected_grading_command(
-                &injected.copy_dest,
-                &mounted_source,
-                &bundle_host_path,
-                base_command,
-            );
             Ok(ResolvedGradingPhase {
                 image: task_image,
                 workdir: task_workdir.to_string(),
-                command,
-                extra_mounts: vec![ResolvedMountReference {
-                    host_path: bundle_host_path,
-                    mount_path: mounted_source,
-                }],
+                command: base_command.to_vec(),
+                extra_mounts: Vec::new(),
+                injected_bundle_host_path: Some(bundle_host_path),
+                injected_copy_dest: Some(injected.copy_dest.clone()),
             })
         }
     }
 }
 
-fn run_benchmark_grading_phase(
-    request: &AdapterRunRequest<'_>,
-    agent_exit_status: &str,
-) -> Result<()> {
-    if !request.benchmark_grading_enabled {
-        return Ok(());
-    }
-    let Some(grader) = request.benchmark_grader else {
-        return Ok(());
-    };
-    let Some(grader_command) = resolve_benchmark_grader_command(request)? else {
-        return Ok(());
-    };
-
-    let grade_error_marker_path = request.trial_paths.out.join(BENCHMARK_GRADE_ERROR_FILENAME);
-    let result_path = &request.io_paths.result_host;
-    if !result_path.exists() || result_path.metadata().map(|meta| meta.len()).unwrap_or(0) == 0 {
-        fs::write(&grade_error_marker_path, b"result_missing\n")?;
-        return Ok(());
-    }
-
-    let resolved = resolve_grading_phase(request, grader, &grader_command)?;
-    ensure_container_image_ready(&resolved.image)?;
-
-    let mut overrides = request.runtime_overrides_env.clone();
-    overrides.insert(
-        AGENTLAB_ENV_AGENT_EXIT_STATUS.to_string(),
-        agent_exit_status.to_string(),
-    );
-    let grader_output = run_container_sidecar_command(
-        request,
-        &resolved.image,
-        &resolved.workdir,
-        &resolved.command,
-        &overrides,
-        "benchmark grader",
-        &resolved.extra_mounts,
-    )?;
-    let expected_output_path = request
-        .trial_paths
-        .out
-        .join(benchmark_grader_expected_output_filename(request.benchmark_grader));
-    let expected_output_present = expected_output_path.exists()
-        && expected_output_path
-            .metadata()
-            .map(|meta| meta.len())
-            .unwrap_or(0)
-            > 0;
-    if !expected_output_present {
-        let reason = if grader_output.status.success() {
-            benchmark_grader_expected_output_filename(request.benchmark_grader).to_string()
-        } else {
-            format!("grader_command_failed:{}", output_error_detail(&grader_output))
-        };
-        let marker = if benchmark_grader_uses_mapper(request.benchmark_grader) {
-            if reason.starts_with("grader_command_failed:") {
-                reason
-            } else {
-                "raw_grader_output_missing".to_string()
-            }
-        } else if reason.starts_with("grader_command_failed:") {
-            reason
-        } else {
-            "mapped_grader_output_missing".to_string()
-        };
-        fs::write(&grade_error_marker_path, format!("{}\n", marker).into_bytes())?;
-    }
-    Ok(())
-}
-
-fn run_benchmark_conclusion_mapper_phase(request: &AdapterRunRequest<'_>) -> Result<()> {
-    if !request.benchmark_grading_enabled {
-        return Ok(());
-    }
-    let Some(grader) = request.benchmark_grader else {
-        return Ok(());
-    };
-    let Some(mapper_command) = resolve_benchmark_conclusion_mapper_command(request, grader)? else {
-        return Ok(());
-    };
-
-    let grade_error_marker_path = request.trial_paths.out.join(BENCHMARK_GRADE_ERROR_FILENAME);
-    let raw_output_path = request.trial_paths.out.join(RAW_GRADER_OUTPUT_FILENAME);
-    let raw_output_present =
-        raw_output_path.exists() && raw_output_path.metadata().map(|meta| meta.len()).unwrap_or(0) > 0;
-    if !raw_output_present {
-        fs::write(&grade_error_marker_path, b"raw_grader_output_missing\n")?;
-        return Ok(());
-    }
-
-    let resolved = resolve_grading_phase(request, grader, &mapper_command)?;
-    ensure_container_image_ready(&resolved.image)?;
-    let mapper_output = run_container_sidecar_command(
-        request,
-        &resolved.image,
-        &resolved.workdir,
-        &resolved.command,
-        request.runtime_overrides_env,
-        "benchmark conclusion mapper",
-        &resolved.extra_mounts,
-    )?;
-    let mapped_output_path = request.trial_paths.out.join(MAPPED_GRADER_OUTPUT_FILENAME);
-    let mapped_output_present = mapped_output_path.exists()
-        && mapped_output_path
-            .metadata()
-            .map(|meta| meta.len())
-            .unwrap_or(0)
-            > 0;
-    if !mapped_output_present {
-        let marker = if mapper_output.status.success() {
-            "mapped_grader_output_missing".to_string()
-        } else {
-            format!("mapper_command_failed:{}", output_error_detail(&mapper_output))
-        };
-        fs::write(&grade_error_marker_path, format!("{}\n", marker).into_bytes())?;
-    }
-    Ok(())
-}
-
-fn resolve_benchmark_grader_command(
+pub(crate) fn resolve_benchmark_grader_command(
     request: &AdapterRunRequest<'_>,
 ) -> Result<Option<Vec<String>>> {
     if !request.benchmark_grading_enabled {
@@ -3418,7 +3112,7 @@ fn resolve_benchmark_grader_command(
             && !matches_contract_runtime_root(script_path, workspace)
         {
             return Err(anyhow!(
-                "forbidden benchmark grader script path '{}': script must be under {} or the task workdir",
+                "forbidden benchmark adapter script path '{}': script must be under {} or the task workdir",
                 script_path,
                 AGENTLAB_CONTRACT_RUNTIME_AUX_DIR
             ));
@@ -3427,11 +3121,11 @@ fn resolve_benchmark_grader_command(
     Ok(Some(rendered))
 }
 
-fn benchmark_grader_uses_mapper(grader: Option<&BenchmarkGraderConfig>) -> bool {
+pub(crate) fn benchmark_grader_uses_mapper(grader: Option<&BenchmarkGraderConfig>) -> bool {
     grader.is_some_and(|grader| matches!(grader.conclusion.mode, GraderConclusionMode::Mapper))
 }
 
-fn benchmark_grader_expected_output_filename(
+pub(crate) fn benchmark_grader_expected_output_filename(
     grader: Option<&BenchmarkGraderConfig>,
 ) -> &'static str {
     if benchmark_grader_uses_mapper(grader) {
@@ -3441,17 +3135,7 @@ fn benchmark_grader_expected_output_filename(
     }
 }
 
-fn benchmark_grader_expected_output_container_path(
-    grader: Option<&BenchmarkGraderConfig>,
-) -> &'static str {
-    if benchmark_grader_uses_mapper(grader) {
-        DEFAULT_CONTAINER_RAW_GRADER_OUTPUT_PATH
-    } else {
-        DEFAULT_CONTAINER_MAPPED_GRADER_OUTPUT_PATH
-    }
-}
-
-fn resolve_benchmark_conclusion_mapper_command(
+pub(crate) fn resolve_benchmark_conclusion_mapper_command(
     request: &AdapterRunRequest<'_>,
     grader: &BenchmarkGraderConfig,
 ) -> Result<Option<Vec<String>>> {
@@ -3484,11 +3168,7 @@ fn resolve_benchmark_conclusion_mapper_command(
     Ok(Some(vec![rendered]))
 }
 
-fn resolve_agent_execution_image(request: &AdapterRunRequest<'_>) -> Result<String> {
-    Ok(request.runtime.image.clone())
-}
-
-fn resolve_task_sandbox_image(request: &AdapterRunRequest<'_>) -> Result<String> {
+pub(crate) fn resolve_task_sandbox_image(request: &AdapterRunRequest<'_>) -> Result<String> {
     let image = request.task_image.trim();
     if image.is_empty() {
         return Err(anyhow!("task image is required for task sandbox"));
@@ -3496,7 +3176,9 @@ fn resolve_task_sandbox_image(request: &AdapterRunRequest<'_>) -> Result<String>
     Ok(image.to_string())
 }
 
-fn resolve_container_workspace<'a>(request: &'a AdapterRunRequest<'_>) -> Result<&'a str> {
+pub(crate) fn resolve_container_workspace<'a>(
+    request: &'a AdapterRunRequest<'_>,
+) -> Result<&'a str> {
     let workdir = request.task_workdir.trim();
     if workdir.is_empty() {
         return Err(anyhow!("task workdir is required for task sandbox"));
@@ -3504,241 +3186,7 @@ fn resolve_container_workspace<'a>(request: &'a AdapterRunRequest<'_>) -> Result
     Ok(workdir)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ContainerPlane {
-    AgentRuntime,
-    TaskSandbox,
-}
-
-fn append_container_sandbox_args(
-    cmd: &mut Command,
-    request: &AdapterRunRequest<'_>,
-    plane: ContainerPlane,
-    workspace: &str,
-) -> Result<()> {
-    let network_mode = match plane {
-        ContainerPlane::AgentRuntime => request.runtime.network.as_str(),
-        ContainerPlane::TaskSandbox => request.network_mode,
-    };
-    if network_mode == "none" {
-        cmd.arg("--network=none");
-    }
-
-    let no_new_privileges = request
-        .runtime_experiment
-        .pointer("/policy/task_sandbox/hardening/no_new_privileges")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(true);
-    if no_new_privileges {
-        cmd.args(["--security-opt", "no-new-privileges"]);
-    }
-
-    let drop_all_caps = request
-        .runtime_experiment
-        .pointer("/policy/task_sandbox/hardening/drop_all_caps")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(true);
-    if drop_all_caps {
-        cmd.args(["--cap-drop", "ALL"]);
-    }
-
-    let cpu_limit = request
-        .runtime_experiment
-        .pointer("/policy/task_sandbox/resources/cpu_count")
-        .and_then(|v| v.as_u64());
-    if let Some(cpu) = cpu_limit {
-        cmd.arg("--cpus").arg(cpu.to_string());
-    }
-    let memory_limit_mb = request
-        .runtime_experiment
-        .pointer("/policy/task_sandbox/resources/memory_mb")
-        .and_then(|v| v.as_u64());
-    if let Some(mem) = memory_limit_mb {
-        cmd.arg("--memory").arg(format!("{}m", mem));
-    }
-
-    cmd.args([
-        "-v",
-        &format!(
-            "{}:{}:ro",
-            request.trial_paths.in_dir.display(),
-            AGENTLAB_CONTRACT_IN_DIR
-        ),
-    ]);
-    cmd.args([
-        "-v",
-        &format!(
-            "{}:{}",
-            request.trial_paths.out.display(),
-            AGENTLAB_CONTRACT_OUT_DIR
-        ),
-    ]);
-    cmd.args([
-        "-v",
-        &format!(
-            "{}:{}",
-            request.trial_paths.workspace.display(),
-            workspace
-        ),
-    ]);
-    let sandbox_profile = request
-        .runtime_experiment
-        .pointer("/policy/task_sandbox/profile")
-        .and_then(|v| v.as_str())
-        .unwrap_or("default");
-    if sandbox_profile == "swebench_testbed" {
-        cmd.args([
-            "-v",
-            &format!("{}:/testbed", request.trial_paths.workspace.display()),
-        ]);
-    }
-    for mount in request.dynamic_mounts {
-        cmd.args([
-            "-v",
-            &format!("{}:{}:ro", mount.host_path.display(), mount.mount_path),
-        ]);
-    }
-    if matches!(plane, ContainerPlane::AgentRuntime) {
-        if let Some(bundle) = request.agent_artifact {
-            if let Ok(bundle_root) = resolve_agent_artifact_mount_dir(bundle) {
-                cmd.args(["-v", &format!("{}:/opt/agent:ro", bundle_root.display())]);
-            }
-        }
-    }
-    cmd.args(["--tmpfs", "/tmp:rw"]);
-    // Mask legacy image-level /workspace so agent cannot read image internals.
-    cmd.args(["--tmpfs", "/workspace:rw"]);
-    // Mask benchmark internals bundled in task images from agent runtime view.
-    if matches!(plane, ContainerPlane::AgentRuntime) {
-        cmd.args(["--tmpfs", "/opt/bench:rw"]);
-    }
-    cmd.args(["-w", workspace]);
-    Ok(())
-}
-
-fn append_container_env_args(
-    cmd: &mut Command,
-    request: &AdapterRunRequest<'_>,
-    workspace: &str,
-) {
-    let mut path_overridden = false;
-    for (key, value) in request.runtime_overrides_env {
-        if key == "PATH" {
-            path_overridden = true;
-        }
-        cmd.arg("-e").arg(format!(
-            "{}={}",
-            key,
-            replace_task_workdir_placeholder(value, workspace)
-        ));
-    }
-    for (key, value) in request.runtime_env {
-        if key == "PATH" {
-            path_overridden = true;
-        }
-        cmd.arg("-e").arg(format!(
-            "{}={}",
-            key,
-            replace_task_workdir_placeholder(value, workspace)
-        ));
-    }
-    if request.agent_artifact.is_some() && !path_overridden {
-        cmd.arg("-e").arg(AGENT_ARTIFACT_PATH_ENV_VALUE);
-    }
-    cmd.arg("-e").arg(format!("WORKSPACE={}", workspace));
-}
-
-fn append_container_entrypoint(
-    cmd: &mut Command,
-    request: &AdapterRunRequest<'_>,
-    command: &[String],
-    grader_command: Option<Vec<String>>,
-) {
-    if let Some(grader_command) = grader_command {
-        let artifact_path_export = if request.agent_artifact.is_some() {
-            format!("export {}\n", AGENT_ARTIFACT_PATH_ENV_VALUE)
-        } else {
-            String::new()
-        };
-        let grade_error_marker_path = output_peer_path(
-            &request.io_paths.result_path,
-            BENCHMARK_GRADE_ERROR_FILENAME,
-        );
-        let expected_output_path =
-            benchmark_grader_expected_output_container_path(request.benchmark_grader);
-        let missing_output_marker = if benchmark_grader_uses_mapper(request.benchmark_grader) {
-            "raw_grader_output_missing"
-        } else {
-            "mapped_grader_output_missing"
-        };
-        let wrapped = format!(
-            "set +e\n\
-             rm -f {marker}\n\
-             {artifact_path_export}\
-             {agent}\n\
-             agent_status=$?\n\
-             export {agent_exit_env}=\"$agent_status\"\n\
-             if [ ! -s {result_path} ]; then\n\
-               printf '%s\\n' \"result_missing\" > {marker}\n\
-               if [ \"$agent_status\" -ne 0 ]; then\n\
-                 exit \"$agent_status\"\n\
-               fi\n\
-               exit {grade_error_code}\n\
-             fi\n\
-             {grader}\n\
-             grader_status=$?\n\
-             if [ ! -s {expected_output_path} ]; then\n\
-               if [ \"$grader_status\" -ne 0 ]; then\n\
-                 printf '%s\\n' \"grader_command_failed:$grader_status\" > {marker}\n\
-               else\n\
-                 printf '%s\\n' \"{missing_output_marker}\" > {marker}\n\
-               fi\n\
-             fi\n\
-             if [ -s {marker} ]; then\n\
-               exit {grade_error_code}\n\
-             fi\n\
-             if [ \"$agent_status\" -ne 0 ]; then\n\
-               exit \"$agent_status\"\n\
-             fi\n\
-             exit 0",
-            marker = shell_quote(&grade_error_marker_path),
-            artifact_path_export = artifact_path_export,
-            agent = shell_join(command),
-            agent_exit_env = AGENTLAB_ENV_AGENT_EXIT_STATUS,
-            result_path = shell_quote(&request.io_paths.result_path),
-            grader = shell_join(&grader_command),
-            expected_output_path = shell_quote(expected_output_path),
-            missing_output_marker = missing_output_marker,
-            grade_error_code = BENCHMARK_GRADING_POLICY_EXIT_CODE,
-        );
-        cmd.arg("/bin/sh");
-        cmd.arg("-lc");
-        cmd.arg(wrapped);
-    } else {
-        cmd.args(command);
-    }
-}
-
-fn build_baked_container_command(
-    request: &AdapterRunRequest<'_>,
-    plane: ContainerPlane,
-    image: &str,
-    workspace: &str,
-    command: &[String],
-    grader_command: Option<Vec<String>>,
-) -> Command {
-    let mut cmd = Command::new("docker");
-    cmd.arg("run").arg("--rm").args(["--pull", "never"]);
-    append_container_platform_arg(&mut cmd, image);
-    append_container_sandbox_args(&mut cmd, request, plane, workspace)
-        .expect("task workdir should be resolved before container command build");
-    append_container_env_args(&mut cmd, request, workspace);
-    cmd.arg(image);
-    append_container_entrypoint(&mut cmd, request, command, grader_command);
-    cmd
-}
-
-fn run_checked_command(mut cmd: Command, step: &str) -> Result<std::process::Output> {
+pub(crate) fn run_checked_command(mut cmd: Command, step: &str) -> Result<std::process::Output> {
     let out = cmd.output()?;
     if out.status.success() {
         return Ok(out);
@@ -3747,7 +3195,7 @@ fn run_checked_command(mut cmd: Command, step: &str) -> Result<std::process::Out
     Err(anyhow!("{}: {}", step, detail))
 }
 
-fn output_error_detail(out: &Output) -> String {
+pub(crate) fn output_error_detail(out: &Output) -> String {
     let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
     let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
     if !stderr.is_empty() {
@@ -3759,7 +3207,8 @@ fn output_error_detail(out: &Output) -> String {
     }
 }
 
-fn resolve_local_image_alias(image: &str) -> Option<String> {
+#[cfg(test)]
+pub(crate) fn resolve_local_image_alias(image: &str) -> Option<String> {
     image
         .strip_prefix("swebench/")
         .filter(|candidate| candidate.starts_with("sweb.eval."))
@@ -3777,109 +3226,22 @@ pub(crate) fn resolve_container_platform(image: &str) -> Option<&'static str> {
     None
 }
 
-pub(crate) fn append_container_platform_arg(cmd: &mut Command, image: &str) {
-    if let Some(platform) = resolve_container_platform(image) {
-        cmd.arg("--platform").arg(platform);
-    }
+pub(crate) fn resolve_container_image_digest(image: &str) -> Option<String> {
+    let runtime = crate::backend::docker::DockerRuntime::connect().ok()?;
+    let metadata = runtime.ensure_image(image).ok()?;
+    metadata
+        .repo_digests
+        .first()
+        .and_then(|value| value.rsplit_once('@').map(|(_, digest)| digest.to_string()))
+        .or(metadata.image_id)
 }
 
-fn ensure_container_image_ready(image: &str) -> Result<()> {
-    let inspect_output = Command::new("docker")
-        .args(["image", "inspect", image])
-        .output()?;
-    if inspect_output.status.success() {
-        return Ok(());
-    }
-    if let Some(local_alias) = resolve_local_image_alias(image) {
-        let alias_inspect = Command::new("docker")
-            .args(["image", "inspect", &local_alias])
-            .output()?;
-        if alias_inspect.status.success() {
-            emit_preflight_log(format!(
-                "container image '{}' missing canonical tag; tagging local alias '{}'",
-                image, local_alias
-            ));
-            let tag_output = Command::new("docker")
-                .args(["image", "tag", &local_alias, image])
-                .output()?;
-            if tag_output.status.success() {
-                return Ok(());
-            }
-            return Err(anyhow!(
-                "container image alias '{}' found locally, but failed to tag as '{}': {}",
-                local_alias,
-                image,
-                output_error_detail(&tag_output),
-            ));
-        }
-    }
-    emit_preflight_log(format!(
-        "container image '{}' not found locally; pulling",
-        image
-    ));
-    let pull_started = Instant::now();
-    let pull_output = Command::new("docker").args(["pull", image]).output()?;
-    if pull_output.status.success() {
-        emit_preflight_log(format!(
-            "pulled '{}' in {:.1}s",
-            image,
-            pull_started.elapsed().as_secs_f32()
-        ));
-        return Ok(());
-    }
-    Err(anyhow!(
-        "container image not available: {} (pull: {})",
-        image,
-        output_error_detail(&pull_output),
-    ))
-}
-
-fn resolve_container_image_digest(image: &str) -> Option<String> {
-    let inspect_output = Command::new("docker")
-        .args([
-            "image",
-            "inspect",
-            image,
-            "--format",
-            "{{index .RepoDigests 0}}",
-        ])
-        .output()
-        .ok()?;
-    if !inspect_output.status.success() {
-        return None;
-    }
-    let raw = String::from_utf8_lossy(&inspect_output.stdout)
-        .trim()
-        .to_string();
-    if let Some((_, digest)) = raw.rsplit_once('@') {
-        if digest.starts_with("sha256:") {
-            return Some(digest.to_string());
-        }
-    }
-
-    let id_output = Command::new("docker")
-        .args(["image", "inspect", image, "--format", "{{.Id}}"])
-        .output()
-        .ok()?;
-    if !id_output.status.success() {
-        return None;
-    }
-    let raw = String::from_utf8_lossy(&id_output.stdout)
-        .trim()
-        .to_string();
-    if raw.starts_with("sha256:") {
-        Some(raw)
-    } else {
-        None
-    }
-}
-
-fn agent_artifact_cache_lock() -> &'static Mutex<()> {
+pub(crate) fn agent_artifact_cache_lock() -> &'static Mutex<()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| Mutex::new(()))
 }
 
-fn repair_agent_artifact_layout(unpacked_dir: &Path) -> Result<()> {
+pub(crate) fn repair_agent_artifact_layout(unpacked_dir: &Path) -> Result<()> {
     let packages_root = unpacked_dir.join("packages");
     let nested_packages_root = packages_root.join("packages");
     if !packages_root.is_dir() || !nested_packages_root.is_dir() {
@@ -4009,7 +3371,9 @@ pub(crate) fn resolve_agent_artifact_mount_dir(artifact: &Path) -> Result<PathBu
     Ok(unpacked_dir)
 }
 
-fn resolve_runtime_agent_command(request: &AdapterRunRequest<'_>) -> Result<Vec<String>> {
+pub(crate) fn resolve_runtime_agent_command(
+    request: &AdapterRunRequest<'_>,
+) -> Result<Vec<String>> {
     if request.runtime.command_raw.is_empty() {
         return Err(anyhow!("resolved runtime.agent_runtime.command is empty"));
     }
@@ -4025,14 +3389,25 @@ fn resolve_runtime_agent_command(request: &AdapterRunRequest<'_>) -> Result<Vec<
             .iter()
             .map(|token| replace_task_workdir_placeholder(token, request.task_workdir)),
     );
+    #[cfg(test)]
+    {
+        if !request.runtime.io.input_arg.trim().is_empty() {
+            command.push(request.runtime.io.input_arg.clone());
+            command.push(request.io_paths.trial_input_path.clone());
+        }
+        if !request.runtime.io.output_arg.trim().is_empty() {
+            command.push(request.runtime.io.output_arg.clone());
+            command.push(request.io_paths.result_path.clone());
+        }
+    }
     Ok(command)
 }
 
-fn replace_task_workdir_placeholder(raw: &str, task_workdir: &str) -> String {
+pub(crate) fn replace_task_workdir_placeholder(raw: &str, task_workdir: &str) -> String {
     raw.replace(TASK_WORKDIR_TEMPLATE_PLACEHOLDER, task_workdir)
 }
 
-struct PreflightProbeRoot {
+pub(crate) struct PreflightProbeRoot {
     path: PathBuf,
 }
 
@@ -4042,7 +3417,7 @@ impl Drop for PreflightProbeRoot {
     }
 }
 
-struct PreflightProbeContext {
+pub(crate) struct PreflightProbeContext {
     _root: PreflightProbeRoot,
     trial_paths: TrialPaths,
     io_paths: PreparedTrialIo,
@@ -4053,7 +3428,7 @@ struct PreflightProbeContext {
     task_materialization_kind: TaskMaterializationKind,
 }
 
-fn create_preflight_probe_root(label: &str) -> Result<PreflightProbeRoot> {
+pub(crate) fn create_preflight_probe_root(label: &str) -> Result<PreflightProbeRoot> {
     let root = std::env::temp_dir().join(format!(
         "agentlab_preflight_probe_{}_{}_{}",
         sanitize_for_fs(label),
@@ -4064,7 +3439,7 @@ fn create_preflight_probe_root(label: &str) -> Result<PreflightProbeRoot> {
     Ok(PreflightProbeRoot { path: root })
 }
 
-fn select_preflight_probe_task(
+pub(crate) fn select_preflight_probe_task(
     tasks: &[Value],
     image: &str,
 ) -> Result<(usize, TaskBoundaryMaterialization)> {
@@ -4093,14 +3468,51 @@ fn select_preflight_probe_task(
     ))
 }
 
-fn build_preflight_probe_context(
+pub(crate) fn build_preflight_probe_context(
     runtime_profile: &VariantRuntimeProfile,
     variant: &Variant,
     tasks: &[Value],
     image: &str,
     project_root: &Path,
 ) -> Result<PreflightProbeContext> {
-    let (task_idx, task_boundary) = select_preflight_probe_task(tasks, image)?;
+    let (task_idx, task_boundary) = match select_preflight_probe_task(tasks, image) {
+        Ok(selected) => selected,
+        Err(err) if tasks.is_empty() => (
+            0,
+            TaskBoundaryMaterialization {
+                declaration: json!({
+                    "schema_version": "task_row_v1",
+                    "id": "preflight_probe_task",
+                    "image": image,
+                    "workdir": "/workspace/task",
+                    "task": {},
+                    "materialization": { "kind": "task_image" }
+                }),
+                task_payload: json!({}),
+                workspace: WorkspaceSpec {
+                    mode: WorkspaceMode::Scratch,
+                    base: WorkspaceBaseSpec {
+                        kind: WorkspaceBaseKind::Empty,
+                        dataset_pack_ref: None,
+                        repo: None,
+                        commit: None,
+                    },
+                    overlays: Vec::new(),
+                    aux_mounts: Vec::new(),
+                },
+                dependencies: json!({}),
+                materialization: TaskMaterializationSpec {
+                    kind: TaskMaterializationKind::TaskImage,
+                    task_bundle_ref: None,
+                },
+                task_id: "preflight_probe_task".to_string(),
+                task_image: image.to_string(),
+                task_workdir: "/workspace/task".to_string(),
+                time_limit_ms: None,
+            },
+        ),
+        Err(err) => return Err(err),
+    };
     let probe_root = create_preflight_probe_root(&format!("{}_{}", variant.id, image))?;
     let trial_dir = probe_root.path.join("trial_1");
     ensure_dir(&trial_dir)?;
@@ -4154,7 +3566,7 @@ fn build_preflight_probe_context(
     })
 }
 
-fn build_preflight_probe_request<'a>(
+pub(crate) fn build_preflight_probe_request<'a>(
     context: &'a PreflightProbeContext,
     runtime_profile: &'a VariantRuntimeProfile,
     benchmark_grader: Option<&'a BenchmarkGraderConfig>,
@@ -4176,57 +3588,57 @@ fn build_preflight_probe_request<'a>(
         task_image: context.task_image.as_str(),
         task_workdir: context.task_workdir.as_str(),
         task_materialization_kind: context.task_materialization_kind.clone(),
-        agent_artifact: Some(runtime_profile.agent_runtime.agent_artifact.as_path()),
+        agent_artifact: runtime_profile
+            .agent_runtime
+            .agent_artifact
+            .exists()
+            .then_some(runtime_profile.agent_runtime.agent_artifact.as_path()),
     }
 }
 
-struct PreflightContractSmokeExecution {
+pub(crate) struct PreflightContractSmokeExecution {
     status: String,
     stdout: String,
     stderr: String,
 }
 
-fn read_optional_text_file(path: &Path) -> Result<String> {
+pub(crate) fn read_optional_text_file(path: &Path) -> Result<String> {
     if !path.exists() {
         return Ok(String::new());
     }
     Ok(fs::read_to_string(path)?)
 }
 
-fn run_preflight_contract_smoke(
+pub(crate) fn run_preflight_contract_smoke(
     request: &AdapterRunRequest<'_>,
 ) -> Result<PreflightContractSmokeExecution> {
-    let adapter = adapter_registry_entry(&request.runtime.adapter_ref)?;
-    let proc_result = adapter.run_trial(request)?;
-    let trial_input: Value = serde_json::from_slice(&fs::read(&request.io_paths.trial_input_host)?)?;
-    let (trial_output, result_parse_error) = load_trial_output_resilient(&request.io_paths.result_host)?;
-    write_grader_input_file(
-        request.io_paths,
-        &trial_input,
-        &trial_output,
-        request.trial_paths,
-        request.task_workdir,
-        &proc_result.status,
-        result_parse_error.as_deref(),
-        &Utc::now().to_rfc3339(),
-        &Utc::now().to_rfc3339(),
-        None,
-        None,
+    let prepared_manifest =
+        load_prepared_task_environment_manifest(&request.trial_paths.trial_dir)?;
+    let runtime_outcome = crate::trial::execution::execute_trial_runtime(
+        &request.trial_paths.trial_dir,
+        0,
+        1,
+        request,
+        &prepared_manifest.task_id,
+        &prepared_manifest.variant_id,
+        prepared_manifest.repl_idx,
+        prepared_manifest
+            .task_sandbox_plan
+            .as_ref()
+            .ok_or_else(|| anyhow!("preflight probe missing task sandbox plan"))?,
     )?;
-    run_benchmark_grading_phase(request, &proc_result.status)?;
-    run_benchmark_conclusion_mapper_phase(request)?;
     let stdout =
         read_optional_text_file(&request.trial_paths.trial_dir.join("harness_stdout.log"))?;
     let stderr =
         read_optional_text_file(&request.trial_paths.trial_dir.join("harness_stderr.log"))?;
     Ok(PreflightContractSmokeExecution {
-        status: proc_result.status,
+        status: runtime_outcome.agent_exit_status,
         stdout,
         stderr,
     })
 }
 
-fn detect_known_probe_output_blockers(stdout: &str, stderr: &str) -> Vec<String> {
+pub(crate) fn detect_known_probe_output_blockers(stdout: &str, stderr: &str) -> Vec<String> {
     let mut blockers = Vec::new();
     for line in stdout.lines().chain(stderr.lines()) {
         let trimmed = line.trim();
@@ -4251,7 +3663,7 @@ fn detect_known_probe_output_blockers(stdout: &str, stderr: &str) -> Vec<String>
     blockers
 }
 
-fn summarize_preflight_failure_logs(stdout: &str, stderr: &str) -> Vec<String> {
+pub(crate) fn summarize_preflight_failure_logs(stdout: &str, stderr: &str) -> Vec<String> {
     let mut lines = Vec::new();
     for line in stderr.lines().chain(stdout.lines()) {
         let trimmed = line.trim();
@@ -4266,7 +3678,7 @@ fn summarize_preflight_failure_logs(stdout: &str, stderr: &str) -> Vec<String> {
     lines
 }
 
-fn validate_preflight_result_payload(path: &Path) -> Vec<String> {
+pub(crate) fn validate_preflight_result_payload(path: &Path) -> Vec<String> {
     let mut failures = Vec::new();
     if !path.exists() {
         failures.push(format!(
@@ -4338,15 +3750,12 @@ fn validate_preflight_result_payload(path: &Path) -> Vec<String> {
     failures
 }
 
-fn validate_preflight_benchmark_smoke_outputs(
+pub(crate) fn validate_preflight_benchmark_smoke_outputs(
     request: &AdapterRunRequest<'_>,
     status: &str,
 ) -> Vec<String> {
     let mut failures = Vec::new();
-    let mapped_grader_output_path = request
-        .trial_paths
-        .out
-        .join(MAPPED_GRADER_OUTPUT_FILENAME);
+    let mapped_grader_output_path = request.trial_paths.out.join(MAPPED_GRADER_OUTPUT_FILENAME);
     let grade_error_path = request.trial_paths.out.join(BENCHMARK_GRADE_ERROR_FILENAME);
 
     let mapped_output_valid = match load_optional_json_record_with_schema(
@@ -4356,9 +3765,9 @@ fn validate_preflight_benchmark_smoke_outputs(
         Ok(Some(_)) => true,
         Ok(None) => {
             failures.push(format!(
-            "contract smoke did not write mapped grader output: {}",
-            mapped_grader_output_path.display()
-        ));
+                "contract smoke did not write mapped grader output: {}",
+                mapped_grader_output_path.display()
+            ));
             false
         }
         Err(err) => {
@@ -4387,7 +3796,7 @@ fn validate_preflight_benchmark_smoke_outputs(
     failures
 }
 
-fn collect_preflight_contract_smoke_failures(
+pub(crate) fn collect_preflight_contract_smoke_failures(
     request: &AdapterRunRequest<'_>,
     execution: &PreflightContractSmokeExecution,
 ) -> Vec<String> {
@@ -4421,7 +3830,7 @@ fn collect_preflight_contract_smoke_failures(
         .collect()
 }
 
-fn resolve_agent_runtime_command(
+pub(crate) fn resolve_agent_runtime_command(
     command: &[String],
     bindings: &Value,
     runtime_env_inputs: &BTreeMap<String, String>,
@@ -4429,159 +3838,17 @@ fn resolve_agent_runtime_command(
     resolve_command_templates(command, bindings, runtime_env_inputs)
 }
 
-fn validate_agent_runtime_command(command: &[String], _project_root: &Path) -> Result<()> {
+pub(crate) fn validate_agent_runtime_command(
+    command: &[String],
+    _project_root: &Path,
+) -> Result<()> {
     if command.is_empty() {
         return Err(anyhow!("runtime.agent_runtime.command must not be empty"));
     }
     Ok(())
 }
 
-fn ensure_clean_output_file(path: &Path, label: &str) -> Result<()> {
-    if !path.exists() {
-        if let Some(parent) = path.parent() {
-            ensure_dir(parent)?;
-        }
-        return Ok(());
-    }
-    if path.is_file() {
-        fs::remove_file(path)?;
-        if let Some(parent) = path.parent() {
-            ensure_dir(parent)?;
-        }
-        return Ok(());
-    }
-    Err(anyhow!("{} must be a file path: {}", label, path.display()))
-}
-
-fn copy_stream_to_file<R: Read>(mut reader: R, mut file: fs::File) -> Result<()> {
-    let mut buf = [0u8; 8192];
-    loop {
-        let n = reader.read(&mut buf)?;
-        if n == 0 {
-            break;
-        }
-        file.write_all(&buf[..n])?;
-    }
-    file.flush()?;
-    Ok(())
-}
-
-fn terminate_child_process(child: &mut std::process::Child) {
-    let _ = child.kill();
-    let _ = child.wait();
-}
-
-fn run_adapter_process(
-    mut cmd: Command,
-    output_path: &Path,
-    start_response_path: Option<&Path>,
-    stdout_log_path: &Path,
-    stderr_log_path: &Path,
-) -> Result<ProcessRunResult> {
-    ensure_clean_output_file(output_path, "output path")?;
-    ensure_clean_output_file(stdout_log_path, "stdout log path")?;
-    ensure_clean_output_file(stderr_log_path, "stderr log path")?;
-
-    cmd.stdin(Stdio::null());
-    cmd.stdout(Stdio::piped());
-    cmd.stderr(Stdio::piped());
-
-    let mut child = cmd.spawn()?;
-    let stdout_pipe = match child.stdout.take() {
-        Some(pipe) => pipe,
-        None => {
-            terminate_child_process(&mut child);
-            return Err(anyhow!("failed to capture child stdout pipe"));
-        }
-    };
-    let stderr_pipe = match child.stderr.take() {
-        Some(pipe) => pipe,
-        None => {
-            terminate_child_process(&mut child);
-            return Err(anyhow!("failed to capture child stderr pipe"));
-        }
-    };
-
-    let stdout_file = match fs::File::create(stdout_log_path) {
-        Ok(file) => file,
-        Err(err) => {
-            terminate_child_process(&mut child);
-            return Err(err.into());
-        }
-    };
-    let stderr_file = match fs::File::create(stderr_log_path) {
-        Ok(file) => file,
-        Err(err) => {
-            terminate_child_process(&mut child);
-            return Err(err.into());
-        }
-    };
-
-    let stdout_handle = match thread::Builder::new()
-        .name("agentlab-stdout-capture".to_string())
-        .spawn(move || copy_stream_to_file(stdout_pipe, stdout_file))
-    {
-        Ok(handle) => handle,
-        Err(err) => {
-            terminate_child_process(&mut child);
-            return Err(anyhow!("failed to spawn stdout capture thread: {}", err));
-        }
-    };
-    let stderr_handle = match thread::Builder::new()
-        .name("agentlab-stderr-capture".to_string())
-        .spawn(move || copy_stream_to_file(stderr_pipe, stderr_file))
-    {
-        Ok(handle) => handle,
-        Err(err) => {
-            terminate_child_process(&mut child);
-            let _ = stdout_handle.join();
-            return Err(anyhow!("failed to spawn stderr capture thread: {}", err));
-        }
-    };
-
-    if let Some(path) = start_response_path {
-        if let Err(err) = wait_for_file(path, Duration::from_secs(10)) {
-            terminate_child_process(&mut child);
-            let _ = stdout_handle.join();
-            let _ = stderr_handle.join();
-            return Err(err);
-        }
-    }
-
-    let status = child.wait()?;
-    match stdout_handle.join() {
-        Ok(result) => result?,
-        Err(_) => return Err(anyhow!("stdout capture thread panicked")),
-    }
-    match stderr_handle.join() {
-        Ok(result) => result?,
-        Err(_) => return Err(anyhow!("stderr capture thread panicked")),
-    }
-
-    Ok(ProcessRunResult {
-        status: status
-            .code()
-            .map(|c| c.to_string())
-            .unwrap_or_else(|| "signal".to_string()),
-    })
-}
-
-fn wait_for_file(path: &Path, timeout: Duration) -> Result<()> {
-    let deadline = Instant::now() + timeout;
-    while Instant::now() < deadline {
-        if path.exists() {
-            return Ok(());
-        }
-        thread::sleep(Duration::from_millis(25));
-    }
-    Err(anyhow!(
-        "timeout waiting for file {} after {:?}",
-        path.display(),
-        timeout
-    ))
-}
-
-fn shell_join(parts: &[String]) -> String {
+pub(crate) fn shell_join(parts: &[String]) -> String {
     parts
         .iter()
         .map(|p| shell_quote(p))
@@ -4589,7 +3856,7 @@ fn shell_join(parts: &[String]) -> String {
         .join(" ")
 }
 
-fn shell_quote(s: &str) -> String {
+pub(crate) fn shell_quote(s: &str) -> String {
     if s.is_empty() {
         "''".to_string()
     } else if s
@@ -4602,7 +3869,7 @@ fn shell_quote(s: &str) -> String {
     }
 }
 
-fn trial_output_error_payload(code: &str, message: &str) -> Value {
+pub(crate) fn trial_output_error_payload(code: &str, message: &str) -> Value {
     json!({
         "schema_version": "agent_result_v1",
         "outcome": "error",
@@ -4613,7 +3880,7 @@ fn trial_output_error_payload(code: &str, message: &str) -> Value {
     })
 }
 
-fn load_trial_output_resilient(path: &Path) -> Result<(Value, Option<String>)> {
+pub(crate) fn load_trial_output_resilient(path: &Path) -> Result<(Value, Option<String>)> {
     if !path.exists() {
         return Ok((
             trial_output_error_payload("result_missing", "agent did not write a result payload"),
@@ -4638,14 +3905,18 @@ fn load_trial_output_resilient(path: &Path) -> Result<(Value, Option<String>)> {
     }
 }
 
-fn result_file_ref_path(result_value: &Value) -> Option<&str> {
+pub(crate) fn result_file_ref_path(result_value: &Value) -> Option<&str> {
     result_value
         .get("artifact")
         .and_then(Value::as_str)
-        .or_else(|| result_value.pointer("/artifact/path").and_then(Value::as_str))
+        .or_else(|| {
+            result_value
+                .pointer("/artifact/path")
+                .and_then(Value::as_str)
+        })
 }
 
-fn artifact_type_from_trial_input(trial_input: &Value) -> ArtifactType {
+pub(crate) fn artifact_type_from_trial_input(trial_input: &Value) -> ArtifactType {
     match trial_input
         .pointer("/artifact_type")
         .and_then(Value::as_str)
@@ -4658,7 +3929,7 @@ fn artifact_type_from_trial_input(trial_input: &Value) -> ArtifactType {
     }
 }
 
-fn extract_candidate_artifact_record(
+pub(crate) fn extract_candidate_artifact_record(
     result_value: &Value,
     expected_artifact_type: ArtifactType,
 ) -> CandidateArtifactRecord {
@@ -4717,7 +3988,7 @@ fn extract_candidate_artifact_record(
     }
 }
 
-fn stage_grader_aux_copy(
+pub(crate) fn stage_grader_aux_copy(
     trial_paths: &TrialPaths,
     filename: &str,
     source: &Path,
@@ -4727,10 +3998,13 @@ fn stage_grader_aux_copy(
     }
     let host_path = trial_paths.in_dir.join("grader").join(filename);
     copy_file_if_exists(source, &host_path)?;
-    Ok(Some(format!("{}/{}", AGENTLAB_CONTRACT_GRADER_AUX_DIR, filename)))
+    Ok(Some(format!(
+        "{}/{}",
+        AGENTLAB_CONTRACT_GRADER_AUX_DIR, filename
+    )))
 }
 
-fn build_grader_input_value(
+pub(crate) fn build_grader_input_value(
     trial_input: &Value,
     trial_output: &Value,
     trial_paths: &TrialPaths,
@@ -4785,7 +4059,10 @@ fn build_grader_input_value(
     Ok(GraderInputV1 {
         schema_version: "grader_input_v1".to_string(),
         ids,
-        task: trial_input.pointer("/task").cloned().unwrap_or_else(|| json!({})),
+        task: trial_input
+            .pointer("/task")
+            .cloned()
+            .unwrap_or_else(|| json!({})),
         artifact_type,
         agent_phase: GraderInputAgentPhase {
             exit_code: agent_exit_status.parse::<i32>().ok(),
@@ -4813,7 +4090,7 @@ fn build_grader_input_value(
     })
 }
 
-fn write_grader_input_file(
+pub(crate) fn write_grader_input_file(
     io_paths: &PreparedTrialIo,
     trial_input: &Value,
     trial_output: &Value,
@@ -4838,15 +4115,18 @@ fn write_grader_input_file(
         diff_path,
         patch_path,
     )?;
-    atomic_write_json_pretty(&io_paths.grader_input_host, &serde_json::to_value(grader_input)?)?;
+    atomic_write_json_pretty(
+        &io_paths.grader_input_host,
+        &serde_json::to_value(grader_input)?,
+    )?;
     Ok(())
 }
 
-fn resolve_trial_io_host_path(path: &str, paths: &TrialPaths) -> Result<PathBuf> {
+pub(crate) fn resolve_trial_io_host_path(path: &str, paths: &TrialPaths) -> Result<PathBuf> {
     map_container_path_to_host(path, paths)
 }
 
-fn prepare_io_paths(paths: &TrialPaths, input_bytes: &[u8]) -> Result<PreparedTrialIo> {
+pub(crate) fn prepare_io_paths(paths: &TrialPaths, input_bytes: &[u8]) -> Result<PreparedTrialIo> {
     let trial_input_path = DEFAULT_CONTAINER_TRIAL_INPUT_PATH.to_string();
     let grader_input_path = DEFAULT_CONTAINER_GRADER_INPUT_PATH.to_string();
     let result_path = DEFAULT_CONTAINER_RESULT_PATH.to_string();
@@ -4912,7 +4192,7 @@ fn prepare_io_paths(paths: &TrialPaths, input_bytes: &[u8]) -> Result<PreparedTr
     })
 }
 
-fn materialize_trial_result(trial_dir: &Path, output_path: &Path) -> Result<PathBuf> {
+pub(crate) fn materialize_trial_result(trial_dir: &Path, output_path: &Path) -> Result<PathBuf> {
     let canonical_output = trial_dir.join("result.json");
     if output_path != canonical_output {
         if canonical_output.exists() {
@@ -4928,7 +4208,7 @@ fn materialize_trial_result(trial_dir: &Path, output_path: &Path) -> Result<Path
     Ok(canonical_output)
 }
 
-fn copy_file_if_exists(src: &Path, dst: &Path) -> Result<()> {
+pub(crate) fn copy_file_if_exists(src: &Path, dst: &Path) -> Result<()> {
     if !src.exists() {
         return Ok(());
     }
@@ -4942,7 +4222,7 @@ fn copy_file_if_exists(src: &Path, dst: &Path) -> Result<()> {
     Ok(())
 }
 
-fn copy_dir_preserve_contents(src: &Path, dst: &Path) -> Result<()> {
+pub(crate) fn copy_dir_preserve_contents(src: &Path, dst: &Path) -> Result<()> {
     if !src.exists() {
         return Ok(());
     }
@@ -4981,7 +4261,7 @@ fn copy_dir_preserve_contents(src: &Path, dst: &Path) -> Result<()> {
     Ok(())
 }
 
-fn materialize_trial_runtime_layout(
+pub(crate) fn materialize_trial_runtime_layout(
     trial_dir: &Path,
     paths: &TrialPaths,
     mode: MaterializationMode,
@@ -5016,12 +4296,14 @@ fn materialize_trial_runtime_layout(
     apply_materialization_policy(trial_dir, mode)
 }
 
-fn write_adapter_continue_control(path: &Path) -> Result<()> {
+#[cfg(test)]
+pub(crate) fn write_adapter_continue_control(path: &Path) -> Result<()> {
     let _ = write_adapter_control_action(path, 0, "continue", None, "run_loop")?;
     Ok(())
 }
 
-fn write_adapter_control_action(
+#[cfg(test)]
+pub(crate) fn write_adapter_control_action(
     path: &Path,
     seq: u64,
     action: &str,
@@ -5042,14 +4324,14 @@ fn write_adapter_control_action(
     Ok(version)
 }
 
-fn resolve_agent_runtime_manifest_path(paths: &TrialPaths) -> Result<PathBuf> {
+pub(crate) fn resolve_agent_runtime_manifest_path(paths: &TrialPaths) -> Result<PathBuf> {
     map_container_path_to_host(
         &format!("{}/harness_manifest.json", AGENTLAB_CONTRACT_OUT_DIR),
         paths,
     )
 }
 
-fn resolve_exec_digest(command: &[String], exp_dir: &Path) -> Result<String> {
+pub(crate) fn resolve_exec_digest(command: &[String], exp_dir: &Path) -> Result<String> {
     if let Some(candidate_part) = resolve_command_digest_target(command) {
         let candidate = Path::new(candidate_part);
         let host_path = if candidate.is_relative() {
@@ -5064,7 +4346,7 @@ fn resolve_exec_digest(command: &[String], exp_dir: &Path) -> Result<String> {
     Ok(sha256_bytes(command.join(" ").as_bytes()))
 }
 
-fn write_state_inventory(
+pub(crate) fn write_state_inventory(
     trial_dir: &Path,
     json_value: &Value,
     agent_runtime: &AgentRuntimeConfig,
@@ -5186,7 +4468,7 @@ fn write_state_inventory(
     Ok(())
 }
 
-fn remove_path_if_exists(path: &Path) -> Result<()> {
+pub(crate) fn remove_path_if_exists(path: &Path) -> Result<()> {
     match fs::symlink_metadata(path) {
         Ok(meta) if meta.file_type().is_symlink() || meta.is_file() => {
             make_path_tree_writable(path)?;
@@ -5207,7 +4489,7 @@ fn remove_path_if_exists(path: &Path) -> Result<()> {
 }
 
 #[cfg(unix)]
-fn make_path_tree_writable(path: &Path) -> Result<()> {
+pub(crate) fn make_path_tree_writable(path: &Path) -> Result<()> {
     use std::os::unix::fs::PermissionsExt;
 
     let meta = match fs::symlink_metadata(path) {
@@ -5254,11 +4536,11 @@ fn make_path_tree_writable(path: &Path) -> Result<()> {
 }
 
 #[cfg(not(unix))]
-fn make_path_tree_writable(_path: &Path) -> Result<()> {
+pub(crate) fn make_path_tree_writable(_path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn preserve_symlink(path: &Path, target: &Path) -> Result<()> {
+pub(crate) fn preserve_symlink(path: &Path, target: &Path) -> Result<()> {
     let link_target = fs::read_link(path)?;
     remove_path_if_exists(target)?;
     #[cfg(unix)]
@@ -5268,7 +4550,10 @@ fn preserve_symlink(path: &Path, target: &Path) -> Result<()> {
     Ok(())
 }
 
-fn apply_materialization_policy(trial_dir: &Path, mode: MaterializationMode) -> Result<()> {
+pub(crate) fn apply_materialization_policy(
+    trial_dir: &Path,
+    mode: MaterializationMode,
+) -> Result<()> {
     match mode {
         MaterializationMode::Full => return Ok(()),
         MaterializationMode::OutputsOnly => {
@@ -5292,7 +4577,7 @@ fn apply_materialization_policy(trial_dir: &Path, mode: MaterializationMode) -> 
     Ok(())
 }
 
-fn map_container_path_to_host(path: &str, paths: &TrialPaths) -> Result<PathBuf> {
+pub(crate) fn map_container_path_to_host(path: &str, paths: &TrialPaths) -> Result<PathBuf> {
     map_contract_path_to_host(
         path,
         &ContractPathHostRoots::from_trial_paths(paths),
@@ -5300,7 +4585,7 @@ fn map_container_path_to_host(path: &str, paths: &TrialPaths) -> Result<PathBuf>
     )
 }
 
-fn load_event_rows(
+pub(crate) fn load_event_rows(
     events_path: &Path,
     run_id: &str,
     trial_id: &str,
@@ -5362,7 +4647,7 @@ fn load_event_rows(
     Ok(rows)
 }
 
-fn build_metric_rows(
+pub(crate) fn build_metric_rows(
     run_id: &str,
     trial_id: &str,
     schedule_idx: usize,
@@ -5412,7 +4697,7 @@ fn build_metric_rows(
     rows
 }
 
-fn build_variant_snapshot_rows(
+pub(crate) fn build_variant_snapshot_rows(
     run_id: &str,
     trial_id: &str,
     schedule_idx: usize,
@@ -5445,7 +4730,7 @@ fn build_variant_snapshot_rows(
     rows
 }
 
-fn binding_value_to_text(value: &Value) -> String {
+pub(crate) fn binding_value_to_text(value: &Value) -> String {
     match value {
         Value::Null => "null".to_string(),
         Value::Bool(v) => v.to_string(),
@@ -5455,7 +4740,7 @@ fn binding_value_to_text(value: &Value) -> String {
     }
 }
 
-fn copy_dir_with_policy(
+pub(crate) fn copy_dir_with_policy(
     src: &Path,
     dst: &Path,
     exclude: &[&str],
@@ -5506,15 +4791,15 @@ fn copy_dir_with_policy(
     Ok(())
 }
 
-fn copy_dir_filtered(src: &Path, dst: &Path, exclude: &[&str]) -> Result<()> {
+pub(crate) fn copy_dir_filtered(src: &Path, dst: &Path, exclude: &[&str]) -> Result<()> {
     copy_dir_with_policy(src, dst, exclude, true)
 }
 
-fn copy_dir_preserve_all(src: &Path, dst: &Path, exclude: &[&str]) -> Result<()> {
+pub(crate) fn copy_dir_preserve_all(src: &Path, dst: &Path, exclude: &[&str]) -> Result<()> {
     copy_dir_with_policy(src, dst, exclude, false)
 }
 
-fn command_part_looks_like_path(part: &str) -> bool {
+pub(crate) fn command_part_looks_like_path(part: &str) -> bool {
     part.starts_with('.')
         || part.starts_with('/')
         || part.contains('/')
@@ -5526,7 +4811,7 @@ fn command_part_looks_like_path(part: &str) -> bool {
         || part.ends_with(".sh")
 }
 
-fn resolve_command_digest_target(command: &[String]) -> Option<&str> {
+pub(crate) fn resolve_command_digest_target(command: &[String]) -> Option<&str> {
     if command.is_empty() {
         return None;
     }
