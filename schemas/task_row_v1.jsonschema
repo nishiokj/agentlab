@@ -1,0 +1,47 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agent-lab.local/schemas/task_row_v1.json",
+  "title": "Task Row v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "id",
+    "image",
+    "workdir",
+    "task",
+    "materialization"
+  ],
+  "properties": {
+    "schema_version": { "const": "task_row_v1" },
+    "id": { "type": "string", "minLength": 1 },
+    "image": { "type": "string", "minLength": 1 },
+    "workdir": { "type": "string", "minLength": 1 },
+    "time_limit_ms": { "type": "integer", "minimum": 1 },
+    "task": {
+      "type": "object",
+      "additionalProperties": true
+    },
+    "materialization": {
+      "oneOf": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind"],
+          "properties": {
+            "kind": { "const": "task_image" }
+          }
+        },
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["kind", "task_bundle_ref"],
+          "properties": {
+            "kind": { "const": "base_image_bundle" },
+            "task_bundle_ref": { "type": "string", "minLength": 1 }
+          }
+        }
+      ]
+    }
+  }
+}

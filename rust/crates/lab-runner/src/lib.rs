@@ -1,36 +1,34 @@
-mod types;
-pub use types::*;
-
-use std::sync::atomic::{AtomicBool, Ordering};
+mod model;
+mod config;
+mod backend;
+mod experiment;
+mod package;
+mod persistence;
+mod trial;
+mod util;
 
 /// Global flag set by the ctrlc handler to request graceful shutdown.
 /// Checked by the schedule engine between trials.
-pub static INTERRUPTED: AtomicBool = AtomicBool::new(false);
+pub static INTERRUPTED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
 
-mod config;
-pub use config::validate_knob_overrides;
-use config::*;
-
-mod persistence;
-mod sink;
-
-use persistence::sqlite_store::{
-    run_sqlite_path, JsonRowTable, SqliteRunStore as BackingSqliteStore,
+pub use experiment::runner::{
+    continue_run, continue_run_with_options, describe_experiment, describe_experiment_with_options,
+    fork_trial, recover_run, replay_trial, run_experiment, run_experiment_strict,
+    run_experiment_strict_with_options, run_experiment_with_options,
 };
-use sink::{
-    EventRow, MetricRow, RunManifestRecord, RunSink, SqliteRunStore, TrialRecord,
-    VariantSnapshotRow,
+pub use experiment::control::{
+    kill_run, pause_run, resume_trial, KillResult, PauseResult, ResumeMode, ResumeResult,
 };
+pub use experiment::state::RunExecutionOptions;
+pub use model::{
+    BuildResult, ExperimentSummary, ForkResult, MaterializationMode, PreflightCheck,
+    PreflightReport, PreflightSeverity, RecoverResult, ReplayResult, RunResult,
+};
+pub use package::compile::build_experiment_package;
+pub use package::validate::validate_knob_overrides;
+pub use experiment::preflight::{preflight_experiment, preflight_experiment_with_options};
 
-// Core types, constants, adapter traits, leases, and entrypoint wrappers.
-include!("core.rs");
-// Continue/recover/replay/fork/pause/kill lifecycle operations.
-include!("runner.rs");
-// Schedule engine, execution coordinator, worker plumbing, and packaging.
-include!("lifecycle.rs");
-// Preflight checks, policy loading, benchmark/task model config.
-include!("validations.rs");
-// Runtime IO wiring, task boundary/workspace materialization, adapter process IO.
-include!("io.rs");
 // Runner test suite.
+#[cfg(test)]
 include!("tests.rs");

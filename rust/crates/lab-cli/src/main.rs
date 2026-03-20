@@ -1057,11 +1057,20 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
                 })));
             }
             println!("trial_id: {}", result.trial_id);
-            println!("selector: {}", result.selector);
-            println!("fork_id: {}", result.fork.fork_id);
-            println!("fork_dir: {}", result.fork.fork_dir.display());
-            println!("replay_grade: {}", result.fork.replay_grade);
-            println!("harness_status: {}", result.fork.harness_status);
+            let mode = match result.mode {
+                lab_runner::ResumeMode::RuntimeUnpause => "runtime_unpause",
+                lab_runner::ResumeMode::Fork => "fork",
+            };
+            println!("mode: {}", mode);
+            if let Some(selector) = result.selector.as_deref() {
+                println!("selector: {}", selector);
+            }
+            if let Some(fork) = result.fork.as_ref() {
+                println!("fork_id: {}", fork.fork_id);
+                println!("fork_dir: {}", fork.fork_dir.display());
+                println!("replay_grade: {}", fork.replay_grade);
+                println!("harness_status: {}", fork.harness_status);
+            }
         }
         Commands::Continue {
             run_dir,
@@ -1720,12 +1729,24 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
 
             let exp_yaml = init_profile_template(profile);
             std::fs::write(&exp_path, exp_yaml)?;
+            let tasks_path = exp_path.parent().unwrap_or(&root).join("tasks.jsonl");
+            let wrote_tasks = force || !tasks_path.exists();
+            if wrote_tasks {
+                std::fs::write(&tasks_path, init_task_rows_template())?;
+            }
 
             let exp_show = exp_path.strip_prefix(&root).unwrap_or(&exp_path).display();
+            let tasks_show = tasks_path
+                .strip_prefix(&root)
+                .unwrap_or(&tasks_path)
+                .display();
             println!("wrote: {}", exp_show);
+            if wrote_tasks {
+                println!("wrote: {}", tasks_show);
+            }
             println!(
-                "next: edit {} (fill in dataset path + runtime command/image)",
-                exp_show
+                "next: edit {} and {} (task rows must be task_row_v1)",
+                exp_show, tasks_show
             );
             println!("next: lab build {} --out .lab/builds/<name>", exp_show);
             println!("next: lab describe .lab/builds/<name>");
@@ -1814,7 +1835,6 @@ runtime:
     artifact: ./agents/my-agent-runtime.tar.gz
     image: ghcr.io/acme/agent-runtime:latest
     network: none
-    root_read_only: true
 policy:
   timeout_ms: 300000
   task_sandbox:
@@ -1848,7 +1868,6 @@ runtime:
     artifact: ./agents/my-agent-runtime.tar.gz
     image: ghcr.io/acme/agent-runtime:latest
     network: none
-    root_read_only: true
 policy:
   timeout_ms: 300000
   task_sandbox:
@@ -1886,7 +1905,6 @@ runtime:
     artifact: ./agents/my-agent-runtime.tar.gz
     image: ghcr.io/acme/agent-runtime:latest
     network: none
-    root_read_only: true
 policy:
   timeout_ms: 300000
   task_sandbox:
@@ -1917,7 +1935,6 @@ runtime:
     artifact: ./agents/my-agent-runtime.tar.gz
     image: ghcr.io/acme/agent-runtime:latest
     network: none
-    root_read_only: true
 policy:
   timeout_ms: 300000
   task_sandbox:
@@ -1925,6 +1942,10 @@ policy:
 "
         }
     }
+}
+
+fn init_task_rows_template() -> &'static str {
+    "{\"schema_version\":\"task_row_v1\",\"id\":\"TASK001\",\"image\":\"ghcr.io/acme/task-image:latest\",\"workdir\":\"/workspace/task\",\"time_limit_ms\":300000,\"task\":{\"id\":\"TASK001\",\"prompt\":\"Replace with your benchmark task payload.\"},\"materialization\":{\"kind\":\"task_image\"}}\n"
 }
 
 fn emit_json(value: &Value) {
@@ -2053,8 +2074,9 @@ fn pause_result_to_json(result: &lab_runner::PauseResult) -> Value {
 fn resume_result_to_json(result: &lab_runner::ResumeResult) -> Value {
     json!({
         "trial_id": result.trial_id,
+        "mode": result.mode,
         "selector": result.selector,
-        "fork": fork_result_to_json(&result.fork),
+        "fork": result.fork.as_ref().map(fork_result_to_json),
     })
 }
 

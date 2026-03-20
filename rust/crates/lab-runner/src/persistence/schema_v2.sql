@@ -128,17 +128,7 @@ CREATE TABLE IF NOT EXISTS chain_state_rows (
   PRIMARY KEY (run_id, schedule_idx, attempt, row_seq)
 ) STRICT;
 
-CREATE TABLE IF NOT EXISTS benchmark_prediction_rows (
-  run_id TEXT NOT NULL,
-  schedule_idx INTEGER NOT NULL,
-  attempt INTEGER NOT NULL,
-  row_seq INTEGER NOT NULL,
-  slot_commit_id TEXT NOT NULL,
-  row_json TEXT NOT NULL CHECK(json_valid(row_json)),
-  PRIMARY KEY (run_id, schedule_idx, attempt, row_seq)
-) STRICT;
-
-CREATE TABLE IF NOT EXISTS benchmark_score_rows (
+CREATE TABLE IF NOT EXISTS benchmark_conclusion_rows (
   run_id TEXT NOT NULL,
   schedule_idx INTEGER NOT NULL,
   attempt INTEGER NOT NULL,

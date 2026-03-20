@@ -1,9 +1,8 @@
 #!/usr/bin/env python3
-"""Bench benchmark adapter for AgentLab benchmark protocol v1.
+"""Bench benchmark grader for the AgentLab cutover contract.
 
-Consumes AGENTLAB task/result files and emits:
-- AGENTLAB_BENCHMARK_PREDICTION_PATH
-- AGENTLAB_BENCHMARK_SCORE_PATH
+Consumes ``grader_input_v1`` and emits ``trial_conclusion_v1`` to the mapped
+grader output path.
 """
 
 from __future__ import annotations
@@ -24,7 +23,8 @@ from bench.taskkit.grading import grade_patch_for_task, grade_patch_for_task_dat
 DEFAULT_ADAPTER_ID = "bench_v0"
 DEFAULT_BENCHMARK_NAME = "bench"
 DEFAULT_BENCHMARK_SPLIT = "test"
-RUNNER_WORKSPACE = "/agentlab/workspace"
+DEFAULT_MAPPED_OUTPUT_PATH = "/agentlab/out/mapped_grader_output.json"
+VALID_GRADING_STRATEGIES = {"in_task_image", "injected", "separate"}
 
 
 def _required_env(name: str) -> str:
@@ -44,35 +44,37 @@ def _write_json(path: str | Path, payload: Any) -> None:
     target.write_text(json.dumps(payload, separators=(",", ":")) + "\n", encoding="utf-8")
 
 
-def _env_int(name: str, fallback: int = 0) -> int:
-    raw = os.environ.get(name)
-    if raw is None:
-        return fallback
-    try:
-        return int(raw)
-    except ValueError:
-        return fallback
+def _load_grader_input() -> dict[str, Any]:
+    payload = _read_json(_required_env("AGENTLAB_GRADER_INPUT_PATH"))
+    if isinstance(payload, dict):
+        return payload
+    raise RuntimeError("grader input must be a JSON object")
 
 
-def _env_int_min(name: str, fallback: int, minimum: int) -> int:
-    parsed = _env_int(name, fallback)
-    if parsed < minimum:
-        return fallback
-    return parsed
+def _mapped_output_path() -> str:
+    raw = os.environ.get("AGENTLAB_MAPPED_GRADER_OUTPUT_PATH", "").strip()
+    if raw:
+        return raw
+    return DEFAULT_MAPPED_OUTPUT_PATH
 
 
-def _identity_fields() -> dict[str, Any]:
-    slot_commit_id = os.environ.get("AGENTLAB_SLOT_COMMIT_ID", "").strip() or "slot_pending"
-    return {
-        "schedule_idx": _env_int_min("AGENTLAB_SCHEDULE_IDX", 0, 0),
-        "slot_commit_id": slot_commit_id,
-        "attempt": _env_int_min("AGENTLAB_ATTEMPT", 1, 1),
-        "row_seq": _env_int_min("AGENTLAB_ROW_SEQ", 0, 0),
-    }
+def _grader_strategy() -> str:
+    for env_name in ("AGENTLAB_GRADING_STRATEGY", "AGENTLAB_GRADER_STRATEGY"):
+        raw = os.environ.get(env_name, "").strip()
+        if raw in VALID_GRADING_STRATEGIES:
+            return raw
+    return "in_task_image"
 
 
 def _repo_root() -> Path:
     return REPO_ROOT
+
+
+def _task_payload(grader_input: dict[str, Any]) -> dict[str, Any]:
+    value = grader_input.get("task")
+    if isinstance(value, dict):
+        return value
+    return {}
 
 
 def _task_id(task_payload: Any) -> str:
@@ -187,90 +189,75 @@ def _task_data_from_payload(task_payload: Any) -> dict[str, Any] | None:
     return task_data
 
 
-def _extract_patch_text(agent_result: Any) -> str | None:
-    if not isinstance(agent_result, dict):
+def _extract_patch_from_value(value: Any) -> str | None:
+    if isinstance(value, str) and value.strip():
+        return value
+    if not isinstance(value, dict):
         return None
 
-    # First, direct payload fields.
-    for value in (
-        agent_result.get("patch"),
-        agent_result.get("prediction"),
-    ):
-        if isinstance(value, str) and value.strip():
-            return value
+    for direct in (value.get("patch"), value.get("prediction")):
+        if isinstance(direct, str) and direct.strip():
+            return direct
 
-    answer = agent_result.get("answer")
+    answer = value.get("answer")
     if isinstance(answer, dict):
         candidate = answer.get("patch")
         if isinstance(candidate, str) and candidate.strip():
             return candidate
-        value = answer.get("value")
-        if isinstance(value, str) and value.strip().startswith("diff --git"):
-            return value
+        nested = answer.get("value")
+        if isinstance(nested, str) and nested.strip().startswith("diff --git"):
+            return nested
     elif isinstance(answer, str) and answer.strip().startswith("diff --git"):
         return answer
 
-    output = agent_result.get("output")
+    output = value.get("output")
     if isinstance(output, dict):
         candidate = output.get("patch")
         if isinstance(candidate, str) and candidate.strip():
             return candidate
-
-    # Then artifact file references if present.
-    workspace = Path(os.environ.get("WORKSPACE", RUNNER_WORKSPACE)).resolve()
-    artifacts = agent_result.get("artifacts")
-    if isinstance(artifacts, list):
-        for item in artifacts:
-            if not isinstance(item, dict):
-                continue
-            logical_name = item.get("logical_name")
-            path_value = item.get("path")
-            if not isinstance(path_value, str) or not path_value.strip():
-                continue
-            candidate = Path(path_value)
-            if not candidate.is_absolute():
-                candidate = workspace / candidate
-            if not candidate.exists() or not candidate.is_file():
-                continue
-            lname = logical_name.strip().lower() if isinstance(logical_name, str) else ""
-            if lname.endswith("patch") or candidate.suffix in {".patch", ".diff"}:
-                text = candidate.read_text(encoding="utf-8", errors="replace")
-                if text.strip():
-                    return text
-
     return None
 
 
-def _ids(task_payload: Any) -> dict[str, Any]:
-    return {
-        "run_id": os.environ.get("AGENTLAB_RUN_ID", "run_unknown"),
-        "trial_id": os.environ.get("AGENTLAB_TRIAL_ID", "trial_unknown"),
-        "variant_id": os.environ.get("AGENTLAB_VARIANT_ID", "variant_unknown"),
-        "task_id": os.environ.get("AGENTLAB_TASK_ID", _task_id(task_payload)),
-        "repl_idx": _env_int("AGENTLAB_REPL_IDX", 0),
-    }
+def _candidate_artifact(grader_input: dict[str, Any]) -> dict[str, Any]:
+    payload = grader_input.get("candidate_artifact")
+    if isinstance(payload, dict):
+        return payload
+    return {}
 
 
-def _prediction_record(task_payload: Any, patch_text: str | None) -> dict[str, Any]:
-    prediction: dict[str, Any]
-    if patch_text is not None:
-        prediction = {"kind": "patch", "value": patch_text}
-    else:
-        prediction = {"kind": "text", "value": ""}
+def _patch_from_candidate(grader_input: dict[str, Any]) -> str | None:
+    candidate = _candidate_artifact(grader_input)
+    if candidate.get("state") != "valid":
+        return None
 
-    payload = {
-        "schema_version": "benchmark_prediction_record_v1",
-        "ids": _ids(task_payload),
-        "benchmark": _extract_benchmark_spec(task_payload),
-        "prediction": prediction,
-        "ext": {
-            "bench": {
-                "has_patch": patch_text is not None,
-            }
-        },
-    }
-    payload.update(_identity_fields())
-    return payload
+    artifact_type = candidate.get("artifact_type")
+    payload = candidate.get("payload")
+    if artifact_type == "patch_submission" and isinstance(payload, dict):
+        patch = payload.get("patch")
+        if isinstance(patch, str) and patch.strip():
+            return patch
+        value = payload.get("value")
+        if isinstance(value, str) and value.strip():
+            return value
+    if artifact_type == "text_response" and isinstance(payload, str) and payload.strip():
+        return payload
+    return _extract_patch_from_value(payload)
+
+
+def _patch_from_workspace_delta(grader_input: dict[str, Any]) -> str | None:
+    workspace_delta = grader_input.get("workspace_delta")
+    if not isinstance(workspace_delta, dict):
+        return None
+    if workspace_delta.get("state") != "available":
+        return None
+    patch_path = workspace_delta.get("patch_path")
+    if not isinstance(patch_path, str) or not patch_path.strip():
+        return None
+    candidate = Path(patch_path)
+    if not candidate.exists() or not candidate.is_file():
+        return None
+    text = candidate.read_text(encoding="utf-8", errors="replace")
+    return text if text.strip() else None
 
 
 def _verdict_from_score(score: dict[str, Any] | None) -> str:
@@ -283,59 +270,58 @@ def _verdict_from_score(score: dict[str, Any] | None) -> str:
     return "fail"
 
 
-def _score_record(
+def _reported_outcome(verdict: str) -> str:
+    return {
+        "pass": "success",
+        "fail": "failure",
+        "missing": "missing",
+        "error": "error",
+    }.get(verdict, "error")
+
+
+def build_trial_conclusion(
     task_payload: Any,
+    *,
+    patch_text: str | None,
     score: dict[str, Any] | None,
     error_message: str | None,
 ) -> dict[str, Any]:
     verdict = _verdict_from_score(score)
     resolved = 1.0 if verdict == "pass" else 0.0
 
-    metrics: dict[str, Any] = {
-        "resolved": resolved,
-    }
-    if isinstance(score, dict):
-        metrics["public_pass"] = bool(score.get("public_pass", False))
-        metrics["hidden_pass"] = bool(score.get("hidden_pass", False))
-        metrics["policy_pass"] = bool(score.get("policy_pass", False))
-        failure_label = score.get("failure_label")
-        if isinstance(failure_label, str):
-            metrics["failure_label"] = failure_label
-
-        raw_metrics = score.get("metrics")
-        if isinstance(raw_metrics, dict):
-            hidden_total = raw_metrics.get("hidden_cases_total")
-            hidden_passed = raw_metrics.get("hidden_cases_passed")
-            if isinstance(hidden_total, int):
-                metrics["hidden_cases_total"] = float(hidden_total)
-            if isinstance(hidden_passed, int):
-                metrics["hidden_cases_passed"] = float(hidden_passed)
-
     payload: dict[str, Any] = {
-        "schema_version": "benchmark_score_record_v1",
-        "ids": _ids(task_payload),
         "benchmark": _extract_benchmark_spec(task_payload),
         "verdict": verdict,
-        "primary_metric_name": "resolved",
-        "primary_metric_value": resolved,
-        "metrics": metrics,
-        "evaluator": {"name": "bench_grader", "mode": "custom"},
-        "ext": {
-            "bench": {
-                "failure_label": score.get("failure_label") if isinstance(score, dict) else None,
-                "overall_pass": score.get("overall_pass") if isinstance(score, dict) else None,
-            }
+        "resolved": resolved,
+        "has_patch": patch_text is not None,
+    }
+    if isinstance(score, dict):
+        payload["public_pass"] = bool(score.get("public_pass", False))
+        payload["hidden_pass"] = bool(score.get("hidden_pass", False))
+        payload["policy_pass"] = bool(score.get("policy_pass", False))
+        failure_label = score.get("failure_label")
+        if isinstance(failure_label, str):
+            payload["failure_label"] = failure_label
+        raw_metrics = score.get("metrics")
+        if isinstance(raw_metrics, dict):
+            payload["metrics"] = raw_metrics
+    if error_message:
+        payload["grader_error"] = error_message
+
+    return {
+        "schema_version": "trial_conclusion_v1",
+        "payload": payload,
+        "reported_outcome": _reported_outcome(verdict),
+        "primary_metric": {
+            "name": "resolved",
+            "value": resolved,
+        },
+        "grader": {
+            "name": "bench_grader",
+            "strategy": _grader_strategy(),
+            "version": "v1",
         },
     }
-
-    if error_message:
-        payload["error"] = {
-            "error_type": "BENCH_GRADER_ERROR",
-            "message": error_message,
-        }
-
-    payload.update(_identity_fields())
-    return payload
 
 
 def _grade_with_bench(task_payload: Any, patch_text: str | None) -> tuple[dict[str, Any] | None, str | None]:
@@ -364,22 +350,17 @@ def _grade_with_bench(task_payload: Any, patch_text: str | None) -> tuple[dict[s
 
 
 def main() -> int:
-    task_path = _required_env("AGENTLAB_TASK_PATH")
-    result_path = _required_env("AGENTLAB_RESULT_PATH")
-    prediction_path = _required_env("AGENTLAB_BENCHMARK_PREDICTION_PATH")
-    score_path = _required_env("AGENTLAB_BENCHMARK_SCORE_PATH")
-
-    task_payload = _read_json(task_path)
-    agent_result = _read_json(result_path)
-    patch_text = _extract_patch_text(agent_result)
-
+    grader_input = _load_grader_input()
+    task_payload = _task_payload(grader_input)
+    patch_text = _patch_from_candidate(grader_input) or _patch_from_workspace_delta(grader_input)
     score, grade_error = _grade_with_bench(task_payload, patch_text)
-
-    prediction = _prediction_record(task_payload, patch_text)
-    score_record = _score_record(task_payload, score, grade_error)
-
-    _write_json(prediction_path, prediction)
-    _write_json(score_path, score_record)
+    conclusion = build_trial_conclusion(
+        task_payload,
+        patch_text=patch_text,
+        score=score,
+        error_message=grade_error,
+    )
+    _write_json(_mapped_output_path(), conclusion)
     return 0
 
 

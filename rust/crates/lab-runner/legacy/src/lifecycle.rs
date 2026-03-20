@@ -1,34 +1,6 @@
-impl RunSink for BufferedRunSink {
-    fn write_run_manifest(&mut self, _run: &RunManifestRecord) -> Result<()> {
-        Ok(())
-    }
+use crate::*;
 
-    fn append_trial_record(&mut self, row: &TrialRecord) -> Result<()> {
-        self.trial_records.push(row.clone());
-        Ok(())
-    }
-
-    fn append_metric_rows(&mut self, rows: &[MetricRow]) -> Result<()> {
-        self.metric_rows.extend(rows.iter().cloned());
-        Ok(())
-    }
-
-    fn append_event_rows(&mut self, rows: &[EventRow]) -> Result<()> {
-        self.event_rows.extend(rows.iter().cloned());
-        Ok(())
-    }
-
-    fn append_variant_snapshot(&mut self, rows: &[VariantSnapshotRow]) -> Result<()> {
-        self.variant_snapshot_rows.extend(rows.iter().cloned());
-        Ok(())
-    }
-
-    fn flush(&mut self) -> Result<()> {
-        Ok(())
-    }
-}
-
-fn load_jsonl_value_rows(path: &Path) -> Result<Vec<Value>> {
+pub(crate) fn load_jsonl_value_rows(path: &Path) -> Result<Vec<Value>> {
     if !path.exists() {
         return Ok(Vec::new());
     }
@@ -46,7 +18,7 @@ fn load_jsonl_value_rows(path: &Path) -> Result<Vec<Value>> {
     Ok(rows)
 }
 
-fn read_optional_json_value(path: &Path) -> Result<Option<Value>> {
+pub(crate) fn read_optional_json_value(path: &Path) -> Result<Option<Value>> {
     if !path.exists() {
         return Ok(None);
     }
@@ -57,7 +29,10 @@ fn read_optional_json_value(path: &Path) -> Result<Option<Value>> {
     Ok(Some(serde_json::from_str::<Value>(&raw)?))
 }
 
-fn load_optional_json_record_with_schema(schema_name: &str, path: &Path) -> Result<Option<Value>> {
+pub(crate) fn load_optional_json_record_with_schema(
+    schema_name: &str,
+    path: &Path,
+) -> Result<Option<Value>> {
     let Some(value) = read_optional_json_value(path)? else {
         return Ok(None);
     };
@@ -74,704 +49,80 @@ fn load_optional_json_record_with_schema(schema_name: &str, path: &Path) -> Resu
     Ok(Some(value))
 }
 
-fn trial_index_from_trial_id(trial_id: &str) -> Option<usize> {
+pub(crate) fn mapped_grader_output_state(
+    trial_conclusion_row: Option<&Value>,
+    grade_error_reason: Option<&str>,
+) -> Option<&'static str> {
+    if trial_conclusion_row.is_some() {
+        Some("valid")
+    } else if let Some(reason) = grade_error_reason {
+        if reason.starts_with("mapped_grader_output_invalid:") {
+            Some("present_invalid")
+        } else if reason.starts_with("mapped_grader_output_missing:") {
+            Some("missing")
+        } else {
+            Some("missing")
+        }
+    } else {
+        None
+    }
+}
+
+pub(crate) fn task_grading_enabled(task_payload: &Value) -> bool {
+    task_payload
+        .pointer("/grading/enabled")
+        .and_then(Value::as_bool)
+        .unwrap_or(true)
+}
+
+pub(crate) fn benchmark_retry_inputs(
+    benchmark_grading_enabled: bool,
+    trial_output: &Value,
+    trial_conclusion_row: Option<&Value>,
+    grade_error_reason: Option<&str>,
+    agent_exit_status: &str,
+) -> (String, String) {
+    let agent_outcome = trial_output_payload_view(trial_output)
+        .get("outcome")
+        .and_then(Value::as_str)
+        .unwrap_or("error");
+    if !benchmark_grading_enabled {
+        return (agent_outcome.to_string(), agent_exit_status.to_string());
+    }
+    if grade_error_reason.is_some() {
+        return ("error".to_string(), "0".to_string());
+    }
+    if let Some(mapped_outcome) = trial_conclusion_row
+        .and_then(|row| row.pointer("/reported_outcome"))
+        .and_then(Value::as_str)
+        .and_then(trial_conclusion_outcome_to_trial_outcome)
+    {
+        return (mapped_outcome.to_string(), "0".to_string());
+    }
+    if trial_conclusion_row.is_some() {
+        return ("missing".to_string(), "0".to_string());
+    }
+    ("error".to_string(), "0".to_string())
+}
+
+pub(crate) fn trial_output_payload_view<'a>(trial_output: &'a Value) -> &'a Value {
+    if trial_output.get("schema_version").and_then(Value::as_str) == Some("artifact_envelope_v1") {
+        trial_output.get("artifact").unwrap_or(trial_output)
+    } else {
+        trial_output
+    }
+}
+
+pub(crate) fn trial_index_from_trial_id(trial_id: &str) -> Option<usize> {
     trial_id
         .strip_prefix("trial_")
         .and_then(|suffix| suffix.parse::<usize>().ok())
         .filter(|idx| *idx > 0)
 }
 
-struct TrialExecutor;
+pub(crate) struct RunCoordinator;
 
-impl TrialExecutor {
-    #[allow(clippy::too_many_arguments)]
-    fn execute_slot(
-        _mode: ScheduleEngineMode,
-        run_dir: &Path,
-        run_id: &str,
-        workload_type: &str,
-        project_root: &Path,
-        _dataset_path: &Path,
-        variants: &[Variant],
-        tasks: &[Value],
-        schedule_idx: usize,
-        slot: &TrialSlot,
-        policy_config: &PolicyConfig,
-        benchmark_config: &BenchmarkConfig,
-        variant_runtime_profiles: &[VariantRuntimeProfile],
-        _behavior: &RunBehavior,
-        materialize_mode: MaterializationMode,
-        task_boundary_policy: &TaskBoundaryPolicy,
-        trials_dir: &Path,
-        _evidence_dir: &Path,
-        evidence_records_path: &Path,
-        task_chain_states_path: &Path,
-        artifact_store: &ArtifactStore,
-        trial_index: &mut usize,
-        chain_states: &mut BTreeMap<String, ChainRuntimeState>,
-        baseline_id: &str,
-        run_sink: &mut dyn RunSink,
-    ) -> Result<TrialExecutionResult> {
-        let variant = &variants[slot.variant_idx];
-        let variant_runtime = &variant_runtime_profiles[slot.variant_idx];
-        let agent_runtime = &variant_runtime.agent_runtime;
-        let agent_runtime_env = &variant_runtime.agent_runtime_env;
-        let trial_experiment = &variant_runtime.experiment;
-        let invocation_source = variant_runtime.invocation_source.clone();
-        let configured_network_mode = variant_runtime.configured_network_mode.as_str();
-        let effective_network_mode = variant_runtime.effective_network_mode.as_str();
-        let task_idx = slot.task_idx;
-        let task = &tasks[task_idx];
-        let task_boundary = parse_task_boundary_from_packaged_task(task)?;
-        let _ = task_boundary_policy;
-        validate_task_boundary_workspace_materialization(&task_boundary)?;
-        let repl = slot.repl_idx;
-        let task_id = task_boundary
-            .task_payload
-            .get("id")
-            .and_then(|v| v.as_str())
-            .map(|s| s.to_string())
-            .unwrap_or_else(|| format!("task_{}", task_idx));
-        let benchmark_grading_enabled = benchmark_config.grader.is_some()
-            && task_boundary
-                .task_payload
-                .pointer("/grading/enabled")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(true);
-        let effective_policy = resolve_effective_task_policy(
-            policy_config,
-            &benchmark_config.policy,
-            &task_boundary.task_payload,
-        );
-        let chain_label = resolve_chain_label(
-            &task_boundary.task_payload,
-            &task_id,
-            effective_policy.state_policy,
-        );
-        let chain_key = format!("{}::{}", variant.id, chain_label);
-        let chain_step_index = chain_states
-            .get(&chain_key)
-            .map(|state| state.step_index + 1)
-            .unwrap_or(0);
-        let has_chain_snapshot = chain_states.contains_key(&chain_key);
-
-        *trial_index += 1;
-        let trial_id = format!("trial_{}", *trial_index);
-        let trial_dir = trials_dir.join(&trial_id);
-        ensure_dir(&trial_dir)?;
-        write_trial_state(&trial_dir, &trial_id, "running", None, None, None)?;
-        let mut trial_guard = TrialStateGuard::new(&trial_dir, &trial_id);
-
-        let existing_workspace_ref = if matches!(effective_policy.state_policy, StatePolicy::IsolatePerTrial)
-            || !has_chain_snapshot
-        {
-            None
-        } else {
-            chain_states
-                .get(&chain_key)
-                .and_then(|chain_state| chain_state.latest_workspace_ref.as_deref())
-        };
-        let prepared = prepare_task_environment(
-            project_root,
-            &trial_dir,
-            run_id,
-            &trial_id,
-            trial_experiment,
-            variant,
-            task_idx,
-            repl,
-            &task_boundary,
-            agent_runtime,
-            existing_workspace_ref,
-        )?;
-        let PreparedTaskEnvironment {
-            manifest: prepared_manifest,
-            trial_paths,
-            io_paths,
-            dynamic_mounts,
-            trial_input: input,
-        } = prepared;
-        let input_bytes = serde_json::to_vec_pretty(&input)?;
-        let trial_input_ref = artifact_store.put_bytes(&input_bytes)?;
-        let mut bootstrap_store = BackingSqliteStore::open(run_dir)?;
-        bootstrap_store.upsert_attempt_object(
-            run_id,
-            &trial_id,
-            schedule_idx,
-            0,
-            "trial_input",
-            &trial_input_ref,
-            None,
-        )?;
-        let variant_digest = variant_digest(variant)?;
-
-        let trial_metadata = json!({
-            "schema_version": "trial_metadata_v1",
-            "variant_digest": variant_digest,
-            "ids": {
-                "run_id": run_id,
-                "trial_id": trial_id.as_str(),
-                "variant_id": variant.id.as_str(),
-                "task_id": task_id.as_str(),
-                "repl_idx": repl,
-                "task_index": task_idx
-            },
-            "runtime": {
-                "integration_level": agent_runtime.integration_level.as_str(),
-                "network_mode_requested": configured_network_mode,
-                "network_mode_effective": effective_network_mode,
-                "agent_runtime": {
-                    "image": agent_runtime.image.clone(),
-                    "workspace": AGENTLAB_CONTRACT_WORKSPACE_DIR,
-                },
-                "task_sandbox": {
-                    "executor": "docker",
-                    "image": prepared_manifest.task_image.clone(),
-                    "workspace": AGENTLAB_CONTRACT_WORKSPACE_DIR
-                }
-            },
-            "policy_merge": {
-                "global_defaults": {
-                    "state_policy": "isolate_per_trial",
-                    "task_model": "independent",
-                    "scoring_lifecycle": "predict_then_score",
-                    "required_evidence_classes": []
-                },
-                "experiment_type_policy": {
-                    "state_policy": match policy_config.state {
-                        StatePolicy::IsolatePerTrial => "isolate_per_trial",
-                        StatePolicy::PersistPerTask => "persist_per_task",
-                        StatePolicy::Accumulate => "accumulate",
-                    }
-                },
-                "benchmark_type_policy": {
-                    "task_model": benchmark_config.policy.task_model.as_str(),
-                    "scoring_lifecycle": benchmark_config.policy.scoring_lifecycle.as_str(),
-                    "required_evidence_classes": benchmark_config.policy.required_evidence_classes.clone()
-                },
-                "task_override": task_boundary.task_payload.get("policy_override").cloned(),
-                "effective": {
-                    "state_policy": match effective_policy.state_policy {
-                        StatePolicy::IsolatePerTrial => "isolate_per_trial",
-                        StatePolicy::PersistPerTask => "persist_per_task",
-                        StatePolicy::Accumulate => "accumulate",
-                    },
-                    "task_model": effective_policy.task_model.as_str(),
-                    "scoring_lifecycle": effective_policy.scoring_lifecycle.as_str(),
-                    "required_evidence_classes": effective_policy.required_evidence_classes.clone(),
-                    "chain_failure_policy": effective_policy.chain_failure_policy.as_str(),
-                }
-            },
-            "chain": {
-                "chain_id": chain_key.as_str(),
-                "step_index": chain_step_index
-            }
-        });
-        atomic_write_json_pretty(&trial_dir.join("trial_metadata.json"), &trial_metadata)?;
-
-        stage_benchmark_trial_preflight(
-            benchmark_config,
-            &trial_dir,
-            run_id,
-            &trial_id,
-            schedule_idx,
-            &variant.id,
-            &task_boundary.task_payload,
-            Some(prepared_manifest.task_image.as_str()),
-            &io_paths.input_host,
-        )?;
-        let runtime_env = prepared_manifest.runtime_env.clone();
-        let benchmark_prediction_path = trial_paths.out.join(BENCHMARK_PREDICTION_FILENAME);
-        let benchmark_score_path = trial_paths.out.join(BENCHMARK_SCORE_FILENAME);
-        let benchmark_grade_error_path = trial_paths.out.join(BENCHMARK_GRADE_ERROR_FILENAME);
-        let adapter = adapter_registry_entry(&agent_runtime.adapter_ref)?;
-        let trial_evidence_dir = trial_dir.join("evidence");
-        ensure_dir(&trial_evidence_dir)?;
-
-        let pre_snapshot_manifest = collect_workspace_snapshot_manifest(&trial_paths.workspace)?;
-        let pre_snapshot_path = trial_evidence_dir.join("workspace_pre_snapshot.json");
-        atomic_write_json_pretty(&pre_snapshot_path, &pre_snapshot_manifest)?;
-        let pre_snapshot_ref = artifact_store.put_file(&pre_snapshot_path)?;
-
-        let (chain_root_snapshot_ref, chain_root_snapshot_manifest) =
-            if let Some(existing) = chain_states.get(&chain_key) {
-                (
-                    existing.chain_root_snapshot_ref.clone(),
-                    existing.chain_root_snapshot_manifest.clone(),
-                )
-            } else {
-                (pre_snapshot_ref.clone(), pre_snapshot_manifest.clone())
-            };
-
-        let mut status = String::new();
-        let mut trial_output =
-            trial_output_error_payload("result_missing", "agent did not write a result payload");
-        let mut result_parse_error: Option<String> = None;
-        let trial_started_at = Instant::now();
-        for attempt in 0..policy_config.retry_max_attempts {
-            let _ = fs::remove_file(&benchmark_prediction_path);
-            let _ = fs::remove_file(&benchmark_score_path);
-            let _ = fs::remove_file(&benchmark_grade_error_path);
-
-            let run_request = AdapterRunRequest {
-                runtime_experiment: trial_experiment,
-                runtime: agent_runtime,
-                variant_args: &variant_runtime.variant_args,
-                runtime_env: &runtime_env,
-                runtime_overrides_env: agent_runtime_env,
-                trial_paths: &trial_paths,
-                dynamic_mounts: &dynamic_mounts,
-                io_paths: &io_paths,
-                network_mode: effective_network_mode,
-                benchmark_grader: benchmark_config.grader.as_ref(),
-                benchmark_grading_enabled,
-                run_id,
-                task_image: Some(prepared_manifest.task_image.as_str()),
-                agent_artifact: Some(agent_runtime.agent_artifact.as_path()),
-            };
-            let proc_result = adapter.run_trial(&run_request)?;
-            status = proc_result.status;
-
-            let (loaded_output, parse_error) = load_trial_output_resilient(&io_paths.output_host)?;
-            trial_output = loaded_output;
-            result_parse_error = parse_error;
-
-            let outcome = trial_output
-                .get("outcome")
-                .and_then(|v| v.as_str())
-                .unwrap_or("error");
-            let is_last_attempt = attempt + 1 >= policy_config.retry_max_attempts;
-            if !is_last_attempt && should_retry_outcome(outcome, &status, &policy_config.retry_on) {
-                continue;
-            }
-            break;
-        }
-
-        let mut deferred_benchmark_prediction_records = Vec::new();
-        let mut deferred_benchmark_score_records = Vec::new();
-        let mut grade_error_reason: Option<String> = None;
-        let mut missing_score_reason: Option<String> = None;
-        if benchmark_grading_enabled {
-            match load_optional_json_record_with_schema(
-                "benchmark_prediction_record_v1.jsonschema",
-                &benchmark_prediction_path,
-            ) {
-                Ok(Some(row)) => deferred_benchmark_prediction_records.push(row),
-                Ok(None) => {}
-                Err(err) => {
-                    grade_error_reason = Some(format!("prediction_record_invalid: {}", err));
-                }
-            }
-            match load_optional_json_record_with_schema(
-                "benchmark_score_record_v1.jsonschema",
-                &benchmark_score_path,
-            ) {
-                Ok(Some(row)) => deferred_benchmark_score_records.push(row),
-                Ok(None) => {
-                    missing_score_reason = Some(format!(
-                        "score_record_missing: {}",
-                        benchmark_score_path.display()
-                    ));
-                }
-                Err(err) => {
-                    grade_error_reason = Some(format!("score_record_invalid: {}", err));
-                }
-            }
-            if grade_error_reason.is_none() && benchmark_grade_error_path.exists() {
-                let marker_reason = fs::read_to_string(&benchmark_grade_error_path)
-                    .unwrap_or_else(|_| "grade_error".to_string());
-                grade_error_reason = Some(marker_reason.trim().to_string());
-            }
-            if grade_error_reason.is_none() {
-                if let Some(reason) = missing_score_reason.take() {
-                    grade_error_reason = Some(reason);
-                } else if status == BENCHMARK_GRADING_POLICY_EXIT_CODE.to_string() {
-                    grade_error_reason = Some("grading_policy_exit".to_string());
-                }
-            }
-        }
-
-        let post_snapshot_manifest = collect_workspace_snapshot_manifest(&trial_paths.workspace)?;
-        let post_snapshot_path = trial_evidence_dir.join("workspace_post_snapshot.json");
-        atomic_write_json_pretty(&post_snapshot_path, &post_snapshot_manifest)?;
-        let post_snapshot_ref = artifact_store.put_file(&post_snapshot_path)?;
-
-        let diff_incremental =
-            diff_workspace_snapshots(&pre_snapshot_manifest, &post_snapshot_manifest);
-        let diff_cumulative =
-            diff_workspace_snapshots(&chain_root_snapshot_manifest, &post_snapshot_manifest);
-        let patch_incremental = derive_patch_from_diff(&diff_incremental);
-        let patch_cumulative = derive_patch_from_diff(&diff_cumulative);
-
-        let diff_incremental_path = trial_evidence_dir.join("workspace_diff_incremental.json");
-        let diff_cumulative_path = trial_evidence_dir.join("workspace_diff_cumulative.json");
-        let patch_incremental_path = trial_evidence_dir.join("workspace_patch_incremental.json");
-        let patch_cumulative_path = trial_evidence_dir.join("workspace_patch_cumulative.json");
-        atomic_write_json_pretty(&diff_incremental_path, &diff_incremental)?;
-        atomic_write_json_pretty(&diff_cumulative_path, &diff_cumulative)?;
-        atomic_write_json_pretty(&patch_incremental_path, &patch_incremental)?;
-        atomic_write_json_pretty(&patch_cumulative_path, &patch_cumulative)?;
-
-        let diff_incremental_ref = artifact_store.put_file(&diff_incremental_path)?;
-        let diff_cumulative_ref = artifact_store.put_file(&diff_cumulative_path)?;
-        let patch_incremental_ref = artifact_store.put_file(&patch_incremental_path)?;
-        let patch_cumulative_ref = artifact_store.put_file(&patch_cumulative_path)?;
-        let workspace_bundle_ref = if workspace_diff_is_empty(&diff_incremental) {
-            chain_states
-                .get(&chain_key)
-                .and_then(|state| state.latest_workspace_ref.clone())
-        } else {
-            Some(capture_workspace_object_ref(
-                artifact_store,
-                &trial_paths.workspace,
-            )?)
-        };
-
-        if !matches!(effective_policy.state_policy, StatePolicy::IsolatePerTrial) {
-            chain_states.insert(
-                chain_key.clone(),
-                ChainRuntimeState {
-                    chain_root_snapshot_ref: chain_root_snapshot_ref.clone(),
-                    chain_root_snapshot_manifest: chain_root_snapshot_manifest.clone(),
-                    latest_snapshot_ref: post_snapshot_ref.clone(),
-                    latest_workspace_ref: workspace_bundle_ref.clone(),
-                    step_index: chain_step_index,
-                },
-            );
-        }
-
-        let trial_output_ref =
-            artifact_store.put_bytes(&serde_json::to_vec_pretty(&trial_output)?)?;
-
-        let stdout_path = trial_dir.join("harness_stdout.log");
-        let stderr_path = trial_dir.join("harness_stderr.log");
-        let stdout_ref = if stdout_path.exists() {
-            Some(artifact_store.put_file(&stdout_path)?)
-        } else {
-            None
-        };
-        let stderr_ref = if stderr_path.exists() {
-            Some(artifact_store.put_file(&stderr_path)?)
-        } else {
-            None
-        };
-
-        let hook_events_path = if io_paths.events_host.exists() {
-            Some(io_paths.events_host.clone())
-        } else {
-            None
-        };
-        let hook_events_ref = if let Some(path) = hook_events_path.as_ref() {
-            Some(artifact_store.put_file(path)?)
-        } else {
-            None
-        };
-
-        let trial_duration_ms = trial_started_at.elapsed().as_secs_f64() * 1000.0;
-        let mut evidence_record = json!({
-            "schema_version": "evidence_record_v1",
-            "ts": Utc::now().to_rfc3339(),
-            "ids": {
-                "run_id": run_id,
-                "trial_id": trial_id.as_str(),
-                "variant_id": variant.id.as_str(),
-                "task_id": task_id.as_str(),
-                "repl_idx": repl
-            },
-            "policy": {
-                "state_policy": match effective_policy.state_policy {
-                    StatePolicy::IsolatePerTrial => "isolate_per_trial",
-                    StatePolicy::PersistPerTask => "persist_per_task",
-                    StatePolicy::Accumulate => "accumulate",
-                },
-                "task_model": effective_policy.task_model.as_str(),
-                "chain_id": chain_key.as_str(),
-                "chain_step_index": chain_step_index
-            },
-            "runtime": {
-                "executor": "docker",
-                "exit_status": status.as_str(),
-                "duration_ms": trial_duration_ms
-            },
-            "evidence": {
-                "trial_input_ref": trial_input_ref.clone(),
-                "trial_output_ref": trial_output_ref.clone(),
-                "stdout_ref": stdout_ref.clone(),
-                "stderr_ref": stderr_ref.clone(),
-                "hook_events_ref": hook_events_ref.clone(),
-                "harness_request_ref": trial_input_ref.clone(),
-                "harness_response_ref": trial_output_ref.clone(),
-                "workspace_pre_ref": pre_snapshot_ref.clone(),
-                "workspace_post_ref": post_snapshot_ref.clone(),
-                "diff_incremental_ref": diff_incremental_ref.clone(),
-                "diff_cumulative_ref": diff_cumulative_ref.clone(),
-                "patch_incremental_ref": patch_incremental_ref.clone(),
-                "patch_cumulative_ref": patch_cumulative_ref.clone(),
-                "workspace_bundle_ref": workspace_bundle_ref.clone()
-            }
-        });
-
-        if let Some(evidence) = evidence_record
-            .get_mut("evidence")
-            .and_then(Value::as_object_mut)
-        {
-            if stdout_ref.is_none() {
-                evidence.remove("stdout_ref");
-            }
-            if stderr_ref.is_none() {
-                evidence.remove("stderr_ref");
-            }
-            if hook_events_ref.is_none() {
-                evidence.remove("hook_events_ref");
-            }
-        }
-        validate_required_evidence_classes(
-            &evidence_record,
-            &effective_policy.required_evidence_classes,
-        )?;
-        append_jsonl(evidence_records_path, &evidence_record)?;
-
-        let checkpoint_labels = trial_output
-            .get("checkpoints")
-            .and_then(Value::as_array)
-            .map(|rows| {
-                rows.iter()
-                    .filter_map(|row| {
-                        row.get("logical_name")
-                            .and_then(Value::as_str)
-                            .or_else(|| row.get("path").and_then(Value::as_str))
-                    })
-                    .map(str::to_string)
-                    .collect::<Vec<_>>()
-            })
-            .unwrap_or_default();
-
-        let chain_state_record = json!({
-            "schema_version": "task_chain_state_v1",
-            "ts": Utc::now().to_rfc3339(),
-            "run_id": run_id,
-            "chain_id": chain_key.as_str(),
-            "task_model": effective_policy.task_model.as_str(),
-            "step_index": chain_step_index,
-            "ids": {
-                "trial_id": trial_id.as_str(),
-                "variant_id": variant.id.as_str(),
-                "task_id": task_id.as_str(),
-                "repl_idx": repl
-            },
-            "snapshots": {
-                "chain_root_ref": chain_root_snapshot_ref,
-                "prev_ref": pre_snapshot_ref,
-                "post_ref": post_snapshot_ref
-            },
-            "diffs": {
-                "incremental_ref": diff_incremental_ref,
-                "cumulative_ref": diff_cumulative_ref,
-                "patch_incremental_ref": patch_incremental_ref,
-                "patch_cumulative_ref": patch_cumulative_ref
-            },
-            "checkpoint_labels": checkpoint_labels,
-            "ext": {
-                "latest_snapshot_ref": chain_states
-                    .get(&chain_key)
-                    .map(|state| state.latest_snapshot_ref.clone()),
-                "latest_workspace_ref": chain_states
-                    .get(&chain_key)
-                    .and_then(|state| state.latest_workspace_ref.clone())
-            }
-        });
-        append_jsonl(task_chain_states_path, &chain_state_record)?;
-
-        write_state_inventory(
-            &trial_dir,
-            trial_experiment,
-            agent_runtime,
-            &trial_paths,
-            &resolve_exec_digest(&agent_runtime.command_raw, project_root)?,
-            effective_network_mode,
-            invocation_source.as_str(),
-            Some(task_boundary.task_image.as_str()),
-        )?;
-
-        let manifest_path = resolve_agent_runtime_manifest_path(&trial_paths)?;
-        if manifest_path.exists() && io_paths.events_host.exists() {
-            let manifest = load_manifest(&manifest_path)?;
-            let schema = compile_schema("hook_events_v1.jsonschema")?;
-            let _ = validate_hooks(&manifest, &io_paths.events_host, &schema);
-        }
-
-        let benchmark_score_row = deferred_benchmark_score_records.first();
-        let mut outcome = trial_output
-            .get("outcome")
-            .and_then(|v| v.as_str())
-            .unwrap_or("error")
-            .to_string();
-        if benchmark_grading_enabled && grade_error_reason.is_none() {
-            if let Some(mapped_outcome) = benchmark_score_row
-                .and_then(|row| row.pointer("/verdict"))
-                .and_then(Value::as_str)
-                .and_then(benchmark_verdict_to_trial_outcome)
-            {
-                outcome = mapped_outcome.to_string();
-            }
-        }
-        let mut metrics = trial_output.get("metrics").cloned().unwrap_or(json!({}));
-        if let Some(obj) = metrics.as_object_mut() {
-            obj.insert("status_code".to_string(), json!(status.clone()));
-            if let Some(verdict) = benchmark_score_row
-                .and_then(|row| row.pointer("/verdict"))
-                .and_then(Value::as_str)
-            {
-                obj.insert("benchmark_verdict".to_string(), json!(verdict));
-            }
-            if let Some(reason) = grade_error_reason.as_ref() {
-                obj.insert("grade_error".to_string(), json!(true));
-                obj.insert("grade_error_reason".to_string(), json!(reason));
-            }
-        }
-        let benchmark_primary = benchmark_score_row.and_then(|row| {
-            let name = row
-                .pointer("/primary_metric_name")
-                .and_then(Value::as_str)
-                .map(str::to_string)?;
-            let value = row
-                .pointer("/primary_metric_value")
-                .cloned()
-                .unwrap_or(json!(null));
-            Some((name, value))
-        });
-        let (primary_metric_name, primary_metric_value) = if benchmark_grading_enabled
-            && grade_error_reason.is_none()
-        {
-            if let Some((name, value)) = benchmark_primary {
-                (name, value)
-            } else if let Some(obj) = trial_output.get("objective").and_then(|v| v.as_object()) {
-                let name = obj
-                    .get("name")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("primary_metric")
-                    .to_string();
-                let value = obj.get("value").cloned().unwrap_or(json!(null));
-                (name, value)
-            } else {
-                let fallback = if outcome == "success" { 1.0 } else { 0.0 };
-                ("success".to_string(), json!(fallback))
-            }
-        } else if let Some(obj) = trial_output.get("objective").and_then(|v| v.as_object()) {
-            let name = obj
-                .get("name")
-                .and_then(|v| v.as_str())
-                .unwrap_or("primary_metric")
-                .to_string();
-            let value = obj.get("value").cloned().unwrap_or(json!(null));
-            (name, value)
-        } else {
-            let fallback = if outcome == "success" { 1.0 } else { 0.0 };
-            ("success".to_string(), json!(fallback))
-        };
-        let bindings = variant_bindings_for_summary(variant);
-        let event_rows = if io_paths.events_host.exists() {
-            load_event_rows(
-                &io_paths.events_host,
-                run_id,
-                &trial_id,
-                schedule_idx,
-                &variant.id,
-                &task_id,
-                repl,
-            )?
-        } else {
-            Vec::new()
-        };
-        let metric_rows = build_metric_rows(
-            run_id,
-            &trial_id,
-            schedule_idx,
-            &variant.id,
-            &task_id,
-            repl,
-            &outcome,
-            &metrics,
-            &primary_metric_name,
-            &primary_metric_value,
-        );
-        let variant_snapshot_rows = build_variant_snapshot_rows(
-            run_id,
-            &trial_id,
-            schedule_idx,
-            &variant.id,
-            baseline_id,
-            &task_id,
-            repl,
-            &bindings,
-        );
-        run_sink.append_trial_record(&TrialRecord {
-            run_id: run_id.to_string(),
-            trial_id: trial_id.clone(),
-            schedule_idx,
-            slot_commit_id: String::new(),
-            attempt: 0,
-            row_seq: 0,
-            baseline_id: baseline_id.to_string(),
-            workload_type: workload_type.to_string(),
-            variant_id: variant.id.clone(),
-            task_index: task_idx,
-            task_id: task_id.clone(),
-            repl_idx: repl,
-            outcome: outcome.clone(),
-            success: outcome == "success" && grade_error_reason.is_none(),
-            status_code: status.clone(),
-            integration_level: agent_runtime.integration_level.clone(),
-            network_mode_requested: configured_network_mode.to_string(),
-            network_mode_effective: effective_network_mode.to_string(),
-            primary_metric_name: primary_metric_name.clone(),
-            primary_metric_value: primary_metric_value.clone(),
-            metrics: metrics.clone(),
-            bindings: bindings.clone(),
-            hook_events_total: event_rows.len(),
-            has_hook_events: !event_rows.is_empty(),
-        })?;
-        run_sink.append_metric_rows(&metric_rows)?;
-        run_sink.append_event_rows(&event_rows)?;
-        run_sink.append_variant_snapshot(&variant_snapshot_rows)?;
-
-        let failure_classification = if grade_error_reason.is_some() {
-            trial_guard.complete("failed", Some("grade_error"))?;
-            Some("grade_error".to_string())
-        } else if status != "0" {
-            trial_guard.complete("failed", Some("agent_exit_nonzero"))?;
-            Some("agent_exit_nonzero".to_string())
-        } else if result_parse_error.is_some() {
-            trial_guard.complete("failed", Some("result_parse_error"))?;
-            Some("result_parse_error".to_string())
-        } else if status == "0" && outcome != "error" {
-            trial_guard.complete("completed", None)?;
-            None
-        } else {
-            trial_guard.complete("failed", Some("result_error"))?;
-            Some("result_error".to_string())
-        };
-
-        materialize_trial_runtime_layout(&trial_dir, &trial_paths, materialize_mode)?;
-        trial_paths.cleanup_scratch()?;
-
-        let slot_status = if grade_error_reason.is_none() && status == "0" && outcome != "error" {
-            "completed"
-        } else {
-            "failed"
-        };
-        let mut result =
-            TrialExecutionResult::minimal(trial_id, slot_status, Some(slot.variant_idx));
-        result.deferred_benchmark_prediction_records = deferred_benchmark_prediction_records;
-        result.deferred_benchmark_score_records = deferred_benchmark_score_records;
-        result.failure_classification = failure_classification;
-        Ok(result)
-    }
-}
-
-struct RunCoordinator;
-
-fn slot_commit_payload_digest_for_result(
+pub(crate) fn slot_commit_payload_digest_for_result(
     schedule_idx: usize,
     trial_result: &TrialExecutionResult,
 ) -> Result<String> {
@@ -785,14 +136,14 @@ fn slot_commit_payload_digest_for_result(
         "variant_snapshot_rows": trial_result.deferred_variant_snapshot_rows.clone(),
         "evidence_rows": trial_result.deferred_evidence_records.clone(),
         "chain_state_rows": trial_result.deferred_chain_state_records.clone(),
-        "benchmark_prediction_rows": trial_result.deferred_benchmark_prediction_records.clone(),
-        "benchmark_score_rows": trial_result.deferred_benchmark_score_records.clone(),
+        "trial_conclusion_rows": trial_result.deferred_trial_conclusion_records.clone(),
     });
     Ok(canonical_json_digest(&payload))
 }
 
-fn annotate_row_identity(
+pub(crate) fn annotate_row_identity(
     value: &mut Value,
+    run_id: &str,
     schedule_idx: usize,
     slot_commit_id: &str,
     attempt: usize,
@@ -801,14 +152,16 @@ fn annotate_row_identity(
     let Some(obj) = value.as_object_mut() else {
         return;
     };
+    obj.insert("run_id".to_string(), json!(run_id));
     obj.insert("schedule_idx".to_string(), json!(schedule_idx));
     obj.insert("slot_commit_id".to_string(), json!(slot_commit_id));
     obj.insert("attempt".to_string(), json!(attempt));
     obj.insert("row_seq".to_string(), json!(row_seq));
 }
 
-fn annotate_value_rows(
+pub(crate) fn annotate_value_rows(
     rows: &[Value],
+    run_id: &str,
     schedule_idx: usize,
     slot_commit_id: &str,
     attempt: usize,
@@ -817,13 +170,20 @@ fn annotate_value_rows(
         .enumerate()
         .map(|(row_seq, row)| {
             let mut next = row.clone();
-            annotate_row_identity(&mut next, schedule_idx, slot_commit_id, attempt, row_seq);
+            annotate_row_identity(
+                &mut next,
+                run_id,
+                schedule_idx,
+                slot_commit_id,
+                attempt,
+                row_seq,
+            );
             next
         })
         .collect()
 }
 
-fn annotate_trial_rows(
+pub(crate) fn annotate_trial_rows(
     rows: &[TrialRecord],
     schedule_idx: usize,
     slot_commit_id: &str,
@@ -842,7 +202,7 @@ fn annotate_trial_rows(
         .collect()
 }
 
-fn annotate_metric_rows(
+pub(crate) fn annotate_metric_rows(
     rows: &[MetricRow],
     schedule_idx: usize,
     slot_commit_id: &str,
@@ -861,7 +221,7 @@ fn annotate_metric_rows(
         .collect()
 }
 
-fn annotate_event_rows(
+pub(crate) fn annotate_event_rows(
     rows: &[EventRow],
     schedule_idx: usize,
     slot_commit_id: &str,
@@ -880,7 +240,7 @@ fn annotate_event_rows(
         .collect()
 }
 
-fn annotate_variant_snapshot_rows(
+pub(crate) fn annotate_variant_snapshot_rows(
     rows: &[VariantSnapshotRow],
     schedule_idx: usize,
     slot_commit_id: &str,
@@ -925,6 +285,7 @@ impl RunCoordinator {
             variant_snapshots: 0,
             evidence: 0,
             chain_states: 0,
+            conclusions: 0,
             predictions: 0,
             scores: 0,
         };
@@ -993,13 +354,12 @@ impl RunCoordinator {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn commit_trial_slot(
+    pub(crate) fn commit_trial_slot(
         run_dir: &Path,
         policy_config: &PolicyConfig,
         evidence_records_path: &Path,
         task_chain_states_path: &Path,
-        benchmark_predictions_path: &Path,
-        benchmark_scores_path: &Path,
+        benchmark_conclusions_path: &Path,
         schedule_progress: &mut ScheduleProgress,
         schedule_idx: usize,
         trial_index: usize,
@@ -1024,8 +384,9 @@ impl RunCoordinator {
             variant_snapshots: trial_result.deferred_variant_snapshot_rows.len(),
             evidence: trial_result.deferred_evidence_records.len(),
             chain_states: trial_result.deferred_chain_state_records.len(),
-            predictions: trial_result.deferred_benchmark_prediction_records.len(),
-            scores: trial_result.deferred_benchmark_score_records.len(),
+            conclusions: trial_result.deferred_trial_conclusion_records.len(),
+            predictions: 0,
+            scores: 0,
         };
         append_slot_commit_record(
             run_dir,
@@ -1049,6 +410,7 @@ impl RunCoordinator {
 
         let evidence_rows = annotate_value_rows(
             &trial_result.deferred_evidence_records,
+            &schedule_progress.run_id,
             schedule_idx,
             &slot_commit_id,
             attempt,
@@ -1058,6 +420,7 @@ impl RunCoordinator {
         }
         let chain_rows = annotate_value_rows(
             &trial_result.deferred_chain_state_records,
+            &schedule_progress.run_id,
             schedule_idx,
             &slot_commit_id,
             attempt,
@@ -1065,23 +428,15 @@ impl RunCoordinator {
         for record in &chain_rows {
             append_jsonl(task_chain_states_path, record)?;
         }
-        let prediction_rows = annotate_value_rows(
-            &trial_result.deferred_benchmark_prediction_records,
+        let conclusion_rows = annotate_value_rows(
+            &trial_result.deferred_trial_conclusion_records,
+            &schedule_progress.run_id,
             schedule_idx,
             &slot_commit_id,
             attempt,
         );
-        for row in &prediction_rows {
-            append_jsonl(benchmark_predictions_path, row)?;
-        }
-        let score_rows = annotate_value_rows(
-            &trial_result.deferred_benchmark_score_records,
-            schedule_idx,
-            &slot_commit_id,
-            attempt,
-        );
-        for row in &score_rows {
-            append_jsonl(benchmark_scores_path, row)?;
+        for row in &conclusion_rows {
+            append_jsonl(benchmark_conclusions_path, row)?;
         }
         let trial_rows = annotate_trial_rows(
             &trial_result.deferred_trial_records,
@@ -1167,6 +522,9 @@ impl RunCoordinator {
         next_progress.consecutive_failures = next_consecutive_failures.clone();
         next_progress.updated_at = Utc::now().to_rfc3339();
         write_schedule_progress(run_dir, &next_progress)?;
+        let _ = crate::trial::state::reconcile_trial_attempt_as_committed(
+            &run_dir.join("trials").join(&trial_result.trial_id),
+        );
 
         *schedule_progress = next_progress;
         emit_slot_commit_progress(
@@ -1185,20 +543,23 @@ impl RunCoordinator {
 }
 
 #[derive(Debug, Clone)]
-enum PendingSlotCommit {
+pub(crate) enum PendingSlotCommit {
     SkippedPruned,
     Trial(Box<TrialExecutionResult>),
 }
 
-struct DeterministicCommitter {
-    next_commit_idx: usize,
-    committed_keys: HashSet<String>,
-    pending_by_schedule: BTreeMap<usize, PendingSlotCommit>,
-    slot_attempts: HashMap<usize, usize>,
+pub(crate) struct DeterministicCommitter {
+    pub(crate) next_commit_idx: usize,
+    pub(crate) committed_keys: HashSet<String>,
+    pub(crate) pending_by_schedule: BTreeMap<usize, PendingSlotCommit>,
+    pub(crate) slot_attempts: HashMap<usize, usize>,
 }
 
 impl DeterministicCommitter {
-    fn from_progress(progress: &ScheduleProgress, journal_records: &[SlotCommitRecord]) -> Self {
+    pub(crate) fn from_progress(
+        progress: &ScheduleProgress,
+        journal_records: &[SlotCommitRecord],
+    ) -> Self {
         let mut committed_keys = HashSet::new();
         let mut slot_attempts = highest_attempt_by_schedule(journal_records);
         for slot in &progress.completed_slots {
@@ -1216,7 +577,7 @@ impl DeterministicCommitter {
         }
     }
 
-    fn commit_key_for_slot_completion(slot: &SlotCompletion) -> String {
+    pub(crate) fn commit_key_for_slot_completion(slot: &SlotCompletion) -> String {
         format!("{}:{}:{}", slot.schedule_index, slot.trial_id, slot.status)
     }
 
@@ -1234,11 +595,15 @@ impl DeterministicCommitter {
         }
     }
 
-    fn enqueue_skipped(&mut self, schedule_idx: usize) -> Result<bool> {
+    pub(crate) fn enqueue_skipped(&mut self, schedule_idx: usize) -> Result<bool> {
         self.enqueue(schedule_idx, PendingSlotCommit::SkippedPruned)
     }
 
-    fn enqueue_trial(&mut self, schedule_idx: usize, result: TrialExecutionResult) -> Result<bool> {
+    pub(crate) fn enqueue_trial(
+        &mut self,
+        schedule_idx: usize,
+        result: TrialExecutionResult,
+    ) -> Result<bool> {
         self.enqueue(schedule_idx, PendingSlotCommit::Trial(Box::new(result)))
     }
 
@@ -1268,7 +633,7 @@ impl DeterministicCommitter {
         Ok(true)
     }
 
-    fn pending_trial_completion_records(&self) -> Vec<PendingTrialCompletionRecord> {
+    pub(crate) fn pending_trial_completion_records(&self) -> Vec<PendingTrialCompletionRecord> {
         let mut out = Vec::new();
         for (schedule_idx, pending) in &self.pending_by_schedule {
             if let PendingSlotCommit::Trial(result) = pending {
@@ -1283,14 +648,13 @@ impl DeterministicCommitter {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn drain_ready(
+    pub(crate) fn drain_ready(
         &mut self,
         run_dir: &Path,
         policy_config: &PolicyConfig,
         evidence_records_path: &Path,
         task_chain_states_path: &Path,
-        benchmark_predictions_path: &Path,
-        benchmark_scores_path: &Path,
+        benchmark_conclusions_path: &Path,
         schedule_progress: &mut ScheduleProgress,
         trial_index: usize,
         pruned_variants: &mut HashSet<usize>,
@@ -1317,8 +681,7 @@ impl DeterministicCommitter {
                         policy_config,
                         evidence_records_path,
                         task_chain_states_path,
-                        benchmark_predictions_path,
-                        benchmark_scores_path,
+                        benchmark_conclusions_path,
                         schedule_progress,
                         schedule_idx,
                         trial_index,
@@ -1339,28 +702,23 @@ impl DeterministicCommitter {
 }
 
 #[derive(Clone)]
-struct ParallelWorkerExecutionContext {
-    mode: ScheduleEngineMode,
+pub(crate) struct ParallelWorkerExecutionContext {
     run_dir: PathBuf,
     run_id: String,
     workload_type: String,
     project_root: PathBuf,
-    dataset_path: PathBuf,
     variants: Vec<Variant>,
     tasks: Vec<Value>,
     policy_config: PolicyConfig,
     benchmark_config: BenchmarkConfig,
     variant_runtime_profiles: Vec<VariantRuntimeProfile>,
-    behavior: RunBehavior,
     materialize_mode: MaterializationMode,
-    task_boundary_policy: TaskBoundaryPolicy,
     trials_dir: PathBuf,
-    evidence_dir: PathBuf,
     baseline_id: String,
 }
 
 #[derive(Debug, Clone)]
-struct InFlightDispatch {
+pub(crate) struct InFlightDispatch {
     schedule_idx: usize,
     trial_id: String,
     variant_idx: usize,
@@ -1369,7 +727,21 @@ struct InFlightDispatch {
     started_at: String,
 }
 
-fn in_flight_active_trials(
+pub(crate) struct LocalTrialLaunch {
+    schedule_idx: usize,
+    trial_id: String,
+    slot: TrialSlot,
+    trial_paths: TrialPaths,
+}
+
+#[derive(Debug)]
+pub(crate) struct LocalTrialCompletion {
+    trial_id: String,
+    schedule_idx: usize,
+    result: std::result::Result<TrialExecutionResult, String>,
+}
+
+pub(crate) fn in_flight_active_trials(
     in_flight: &HashMap<String, InFlightDispatch>,
 ) -> Vec<RunControlActiveTrial> {
     let mut active: Vec<RunControlActiveTrial> = in_flight
@@ -1380,6 +752,7 @@ fn in_flight_active_trials(
             schedule_idx: Some(item.schedule_idx),
             variant_id: Some(item.variant_id.clone()),
             started_at: Some(item.started_at.clone()),
+            #[cfg(test)]
             control: None,
         })
         .collect();
@@ -1387,341 +760,15 @@ fn in_flight_active_trials(
     active
 }
 
-fn remove_in_flight_tickets(
-    in_flight: &mut HashMap<String, InFlightDispatch>,
-    in_flight_by_variant: &mut BTreeMap<usize, usize>,
-    ticket_ids: &HashSet<String>,
-) {
-    for ticket_id in ticket_ids {
-        if let Some(removed) = in_flight.remove(ticket_id.as_str()) {
-            if let Some(count) = in_flight_by_variant.get_mut(&removed.variant_idx) {
-                if *count > 0 {
-                    *count -= 1;
-                }
-                if *count == 0 {
-                    in_flight_by_variant.remove(&removed.variant_idx);
-                }
-            }
-        }
-    }
-}
-
-fn process_parallel_worker_control_request(
-    run_dir: &Path,
-    run_id: &str,
-    backend: &dyn WorkerBackend,
-    in_flight: &mut HashMap<String, InFlightDispatch>,
-    in_flight_by_variant: &mut BTreeMap<usize, usize>,
-) -> Result<Option<ScheduleEngineOutcome>> {
-    let Some(request) = load_pending_parallel_worker_control_request(run_dir)? else {
-        return Ok(None);
-    };
-
-    let mut target_trial_ids = if request.target_trial_ids.is_empty() {
-        in_flight
-            .values()
-            .map(|entry| entry.trial_id.clone())
-            .collect::<Vec<_>>()
-    } else {
-        request.target_trial_ids.clone()
-    };
-    target_trial_ids.sort();
-    target_trial_ids.dedup();
-
-    let mut processed_trial_ids: Vec<String> = Vec::new();
-    let mut failed_trials: Vec<String> = Vec::new();
-    let mut removed_ticket_ids: HashSet<String> = HashSet::new();
-
-    match request.action {
-        ParallelWorkerControlAction::Pause => {
-            let pause_label = request.label.as_deref().unwrap_or("pause");
-            let mut paused_active_trials: Vec<RunControlActiveTrial> = Vec::new();
-            let mut checkpoint_acked_all = true;
-            let mut stop_acked_all = true;
-            if target_trial_ids.is_empty() {
-                failed_trials.push("pause_no_active_trial".to_string());
-            }
-
-            for trial_id in &target_trial_ids {
-                let maybe_dispatch = in_flight.iter().find_map(|(ticket_id, dispatch)| {
-                    if dispatch.trial_id == *trial_id {
-                        Some((ticket_id.clone(), dispatch.clone()))
-                    } else {
-                        None
-                    }
-                });
-                let Some((ticket_id, dispatch)) = maybe_dispatch else {
-                    failed_trials.push(format!("{}: pause_target_not_active", trial_id));
-                    continue;
-                };
-
-                let pause_ack = match backend.request_pause(&dispatch.worker_id, pause_label) {
-                    Ok(ack) => ack,
-                    Err(err) => {
-                        failed_trials.push(format!("{}: pause request failed ({})", trial_id, err));
-                        continue;
-                    }
-                };
-                checkpoint_acked_all &= pause_ack.accepted;
-                if let Err(err) = backend.request_stop(
-                    &dispatch.worker_id,
-                    format!("pause:{}", pause_label).as_str(),
-                ) {
-                    failed_trials
-                        .push(format!("{}: pause stop request failed ({})", trial_id, err));
-                    stop_acked_all = false;
-                    continue;
-                }
-
-                let trial_dir = run_dir.join("trials").join(trial_id);
-                if let Err(err) = write_trial_state(
-                    &trial_dir,
-                    trial_id,
-                    "paused",
-                    Some(pause_label),
-                    Some(pause_label),
-                    Some("paused_by_user"),
-                ) {
-                    failed_trials.push(format!(
-                        "{}: failed to write trial_state ({})",
-                        trial_id, err
-                    ));
-                    stop_acked_all = false;
-                    continue;
-                }
-
-                paused_active_trials.push(RunControlActiveTrial {
-                    trial_id: dispatch.trial_id.clone(),
-                    worker_id: dispatch.worker_id.clone(),
-                    schedule_idx: Some(dispatch.schedule_idx),
-                    variant_id: Some(dispatch.variant_id.clone()),
-                    started_at: Some(dispatch.started_at.clone()),
-                    control: None,
-                });
-                removed_ticket_ids.insert(ticket_id);
-                processed_trial_ids.push(trial_id.clone());
-            }
-
-            remove_in_flight_tickets(in_flight, in_flight_by_variant, &removed_ticket_ids);
-            let pause_meta = RunControlPauseMetadata {
-                label: pause_label.to_string(),
-                requested_at: Utc::now().to_rfc3339(),
-                requested_by: Some("user".to_string()),
-            };
-            if failed_trials.is_empty() {
-                write_run_control_v2(
-                    run_dir,
-                    run_id,
-                    "paused",
-                    &paused_active_trials,
-                    Some(&pause_meta),
-                )?;
-                write_parallel_worker_control_response(
-                    run_dir,
-                    ParallelWorkerControlResponse {
-                        request_id: request.request_id,
-                        action: ParallelWorkerControlAction::Pause,
-                        status: PARALLEL_WORKER_CONTROL_RESPONSE_COMPLETED.to_string(),
-                        processed_at: Utc::now().to_rfc3339(),
-                        processed_trial_ids,
-                        failed_trials: Vec::new(),
-                        checkpoint_acked: Some(checkpoint_acked_all),
-                        stop_acked: Some(stop_acked_all),
-                        message: None,
-                    },
-                )?;
-                return Ok(Some(ScheduleEngineOutcome::Paused));
-            }
-
-            let survivors = in_flight_active_trials(in_flight);
-            write_run_control_v2(
-                run_dir,
-                run_id,
-                "interrupted",
-                &survivors,
-                Some(&pause_meta),
-            )?;
-            let message = format!(
-                "pause request failed for {} of {} targeted trial(s): {}",
-                failed_trials.len(),
-                target_trial_ids.len(),
-                failed_trials.join(" | ")
-            );
-            write_parallel_worker_control_response(
-                run_dir,
-                ParallelWorkerControlResponse {
-                    request_id: request.request_id,
-                    action: ParallelWorkerControlAction::Pause,
-                    status: PARALLEL_WORKER_CONTROL_RESPONSE_FAILED.to_string(),
-                    processed_at: Utc::now().to_rfc3339(),
-                    processed_trial_ids,
-                    failed_trials,
-                    checkpoint_acked: Some(checkpoint_acked_all),
-                    stop_acked: Some(stop_acked_all),
-                    message: Some(message),
-                },
-            )?;
-            Ok(Some(ScheduleEngineOutcome::Interrupted))
-        }
-        ParallelWorkerControlAction::Stop => {
-            let stop_reason = request.reason.as_deref().unwrap_or("killed_by_user");
-
-            for trial_id in &target_trial_ids {
-                let maybe_dispatch = in_flight.iter().find_map(|(ticket_id, dispatch)| {
-                    if dispatch.trial_id == *trial_id {
-                        Some((ticket_id.clone(), dispatch.clone()))
-                    } else {
-                        None
-                    }
-                });
-                let Some((ticket_id, dispatch)) = maybe_dispatch else {
-                    failed_trials.push(format!("{}: kill_target_not_active", trial_id));
-                    continue;
-                };
-
-                if let Err(err) = backend.request_stop(&dispatch.worker_id, stop_reason) {
-                    failed_trials.push(format!("{}: stop request failed ({})", trial_id, err));
-                    continue;
-                }
-
-                let trial_dir = run_dir.join("trials").join(trial_id);
-                if let Err(err) = write_trial_state(
-                    &trial_dir,
-                    trial_id,
-                    "killed",
-                    None,
-                    None,
-                    Some("killed_by_user"),
-                ) {
-                    failed_trials.push(format!(
-                        "{}: failed to write trial_state ({})",
-                        trial_id, err
-                    ));
-                    continue;
-                }
-                removed_ticket_ids.insert(ticket_id);
-                processed_trial_ids.push(trial_id.clone());
-            }
-
-            remove_in_flight_tickets(in_flight, in_flight_by_variant, &removed_ticket_ids);
-            if failed_trials.is_empty() {
-                write_run_control_v2(run_dir, run_id, "killed", &[], None)?;
-                write_parallel_worker_control_response(
-                    run_dir,
-                    ParallelWorkerControlResponse {
-                        request_id: request.request_id,
-                        action: ParallelWorkerControlAction::Stop,
-                        status: PARALLEL_WORKER_CONTROL_RESPONSE_COMPLETED.to_string(),
-                        processed_at: Utc::now().to_rfc3339(),
-                        processed_trial_ids,
-                        failed_trials: Vec::new(),
-                        checkpoint_acked: None,
-                        stop_acked: Some(true),
-                        message: None,
-                    },
-                )?;
-                return Ok(Some(ScheduleEngineOutcome::Killed));
-            }
-
-            let survivors = in_flight_active_trials(in_flight);
-            write_run_control_v2(run_dir, run_id, "interrupted", &survivors, None)?;
-            let message = format!(
-                "stop request failed for {} of {} targeted trial(s): {}",
-                failed_trials.len(),
-                target_trial_ids.len(),
-                failed_trials.join(" | ")
-            );
-            write_parallel_worker_control_response(
-                run_dir,
-                ParallelWorkerControlResponse {
-                    request_id: request.request_id,
-                    action: ParallelWorkerControlAction::Stop,
-                    status: PARALLEL_WORKER_CONTROL_RESPONSE_FAILED.to_string(),
-                    processed_at: Utc::now().to_rfc3339(),
-                    processed_trial_ids,
-                    failed_trials,
-                    checkpoint_acked: None,
-                    stop_acked: Some(false),
-                    message: Some(message),
-                },
-            )?;
-            Ok(Some(ScheduleEngineOutcome::Interrupted))
-        }
-    }
-}
-
-fn decode_parallel_completion_result(
-    completion: &TrialCompletion,
-    in_flight: &InFlightDispatch,
-) -> Result<TrialExecutionResult> {
-    if completion.classification == "trial_execution_result" {
-        let mut result: TrialExecutionResult = serde_json::from_value(completion.artifacts.clone())
-            .map_err(|err| {
-                anyhow!(
-                    "parallel worker completion decode failed for ticket {}: {}",
-                    completion.ticket.ticket_id,
-                    err
-                )
-            })?;
-        if result.trial_id != in_flight.trial_id {
-            return Err(anyhow!(
-                "parallel worker completion trial_id mismatch: expected {}, got {}",
-                in_flight.trial_id,
-                result.trial_id
-            ));
-        }
-        if result.variant_idx.is_none() {
-            result.variant_idx = Some(in_flight.variant_idx);
-        }
-        return Ok(result);
-    }
-    if completion.classification == "local_worker_error" {
-        let detail = completion
-            .artifacts
-            .pointer("/error")
-            .and_then(|v| v.as_str())
-            .map(str::trim)
-            .filter(|v| !v.is_empty())
-            .unwrap_or("unknown local worker error");
-        return Err(anyhow!(
-            "local worker trial execution failed (trial_id={}, schedule_idx={}): {}",
-            in_flight.trial_id,
-            in_flight.schedule_idx,
-            detail
-        ));
-    }
-    Ok(TrialExecutionResult::worker_lost(
-        in_flight.trial_id.clone(),
-        Some(in_flight.variant_idx),
-        Some(completion.classification.clone()),
-    ))
-}
-
-fn is_worker_backend_capacity_error(err: &anyhow::Error) -> bool {
-    let message = err.to_string();
-    message.starts_with(LOCAL_WORKER_CAPACITY_ERROR_PREFIX) || message.contains("at capacity")
-}
-
-fn submit_dispatch_with_backpressure(
-    backend: &dyn WorkerBackend,
-    dispatch: TrialDispatch,
-) -> Result<Option<WorkerTicket>> {
-    match backend.submit(dispatch) {
-        Ok(ticket) => Ok(Some(ticket)),
-        Err(err) if is_worker_backend_capacity_error(&err) => Ok(None),
-        Err(err) => Err(err),
-    }
-}
-
-fn execute_parallel_worker_trial(
+pub(crate) fn execute_local_trial(
     context: &ParallelWorkerExecutionContext,
-    dispatch: TrialDispatch,
-) -> Result<TrialCompletion> {
+    launch: LocalTrialLaunch,
+) -> Result<TrialExecutionResult> {
     let payload_dir = context
         .run_dir
         .join("runtime")
         .join("worker_payload")
-        .join(&dispatch.trial_id);
+        .join(&launch.trial_id);
     if payload_dir.exists() {
         fs::remove_dir_all(&payload_dir)?;
     }
@@ -1729,71 +776,147 @@ fn execute_parallel_worker_trial(
     let payload_evidence = payload_dir.join("evidence_records.jsonl");
     let payload_chain = payload_dir.join("task_chain_states.jsonl");
 
-    let mut local_trial_index = trial_index_from_trial_id(&dispatch.trial_id)
-        .unwrap_or(dispatch.schedule_idx + 1)
+    let mut local_trial_index = trial_index_from_trial_id(&launch.trial_id)
+        .unwrap_or(launch.schedule_idx + 1)
         .saturating_sub(1);
     let mut local_chain_states: BTreeMap<String, ChainRuntimeState> = BTreeMap::new();
     let mut buffered_sink = BufferedRunSink::default();
     let artifact_store = ArtifactStore::new(context.run_dir.join("artifacts"));
-    let execution = (|| -> Result<TrialCompletion> {
-        let mut trial_result = TrialExecutor::execute_slot(
-            context.mode,
-            &context.run_dir,
-            &context.run_id,
-            &context.workload_type,
-            &context.project_root,
-            &context.dataset_path,
-            &context.variants,
-            &context.tasks,
-            dispatch.schedule_idx,
-            &dispatch.slot,
-            &context.policy_config,
-            &context.benchmark_config,
-            &context.variant_runtime_profiles,
-            &context.behavior,
-            context.materialize_mode,
-            &context.task_boundary_policy,
-            &context.trials_dir,
-            &context.evidence_dir,
-            &payload_evidence,
-            &payload_chain,
-            &artifact_store,
-            &mut local_trial_index,
-            &mut local_chain_states,
-            &context.baseline_id,
-            &mut buffered_sink,
+    let execution = (|| -> Result<TrialExecutionResult> {
+        let mut trial_result = crate::trial::schedule::execute_scheduled_trial(
+            crate::trial::schedule::ScheduledTrialRequest {
+                run_dir: &context.run_dir,
+                run_id: &context.run_id,
+                workload_type: &context.workload_type,
+                project_root: &context.project_root,
+                variants: &context.variants,
+                tasks: &context.tasks,
+                schedule_idx: launch.schedule_idx,
+                slot: &launch.slot,
+                policy_config: &context.policy_config,
+                benchmark_config: &context.benchmark_config,
+                variant_runtime_profiles: &context.variant_runtime_profiles,
+                materialize_mode: context.materialize_mode,
+                precomputed_trial_paths: Some(launch.trial_paths),
+                trials_dir: &context.trials_dir,
+                evidence_records_path: &payload_evidence,
+                task_chain_states_path: &payload_chain,
+                artifact_store: &artifact_store,
+                trial_index: &mut local_trial_index,
+                chain_states: &mut local_chain_states,
+                baseline_id: &context.baseline_id,
+                run_sink: &mut buffered_sink,
+            },
         )?;
-        trial_result.variant_idx = Some(dispatch.slot.variant_idx);
+        trial_result.variant_idx = Some(launch.slot.variant_idx);
         trial_result.deferred_trial_records = buffered_sink.trial_records;
         trial_result.deferred_metric_rows = buffered_sink.metric_rows;
         trial_result.deferred_event_rows = buffered_sink.event_rows;
         trial_result.deferred_variant_snapshot_rows = buffered_sink.variant_snapshot_rows;
         trial_result.deferred_evidence_records = load_jsonl_value_rows(&payload_evidence)?;
         trial_result.deferred_chain_state_records = load_jsonl_value_rows(&payload_chain)?;
-
-        Ok(TrialCompletion {
-            ticket: WorkerTicket {
-                worker_id: String::new(),
-                ticket_id: String::new(),
-                trial_id: dispatch.trial_id.clone(),
-            },
-            schedule_idx: dispatch.schedule_idx,
-            completion_seq: None,
-            terminal_status: trial_result.slot_status.clone(),
-            classification: "trial_execution_result".to_string(),
-            artifacts: serde_json::to_value(trial_result)?,
-            metrics: json!({}),
-            runtime_summary: json!({}),
-        })
+        Ok(trial_result)
     })();
 
-    // Always attempt to cleanup worker payload materialization, including error paths.
     let _ = fs::remove_dir_all(&payload_dir);
     execution
 }
 
+pub(crate) fn spawn_local_trial(
+    context: Arc<ParallelWorkerExecutionContext>,
+    launch: LocalTrialLaunch,
+    completion_tx: mpsc::Sender<LocalTrialCompletion>,
+) -> Result<()> {
+    let thread_name = format!("agentlab-{}", launch.trial_id);
+    let completion_trial_id = launch.trial_id.clone();
+    let completion_schedule_idx = launch.schedule_idx;
+    thread::Builder::new()
+        .name(thread_name)
+        .spawn(move || {
+            let result = match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                execute_local_trial(context.as_ref(), launch)
+            })) {
+                Ok(Ok(result)) => Ok(result),
+                Ok(Err(err)) => Err(err.to_string()),
+                Err(_) => Err("local trial execution panicked".to_string()),
+            };
+            let _ = completion_tx.send(LocalTrialCompletion {
+                trial_id: completion_trial_id,
+                schedule_idx: completion_schedule_idx,
+                result,
+            });
+        })
+        .map(|_| ())
+        .map_err(|err| anyhow!("failed to spawn local trial thread: {}", err))
+}
+
+pub(crate) fn poll_local_trial_completions(
+    completion_rx: &mpsc::Receiver<LocalTrialCompletion>,
+    timeout: Duration,
+) -> Result<Vec<LocalTrialCompletion>> {
+    let first = if timeout.is_zero() {
+        match completion_rx.try_recv() {
+            Ok(completion) => Some(completion),
+            Err(mpsc::TryRecvError::Empty) => None,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                return Err(anyhow!("local scheduler completion channel disconnected"));
+            }
+        }
+    } else {
+        match completion_rx.recv_timeout(timeout) {
+            Ok(completion) => Some(completion),
+            Err(mpsc::RecvTimeoutError::Timeout) => None,
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return Err(anyhow!("local scheduler completion channel disconnected"));
+            }
+        }
+    };
+
+    let Some(first) = first else {
+        return Ok(Vec::new());
+    };
+
+    let mut completions = vec![first];
+    loop {
+        match completion_rx.try_recv() {
+            Ok(completion) => completions.push(completion),
+            Err(mpsc::TryRecvError::Empty) => break,
+            Err(mpsc::TryRecvError::Disconnected) => {
+                return Err(anyhow!("local scheduler completion channel disconnected"));
+            }
+        }
+    }
+    Ok(completions)
+}
+
+pub(crate) fn load_external_schedule_outcome_request(
+    run_dir: &Path,
+) -> Result<Option<ScheduleEngineOutcome>> {
+    let run_control = load_json_file(&run_control_path(run_dir))?;
+    let status = run_control
+        .pointer("/status")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    Ok(match status {
+        "paused" => Some(ScheduleEngineOutcome::Paused),
+        "killed" => Some(ScheduleEngineOutcome::Killed),
+        _ => None,
+    })
+}
+
+pub(crate) fn schedule_engine_status(
+    requested_outcome: Option<ScheduleEngineOutcome>,
+) -> &'static str {
+    match requested_outcome {
+        Some(ScheduleEngineOutcome::Paused) => "paused",
+        Some(ScheduleEngineOutcome::Killed) => "killed",
+        Some(ScheduleEngineOutcome::Interrupted) => "interrupted",
+        _ => "running",
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
-fn execute_schedule_engine_parallel(
+pub(crate) fn execute_schedule_engine_local(
     mode: ScheduleEngineMode,
     run_dir: &Path,
     run_id: &str,
@@ -1823,39 +946,31 @@ fn execute_schedule_engine_parallel(
     max_concurrency: usize,
 ) -> Result<ScheduleEngineOutcome> {
     let benchmark_dir = run_dir.join("benchmark");
-    let benchmark_predictions_path = benchmark_dir.join("predictions.jsonl");
-    let benchmark_scores_path = benchmark_dir.join("scores.jsonl");
+    let benchmark_conclusions_path = benchmark_dir.join("conclusions.jsonl");
 
     let requested_dispatch_capacity = max_concurrency.max(1);
-    let worker_context = Arc::new(ParallelWorkerExecutionContext {
-        mode,
+    let configured_ceiling = parse_local_worker_capacity_ceiling_from_env()?;
+    let (dispatch_capacity, capacity_warning) =
+        resolve_local_worker_max_in_flight(requested_dispatch_capacity, configured_ceiling);
+    if let Some(warning) = capacity_warning {
+        eprintln!("{}", warning);
+    }
+
+    let execution_context = Arc::new(ParallelWorkerExecutionContext {
         run_dir: run_dir.to_path_buf(),
         run_id: run_id.to_string(),
         workload_type: workload_type.to_string(),
         project_root: project_root.to_path_buf(),
-        dataset_path: dataset_path.to_path_buf(),
         variants: variants.to_vec(),
         tasks: tasks.to_vec(),
         policy_config: policy_config.clone(),
         benchmark_config: benchmark_config.clone(),
         variant_runtime_profiles: variant_runtime_profiles.to_vec(),
-        behavior: behavior.clone(),
         materialize_mode,
-        task_boundary_policy: task_boundary_policy.clone(),
         trials_dir: trials_dir.to_path_buf(),
-        evidence_dir: evidence_dir.to_path_buf(),
         baseline_id: baseline_id.to_string(),
     });
-    let executor_context = worker_context.clone();
-    let executor: Arc<LocalTrialExecutor> = Arc::new(move |dispatch: TrialDispatch| {
-        execute_parallel_worker_trial(executor_context.as_ref(), dispatch)
-    });
-    let local_backend = LocalThreadWorkerBackend::new(requested_dispatch_capacity, executor)?;
-    if let Some(warning) = local_backend.capacity_warning() {
-        eprintln!("{}", warning);
-    }
-    let dispatch_capacity = local_backend.effective_max_in_flight();
-    let backend: Box<dyn WorkerBackend> = Box::new(local_backend);
+    let (completion_tx, completion_rx) = mpsc::channel::<LocalTrialCompletion>();
     let min_free_bytes = resolve_min_free_bytes()?;
     let max_run_bytes = parse_max_run_bytes_from_env()?;
     let disk_check_interval = Duration::from_secs(RUNTIME_DISK_HEADROOM_CHECK_INTERVAL_SECONDS);
@@ -1900,6 +1015,9 @@ fn execute_schedule_engine_parallel(
                 variant_idx,
                 Some("worker_lost".to_string()),
             );
+            let _ = crate::trial::state::reconcile_trial_attempt_as_abandoned(
+                &run_dir.join("trials").join(&recovered.trial_id),
+            );
             committer.enqueue_trial(schedule_idx, result)?;
         }
     }
@@ -1914,8 +1032,7 @@ fn execute_schedule_engine_parallel(
         policy_config,
         evidence_records_path,
         task_chain_states_path,
-        &benchmark_predictions_path,
-        &benchmark_scores_path,
+        &benchmark_conclusions_path,
         schedule_progress,
         *trial_index,
         pruned_variants,
@@ -1930,10 +1047,14 @@ fn execute_schedule_engine_parallel(
         &in_flight_active_trials(&in_flight),
         None,
     )?;
+    let mut requested_outcome: Option<ScheduleEngineOutcome> = None;
 
     while committer.next_commit_idx < schedule.len() || !in_flight.is_empty() {
         if INTERRUPTED.load(Ordering::SeqCst) {
-            emit_run_log(run_id, "received interrupt signal, shutting down gracefully");
+            emit_run_log(
+                run_id,
+                "received interrupt signal, shutting down gracefully",
+            );
             write_run_control_v2(
                 run_dir,
                 run_id,
@@ -1942,6 +1063,9 @@ fn execute_schedule_engine_parallel(
                 None,
             )?;
             return Ok(ScheduleEngineOutcome::Interrupted);
+        }
+        if let Some(external_outcome) = load_external_schedule_outcome_request(run_dir)? {
+            requested_outcome = Some(external_outcome);
         }
 
         if last_disk_check.elapsed() >= disk_check_interval {
@@ -1955,20 +1079,12 @@ fn execute_schedule_engine_parallel(
             }
         }
 
-        if let Some(outcome) = process_parallel_worker_control_request(
-            run_dir,
-            run_id,
-            backend.as_ref(),
-            &mut in_flight,
-            &mut in_flight_by_variant,
-        )? {
-            return Ok(outcome);
-        }
-
         let mut made_progress = false;
-        let mut dispatch_backpressured = false;
 
-        while next_dispatch_idx < schedule.len() && in_flight.len() < dispatch_capacity {
+        while requested_outcome.is_none()
+            && next_dispatch_idx < schedule.len()
+            && in_flight.len() < dispatch_capacity
+        {
             let slot = &schedule[next_dispatch_idx];
             if pruned_variants.contains(&slot.variant_idx) {
                 committer.enqueue_skipped(next_dispatch_idx)?;
@@ -1989,40 +1105,27 @@ fn execute_schedule_engine_parallel(
             let proposed_trial_index = trial_index.saturating_add(1);
             let trial_id = format!("trial_{}", proposed_trial_index);
             let variant = &variants[slot.variant_idx];
-            let task_boundary = parse_task_boundary_from_packaged_task(&tasks[slot.task_idx])?;
-            let task_id = task_boundary
-                .task_payload
-                .get("id")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string())
-                .unwrap_or_else(|| format!("task_{}", slot.task_idx));
-            let dispatch = TrialDispatch {
-                run_id: run_id.to_string(),
-                trial_id: trial_id.clone(),
+            let trial_dir = trials_dir.join(&trial_id);
+            ensure_dir(&trial_dir)?;
+            let trial_paths = TrialPaths::new(&trial_dir, project_root)?;
+            trial_paths.prepare(false)?;
+            let launch = LocalTrialLaunch {
                 schedule_idx: next_dispatch_idx,
+                trial_id: trial_id.clone(),
                 slot: slot.clone(),
-                variant_id: variant.id.clone(),
-                task_id,
-                repl_idx: slot.repl_idx,
-                runtime_profile: json!({}),
-                task_payload: task_boundary.task_payload,
-                effective_policy: json!({}),
+                trial_paths,
             };
-            let Some(ticket) = submit_dispatch_with_backpressure(backend.as_ref(), dispatch)?
-            else {
-                dispatch_backpressured = true;
-                break;
-            };
+            spawn_local_trial(execution_context.clone(), launch, completion_tx.clone())?;
             *trial_index = proposed_trial_index;
             let started_at = Utc::now().to_rfc3339();
             in_flight.insert(
-                ticket.ticket_id.clone(),
+                trial_id.clone(),
                 InFlightDispatch {
                     schedule_idx: next_dispatch_idx,
                     trial_id: trial_id.clone(),
                     variant_idx: slot.variant_idx,
                     variant_id: variant.id.clone(),
-                    worker_id: ticket.worker_id.clone(),
+                    worker_id: RUN_CONTROL_UNKNOWN_WORKER_ID.to_string(),
                     started_at,
                 },
             );
@@ -2032,16 +1135,10 @@ fn execute_schedule_engine_parallel(
             write_run_control_v2(
                 run_dir,
                 run_id,
-                "running",
+                schedule_engine_status(requested_outcome),
                 &in_flight_active_trials(&in_flight),
                 None,
             )?;
-        }
-
-        if dispatch_backpressured && in_flight.is_empty() {
-            return Err(anyhow!(
-                "parallel coordinator protocol fault: backend reported capacity with no active tickets"
-            ));
         }
 
         let committed = committer.drain_ready(
@@ -2049,8 +1146,7 @@ fn execute_schedule_engine_parallel(
             policy_config,
             evidence_records_path,
             task_chain_states_path,
-            &benchmark_predictions_path,
-            &benchmark_scores_path,
+            &benchmark_conclusions_path,
             schedule_progress,
             *trial_index,
             pruned_variants,
@@ -2065,29 +1161,35 @@ fn execute_schedule_engine_parallel(
         if committer.next_commit_idx >= schedule.len() && in_flight.is_empty() {
             break;
         }
+        if let Some(outcome) = requested_outcome {
+            if in_flight.is_empty() {
+                return Ok(outcome);
+            }
+        }
 
         let poll_timeout = if made_progress {
             Duration::from_millis(0)
         } else {
             Duration::from_millis(50)
         };
-        let completions = backend.poll_completions(poll_timeout)?;
+        let completions = poll_local_trial_completions(&completion_rx, poll_timeout)?;
         if completions.is_empty() {
             continue;
         }
 
         for completion in completions {
-            let in_flight_entry = in_flight
-                .remove(completion.ticket.ticket_id.as_str())
-                .ok_or_else(|| {
-                    anyhow!(
-                        "parallel coordinator protocol fault: completion for unknown ticket {}",
-                        completion.ticket.ticket_id
-                    )
-                })?;
+            let in_flight_entry =
+                in_flight
+                    .remove(completion.trial_id.as_str())
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "local scheduler protocol fault: completion for unknown trial {}",
+                            completion.trial_id
+                        )
+                    })?;
             if completion.schedule_idx != in_flight_entry.schedule_idx {
                 return Err(anyhow!(
-                    "parallel coordinator protocol fault: completion schedule_idx {} did not match dispatched schedule_idx {}",
+                    "local scheduler protocol fault: completion schedule_idx {} did not match dispatched schedule_idx {}",
                     completion.schedule_idx,
                     in_flight_entry.schedule_idx
                 ));
@@ -2100,7 +1202,27 @@ fn execute_schedule_engine_parallel(
                     in_flight_by_variant.remove(&in_flight_entry.variant_idx);
                 }
             }
-            let trial_result = decode_parallel_completion_result(&completion, &in_flight_entry)?;
+            let mut trial_result = match completion.result {
+                Ok(result) => result,
+                Err(detail) => {
+                    return Err(anyhow!(
+                        "local trial execution failed (trial_id={}, schedule_idx={}): {}",
+                        in_flight_entry.trial_id,
+                        in_flight_entry.schedule_idx,
+                        detail
+                    ));
+                }
+            };
+            if trial_result.trial_id != in_flight_entry.trial_id {
+                return Err(anyhow!(
+                    "local scheduler protocol fault: completion trial_id mismatch: expected {}, got {}",
+                    in_flight_entry.trial_id,
+                    trial_result.trial_id
+                ));
+            }
+            if trial_result.variant_idx.is_none() {
+                trial_result.variant_idx = Some(in_flight_entry.variant_idx);
+            }
             committer.enqueue_trial(in_flight_entry.schedule_idx, trial_result)?;
         }
         persist_pending_trial_completions(run_dir, &committer)?;
@@ -2108,7 +1230,7 @@ fn execute_schedule_engine_parallel(
         write_run_control_v2(
             run_dir,
             run_id,
-            "running",
+            schedule_engine_status(requested_outcome),
             &in_flight_active_trials(&in_flight),
             None,
         )?;
@@ -2117,8 +1239,7 @@ fn execute_schedule_engine_parallel(
             policy_config,
             evidence_records_path,
             task_chain_states_path,
-            &benchmark_predictions_path,
-            &benchmark_scores_path,
+            &benchmark_conclusions_path,
             schedule_progress,
             *trial_index,
             pruned_variants,
@@ -2126,6 +1247,11 @@ fn execute_schedule_engine_parallel(
             run_sink,
         )?;
         persist_pending_trial_completions(run_dir, &committer)?;
+        if let Some(outcome) = requested_outcome {
+            if in_flight.is_empty() {
+                return Ok(outcome);
+            }
+        }
     }
 
     committer.drain_ready(
@@ -2133,8 +1259,7 @@ fn execute_schedule_engine_parallel(
         policy_config,
         evidence_records_path,
         task_chain_states_path,
-        &benchmark_predictions_path,
-        &benchmark_scores_path,
+        &benchmark_conclusions_path,
         schedule_progress,
         *trial_index,
         pruned_variants,
@@ -2145,15 +1270,15 @@ fn execute_schedule_engine_parallel(
     write_run_control_v2(
         run_dir,
         run_id,
-        "running",
+        schedule_engine_status(requested_outcome),
         &in_flight_active_trials(&in_flight),
         None,
     )?;
-    Ok(ScheduleEngineOutcome::Completed)
+    Ok(requested_outcome.unwrap_or(ScheduleEngineOutcome::Completed))
 }
 
 #[allow(clippy::too_many_arguments)]
-fn execute_schedule_engine(
+pub(crate) fn execute_schedule_engine(
     mode: ScheduleEngineMode,
     run_dir: &Path,
     run_id: &str,
@@ -2184,11 +1309,11 @@ fn execute_schedule_engine(
 ) -> Result<ScheduleEngineOutcome> {
     if !matches!(policy_config.state, StatePolicy::IsolatePerTrial) {
         return Err(anyhow!(
-            "parallel worker hard cutover supports only isolate_per_trial state policy; got {:?}",
+            "local async docker path supports only isolate_per_trial state policy; got {:?}",
             policy_config.state
         ));
     }
-    execute_schedule_engine_parallel(
+    execute_schedule_engine_local(
         mode,
         run_dir,
         run_id,
@@ -2218,7 +1343,7 @@ fn execute_schedule_engine(
         max_concurrency,
     )
 }
-fn load_authoring_input_for_build(
+pub(crate) fn load_authoring_input_for_build(
     path: &Path,
     overrides_path: Option<&Path>,
 ) -> Result<LoadedExperimentInput> {
@@ -2262,11 +1387,11 @@ fn load_authoring_input_for_build(
     })
 }
 
-fn as_portable_rel(path: &Path) -> String {
+pub(crate) fn as_portable_rel(path: &Path) -> String {
     path.to_string_lossy().replace('\\', "/")
 }
 
-fn copy_path_into_package(source: &Path, destination: &Path) -> Result<()> {
+pub(crate) fn copy_path_into_package(source: &Path, destination: &Path) -> Result<()> {
     if source.is_dir() {
         ensure_dir(destination)?;
         return copy_dir_preserve_all(source, destination, &[]);
@@ -2284,88 +1409,104 @@ fn copy_path_into_package(source: &Path, destination: &Path) -> Result<()> {
     ))
 }
 
-fn stage_task_workspace_dependencies_for_package(
-    tasks: &[TaskDeclaration],
-    project_root: &Path,
-    package_dir: &Path,
-) -> Result<()> {
-    let mut dataset_pack_refs = HashSet::new();
-    let mut git_checkout_commits: BTreeMap<String, HashSet<String>> = BTreeMap::new();
-
-    for (idx, task) in tasks.iter().enumerate() {
-        if matches!(task.workspace.base.kind, WorkspaceBaseKind::DatasetPack) {
-            let dataset_pack_ref = task
-                .workspace
-                .base
-                .dataset_pack_ref
-                .clone()
-                .ok_or_else(|| {
-                    anyhow!(
-                        "package build missing workspace.base.dataset_pack_ref for packaged task row {}",
-                        idx + 1
-                    )
-                })?;
-            dataset_pack_refs.insert(dataset_pack_ref);
-        }
-
-        if matches!(task.workspace.base.kind, WorkspaceBaseKind::GitCheckout) {
-            let repo = task
-                .workspace
-                .base
-                .repo
-                .clone()
-                .ok_or_else(|| {
-                    anyhow!(
-                        "package build missing workspace.base.repo for packaged task row {}",
-                        idx + 1
-                    )
-                })?;
-            let commit = task
-                .workspace
-                .base
-                .commit
-                .clone()
-                .ok_or_else(|| {
-                    anyhow!(
-                        "package build missing workspace.base.commit for packaged task row {}",
-                        idx + 1
-                    )
-                })?;
-            git_checkout_commits.entry(repo).or_default().insert(commit);
-        }
-
-        for mount in &task.workspace.aux_mounts {
-            dataset_pack_refs.insert(mount.dataset_pack_ref.clone());
-        }
+pub(crate) fn packaged_task_bundle_rel_path(
+    task_id: &str,
+    task_idx: usize,
+    source: Option<&Path>,
+) -> PathBuf {
+    let stem = format!("{}_{}", sanitize_for_fs(task_id), task_idx + 1);
+    let base = PathBuf::from("tasks").join("task_bundles");
+    let Some(source) = source else {
+        return base.join(stem);
+    };
+    let Some(name) = source.file_name().and_then(|value| value.to_str()) else {
+        return base.join(stem);
+    };
+    if source.is_dir() {
+        return base.join(stem);
     }
-
-    for dataset_pack_ref in dataset_pack_refs {
-        let digest = parse_dataset_pack_ref_digest(&dataset_pack_ref)?;
-        let source = resolve_dataset_pack_host_path(project_root, &dataset_pack_ref)?;
-        let destination = package_dir
-            .join(".lab")
-            .join("dataset_packs")
-            .join("sha256")
-            .join(digest);
-        copy_path_into_package(&source, &destination)?;
-    }
-
-    for (repo, commits) in git_checkout_commits {
-        for commit in commits {
-            let _ = hydrate_git_checkout_cache(project_root, &repo, &commit)?;
-        }
-        let source = git_repo_cache_dir(project_root, &repo);
-        let destination = package_dir
-            .join(".lab")
-            .join("git_checkouts")
-            .join(sanitize_for_fs(&repo));
-        copy_path_into_package(&source, &destination)?;
-    }
-
-    Ok(())
+    base.join(format!("{}_{}", stem, name))
 }
 
-fn write_packaged_task_declarations(path: &Path, tasks: &[TaskDeclaration]) -> Result<()> {
+pub(crate) fn resolve_task_bundle_source_for_package(
+    raw: &str,
+    dataset_dir: &Path,
+    exp_dir: &Path,
+) -> Result<PathBuf> {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(anyhow!("task bundle ref cannot be empty"));
+    }
+    let source = Path::new(trimmed);
+    if source.is_absolute() {
+        return Ok(source.to_path_buf());
+    }
+    let dataset_candidate = dataset_dir.join(source);
+    if dataset_candidate.exists() {
+        return Ok(dataset_candidate);
+    }
+    let exp_candidate = exp_dir.join(source);
+    if exp_candidate.exists() {
+        return Ok(exp_candidate);
+    }
+    Err(anyhow!(
+        "task bundle ref '{}' could not be resolved relative to dataset or experiment directory",
+        raw
+    ))
+}
+
+pub(crate) fn stage_task_row_bundle_for_package(
+    task_row: &TaskRow,
+    task_idx: usize,
+    dataset_dir: &Path,
+    exp_dir: &Path,
+    package_dir: &Path,
+) -> Result<TaskRow> {
+    let mut staged = task_row.clone();
+    if !matches!(
+        staged.materialization.kind,
+        TaskMaterializationKind::BaseImageBundle
+    ) {
+        return Ok(staged);
+    }
+    let raw_bundle_ref = staged
+        .materialization
+        .task_bundle_ref
+        .as_deref()
+        .ok_or_else(|| {
+            anyhow!(
+                "task '{}' is missing materialization.task_bundle_ref for base_image_bundle",
+                staged.id
+            )
+        })?;
+    let source = resolve_task_bundle_source_for_package(raw_bundle_ref, dataset_dir, exp_dir)?;
+    let bundle_rel = packaged_task_bundle_rel_path(&staged.id, task_idx, Some(&source));
+    copy_path_into_package(&source, &package_dir.join(&bundle_rel))?;
+    staged.materialization.task_bundle_ref = Some(as_portable_rel(&bundle_rel));
+    Ok(staged)
+}
+
+pub(crate) fn compile_tasks_for_package(
+    tasks: &[Value],
+    _project_root: &Path,
+    exp_dir: &Path,
+    dataset_path: &Path,
+    package_dir: &Path,
+) -> Result<Vec<Value>> {
+    let dataset_dir = dataset_path.parent().unwrap_or(exp_dir);
+    let mut compiled = Vec::with_capacity(tasks.len());
+    for (idx, task) in tasks.iter().enumerate() {
+        let task_row = parse_task_row(task).with_context(|| {
+            format!("package build task {} is not a valid task_row_v1", idx + 1)
+        })?;
+        let row =
+            stage_task_row_bundle_for_package(&task_row, idx, dataset_dir, exp_dir, package_dir)?;
+        compiled.push(serde_json::to_value(row)?);
+    }
+    Ok(compiled)
+}
+
+pub(crate) fn write_packaged_tasks(path: &Path, tasks: &[Value]) -> Result<()> {
     let mut bytes = Vec::new();
     for task in tasks {
         serde_json::to_writer(&mut bytes, task)?;
@@ -2374,7 +1515,7 @@ fn write_packaged_task_declarations(path: &Path, tasks: &[TaskDeclaration]) -> R
     atomic_write_bytes(path, &bytes)
 }
 
-fn stage_source_into_package(
+pub(crate) fn stage_source_into_package(
     raw_source: &str,
     exp_dir: &Path,
     package_dir: &Path,
@@ -2414,7 +1555,7 @@ fn stage_source_into_package(
     Ok(rel_portable)
 }
 
-fn stage_public_runtime_path_reference(
+pub(crate) fn stage_public_runtime_path_reference(
     rel: &Path,
     exp_dir: &Path,
     package_dir: &Path,
@@ -2433,9 +1574,9 @@ fn stage_public_runtime_path_reference(
         )
     })?;
     if copies.contains_key(&rel_portable) {
-        return Ok(contract_deps_destination_path(&rel_portable));
+        return Ok(task_workdir_support_destination_path(&rel_portable));
     }
-    let packaged_rel = PathBuf::from(PACKAGED_RUNTIME_DEPS_DIR).join(rel);
+    let packaged_rel = PathBuf::from(PACKAGED_RUNTIME_ASSETS_DIR).join(rel);
     let packaged_rel_portable = as_portable_rel(&packaged_rel);
     let destination = package_dir.join(&packaged_rel);
     copy_path_into_package(&resolved, &destination)?;
@@ -2443,14 +1584,20 @@ fn stage_public_runtime_path_reference(
     manifest_entries.push(RuntimePathStagingManifestEntry {
         original_relative_path: rel_portable.clone(),
         packaged_path: packaged_rel_portable,
-        runtime_path: contract_deps_destination_path(&rel_portable),
+        runtime_path: task_workdir_support_destination_path(&rel_portable),
         required: true,
         read_only: true,
     });
-    Ok(contract_deps_destination_path(&rel_portable))
+    Ok(task_workdir_support_destination_path(&rel_portable))
 }
 
-fn rewrite_packaged_runtime_asset_entries(
+pub(crate) fn is_runner_staged_destination_path(raw: &str) -> bool {
+    strip_task_workdir_support_destination_path(raw).is_some()
+        || raw == AGENTLAB_CONTRACT_RUNTIME_AUX_DIR
+        || raw.starts_with(&format!("{}/", AGENTLAB_CONTRACT_RUNTIME_AUX_DIR))
+}
+
+pub(crate) fn rewrite_packaged_runtime_asset_entries(
     entries: Option<&mut Value>,
     field_name: &str,
     exp_dir: &Path,
@@ -2470,7 +1617,7 @@ fn rewrite_packaged_runtime_asset_entries(
             raw,
             exp_dir,
             package_dir,
-            PACKAGED_RUNTIME_DEPS_DIR,
+            PACKAGED_RUNTIME_ASSETS_DIR,
             "dep",
             file_copies,
             file_counter,
@@ -2489,7 +1636,82 @@ fn rewrite_packaged_runtime_asset_entries(
     Ok(())
 }
 
-fn stage_command_path_refs_for_package(
+pub(crate) fn rewrite_optional_package_source_path(
+    value: Option<&mut Value>,
+    field_name: &str,
+    exp_dir: &Path,
+    package_dir: &Path,
+    subdir: &str,
+    prefix: &str,
+    file_copies: &mut BTreeMap<String, String>,
+    file_counter: &mut usize,
+) -> Result<()> {
+    let Some(item) = value else {
+        return Ok(());
+    };
+    let Some(raw) = item
+        .as_str()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(());
+    };
+    let rel = stage_source_into_package(
+        raw,
+        exp_dir,
+        package_dir,
+        subdir,
+        prefix,
+        file_copies,
+        file_counter,
+    )
+    .with_context(|| {
+        format!(
+            "failed to stage {} '{}' into sealed package",
+            field_name, raw
+        )
+    })?;
+    *item = Value::String(rel);
+    Ok(())
+}
+
+pub(crate) fn stage_optional_public_runtime_path_for_package(
+    value: Option<&mut Value>,
+    field_name: &str,
+    exp_dir: &Path,
+    package_dir: &Path,
+    public_path_copies: &mut BTreeMap<String, String>,
+    staging_manifest_entries: &mut Vec<RuntimePathStagingManifestEntry>,
+) -> Result<()> {
+    let Some(item) = value else {
+        return Ok(());
+    };
+    let Some(raw) = item
+        .as_str()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(());
+    };
+    if is_runner_staged_destination_path(raw) {
+        return Ok(());
+    }
+    let Some(rel) = resolve_existing_public_path_reference(raw, exp_dir, field_name)? else {
+        return Ok(());
+    };
+    let contract_path = stage_public_runtime_path_reference(
+        &rel,
+        exp_dir,
+        package_dir,
+        public_path_copies,
+        staging_manifest_entries,
+        field_name,
+    )?;
+    *item = Value::String(contract_path);
+    Ok(())
+}
+
+pub(crate) fn stage_command_path_refs_for_package(
     command_root: Option<&mut Value>,
     field_name: &str,
     exp_dir: &Path,
@@ -2514,11 +1736,15 @@ fn stage_command_path_refs_for_package(
         if idx == 0 {
             continue;
         }
+        if is_runner_staged_destination_path(token) {
+            continue;
+        }
         let Some(rel) = resolve_existing_public_path_reference(
             token,
             exp_dir,
             &format!("{}[{}]", field_name, idx),
-        )? else {
+        )?
+        else {
             continue;
         };
         let contract_path = stage_public_runtime_path_reference(
@@ -2534,7 +1760,7 @@ fn stage_command_path_refs_for_package(
     Ok(())
 }
 
-fn stage_runtime_command_env_path_refs_for_package(
+pub(crate) fn stage_runtime_command_env_path_refs_for_package(
     runtime_root: &mut Value,
     exp_dir: &Path,
     package_dir: &Path,
@@ -2571,11 +1797,15 @@ fn stage_runtime_command_env_path_refs_for_package(
                     key
                 ));
             }
+            if is_runner_staged_destination_path(raw) {
+                continue;
+            }
             let Some(rel) = resolve_existing_public_path_reference(
                 raw,
                 exp_dir,
                 &format!("runtime.agent_runtime.env.{}", key),
-            )? else {
+            )?
+            else {
                 continue;
             };
             let contract_path = stage_public_runtime_path_reference(
@@ -2592,7 +1822,7 @@ fn stage_runtime_command_env_path_refs_for_package(
     Ok(())
 }
 
-fn collect_command_staging_entries(
+pub(crate) fn collect_command_staging_entries(
     command_root: Option<&Value>,
     field_name: &str,
     catalog: &BTreeMap<String, RuntimePathStagingManifestEntry>,
@@ -2609,7 +1839,7 @@ fn collect_command_staging_entries(
         let Some(runtime_path) = item.as_str().map(str::trim) else {
             return Err(anyhow!("{}[{}] must be a string", field_name, idx));
         };
-        if !runtime_path.starts_with(AGENTLAB_CONTRACT_DEPS_DIR) {
+        if strip_task_workdir_support_destination_path(runtime_path).is_none() {
             continue;
         }
         if !seen.insert(runtime_path.to_string()) {
@@ -2628,7 +1858,7 @@ fn collect_command_staging_entries(
     Ok(())
 }
 
-fn collect_runtime_command_env_staging_entries(
+pub(crate) fn collect_runtime_command_env_staging_entries(
     experiment: &Value,
     catalog: &BTreeMap<String, RuntimePathStagingManifestEntry>,
 ) -> Result<Vec<RuntimePathStagingManifestEntry>> {
@@ -2663,9 +1893,12 @@ fn collect_runtime_command_env_staging_entries(
     {
         for (key, value) in items {
             let Some(runtime_path) = value.as_str().map(str::trim) else {
-                return Err(anyhow!("runtime.agent_runtime.env.{} must be a string", key));
+                return Err(anyhow!(
+                    "runtime.agent_runtime.env.{} must be a string",
+                    key
+                ));
             };
-            if !runtime_path.starts_with(AGENTLAB_CONTRACT_DEPS_DIR) {
+            if strip_task_workdir_support_destination_path(runtime_path).is_none() {
                 continue;
             }
             if !seen.insert(runtime_path.to_string()) {
@@ -2685,7 +1918,7 @@ fn collect_runtime_command_env_staging_entries(
     Ok(entries)
 }
 
-fn lookup_runtime_staging_entry(
+pub(crate) fn lookup_runtime_staging_entry(
     catalog: &BTreeMap<String, RuntimePathStagingManifestEntry>,
     runtime_path: &str,
 ) -> Option<RuntimePathStagingManifestEntry> {
@@ -2699,14 +1932,14 @@ fn lookup_runtime_staging_entry(
         .cloned()
 }
 
-fn matches_contract_runtime_root(path: &str, root: &str) -> bool {
+pub(crate) fn matches_contract_runtime_root(path: &str, root: &str) -> bool {
     path == root
         || path
             .strip_prefix(root)
             .is_some_and(|suffix| suffix.starts_with('/'))
 }
 
-fn collect_packaged_runtime_asset_entries(
+pub(crate) fn collect_packaged_runtime_asset_entries(
     value: Option<&Value>,
     field_name: &str,
 ) -> Result<Vec<RuntimePathStagingManifestEntry>> {
@@ -2735,18 +1968,21 @@ fn collect_packaged_runtime_asset_entries(
                 packaged_path,
                 &format!("{}[{}].packaged_path", field_name, idx),
             )?,
-            runtime_path: validate_runtime_contract_path(
+            runtime_path: validate_runner_staged_destination_path(
                 runtime_path,
                 &format!("{}[{}].runtime_path", field_name, idx),
             )?,
             required: obj.get("required").and_then(Value::as_bool).unwrap_or(true),
-            read_only: obj.get("read_only").and_then(Value::as_bool).unwrap_or(true),
+            read_only: obj
+                .get("read_only")
+                .and_then(Value::as_bool)
+                .unwrap_or(true),
         });
     }
     Ok(entries)
 }
 
-fn merge_runtime_path_staging_entries(
+pub(crate) fn merge_runtime_path_staging_entries(
     base: &mut Vec<RuntimePathStagingManifestEntry>,
     extra: Vec<RuntimePathStagingManifestEntry>,
 ) {
@@ -2762,7 +1998,7 @@ fn merge_runtime_path_staging_entries(
     }
 }
 
-fn write_runtime_staging_manifest(
+pub(crate) fn write_runtime_staging_manifest(
     package_dir: &Path,
     experiment: &Value,
     entries: &[RuntimePathStagingManifestEntry],
@@ -2826,7 +2062,7 @@ fn write_runtime_staging_manifest(
     atomic_write_json_pretty(&package_dir.join(STAGING_MANIFEST_FILE), &manifest_value)
 }
 
-fn rewrite_runtime_paths_for_package(
+pub(crate) fn rewrite_runtime_paths_for_package(
     runtime_root: &mut Value,
     exp_dir: &Path,
     package_dir: &Path,
@@ -2867,7 +2103,7 @@ fn rewrite_runtime_paths_for_package(
     Ok(())
 }
 
-fn rewrite_benchmark_paths_for_package(
+pub(crate) fn rewrite_benchmark_paths_for_package(
     benchmark_root: &mut Value,
     exp_dir: &Path,
     package_dir: &Path,
@@ -2900,6 +2136,24 @@ fn rewrite_benchmark_paths_for_package(
         public_path_copies,
         staging_manifest_entries,
     )?;
+    stage_optional_public_runtime_path_for_package(
+        benchmark_root.pointer_mut("/grader/conclusion/mapper"),
+        "benchmark.grader.conclusion.mapper",
+        exp_dir,
+        package_dir,
+        public_path_copies,
+        staging_manifest_entries,
+    )?;
+    rewrite_optional_package_source_path(
+        benchmark_root.pointer_mut("/grader/injected/bundle"),
+        "benchmark.grader.injected.bundle",
+        exp_dir,
+        package_dir,
+        "files",
+        "grader_bundle",
+        file_copies,
+        file_counter,
+    )?;
     stage_command_path_refs_for_package(
         benchmark_root.pointer_mut("/adapter/command"),
         "benchmark.adapter.command",
@@ -2911,7 +2165,7 @@ fn rewrite_benchmark_paths_for_package(
     Ok(())
 }
 
-fn sanitize_name_for_path(raw: &str) -> String {
+pub(crate) fn sanitize_name_for_path(raw: &str) -> String {
     let mut out = String::new();
     for ch in raw.chars() {
         if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
@@ -2972,19 +2226,25 @@ pub fn build_experiment_package(
     ensure_dir(&package_dir.join("agent_builds"))?;
     ensure_dir(&package_dir.join("tasks"))?;
     ensure_dir(&package_dir.join("files"))?;
-    ensure_dir(&package_dir.join(PACKAGED_RUNTIME_DEPS_DIR))?;
+    ensure_dir(&package_dir.join(PACKAGED_RUNTIME_ASSETS_DIR))?;
 
     let dataset_path = resolve_dataset_path(&json_value, &loaded.exp_dir)?;
     let dataset_target = package_dir.join("tasks").join("tasks.jsonl");
-    let packaged_tasks = load_task_specs_for_build(&dataset_path, &json_value)?;
-    write_packaged_task_declarations(&dataset_target, &packaged_tasks)?;
+    let raw_tasks = load_task_rows_for_build(&dataset_path, &json_value)?;
+    let packaged_tasks = compile_tasks_for_package(
+        &raw_tasks,
+        &loaded.project_root,
+        &loaded.exp_dir,
+        &dataset_path,
+        &package_dir,
+    )?;
+    write_packaged_tasks(&dataset_target, &packaged_tasks)?;
     let dataset_rel = PathBuf::from("tasks").join("tasks.jsonl");
     set_json_pointer_value(
         &mut json_value,
         "/dataset/path",
         json!(as_portable_rel(&dataset_rel)),
     )?;
-    stage_task_workspace_dependencies_for_package(&packaged_tasks, &loaded.project_root, &package_dir)?;
 
     let mut artifact_copies: BTreeMap<String, String> = BTreeMap::new();
     let mut file_copies: BTreeMap<String, String> = BTreeMap::new();
@@ -3134,7 +2394,7 @@ pub fn build_experiment_package(
     })
 }
 
-fn run_experiment_with_behavior(
+pub(crate) fn run_experiment_with_behavior(
     path: &Path,
     behavior: RunBehavior,
     execution: RunExecutionOptions,
@@ -3160,7 +2420,12 @@ fn run_experiment_with_behavior(
     let _engine_lease_guard = start_engine_lease_heartbeat(&run_dir, &run_id)?;
     let mut run_guard = RunControlGuard::new(&run_dir, &run_id);
 
-    for subdir in ["tasks", "files", "agent_builds", PACKAGED_RUNTIME_DEPS_DIR] {
+    for subdir in [
+        "tasks",
+        "files",
+        "agent_builds",
+        PACKAGED_RUNTIME_ASSETS_DIR,
+    ] {
         let source = exp_dir.join(subdir);
         if source.exists() {
             copy_path_into_package(&source, &run_dir.join(subdir))?;
@@ -3173,14 +2438,17 @@ fn run_experiment_with_behavior(
             staging_manifest_source.display()
         ));
     }
-    copy_path_into_package(&staging_manifest_source, &run_dir.join(STAGING_MANIFEST_FILE))
-        .with_context(|| {
-            format!(
-                "failed to copy runtime staging manifest from sealed package {} into run directory {}",
-                staging_manifest_source.display(),
-                run_dir.display()
-            )
-        })?;
+    copy_path_into_package(
+        &staging_manifest_source,
+        &run_dir.join(STAGING_MANIFEST_FILE),
+    )
+    .with_context(|| {
+        format!(
+            "failed to copy runtime staging manifest from sealed package {} into run directory {}",
+            staging_manifest_source.display(),
+            run_dir.display()
+        )
+    })?;
 
     let resolved_path = run_dir.join("resolved_experiment.json");
     atomic_write_json_pretty(&resolved_path, &json_value)?;

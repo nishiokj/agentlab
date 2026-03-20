@@ -1,0 +1,45 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agent-lab.local/schemas/trial_conclusion_v1.json",
+  "title": "Trial Conclusion v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "payload", "grader"],
+  "properties": {
+    "schema_version": { "const": "trial_conclusion_v1" },
+    "payload": {
+      "type": "object",
+      "additionalProperties": true
+    },
+    "reported_outcome": { "type": "string", "minLength": 1 },
+    "primary_metric": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "value"],
+      "properties": {
+        "name": { "type": "string", "minLength": 1 },
+        "value": {
+          "anyOf": [
+            { "type": "number" },
+            { "type": "string" },
+            { "type": "boolean" },
+            { "type": "null" }
+          ]
+        }
+      }
+    },
+    "grader": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["name", "strategy"],
+      "properties": {
+        "name": { "type": "string", "minLength": 1 },
+        "strategy": {
+          "type": "string",
+          "enum": ["in_task_image", "injected", "separate"]
+        },
+        "version": { "type": "string", "minLength": 1 }
+      }
+    }
+  }
+}

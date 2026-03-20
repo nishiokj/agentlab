@@ -4,7 +4,7 @@
   "title": "Trial Input v1",
   "type": "object",
   "additionalProperties": false,
-  "required": ["schema_version", "ids", "task", "bindings", "runtime", "design"],
+  "required": ["schema_version", "ids", "task", "runtime", "design"],
   "properties": {
     "schema_version": { "const": "trial_input_v1" },
     "ids": {
@@ -36,11 +36,6 @@
         }
       }
     },
-    "bindings": {
-      "type": "object",
-      "additionalProperties": true,
-      "description": "Variant bindings/primitives; interpreted by the harness."
-    },
     "design": {
       "type": "object",
       "additionalProperties": false,
@@ -59,62 +54,19 @@
     "runtime": {
       "type": "object",
       "additionalProperties": false,
-      "required": ["paths", "network", "control_plane"],
+      "required": ["network_mode", "allowed_hosts", "task_image", "workdir", "time_limit_ms"],
       "properties": {
-        "paths": {
-          "type": "object",
-          "additionalProperties": false,
-          "required": ["workspace", "state", "dataset", "out", "tmp"],
-          "properties": {
-            "workspace": { "type": "string" },
-            "state": { "type": "string" },
-            "cache": { "type": "string" },
-            "dataset": { "type": "string" },
-            "out": { "type": "string" },
-            "tmp": { "type": "string" }
-          }
+        "network_mode": {
+          "type": "string",
+          "enum": ["none", "full", "allowlist_enforced"]
         },
-        "network": {
-          "type": "object",
-          "additionalProperties": false,
-          "required": ["mode_requested"],
-          "properties": {
-            "mode_requested": {
-              "type": "string",
-              "enum": ["none", "full", "allowlist_enforced"]
-            },
-            "allowed_hosts": {
-              "type": "array",
-              "items": { "type": "string", "minLength": 1 }
-            }
-          }
+        "allowed_hosts": {
+          "type": "array",
+          "items": { "type": "string", "minLength": 1 }
         },
-        "control_plane": {
-          "type": "object",
-          "additionalProperties": false,
-          "required": ["mode", "path"],
-          "properties": {
-            "mode": { "type": "string", "enum": ["file", "uds"] },
-            "path": { "type": "string", "minLength": 1 }
-          }
-        },
-        "budgets": {
-          "type": "object",
-          "additionalProperties": false,
-          "properties": {
-            "max_steps": { "type": "integer", "minimum": 0 },
-            "max_total_tokens": { "type": "integer", "minimum": 0 },
-            "max_tool_calls": { "type": "integer", "minimum": 0 }
-          }
-        },
-        "timeouts": {
-          "type": "object",
-          "additionalProperties": false,
-          "properties": {
-            "trial_seconds": { "type": "integer", "minimum": 1 },
-            "tool_seconds": { "type": "integer", "minimum": 1 }
-          }
-        }
+        "task_image": { "type": "string", "minLength": 1 },
+        "workdir": { "type": "string", "minLength": 1 },
+        "time_limit_ms": { "type": "integer", "minimum": 1 }
       }
     },
     "ext": { "type": "object", "additionalProperties": true }

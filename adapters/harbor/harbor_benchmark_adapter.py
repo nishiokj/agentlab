@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Harbor benchmark adapter that writes AgentLab benchmark records."""
+"""Harbor benchmark grader for the cutover contract."""
 
 from __future__ import annotations
 
@@ -15,6 +15,8 @@ from typing import Any
 DEFAULT_ADAPTER_ID = "harbor_tb2"
 DEFAULT_BENCHMARK_NAME = "terminal_bench_2"
 DEFAULT_SPLIT = "test"
+DEFAULT_MAPPED_OUTPUT_PATH = "/agentlab/out/mapped_grader_output.json"
+VALID_GRADING_STRATEGIES = {"in_task_image", "injected", "separate"}
 
 
 class HarborAdapterError(RuntimeError):
@@ -67,34 +69,25 @@ def _env_int(name: str, fallback: int = 0) -> int:
         return fallback
 
 
-def _env_int_min(name: str, fallback: int, minimum: int) -> int:
-    parsed = _env_int(name, fallback)
-    if parsed < minimum:
-        return fallback
-    return parsed
+def _task_payload(grader_input: dict[str, Any]) -> dict[str, Any]:
+    payload = grader_input.get("task")
+    if isinstance(payload, dict):
+        return payload
+    return {}
 
 
-def _identity_fields() -> dict[str, Any]:
-    slot_commit_id = os.environ.get("AGENTLAB_SLOT_COMMIT_ID", "").strip() or "slot_pending"
-    return {
-        "schedule_idx": _env_int_min("AGENTLAB_SCHEDULE_IDX", 0, 0),
-        "slot_commit_id": slot_commit_id,
-        "attempt": _env_int_min("AGENTLAB_ATTEMPT", 1, 1),
-        "row_seq": _env_int_min("AGENTLAB_ROW_SEQ", 0, 0),
-    }
+def _candidate_artifact(grader_input: dict[str, Any]) -> dict[str, Any]:
+    payload = grader_input.get("candidate_artifact")
+    if isinstance(payload, dict):
+        return payload
+    return {}
 
 
-def _task_id(task_payload: Any) -> str:
-    if isinstance(task_payload, dict):
-        candidate = task_payload.get("id")
-        if isinstance(candidate, str) and candidate.strip():
-            return candidate.strip()
-        nested_task = task_payload.get("task")
-        if isinstance(nested_task, dict):
-            nested_id = nested_task.get("id")
-            if isinstance(nested_id, str) and nested_id.strip():
-                return nested_id.strip()
-    return "task_unknown"
+def _extract_candidate_payload(grader_input: dict[str, Any]) -> Any:
+    candidate = _candidate_artifact(grader_input)
+    if candidate.get("state") == "valid":
+        return candidate.get("payload")
+    return {}
 
 
 def _extract_benchmark_spec(task_payload: Any) -> dict[str, str]:
@@ -119,19 +112,21 @@ def _extract_benchmark_spec(task_payload: Any) -> dict[str, str]:
     return default
 
 
-def _extract_prediction(agent_result: Any) -> dict[str, Any]:
-    if isinstance(agent_result, dict):
-        output = agent_result.get("output")
+def _extract_prediction(candidate_payload: Any) -> dict[str, Any]:
+    if isinstance(candidate_payload, dict):
+        output = candidate_payload.get("output")
         output_patch = output.get("patch") if isinstance(output, dict) else None
-        patch = agent_result.get("patch") or agent_result.get("prediction") or output_patch
+        patch = candidate_payload.get("patch") or candidate_payload.get("prediction") or output_patch
         if isinstance(patch, str) and patch.strip():
             return {"kind": "patch", "value": patch}
         if isinstance(output, dict):
             response = output.get("response") or output.get("text")
             if isinstance(response, str):
                 return {"kind": "text", "value": response}
-        if "output" in agent_result:
-            return {"kind": "json", "value": agent_result["output"]}
+        if "output" in candidate_payload:
+            return {"kind": "json", "value": candidate_payload["output"]}
+    if isinstance(candidate_payload, str) and candidate_payload.strip():
+        return {"kind": "text", "value": candidate_payload}
     return {"kind": "text", "value": ""}
 
 
@@ -166,7 +161,7 @@ def _parse_evaluator_command() -> list[str] | None:
     return None
 
 
-def run_external_evaluator(task_payload: Any, agent_result: Any) -> dict[str, Any] | None:
+def run_external_evaluator(task_payload: Any, candidate_payload: Any) -> dict[str, Any] | None:
     command = _parse_evaluator_command()
     if command is None:
         return None
@@ -177,7 +172,7 @@ def run_external_evaluator(task_payload: Any, agent_result: Any) -> dict[str, An
         result_path = tmp_dir / "result.json"
         output_path = tmp_dir / "evaluation.json"
         task_path.write_text(json.dumps(task_payload), encoding="utf-8")
-        result_path.write_text(json.dumps(agent_result), encoding="utf-8")
+        result_path.write_text(json.dumps(candidate_payload), encoding="utf-8")
 
         env = os.environ.copy()
         env["HARBOR_TASK_PATH"] = str(task_path)
@@ -230,66 +225,63 @@ def run_external_evaluator(task_payload: Any, agent_result: Any) -> dict[str, An
 def _normalize_verdict(value: Any) -> str:
     if isinstance(value, str):
         lowered = value.strip().lower()
-        if lowered in {"pass", "fail", "error"}:
+        if lowered in {"pass", "fail", "error", "missing"}:
             return lowered
     return "error"
 
 
-def _fallback_verdict(agent_result: Any) -> str:
-    if isinstance(agent_result, dict):
-        explicit = _normalize_verdict(agent_result.get("verdict"))
+def _fallback_verdict(grader_input: dict[str, Any], candidate_payload: Any) -> str:
+    if isinstance(candidate_payload, dict):
+        explicit = _normalize_verdict(candidate_payload.get("verdict"))
         if explicit != "error":
             return explicit
-        outcome = agent_result.get("outcome")
+        outcome = candidate_payload.get("outcome")
         if isinstance(outcome, bool):
             return "pass" if outcome else "fail"
-    return "pass" if _env_int("AGENTLAB_AGENT_EXIT_STATUS", 0) == 0 else "fail"
+    candidate = _candidate_artifact(grader_input)
+    if candidate.get("state") == "missing":
+        return "missing"
+    if candidate.get("state") == "invalid":
+        return "error"
+    agent_phase = grader_input.get("agent_phase")
+    if isinstance(agent_phase, dict):
+        exit_code = agent_phase.get("exit_code")
+        if exit_code == 0 or exit_code is None:
+            return "pass"
+    return "fail"
 
 
-def _ids(task_payload: Any) -> dict[str, Any]:
+def _reported_outcome(verdict: str) -> str:
     return {
-        "run_id": os.environ.get("AGENTLAB_RUN_ID", "run_unknown"),
-        "trial_id": os.environ.get("AGENTLAB_TRIAL_ID", "trial_unknown"),
-        "variant_id": os.environ.get("AGENTLAB_VARIANT_ID", "variant_unknown"),
-        "task_id": os.environ.get("AGENTLAB_TASK_ID", _task_id(task_payload)),
-        "repl_idx": _env_int("AGENTLAB_REPL_IDX", 0),
-    }
+        "pass": "success",
+        "fail": "failure",
+        "missing": "missing",
+        "error": "error",
+    }.get(verdict, "error")
 
 
-def build_prediction_record(
-    task_payload: Any, agent_result: Any, evaluation: dict[str, Any] | None
+def _grader_strategy() -> str:
+    for env_name in ("AGENTLAB_GRADING_STRATEGY", "AGENTLAB_GRADER_STRATEGY"):
+        raw = os.environ.get(env_name, "").strip()
+        if raw in VALID_GRADING_STRATEGIES:
+            return raw
+    return "in_task_image"
+
+
+def _mapped_output_path() -> str:
+    raw = os.environ.get("AGENTLAB_MAPPED_GRADER_OUTPUT_PATH", "").strip()
+    if raw:
+        return raw
+    return DEFAULT_MAPPED_OUTPUT_PATH
+
+
+def build_trial_conclusion(
+    task_payload: Any,
+    grader_input: dict[str, Any],
+    candidate_payload: Any,
+    evaluation: dict[str, Any] | None,
 ) -> dict[str, Any]:
-    prediction = None
-    if isinstance(evaluation, dict):
-        candidate = evaluation.get("prediction")
-        if isinstance(candidate, dict):
-            kind = candidate.get("kind")
-            if isinstance(kind, str) and kind:
-                prediction = {
-                    "kind": kind,
-                    "value": candidate.get("value"),
-                }
-    if prediction is None:
-        prediction = _extract_prediction(agent_result)
-
-    mode = "external" if evaluation is not None else "fallback"
-    payload = {
-        "schema_version": "benchmark_prediction_record_v1",
-        "ids": _ids(task_payload),
-        "benchmark": _extract_benchmark_spec(task_payload),
-        "prediction": prediction,
-        "ext": {
-            "harbor": {
-                "evaluation_mode": mode,
-            }
-        },
-    }
-    payload.update(_identity_fields())
-    return payload
-
-
-def build_score_record(task_payload: Any, agent_result: Any, evaluation: dict[str, Any] | None) -> dict[str, Any]:
-    verdict = _fallback_verdict(agent_result)
+    verdict = _fallback_verdict(grader_input, candidate_payload)
     primary_metric_name = "resolved"
     primary_metric_value = 1.0 if verdict == "pass" else 0.0
     metrics: dict[str, float] = {"resolved": primary_metric_value}
@@ -325,39 +317,46 @@ def build_score_record(task_payload: Any, agent_result: Any, evaluation: dict[st
 
     mode = "external" if evaluation is not None else "fallback"
     payload = {
-        "schema_version": "benchmark_score_record_v1",
-        "ids": _ids(task_payload),
         "benchmark": _extract_benchmark_spec(task_payload),
+        "ids": grader_input.get("ids", {}),
         "verdict": verdict,
         "primary_metric_name": primary_metric_name,
         "primary_metric_value": primary_metric_value,
         "metrics": metrics,
+        "prediction": _extract_prediction(candidate_payload),
         "evaluator": evaluator,
-        "ext": {
-            "harbor": {
-                "evaluation_mode": mode,
-            }
+        "harbor": {
+            "evaluation_mode": mode,
         },
     }
-    payload.update(_identity_fields())
-    return payload
+    if isinstance(evaluation, dict):
+        payload["evaluation_output"] = evaluation
+
+    return {
+        "schema_version": "trial_conclusion_v1",
+        "payload": payload,
+        "reported_outcome": _reported_outcome(verdict),
+        "primary_metric": {
+            "name": primary_metric_name,
+            "value": primary_metric_value,
+        },
+        "grader": {
+            "name": "harbor",
+            "strategy": _grader_strategy(),
+            "version": "v1",
+        },
+    }
 
 
 def main() -> int:
-    task_path = _required_env("AGENTLAB_TASK_PATH")
-    result_path = _required_env("AGENTLAB_RESULT_PATH")
-    prediction_path = _required_env("AGENTLAB_BENCHMARK_PREDICTION_PATH")
-    score_path = _required_env("AGENTLAB_BENCHMARK_SCORE_PATH")
-
-    task_payload = _read_json(task_path)
-    agent_result = _read_json(result_path)
-    evaluation = run_external_evaluator(task_payload, agent_result)
-
-    prediction = build_prediction_record(task_payload, agent_result, evaluation)
-    score = build_score_record(task_payload, agent_result, evaluation)
-
-    _write_json(prediction_path, prediction)
-    _write_json(score_path, score)
+    grader_input = _read_json(_required_env("AGENTLAB_GRADER_INPUT_PATH"))
+    if not isinstance(grader_input, dict):
+        raise HarborAdapterError("io.invalid_json", "grader input must be an object", exit_code=22)
+    task_payload = _task_payload(grader_input)
+    candidate_payload = _extract_candidate_payload(grader_input)
+    evaluation = run_external_evaluator(task_payload, candidate_payload)
+    conclusion = build_trial_conclusion(task_payload, grader_input, candidate_payload, evaluation)
+    _write_json(_mapped_output_path(), conclusion)
     return 0
 
 

@@ -82,7 +82,7 @@ class ExtractSwebenchMetaTests(unittest.TestCase):
         self.assertEqual(official_adapter.extract_swebench_meta(payload), expected)
 
 
-class PredictionRecordTests(unittest.TestCase):
+class TrialConclusionTests(unittest.TestCase):
     def setUp(self) -> None:
         self.prev = {k: os.environ.get(k) for k in self._keys()}
         os.environ["AGENTLAB_RUN_ID"] = "run_test"
@@ -108,27 +108,46 @@ class PredictionRecordTests(unittest.TestCase):
             "AGENTLAB_REPL_IDX",
         ]
 
-    def test_prediction_record_contains_non_null_instance_id_for_nested_payload(self) -> None:
+    def test_task_container_conclusion_contains_non_null_instance_id_for_nested_payload(self) -> None:
         payload = {
             "task": {
                 "id": "task_1",
                 "swebench": {"input": {"instance_id": "numpy__numpy-98765"}},
             }
         }
-        record = task_grader.build_prediction_record(payload, {"patch": "diff --git a b"})
+        grader_input = {
+            "ids": {},
+            "agent_phase": {"exit_code": 0},
+            "candidate_artifact": {
+                "state": "valid",
+                "payload": {"patch": "diff --git a b"},
+            },
+        }
+        record = task_grader.build_trial_conclusion(payload, grader_input)
         self.assertEqual(
-            record["ext"]["swebench"]["instance_id"],
+            record["payload"]["swebench"]["instance_id"],
             "numpy__numpy-98765",
         )
 
-    def test_prediction_record_contains_non_null_instance_id_for_top_level_payload(self) -> None:
+    def test_official_conclusion_contains_non_null_instance_id_for_top_level_payload(self) -> None:
         payload = {
             "id": "task_1",
             "swebench": {"input": {"instance_id": "pandas__pandas-54321"}},
         }
-        record = official_adapter.build_prediction_record(payload, {"patch": "diff --git a b"})
+        grader_input = {
+            "ids": {},
+            "candidate_artifact": {
+                "state": "valid",
+                "payload": {"verdict": "pass", "patch": "diff --git a b"},
+            },
+        }
+        record = official_adapter.build_trial_conclusion(
+            payload,
+            grader_input,
+            {"verdict": "pass", "patch": "diff --git a b"},
+        )
         self.assertEqual(
-            record["ext"]["swebench"]["instance_id"],
+            record["payload"]["swebench"]["instance_id"],
             "pandas__pandas-54321",
         )
 

@@ -7,22 +7,18 @@ use std::path::{Path, PathBuf};
 
 pub const AGENTLAB_CONTRACT_IN_DIR: &str = "/agentlab/in";
 pub const AGENTLAB_CONTRACT_OUT_DIR: &str = "/agentlab/out";
-pub const AGENTLAB_CONTRACT_STATE_DIR: &str = "/agentlab/state";
-pub const AGENTLAB_CONTRACT_WORKSPACE_DIR: &str = "/agentlab/workspace";
-pub const AGENTLAB_CONTRACT_DEPS_DIR: &str = "/agentlab/deps";
+pub const AGENTLAB_CONTRACT_METRICS_DIR: &str = "/agentlab/metrics";
+pub const AGENTLAB_CONTRACT_GRADER_AUX_DIR: &str = "/agentlab/in/grader";
+pub const AGENTLAB_CONTRACT_RUNTIME_AUX_DIR: &str = "/agentlab/in/runtime";
+pub const AGENTLAB_TASK_WORKDIR_PLACEHOLDER: &str = "__AGENTLAB_TASK_WORKDIR__";
+pub const AGENTLAB_RUNNER_SUPPORT_REL_DIR: &str = ".agentlab/support";
 
 pub const AGENTLAB_TRIAL_INPUT_PATH: &str = "/agentlab/in/trial_input.json";
-pub const AGENTLAB_CONTROL_PATH: &str = "/agentlab/state/lab_control.json";
-pub const AGENTLAB_TASK_PATH: &str = "/agentlab/in/task.json";
-pub const AGENTLAB_BINDINGS_PATH: &str = "/agentlab/in/bindings.json";
-pub const AGENTLAB_DEPENDENCIES_PATH: &str = "/agentlab/in/dependencies.json";
-pub const AGENTLAB_POLICY_PATH: &str = "/agentlab/in/policy.json";
+pub const AGENTLAB_GRADER_INPUT_PATH: &str = "/agentlab/in/grader_input.json";
 pub const AGENTLAB_RESULT_PATH: &str = "/agentlab/out/result.json";
+pub const AGENTLAB_RAW_GRADER_OUTPUT_PATH: &str = "/agentlab/out/raw_grader_output.json";
+pub const AGENTLAB_MAPPED_GRADER_OUTPUT_PATH: &str = "/agentlab/out/mapped_grader_output.json";
 pub const AGENTLAB_TRAJECTORY_PATH: &str = "/agentlab/out/trajectory.jsonl";
-pub const HARNESS_IN_DIR: &str = "/in";
-pub const HARNESS_OUT_DIR: &str = "/out";
-pub const HARNESS_TASK_PATH: &str = "/in/task.json";
-pub const HARNESS_RESULT_PATH: &str = "/out/result.json";
 
 pub const AGENTLAB_ENV_TIMEOUT_MS: &str = "AGENTLAB_TIMEOUT_MS";
 pub const AGENTLAB_ENV_RUN_ID: &str = "AGENTLAB_RUN_ID";
@@ -30,11 +26,11 @@ pub const AGENTLAB_ENV_TRIAL_ID: &str = "AGENTLAB_TRIAL_ID";
 pub const AGENTLAB_ENV_VARIANT_ID: &str = "AGENTLAB_VARIANT_ID";
 pub const AGENTLAB_ENV_TASK_ID: &str = "AGENTLAB_TASK_ID";
 pub const AGENTLAB_ENV_REPL_IDX: &str = "AGENTLAB_REPL_IDX";
-pub const AGENTLAB_ENV_TASK_PATH: &str = "AGENTLAB_TASK_PATH";
-pub const AGENTLAB_ENV_BINDINGS_PATH: &str = "AGENTLAB_BINDINGS_PATH";
-pub const AGENTLAB_ENV_DEPENDENCIES_PATH: &str = "AGENTLAB_DEPENDENCIES_PATH";
-pub const AGENTLAB_ENV_POLICY_PATH: &str = "AGENTLAB_POLICY_PATH";
+pub const AGENTLAB_ENV_TRIAL_INPUT_PATH: &str = "AGENTLAB_TRIAL_INPUT_PATH";
+pub const AGENTLAB_ENV_GRADER_INPUT_PATH: &str = "AGENTLAB_GRADER_INPUT_PATH";
 pub const AGENTLAB_ENV_RESULT_PATH: &str = "AGENTLAB_RESULT_PATH";
+pub const AGENTLAB_ENV_RAW_GRADER_OUTPUT_PATH: &str = "AGENTLAB_RAW_GRADER_OUTPUT_PATH";
+pub const AGENTLAB_ENV_MAPPED_GRADER_OUTPUT_PATH: &str = "AGENTLAB_MAPPED_GRADER_OUTPUT_PATH";
 pub const AGENTLAB_ENV_TRAJECTORY_PATH: &str = "AGENTLAB_TRAJECTORY_PATH";
 
 #[derive(Debug, Clone)]
@@ -43,17 +39,13 @@ pub struct RunnerRuntimeHostPaths {
     pub out_dir: PathBuf,
     pub state_dir: PathBuf,
     pub workspace_dir: PathBuf,
-    pub deps_dir: PathBuf,
     pub tmp_dir: PathBuf,
-    pub task: PathBuf,
-    pub bindings: PathBuf,
-    pub dependencies: PathBuf,
-    pub policy: PathBuf,
+    pub grader_input: PathBuf,
     pub result: PathBuf,
+    pub raw_grader_output: PathBuf,
+    pub mapped_grader_output: PathBuf,
     pub trajectory: PathBuf,
     pub trial_input: PathBuf,
-    pub trial_output: PathBuf,
-    pub trial_events: PathBuf,
     pub control: PathBuf,
 }
 
@@ -62,24 +54,19 @@ pub fn runner_runtime_host_paths(trial_dir: &Path) -> RunnerRuntimeHostPaths {
     let out_dir = trial_dir.join("out");
     let state_dir = trial_dir.join("state");
     let workspace_dir = trial_dir.join("workspace");
-    let deps_dir = trial_dir.join("deps");
     RunnerRuntimeHostPaths {
         in_dir: in_dir.clone(),
         out_dir: out_dir.clone(),
         state_dir: state_dir.clone(),
         workspace_dir: workspace_dir.clone(),
-        deps_dir: deps_dir.clone(),
         tmp_dir: trial_dir.join("tmp"),
-        task: in_dir.join("task.json"),
-        bindings: in_dir.join("bindings.json"),
-        dependencies: in_dir.join("dependencies.json"),
-        policy: in_dir.join("policy.json"),
+        grader_input: in_dir.join("grader_input.json"),
         result: out_dir.join("result.json"),
+        raw_grader_output: out_dir.join("raw_grader_output.json"),
+        mapped_grader_output: out_dir.join("mapped_grader_output.json"),
         trajectory: out_dir.join("trajectory.jsonl"),
         trial_input: in_dir.join("trial_input.json"),
-        trial_output: out_dir.join("trial_output.json"),
-        trial_events: state_dir.join("events.jsonl"),
-        control: state_dir.join("lab_control.json"),
+        control: in_dir.join("runtime").join("lab_control.json"),
     }
 }
 

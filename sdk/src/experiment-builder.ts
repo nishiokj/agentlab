@@ -348,7 +348,6 @@ export interface ExperimentSpec {
       env_from_host?: string[];
       binding_args?: Array<{ key: string; flag: string }>;
       network?: 'none' | 'full' | 'allowlist_enforced';
-      root_read_only?: boolean;
     };
     telemetry?: {
       trajectory_path?: string;
@@ -425,7 +424,6 @@ export class ExperimentBuilder {
           env: {},
           env_from_host: [],
           network: 'none',
-          root_read_only: true,
         },
       },
       policy: {

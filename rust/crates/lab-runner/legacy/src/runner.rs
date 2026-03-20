@@ -1,3 +1,5 @@
+use crate::*;
+
 pub fn continue_run_with_options(
     run_dir: &Path,
     options: RunExecutionOptions,
@@ -254,12 +256,69 @@ pub fn continue_run_with_options(
     })
 }
 
-fn recover_reconciled_status(previous: &str) -> &'static str {
+pub(crate) fn recover_reconciled_status(previous: &str) -> &'static str {
     match previous {
         "completed" => "completed",
         "killed" => "killed",
         _ => "interrupted",
     }
+}
+
+fn reconcile_runtime_trials_for_recovery(
+    run_dir: &Path,
+    committed_by_schedule: &BTreeMap<usize, SlotCommitRecord>,
+) -> Result<(usize, HashSet<String>)> {
+    let trials_dir = run_dir.join("trials");
+    if !trials_dir.exists() {
+        return Ok((0, HashSet::new()));
+    }
+
+    let mut trial_dirs = fs::read_dir(&trials_dir)?
+        .filter_map(|entry| entry.ok().map(|item| item.path()))
+        .filter(|path| path.is_dir())
+        .collect::<Vec<_>>();
+    trial_dirs.sort();
+
+    let mut released = 0usize;
+    let mut runtime_state_trial_ids = HashSet::new();
+    for trial_dir in trial_dirs {
+        if !crate::trial::state::trial_attempt_state_exists(&trial_dir) {
+            continue;
+        }
+        let Some(trial_id) = trial_dir
+            .file_name()
+            .and_then(|value| value.to_str())
+            .map(str::to_string)
+        else {
+            continue;
+        };
+        runtime_state_trial_ids.insert(trial_id.clone());
+
+        let persisted = crate::trial::state::load_trial_attempt_state(&trial_dir)?;
+        let schedule_idx = persisted.state.slot.schedule_idx as usize;
+        if committed_by_schedule
+            .get(&schedule_idx)
+            .is_some_and(|committed| committed.trial_id == trial_id)
+        {
+            let _ = crate::trial::state::reconcile_trial_attempt_as_committed(&trial_dir);
+            continue;
+        }
+        if !crate::trial::state::trial_phase_requires_recovery_release(&persisted.state.phase) {
+            continue;
+        }
+        let _ = write_trial_state(
+            &trial_dir,
+            &trial_id,
+            "failed",
+            None,
+            None,
+            Some("worker_lost_recovered"),
+        );
+        let _ = crate::trial::state::reconcile_trial_attempt_as_abandoned(&trial_dir);
+        released += 1;
+    }
+
+    Ok((released, runtime_state_trial_ids))
 }
 
 pub fn recover_run(run_dir: &Path, force: bool) -> Result<RecoverResult> {
@@ -337,9 +396,13 @@ pub fn recover_run(run_dir: &Path, force: bool) -> Result<RecoverResult> {
     progress.schema_version = "schedule_progress_v2".to_string();
     progress.updated_at = Utc::now().to_rfc3339();
 
+    let (mut active_trials_released, runtime_state_trial_ids) =
+        reconcile_runtime_trials_for_recovery(&run_dir, &committed_by_schedule)?;
     let active_trials = run_control_active_trials(&control);
-    let mut active_trials_released = 0usize;
     for active in active_trials {
+        if runtime_state_trial_ids.contains(&active.trial_id) {
+            continue;
+        }
         let Some(schedule_idx) = active.schedule_idx else {
             continue;
         };
@@ -358,6 +421,7 @@ pub fn recover_run(run_dir: &Path, force: bool) -> Result<RecoverResult> {
                 None,
                 Some("worker_lost_recovered"),
             );
+            let _ = crate::trial::state::reconcile_trial_attempt_as_abandoned(&trial_dir);
         }
         active_trials_released += 1;
     }
@@ -456,7 +520,7 @@ pub fn replay_trial(run_dir: &Path, trial_id: &str, strict: bool) -> Result<Repl
     ensure_dir(&replay_dir)?;
 
     let replay_trial_id = format!("{}_{}", trial_id, replay_id);
-    let task_boundary = materialize_task_boundary(prepared_manifest.declaration.clone());
+    let task_boundary = materialize_packaged_task_boundary(&prepared_manifest.declaration)?;
     validate_task_boundary_workspace_materialization(&task_boundary)?;
 
     let replay_trial_dir = replay_dir.join("trial_1");
@@ -506,16 +570,20 @@ pub fn replay_trial(run_dir: &Path, trial_id: &str, strict: bool) -> Result<Repl
     )?;
     set_json_pointer_value(&mut input, "/runtime/control_plane/mode", json!("file"))?;
     let input_bytes = serde_json::to_vec_pretty(&input)?;
+    let replay_task_sandbox_image = replay_prepared_manifest.task_sandbox_image().to_string();
+    let replay_task_sandbox_workdir = replay_prepared_manifest
+        .task_sandbox_workdir()
+        .unwrap_or(task_boundary.task_workdir.as_str())
+        .to_string();
 
     let io_paths = prepare_io_paths(&trial_paths, &input_bytes)?;
     let runtime_env = build_runtime_contract_env(
         &run_id,
         &input,
         &io_paths,
-        Some(replay_prepared_manifest.task_image.as_str()),
+        Some(replay_task_sandbox_image.as_str()),
         resolve_trial_timeout_ms(&input),
     );
-    let adapter = adapter_registry_entry(&agent_runtime.adapter_ref)?;
     let run_request = AdapterRunRequest {
         runtime_experiment: &runtime_experiment,
         runtime: &agent_runtime,
@@ -529,13 +597,27 @@ pub fn replay_trial(run_dir: &Path, trial_id: &str, strict: bool) -> Result<Repl
         benchmark_grader: None,
         benchmark_grading_enabled: false,
         run_id: &run_id,
-        task_image: Some(replay_prepared_manifest.task_image.as_str()),
+        task_image: replay_task_sandbox_image.as_str(),
+        task_workdir: replay_task_sandbox_workdir.as_str(),
+        task_materialization_kind: task_boundary.materialization.kind.clone(),
         agent_artifact: Some(agent_runtime.agent_artifact.as_path()),
     };
-    let proc_result = adapter.run_trial(&run_request)?;
-    let status = proc_result.status;
-
-    let (trial_output, result_parse_error) = load_trial_output_resilient(&io_paths.output_host)?;
+    let runtime_outcome = crate::trial::execution::execute_trial_runtime(
+        &replay_trial_dir,
+        0,
+        1,
+        &run_request,
+        &replay_prepared_manifest.task_id,
+        &variant.id,
+        replay_prepared_manifest.repl_idx,
+        replay_prepared_manifest
+            .task_sandbox_plan
+            .as_ref()
+            .ok_or_else(|| anyhow!("prepared replay task missing task sandbox plan"))?,
+    )?;
+    let status = runtime_outcome.agent_exit_status;
+    let trial_output = runtime_outcome.trial_output;
+    let result_parse_error = runtime_outcome.result_parse_error;
 
     let outcome = trial_output
         .get("outcome")
@@ -603,7 +685,7 @@ pub fn replay_trial(run_dir: &Path, trial_id: &str, strict: bool) -> Result<Repl
     })
 }
 
-fn replay_grade_for_integration(level: &str) -> &'static str {
+pub(crate) fn replay_grade_for_integration(level: &str) -> &'static str {
     match level {
         "sdk_full" => "strict",
         "sdk_control" => "checkpointed",
@@ -623,7 +705,7 @@ pub fn fork_trial(
     fork_trial_inner(run_dir, from_trial, selector, set_bindings, strict)
 }
 
-fn fork_trial_inner(
+pub(crate) fn fork_trial_inner(
     run_dir: &Path,
     from_trial: &str,
     selector: &str,
@@ -658,10 +740,11 @@ fn fork_trial_inner(
     let parent_output = load_trial_output_payload(&run_dir, &run_id, from_trial).ok();
     let (variants, _) = load_run_variants(&run_dir, &json_value)?;
     let variant_id = prepared_manifest.variant_id.as_str();
-    let variant = find_variant_by_id(&variants, variant_id)?;
+    let mut variant = find_variant_by_id(&variants, variant_id)?.clone();
+    apply_variant_binding_overrides(&mut variant, set_bindings)?;
     let runtime_profile = resolve_variant_runtime_profile(
         &json_value,
-        variant,
+        &variant,
         &run_dir,
         &RunBehavior::default(),
         &RunExecutionOptions::default(),
@@ -695,7 +778,7 @@ fn fork_trial_inner(
     let fork_dir = run_dir.join("forks").join(&fork_id);
     ensure_dir(&fork_dir)?;
     let fork_trial_id = format!("{}_{}", from_trial, fork_id);
-    let task_boundary = materialize_task_boundary(prepared_manifest.declaration.clone());
+    let task_boundary = materialize_packaged_task_boundary(&prepared_manifest.declaration)?;
     validate_task_boundary_workspace_materialization(&task_boundary)?;
 
     let fork_trial_dir = fork_dir.join("trial_1");
@@ -721,7 +804,7 @@ fn fork_trial_inner(
         &run_id,
         &fork_trial_id,
         &runtime_experiment,
-        variant,
+        &variant,
         prepared_manifest.task_index,
         prepared_manifest.repl_idx,
         &task_boundary,
@@ -735,7 +818,6 @@ fn fork_trial_inner(
         dynamic_mounts,
         trial_input: mut input,
     } = prepared;
-    apply_binding_overrides(&mut input, set_bindings)?;
     set_json_pointer_value(
         &mut input,
         "/ext/fork",
@@ -754,16 +836,20 @@ fn fork_trial_inner(
     )?;
     set_json_pointer_value(&mut input, "/runtime/control_plane/mode", json!("file"))?;
     let input_bytes = serde_json::to_vec_pretty(&input)?;
+    let fork_task_sandbox_image = fork_prepared_manifest.task_sandbox_image().to_string();
+    let fork_task_sandbox_workdir = fork_prepared_manifest
+        .task_sandbox_workdir()
+        .unwrap_or(task_boundary.task_workdir.as_str())
+        .to_string();
 
     let io_paths = prepare_io_paths(&trial_paths, &input_bytes)?;
     let runtime_env = build_runtime_contract_env(
         &run_id,
         &input,
         &io_paths,
-        Some(fork_prepared_manifest.task_image.as_str()),
+        Some(fork_task_sandbox_image.as_str()),
         resolve_trial_timeout_ms(&input),
     );
-    let adapter = adapter_registry_entry(&agent_runtime.adapter_ref)?;
     let run_request = AdapterRunRequest {
         runtime_experiment: &runtime_experiment,
         runtime: &agent_runtime,
@@ -777,13 +863,27 @@ fn fork_trial_inner(
         benchmark_grader: None,
         benchmark_grading_enabled: false,
         run_id: &run_id,
-        task_image: Some(fork_prepared_manifest.task_image.as_str()),
+        task_image: fork_task_sandbox_image.as_str(),
+        task_workdir: fork_task_sandbox_workdir.as_str(),
+        task_materialization_kind: task_boundary.materialization.kind.clone(),
         agent_artifact: Some(agent_runtime.agent_artifact.as_path()),
     };
-    let proc_result = adapter.run_trial(&run_request)?;
-    let status = proc_result.status;
-
-    let (trial_output, result_parse_error) = load_trial_output_resilient(&io_paths.output_host)?;
+    let runtime_outcome = crate::trial::execution::execute_trial_runtime(
+        &fork_trial_dir,
+        0,
+        1,
+        &run_request,
+        &fork_prepared_manifest.task_id,
+        &variant.id,
+        fork_prepared_manifest.repl_idx,
+        fork_prepared_manifest
+            .task_sandbox_plan
+            .as_ref()
+            .ok_or_else(|| anyhow!("prepared fork task missing task sandbox plan"))?,
+    )?;
+    let status = runtime_outcome.agent_exit_status;
+    let trial_output = runtime_outcome.trial_output;
+    let result_parse_error = runtime_outcome.result_parse_error;
     let outcome = trial_output
         .get("outcome")
         .and_then(|v| v.as_str())
@@ -857,104 +957,138 @@ fn fork_trial_inner(
     })
 }
 
-fn active_trials_use_worker_control_plane(
-    active_by_id: &HashMap<String, RunControlActiveTrial>,
-    target_trials: &[String],
-) -> bool {
-    !target_trials.is_empty()
-        && target_trials.iter().all(|trial_id| {
-            active_by_id
-                .get(trial_id)
-                .map(|active| {
-                    active.control.is_none() && active.worker_id != RUN_CONTROL_UNKNOWN_WORKER_ID
-                })
-                .unwrap_or(false)
-        })
-}
-
-fn next_parallel_worker_control_request_id(action: ParallelWorkerControlAction) -> String {
-    format!("{}_{}", action.as_str(), Utc::now().timestamp_micros())
-}
-
-fn request_parallel_worker_pause(
-    run_dir: &Path,
-    run_id: &str,
-    target_trials: &[String],
-    pause_label: &str,
-    timeout: Duration,
-) -> Result<PauseResult> {
-    let request_id = next_parallel_worker_control_request_id(ParallelWorkerControlAction::Pause);
-    write_parallel_worker_control_request(
-        run_dir,
-        ParallelWorkerControlRequest {
-            request_id: request_id.clone(),
-            action: ParallelWorkerControlAction::Pause,
-            requested_at: Utc::now().to_rfc3339(),
-            target_trial_ids: target_trials.to_vec(),
-            label: Some(pause_label.to_string()),
-            reason: None,
-        },
-    )?;
-    let response = wait_for_parallel_worker_control_response(run_dir, &request_id, timeout)?;
-    if response.status != PARALLEL_WORKER_CONTROL_RESPONSE_COMPLETED {
-        let detail = response
-            .message
-            .unwrap_or_else(|| response.failed_trials.join(" | "));
-        return Err(anyhow!("pause_partial_failure: {}", detail));
+fn resolve_kill_trial_control_mode(trial_dir: &Path, trial_id: &str) -> Result<ActiveTrialControlMode> {
+    let runtime_handles = runtime_trial_container_handles(trial_dir)?;
+    if !runtime_handles.is_empty() {
+        return Ok(ActiveTrialControlMode::RuntimeContainers);
     }
-    let trial_id = if target_trials.len() == 1 {
-        target_trials[0].clone()
-    } else {
-        "multi".to_string()
-    };
-    Ok(PauseResult {
-        run_id: run_id.to_string(),
-        trial_id,
-        label: pause_label.to_string(),
-        checkpoint_acked: response.checkpoint_acked.unwrap_or(false),
-        stop_acked: response.stop_acked.unwrap_or(false),
-    })
+    if crate::trial::state::trial_attempt_state_exists(trial_dir) {
+        return Err(anyhow!(
+            "kill_missing_runtime_container: active runtime state exists for {} but no persisted container ids were found",
+            trial_id
+        ));
+    }
+    Err(anyhow!(
+        "kill_missing_runtime_container: no persisted runtime state or container ids exist for {}",
+        trial_id
+    ))
 }
 
-fn request_parallel_worker_stop(
-    run_dir: &Path,
-    run_id: &str,
-    previous_status: &str,
-    target_trials: &[String],
-    timeout: Duration,
-) -> Result<KillResult> {
-    let request_id = next_parallel_worker_control_request_id(ParallelWorkerControlAction::Stop);
-    write_parallel_worker_control_request(
-        run_dir,
-        ParallelWorkerControlRequest {
-            request_id: request_id.clone(),
-            action: ParallelWorkerControlAction::Stop,
-            requested_at: Utc::now().to_rfc3339(),
-            target_trial_ids: target_trials.to_vec(),
-            label: None,
-            reason: Some("killed_by_user".to_string()),
-        },
-    )?;
-    let response = wait_for_parallel_worker_control_response(run_dir, &request_id, timeout)?;
-    if response.status != PARALLEL_WORKER_CONTROL_RESPONSE_COMPLETED {
-        let detail = response
-            .message
-            .unwrap_or_else(|| response.failed_trials.join(" | "));
-        return Err(anyhow!("kill_partial_failure: {}", detail));
+enum ActiveTrialControlMode {
+    RuntimeContainers,
+}
+
+fn runtime_trial_container_handles(
+    trial_dir: &Path,
+) -> Result<Vec<crate::backend::docker::ContainerHandle>> {
+    Ok(
+        crate::trial::state::load_trial_attempt_container_ids(trial_dir)?
+            .into_iter()
+            .map(|container_id| crate::backend::docker::ContainerHandle { container_id })
+            .collect(),
+    )
+}
+
+fn resolve_active_trial_control_mode(
+    trial_dir: &Path,
+    active: &RunControlActiveTrial,
+) -> Result<ActiveTrialControlMode> {
+    let runtime_handles = runtime_trial_container_handles(trial_dir)?;
+    if !runtime_handles.is_empty() {
+        return Ok(ActiveTrialControlMode::RuntimeContainers);
     }
-    Ok(KillResult {
-        run_id: run_id.to_string(),
-        run_dir: run_dir.to_path_buf(),
-        previous_status: previous_status.to_string(),
-        killed_trials: target_trials.to_vec(),
-    })
+    if crate::trial::state::trial_attempt_state_exists(trial_dir) {
+        return Err(anyhow!(
+            "pause_missing_runtime_container: active runtime state exists for {} but no persisted container ids were found",
+            active.trial_id
+        ));
+    }
+    Err(anyhow!(
+        "pause_missing_runtime_container: no persisted runtime state or container ids exist for {}",
+        active.trial_id
+    ))
+}
+
+fn pause_trial_runtime_containers(trial_dir: &Path) -> Result<()> {
+    let handles = runtime_trial_container_handles(trial_dir)?;
+    if handles.is_empty() {
+        return Err(anyhow!(
+            "pause_missing_runtime_container: no persisted runtime containers were recorded for {}",
+            trial_dir.display()
+        ));
+    }
+    let docker = crate::backend::docker::DockerRuntime::connect()?;
+    for handle in &handles {
+        docker.pause_container(handle)?;
+    }
+    let _ = crate::trial::state::reconcile_trial_attempt_as_paused(trial_dir)?;
+    Ok(())
+}
+
+pub(crate) fn kill_trial_runtime_containers_best_effort(trial_dir: &Path) -> Result<bool> {
+    let handles = runtime_trial_container_handles(trial_dir)?;
+    if handles.is_empty() {
+        return Ok(false);
+    }
+    let docker = crate::backend::docker::DockerRuntime::connect()?;
+    for handle in &handles {
+        if let Err(err) = docker.kill_container(&handle) {
+            if !err.to_string().contains("not found") {
+                return Err(err);
+            }
+        }
+        if let Err(err) = docker.remove_container(&handle, true) {
+            if !err.to_string().contains("not found") {
+                return Err(err);
+            }
+        }
+    }
+    let _ = crate::trial::state::reconcile_trial_attempt_as_killed(trial_dir)?;
+    Ok(true)
+}
+
+fn format_trial_phase(phase: &TrialPhase) -> String {
+    serde_json::to_value(phase)
+        .ok()
+        .and_then(|value| value.as_str().map(str::to_string))
+        .unwrap_or_else(|| format!("{phase:?}"))
+}
+
+fn resume_trial_runtime_containers(trial_dir: &Path) -> Result<bool> {
+    if !crate::trial::state::trial_attempt_state_exists(trial_dir) {
+        return Ok(false);
+    }
+    let persisted = crate::trial::state::load_trial_attempt_state(trial_dir)?;
+    if persisted.state.phase != TrialPhase::Paused {
+        return Err(anyhow!(
+            "resume_trial_not_paused: runtime phase is {}",
+            format_trial_phase(&persisted.state.phase)
+        ));
+    }
+    let handles: Vec<crate::backend::docker::ContainerHandle> =
+        crate::trial::state::trial_attempt_container_ids(&persisted.state)
+            .into_iter()
+            .map(|container_id| crate::backend::docker::ContainerHandle { container_id })
+            .collect();
+    if handles.is_empty() {
+        return Err(anyhow!(
+            "resume_missing_runtime_container: paused runtime state exists for {} but no persisted container ids were found",
+            trial_dir.display()
+        ));
+    }
+    let docker = crate::backend::docker::DockerRuntime::connect()?;
+    for handle in &handles {
+        docker.unpause_container(handle)?;
+    }
+    let _ = crate::trial::state::reconcile_trial_attempt_as_resumed(trial_dir)?;
+    Ok(true)
 }
 
 pub fn pause_run(
     run_dir: &Path,
     trial_id: Option<&str>,
     label: Option<&str>,
-    timeout_seconds: u64,
+    _timeout_seconds: u64,
 ) -> Result<PauseResult> {
     let _op_lease = acquire_run_operation_lease(run_dir, RunOperationType::Pause)?;
     let run_dir = run_dir
@@ -997,139 +1131,42 @@ pub fn pause_run(
     };
 
     let pause_label = label.unwrap_or("pause").to_string();
-    let timeout = Duration::from_secs(timeout_seconds.max(1));
     let active_by_id: HashMap<String, RunControlActiveTrial> =
         run_control_active_trials(&run_control)
             .into_iter()
             .map(|entry| (entry.trial_id.clone(), entry))
             .collect();
-    if active_trials_use_worker_control_plane(&active_by_id, &target_trials) {
-        return request_parallel_worker_pause(
-            &run_dir,
-            &run_id,
-            &target_trials,
-            &pause_label,
-            timeout,
-        );
-    }
-
-    let resolved = load_json_file(&run_dir.join("resolved_experiment.json"))?;
-    let (variants, _) = load_run_variants(&run_dir, &resolved)?;
 
     let mut paused_active_trials: Vec<RunControlActiveTrial> = Vec::new();
     let mut failures: Vec<String> = Vec::new();
-    let mut checkpoint_acked_all = true;
-    let mut stop_acked_all = true;
+    let checkpoint_acked_all = true;
+    let stop_acked_all = true;
 
     for target_trial in &target_trials {
-        let active_adapter_value =
-            match run_control_active_adapter_for_trial(&run_control, target_trial) {
-                Some(value) => value,
-                None => {
-                    failures.push(format!("{}: pause_missing_active_adapter", target_trial));
-                    continue;
-                }
-            };
-        let active_control: ActiveAdapterControl =
-            match serde_json::from_value(active_adapter_value) {
-                Ok(control) => control,
-                Err(err) => {
-                    failures.push(format!(
-                        "{}: invalid active adapter control ({})",
-                        target_trial, err
-                    ));
-                    continue;
-                }
-            };
+        let Some(active) = active_by_id.get(target_trial).cloned() else {
+            failures.push(format!(
+                "{}: pause_missing_active_trial_metadata",
+                target_trial
+            ));
+            continue;
+        };
 
         let trial_dir = run_dir.join("trials").join(target_trial);
         if !trial_dir.exists() {
             failures.push(format!("{}: pause_trial_not_found", target_trial));
             continue;
         }
-        let trial_input = match load_trial_input_payload(&run_dir, &run_id, target_trial) {
-            Ok(value) => value,
-            Err(err) => {
-                failures.push(format!(
-                    "{}: failed to read trial input ({})",
-                    target_trial, err
-                ));
-                continue;
-            }
-        };
-        let variant_id = trial_input
-            .pointer("/ids/variant_id")
-            .and_then(|v| v.as_str())
-            .or_else(|| {
-                resolved
-                    .pointer("/baseline/variant_id")
-                    .and_then(|v| v.as_str())
-            })
-            .unwrap_or("");
-        let variant = match find_variant_by_id(&variants, variant_id) {
-            Ok(variant) => variant,
-            Err(err) => {
-                failures.push(format!("{}: {}", target_trial, err));
-                continue;
-            }
-        };
-        let runtime_profile = match resolve_variant_runtime_profile(
-            &resolved,
-            variant,
-            &run_dir,
-            &RunBehavior::default(),
-            &RunExecutionOptions::default(),
-        ) {
-            Ok(profile) => profile,
-            Err(err) => {
-                failures.push(format!("{}: {}", target_trial, err));
-                continue;
-            }
-        };
-        let adapter = match adapter_registry_entry(&runtime_profile.agent_runtime.adapter_ref) {
-            Ok(adapter) => adapter,
-            Err(err) => {
-                failures.push(format!("{}: {}", target_trial, err));
-                continue;
-            }
-        };
-        let capabilities = adapter.capabilities();
-        if !capabilities.pause {
-            failures.push(format!(
-                "{}: pause_unsupported_capability for adapter '{}@{}'",
-                target_trial,
-                runtime_profile.agent_runtime.adapter_ref.id,
-                runtime_profile.agent_runtime.adapter_ref.version
-            ));
-            continue;
-        }
-        if runtime_profile.agent_runtime.adapter_ref.id != active_control.adapter_id
-            || runtime_profile.agent_runtime.adapter_ref.version != active_control.adapter_version
-        {
-            failures.push(format!(
-                "{}: pause_adapter_mismatch active='{}@{}' resolved='{}@{}'",
-                target_trial,
-                active_control.adapter_id,
-                active_control.adapter_version,
-                runtime_profile.agent_runtime.adapter_ref.id,
-                runtime_profile.agent_runtime.adapter_ref.version
-            ));
-            continue;
-        }
-
-        let pause_ack = match adapter.pause_trial(&AdapterPauseRequest {
-            control: &active_control,
-            label: &pause_label,
-            timeout,
-        }) {
-            Ok(ack) => ack,
+        let pause_requested = match resolve_active_trial_control_mode(&trial_dir, &active) {
+            Ok(ActiveTrialControlMode::RuntimeContainers) => pause_trial_runtime_containers(&trial_dir),
             Err(err) => {
                 failures.push(format!("{}: pause request failed ({})", target_trial, err));
                 continue;
             }
         };
-        checkpoint_acked_all &= pause_ack.checkpoint_acked;
-        stop_acked_all &= pause_ack.stop_acked;
+        if let Err(err) = pause_requested {
+            failures.push(format!("{}: pause request failed ({})", target_trial, err));
+            continue;
+        }
         if let Err(err) = write_trial_state(
             &trial_dir,
             target_trial,
@@ -1145,15 +1182,7 @@ pub fn pause_run(
             continue;
         }
 
-        if let Some(mut active) = active_by_id.get(target_trial).cloned() {
-            active.control = Some(active_control.clone());
-            paused_active_trials.push(active);
-        } else {
-            failures.push(format!(
-                "{}: pause_missing_active_trial_metadata",
-                target_trial
-            ));
-        }
+        paused_active_trials.push(active);
     }
 
     let pause_meta = RunControlPauseMetadata {
@@ -1238,40 +1267,76 @@ pub fn kill_run(run_dir: &Path) -> Result<KillResult> {
             .into_iter()
             .map(|entry| (entry.trial_id.clone(), entry))
             .collect();
-    if status == "running"
-        && active_trials_use_worker_control_plane(&active_by_id, &active_trial_ids)
-    {
-        return request_parallel_worker_stop(
-            &run_dir,
-            &run_id,
-            &status,
-            &active_trial_ids,
-            Duration::from_secs(KILL_RUN_WORKER_CONTROL_TIMEOUT_SECONDS),
-        );
-    }
+    let mut survivor_active_trials: Vec<RunControlActiveTrial> = Vec::new();
+    let mut killed_trials: Vec<String> = Vec::new();
+    let mut failures: Vec<String> = Vec::new();
 
     for trial_id in &active_trial_ids {
         let trial_dir = run_dir.join("trials").join(trial_id);
+        let kill_result = match resolve_kill_trial_control_mode(&trial_dir, trial_id) {
+            Ok(ActiveTrialControlMode::RuntimeContainers) => {
+                kill_trial_runtime_containers_best_effort(&trial_dir).and_then(|killed| {
+                    if killed {
+                        Ok(())
+                    } else {
+                        Err(anyhow!(
+                            "kill_missing_runtime_container: no persisted runtime containers were recorded for {}",
+                            trial_id
+                        ))
+                    }
+                })
+            }
+            Err(err) => Err(err),
+        };
+        if let Err(err) = kill_result {
+            failures.push(format!("{}: kill request failed ({})", trial_id, err));
+            if let Some(active) = active_by_id.get(trial_id).cloned() {
+                survivor_active_trials.push(active);
+            }
+            continue;
+        }
         if trial_dir.exists() {
-            let _ = write_trial_state(
+            if let Err(err) = write_trial_state(
                 &trial_dir,
                 trial_id,
                 "killed",
                 None,
                 None,
                 Some("killed_by_user"),
-            );
+            ) {
+                failures.push(format!(
+                    "{}: failed to write trial_state ({})",
+                    trial_id, err
+                ));
+                continue;
+            }
         }
+        killed_trials.push(trial_id.clone());
     }
 
-    write_run_control_v2(&run_dir, &run_id, "killed", &[], None)?;
+    if failures.is_empty() {
+        write_run_control_v2(&run_dir, &run_id, "killed", &[], None)?;
+        return Ok(KillResult {
+            run_id,
+            run_dir: run_dir.to_path_buf(),
+            previous_status: status,
+            killed_trials,
+        });
+    }
 
-    Ok(KillResult {
-        run_id,
-        run_dir: run_dir.to_path_buf(),
-        previous_status: status,
-        killed_trials: active_trial_ids,
-    })
+    write_run_control_v2(
+        &run_dir,
+        &run_id,
+        "interrupted",
+        &survivor_active_trials,
+        None,
+    )?;
+    Err(anyhow!(
+        "kill_partial_failure: killed {} of {} active trial(s); failures: {}",
+        killed_trials.len(),
+        active_trial_ids.len(),
+        failures.join(" | ")
+    ))
 }
 
 pub fn resume_trial(
@@ -1320,6 +1385,31 @@ pub fn resume_trial(
     if !trial_dir.exists() {
         return Err(anyhow!("resume_trial_not_found: {}", target_trial));
     }
+    let run_id = run_control
+        .pointer("/run_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("run")
+        .to_string();
+
+    if crate::trial::state::trial_attempt_state_exists(&trial_dir) {
+        if label.is_some() || !set_bindings.is_empty() || strict {
+            return Err(anyhow!(
+                "resume_runtime_unpause_unsupported: live runtime resume does not support label selection, --set overrides, or --strict"
+            ));
+        }
+        if resume_trial_runtime_containers(&trial_dir)? {
+            write_trial_state(&trial_dir, &target_trial, "running", None, None, None)?;
+            let active_trials = run_control_active_trials(&run_control);
+            write_run_control_v2(&run_dir, &run_id, "running", &active_trials, None)?;
+            return Ok(ResumeResult {
+                trial_id: target_trial,
+                mode: ResumeMode::RuntimeUnpause,
+                selector: None,
+                fork: None,
+            });
+        }
+    }
+
     let trial_state_path = trial_dir.join("trial_state.json");
     if !trial_state_path.exists() {
         return Err(anyhow!(
@@ -1340,22 +1430,18 @@ pub fn resume_trial(
         ));
     }
     let pause_label = trial_state.pointer("/pause_label").and_then(|v| v.as_str());
-    let run_id = run_control
-        .pointer("/run_id")
-        .and_then(|v| v.as_str())
-        .unwrap_or("run")
-        .to_string();
     let selector =
         resolve_resume_selector(&run_dir, &run_id, &target_trial, label.or(pause_label))?;
 
     let fork = fork_trial_inner(&run_dir, &target_trial, &selector, set_bindings, strict)?;
     Ok(ResumeResult {
         trial_id: target_trial,
-        selector,
-        fork,
+        mode: ResumeMode::Fork,
+        selector: Some(selector),
+        fork: Some(fork),
     })
 }
-fn load_trial_payload_from_attempt_objects(
+pub(crate) fn load_trial_payload_from_attempt_objects(
     run_dir: &Path,
     run_id: &str,
     trial_id: &str,
@@ -1370,19 +1456,11 @@ fn load_trial_payload_from_attempt_objects(
     Ok(Some(serde_json::from_slice(&payload)?))
 }
 
-fn load_trial_input_payload(run_dir: &Path, run_id: &str, trial_id: &str) -> Result<Value> {
-    if let Some(value) =
-        load_trial_payload_from_attempt_objects(run_dir, run_id, trial_id, "trial_input")?
-    {
-        return Ok(value);
-    }
-    Err(anyhow!(
-        "trial input payload not found in sqlite for trial '{}'",
-        trial_id
-    ))
-}
-
-fn load_trial_output_payload(run_dir: &Path, run_id: &str, trial_id: &str) -> Result<Value> {
+pub(crate) fn load_trial_output_payload(
+    run_dir: &Path,
+    run_id: &str,
+    trial_id: &str,
+) -> Result<Value> {
     if let Some(value) =
         load_trial_payload_from_attempt_objects(run_dir, run_id, trial_id, "trial_output")?
     {
@@ -1394,7 +1472,7 @@ fn load_trial_output_payload(run_dir: &Path, run_id: &str, trial_id: &str) -> Re
     ))
 }
 
-fn resolve_workspace_ref_from_checkpoint_token(
+pub(crate) fn resolve_workspace_ref_from_checkpoint_token(
     run_dir: &Path,
     token: &str,
 ) -> Result<Option<String>> {
@@ -1405,7 +1483,7 @@ fn resolve_workspace_ref_from_checkpoint_token(
     store.lineage_workspace_ref_by_version(version_id)
 }
 
-fn resolve_resume_selector(
+pub(crate) fn resolve_resume_selector(
     run_dir: &Path,
     run_id: &str,
     trial_id: &str,
@@ -1464,46 +1542,37 @@ fn resolve_resume_selector(
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ContractPathRoot {
+pub(crate) enum ContractPathRoot {
     In,
-    State,
     Out,
-    Deps,
-    Workspace,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum ContractPathMode {
+pub(crate) enum ContractPathMode {
     ContainerMount,
     RuntimeEvents,
 }
 
 #[derive(Debug, Clone)]
-struct ContractPathHostRoots {
-    in_dir: PathBuf,
-    state_dir: PathBuf,
-    out_dir: PathBuf,
-    deps_dir: PathBuf,
-    workspace_dir: PathBuf,
+pub(crate) struct ContractPathHostRoots {
+    pub(crate) in_dir: PathBuf,
+    pub(crate) out_dir: PathBuf,
+    pub(crate) workspace_dir: PathBuf,
 }
 
 impl ContractPathHostRoots {
-    fn from_trial_paths(paths: &TrialPaths) -> Self {
+    pub(crate) fn from_trial_paths(paths: &TrialPaths) -> Self {
         Self {
             in_dir: paths.in_dir.clone(),
-            state_dir: paths.state.clone(),
             out_dir: paths.out.clone(),
-            deps_dir: paths.deps.clone(),
             workspace_dir: paths.workspace.clone(),
         }
     }
 
-    fn from_trial_dir(trial_dir: &Path) -> Self {
+    pub(crate) fn from_trial_dir(trial_dir: &Path) -> Self {
         Self {
             in_dir: trial_dir.join("in"),
-            state_dir: trial_dir.join("state"),
             out_dir: trial_dir.join("out"),
-            deps_dir: trial_dir.join("deps"),
             workspace_dir: trial_dir.join("workspace"),
         }
     }
@@ -1511,15 +1580,12 @@ impl ContractPathHostRoots {
     fn base_for(&self, root: ContractPathRoot) -> &Path {
         match root {
             ContractPathRoot::In => self.in_dir.as_path(),
-            ContractPathRoot::State => self.state_dir.as_path(),
             ContractPathRoot::Out => self.out_dir.as_path(),
-            ContractPathRoot::Deps => self.deps_dir.as_path(),
-            ContractPathRoot::Workspace => self.workspace_dir.as_path(),
         }
     }
 }
 
-fn strip_contract_prefix<'a>(path: &'a str, prefix: &str) -> Option<&'a str> {
+pub(crate) fn strip_contract_prefix<'a>(path: &'a str, prefix: &str) -> Option<&'a str> {
     if path == prefix {
         return Some("");
     }
@@ -1531,46 +1597,40 @@ fn strip_contract_prefix<'a>(path: &'a str, prefix: &str) -> Option<&'a str> {
     }
 }
 
-fn resolve_contract_path_components(path: &str) -> Option<(ContractPathRoot, &str)> {
+pub(crate) fn resolve_contract_path_components(path: &str) -> Option<(ContractPathRoot, &str)> {
     if let Some(rest) = strip_contract_prefix(path, AGENTLAB_CONTRACT_IN_DIR) {
         return Some((ContractPathRoot::In, rest));
-    }
-    if let Some(rest) = strip_contract_prefix(path, AGENTLAB_CONTRACT_STATE_DIR) {
-        return Some((ContractPathRoot::State, rest));
     }
     if let Some(rest) = strip_contract_prefix(path, AGENTLAB_CONTRACT_OUT_DIR) {
         return Some((ContractPathRoot::Out, rest));
     }
-    if let Some(rest) = strip_contract_prefix(path, AGENTLAB_CONTRACT_DEPS_DIR) {
-        return Some((ContractPathRoot::Deps, rest));
-    }
-    if let Some(rest) = strip_contract_prefix(path, AGENTLAB_CONTRACT_WORKSPACE_DIR) {
-        return Some((ContractPathRoot::Workspace, rest));
-    }
     None
 }
 
-fn mode_allows_root(mode: ContractPathMode, root: ContractPathRoot) -> bool {
-    match mode {
-        ContractPathMode::ContainerMount => matches!(
-            root,
-            ContractPathRoot::In
-                | ContractPathRoot::State
-                | ContractPathRoot::Out
-                | ContractPathRoot::Deps
-                | ContractPathRoot::Workspace
-        ),
-        ContractPathMode::RuntimeEvents => matches!(
-            root,
-            ContractPathRoot::In
-                | ContractPathRoot::State
-                | ContractPathRoot::Out
-                | ContractPathRoot::Workspace
-        ),
+pub(crate) fn strip_task_workdir_placeholder_prefix(path: &str) -> Option<&str> {
+    if path == AGENTLAB_TASK_WORKDIR_PLACEHOLDER {
+        return Some("");
+    }
+    let rest = path.strip_prefix(AGENTLAB_TASK_WORKDIR_PLACEHOLDER)?;
+    if rest.starts_with('/') {
+        Some(rest)
+    } else {
+        None
     }
 }
 
-fn map_contract_path_to_host(
+pub(crate) fn mode_allows_root(mode: ContractPathMode, root: ContractPathRoot) -> bool {
+    match mode {
+        ContractPathMode::ContainerMount => {
+            matches!(root, ContractPathRoot::In | ContractPathRoot::Out)
+        }
+        ContractPathMode::RuntimeEvents => {
+            matches!(root, ContractPathRoot::In | ContractPathRoot::Out)
+        }
+    }
+}
+
+pub(crate) fn map_contract_path_to_host(
     path: &str,
     roots: &ContractPathHostRoots,
     mode: ContractPathMode,
@@ -1587,6 +1647,11 @@ fn map_contract_path_to_host(
                 raw
             ),
         });
+    }
+    if matches!(mode, ContractPathMode::ContainerMount) {
+        if let Some(rest) = strip_task_workdir_placeholder_prefix(raw) {
+            return Ok(roots.workspace_dir.join(rest.trim_start_matches('/')));
+        }
     }
     if !raw.starts_with('/') {
         return Err(match mode {
@@ -1623,7 +1688,7 @@ fn map_contract_path_to_host(
     Ok(roots.base_for(root).join(rest.trim_start_matches('/')))
 }
 
-fn resolve_event_path_for_trial(events_path: &str, trial_dir: &Path) -> Result<PathBuf> {
+pub(crate) fn resolve_event_path_for_trial(events_path: &str, trial_dir: &Path) -> Result<PathBuf> {
     map_contract_path_to_host(
         events_path,
         &ContractPathHostRoots::from_trial_dir(trial_dir),
@@ -1631,7 +1696,8 @@ fn resolve_event_path_for_trial(events_path: &str, trial_dir: &Path) -> Result<P
     )
 }
 
-fn read_control_seq(control_path: &Path) -> Result<u64> {
+#[cfg(test)]
+pub(crate) fn read_control_seq(control_path: &Path) -> Result<u64> {
     if !control_path.exists() {
         return Ok(0);
     }
@@ -1639,29 +1705,8 @@ fn read_control_seq(control_path: &Path) -> Result<u64> {
     Ok(value.pointer("/seq").and_then(|v| v.as_u64()).unwrap_or(0))
 }
 
-fn wait_for_adapter_control_ack(
-    events_path: &Path,
-    action: &str,
-    control_version: &str,
-    deadline: Instant,
-) -> Result<()> {
-    loop {
-        if adapter_control_ack_received(events_path, action, control_version)? {
-            return Ok(());
-        }
-        if Instant::now() >= deadline {
-            return Err(anyhow!(
-                "control_ack_missing: action={}, control_version={}, events_path={}",
-                action,
-                control_version,
-                events_path.display()
-            ));
-        }
-        thread::sleep(Duration::from_millis(200));
-    }
-}
-
-fn adapter_control_ack_received(
+#[cfg(test)]
+pub(crate) fn adapter_control_ack_received(
     events_path: &Path,
     action: &str,
     control_version: &str,
@@ -1702,7 +1747,7 @@ fn adapter_control_ack_received(
     Ok(false)
 }
 
-fn parse_fork_selector(selector: &str) -> Result<ForkSelector> {
+pub(crate) fn parse_fork_selector(selector: &str) -> Result<ForkSelector> {
     let (kind, value) = selector
         .split_once(':')
         .ok_or_else(|| anyhow!("invalid selector '{}': expected kind:value", selector))?;
@@ -1729,7 +1774,7 @@ fn parse_fork_selector(selector: &str) -> Result<ForkSelector> {
     }
 }
 
-fn resolve_selector_checkpoint(
+pub(crate) fn resolve_selector_checkpoint(
     selector: &ForkSelector,
     trial_output: Option<&Value>,
     trial_dir: &Path,
@@ -1821,23 +1866,23 @@ fn resolve_selector_checkpoint(
     Ok(None)
 }
 
-fn apply_binding_overrides(
-    input: &mut Value,
+pub(crate) fn apply_variant_binding_overrides(
+    variant: &mut Variant,
     set_bindings: &BTreeMap<String, Value>,
 ) -> Result<()> {
     if set_bindings.is_empty() {
         return Ok(());
     }
-    if input.pointer("/bindings").is_none() {
-        set_json_pointer_value(input, "/bindings", json!({}))?;
+    if !variant.bindings.is_object() {
+        variant.bindings = json!({});
     }
     for (key, value) in set_bindings {
-        let pointer = format!("/bindings/{}", key.split('.').collect::<Vec<_>>().join("/"));
-        set_json_pointer_value(input, &pointer, value.clone())?;
+        let pointer = format!("/{}", key.split('.').collect::<Vec<_>>().join("/"));
+        set_json_pointer_value(&mut variant.bindings, &pointer, value.clone())?;
     }
     Ok(())
 }
-fn is_dx_contract_authoring(json_value: &Value) -> bool {
+pub(crate) fn is_dx_contract_authoring(json_value: &Value) -> bool {
     json_value.pointer("/agent").is_some()
         || json_value.pointer("/overrides").is_some()
         || json_value.pointer("/baseline/id").is_some()
@@ -1845,7 +1890,7 @@ fn is_dx_contract_authoring(json_value: &Value) -> bool {
         || json_value.pointer("/variants").is_some()
 }
 
-fn resolve_default_owner() -> String {
+pub(crate) fn resolve_default_owner() -> String {
     let owner_from_git = Command::new("git")
         .args(["config", "--get", "user.name"])
         .output()
@@ -1864,7 +1909,7 @@ fn resolve_default_owner() -> String {
         .unwrap_or_else(|| "unknown".to_string())
 }
 
-fn tokenize_command_string(raw: &str) -> Result<Vec<String>> {
+pub(crate) fn tokenize_command_string(raw: &str) -> Result<Vec<String>> {
     let mut tokens = Vec::new();
     let mut current = String::new();
     let mut in_single = false;
@@ -1919,7 +1964,10 @@ fn tokenize_command_string(raw: &str) -> Result<Vec<String>> {
     Ok(tokens)
 }
 
-fn parse_dx_command_field_named(value: Option<&Value>, field: &str) -> Result<Vec<String>> {
+pub(crate) fn parse_dx_command_field_named(
+    value: Option<&Value>,
+    field: &str,
+) -> Result<Vec<String>> {
     match value {
         Some(Value::String(raw)) => tokenize_command_string(raw),
         Some(Value::Array(_)) => {
@@ -1934,39 +1982,7 @@ fn parse_dx_command_field_named(value: Option<&Value>, field: &str) -> Result<Ve
     }
 }
 
-fn parse_dx_arg_map(value: Option<&Value>, field: &str) -> Result<Value> {
-    let Some(raw) = value else {
-        return Ok(json!([]));
-    };
-    let items = raw
-        .as_array()
-        .ok_or_else(|| anyhow!("{} must be an array", field))?;
-    let mut mapped = Vec::with_capacity(items.len());
-    for (idx, item) in items.iter().enumerate() {
-        let obj = item
-            .as_object()
-            .ok_or_else(|| anyhow!("{}[{}] must be an object", field, idx))?;
-        let key = obj
-            .get("key")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|v| !v.is_empty())
-            .ok_or_else(|| anyhow!("{}[{}].key must be a non-empty string", field, idx))?;
-        let flag = obj
-            .get("flag")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|v| !v.is_empty())
-            .ok_or_else(|| anyhow!("{}[{}].flag must be a non-empty string", field, idx))?;
-        mapped.push(json!({
-            "key": key,
-            "flag": flag,
-        }));
-    }
-    Ok(Value::Array(mapped))
-}
-
-fn resolve_dx_artifact_path(raw: &str, exp_dir: &Path, project_root: &Path) -> PathBuf {
+pub(crate) fn resolve_dx_artifact_path(raw: &str, exp_dir: &Path, project_root: &Path) -> PathBuf {
     let trimmed = raw.trim();
     let candidate = Path::new(trimmed);
     if candidate.is_absolute() {
@@ -1990,7 +2006,7 @@ fn resolve_dx_artifact_path(raw: &str, exp_dir: &Path, project_root: &Path) -> P
     normalize_path(&direct)
 }
 
-fn compute_artifact_content_digest(path: &Path) -> Result<String> {
+pub(crate) fn compute_artifact_content_digest(path: &Path) -> Result<String> {
     if path.is_file() {
         return sha256_file(path);
     }
@@ -2031,7 +2047,7 @@ fn compute_artifact_content_digest(path: &Path) -> Result<String> {
     Ok(sha256_bytes(lines.join("\n").as_bytes()))
 }
 
-fn agent_artifact_archive_flag(path: &Path) -> Option<&'static str> {
+pub(crate) fn agent_artifact_archive_flag(path: &Path) -> Option<&'static str> {
     let name = path
         .file_name()
         .and_then(|value| value.to_str())
@@ -2045,7 +2061,7 @@ fn agent_artifact_archive_flag(path: &Path) -> Option<&'static str> {
     }
 }
 
-fn is_executable_file(path: &Path) -> bool {
+pub(crate) fn is_executable_file(path: &Path) -> bool {
     let Ok(meta) = fs::metadata(path) else {
         return false;
     };
@@ -2068,7 +2084,7 @@ fn is_executable_file(path: &Path) -> bool {
     }
 }
 
-fn read_file_head(path: &Path, max_bytes: usize) -> Result<Vec<u8>> {
+pub(crate) fn read_file_head(path: &Path, max_bytes: usize) -> Result<Vec<u8>> {
     let mut file = fs::File::open(path)?;
     let mut buf = vec![0u8; max_bytes];
     let read = file.read(&mut buf)?;
@@ -2076,7 +2092,7 @@ fn read_file_head(path: &Path, max_bytes: usize) -> Result<Vec<u8>> {
     Ok(buf)
 }
 
-fn normalize_shell_token(raw: &str) -> Option<String> {
+pub(crate) fn normalize_shell_token(raw: &str) -> Option<String> {
     let trimmed = raw.trim_matches(|ch: char| {
         ch == '"'
             || ch == '\''
@@ -2096,14 +2112,17 @@ fn normalize_shell_token(raw: &str) -> Option<String> {
     Some(trimmed.to_string())
 }
 
-fn token_looks_like_script_source_path(token: &str) -> bool {
+pub(crate) fn token_looks_like_script_source_path(token: &str) -> bool {
     let lower = token.to_ascii_lowercase();
     AGENT_ARTIFACT_SCRIPT_SOURCE_EXTENSIONS
         .iter()
         .any(|ext| lower.ends_with(ext))
 }
 
-fn validate_agent_artifact_entrypoint_script(entrypoint_path: &Path, context: &str) -> Result<()> {
+pub(crate) fn validate_agent_artifact_entrypoint_script(
+    entrypoint_path: &Path,
+    context: &str,
+) -> Result<()> {
     let head = read_file_head(entrypoint_path, AGENT_ARTIFACT_ENTRYPOINT_HEAD_BYTES)?;
     if !head.starts_with(b"#!") {
         return Ok(());
@@ -2163,13 +2182,13 @@ fn validate_agent_artifact_entrypoint_script(entrypoint_path: &Path, context: &s
 }
 
 #[derive(Debug, Clone)]
-struct CommandArtifactTarget {
+pub(crate) struct CommandArtifactTarget {
     token_index: usize,
     raw_token: String,
     resolved_path: PathBuf,
 }
 
-fn resolve_artifact_path_from_command_token(
+pub(crate) fn resolve_artifact_path_from_command_token(
     root: &Path,
     token_index: usize,
     token: &str,
@@ -2208,7 +2227,7 @@ fn resolve_artifact_path_from_command_token(
     }))
 }
 
-fn resolve_command_artifact_targets(
+pub(crate) fn resolve_command_artifact_targets(
     root: &Path,
     command: &[String],
     context: &str,
@@ -2261,7 +2280,11 @@ fn resolve_command_artifact_targets(
     Ok(targets)
 }
 
-fn validate_agent_artifact_root(root: &Path, command: &[String], context: &str) -> Result<()> {
+pub(crate) fn validate_agent_artifact_root(
+    root: &Path,
+    command: &[String],
+    context: &str,
+) -> Result<()> {
     if !root.is_dir() {
         return Err(anyhow!(
             "{} artifact root must be a directory: {}",
@@ -2284,7 +2307,11 @@ fn validate_agent_artifact_root(root: &Path, command: &[String], context: &str) 
     Ok(())
 }
 
-fn validate_agent_artifact_path(path: &Path, command: &[String], context: &str) -> Result<()> {
+pub(crate) fn validate_agent_artifact_path(
+    path: &Path,
+    command: &[String],
+    context: &str,
+) -> Result<()> {
     if path.is_dir() {
         return validate_agent_artifact_root(path, command, context);
     }
@@ -2328,13 +2355,13 @@ fn validate_agent_artifact_path(path: &Path, command: &[String], context: &str) 
 }
 
 #[derive(Debug, Clone)]
-struct RuntimeArtifactValidationSpec {
+pub(crate) struct RuntimeArtifactValidationSpec {
     pointer: String,
     artifact_path: String,
     command: Vec<String>,
 }
 
-fn parse_optional_command_field_named(
+pub(crate) fn parse_optional_command_field_named(
     value: Option<&Value>,
     field: &str,
 ) -> Result<Option<Vec<String>>> {
@@ -2352,7 +2379,7 @@ fn parse_optional_command_field_named(
     }
 }
 
-fn command_for_artifact_validation(
+pub(crate) fn command_for_artifact_validation(
     agent: Option<&Value>,
     field_prefix: &str,
     fallback: Option<&Vec<String>>,
@@ -2367,7 +2394,7 @@ fn command_for_artifact_validation(
     Ok(fallback.cloned())
 }
 
-fn collect_runtime_artifact_validation_specs(
+pub(crate) fn collect_runtime_artifact_validation_specs(
     experiment: &Value,
 ) -> Result<Vec<RuntimeArtifactValidationSpec>> {
     let root_agent = experiment.pointer("/runtime/agent_runtime");
@@ -2435,7 +2462,10 @@ fn collect_runtime_artifact_validation_specs(
     Ok(specs)
 }
 
-fn validate_packaged_runtime_artifacts(package_dir: &Path, experiment: &Value) -> Result<()> {
+pub(crate) fn validate_packaged_runtime_artifacts(
+    package_dir: &Path,
+    experiment: &Value,
+) -> Result<()> {
     let mut seen_specs = HashSet::new();
     for spec in collect_runtime_artifact_validation_specs(experiment)? {
         let trimmed = spec.artifact_path.trim();
@@ -2455,7 +2485,7 @@ fn validate_packaged_runtime_artifacts(package_dir: &Path, experiment: &Value) -
 }
 
 #[derive(Debug, Clone)]
-struct DxResolvedAgentBuild {
+pub(crate) struct DxResolvedAgentBuild {
     artifact_raw: String,
     artifact_path: PathBuf,
     artifact_digest: String,
@@ -2467,7 +2497,7 @@ struct DxResolvedAgentBuild {
 }
 
 #[derive(Debug, Clone)]
-struct DxVariantSpec {
+pub(crate) struct DxVariantSpec {
     id: String,
     baseline: bool,
     agent_ref: String,
@@ -2475,7 +2505,7 @@ struct DxVariantSpec {
     env: BTreeMap<String, String>,
 }
 
-fn uses_new_variant_agent_model(json_value: &Value) -> bool {
+pub(crate) fn uses_new_variant_agent_model(json_value: &Value) -> bool {
     if matches!(json_value.pointer("/agent_builds"), Some(Value::Array(_))) {
         return true;
     }
@@ -2489,7 +2519,7 @@ fn uses_new_variant_agent_model(json_value: &Value) -> bool {
     })
 }
 
-fn reject_removed_dx_agent_fields(root: &Value, root_name: &str) -> Result<()> {
+pub(crate) fn reject_removed_dx_agent_fields(root: &Value, root_name: &str) -> Result<()> {
     let removed = [
         ("arg_map", "put public argv directly in agent.command using $binding placeholders"),
         (
@@ -2524,11 +2554,11 @@ fn reject_removed_dx_agent_fields(root: &Value, root_name: &str) -> Result<()> {
     Ok(())
 }
 
-fn contains_removed_runtime_template(raw: &str) -> bool {
+pub(crate) fn contains_removed_runtime_template(raw: &str) -> bool {
     raw.contains("${")
 }
 
-fn resolve_existing_public_path_reference(
+pub(crate) fn resolve_existing_public_path_reference(
     raw: &str,
     exp_dir: &Path,
     field_name: &str,
@@ -2537,6 +2567,7 @@ fn resolve_existing_public_path_reference(
     if trimmed.is_empty()
         || trimmed.starts_with('/')
         || trimmed.starts_with('-')
+        || trimmed.starts_with(AGENTLAB_TASK_WORKDIR_PLACEHOLDER)
         || trimmed.contains('$')
         || trimmed.contains("://")
     {
@@ -2568,7 +2599,7 @@ fn resolve_existing_public_path_reference(
     }
 }
 
-fn validate_dx_command_and_env_surface(
+pub(crate) fn validate_dx_command_and_env_surface(
     command: &[String],
     env: &BTreeMap<String, String>,
     root_name: &str,
@@ -2611,7 +2642,7 @@ fn validate_dx_command_and_env_surface(
     Ok(())
 }
 
-fn validate_dx_support_file_relpath(raw: &str, field_name: &str) -> Result<String> {
+pub(crate) fn validate_dx_support_file_relpath(raw: &str, field_name: &str) -> Result<String> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         return Err(anyhow!("{} must not be empty", field_name));
@@ -2639,7 +2670,7 @@ fn validate_dx_support_file_relpath(raw: &str, field_name: &str) -> Result<Strin
     Ok(normalized.to_string_lossy().replace('\\', "/"))
 }
 
-fn dx_runtime_asset_value(build_source_path: &Path, runtime_path: &str) -> Value {
+pub(crate) fn dx_runtime_asset_value(build_source_path: &Path, runtime_path: &str) -> Value {
     json!({
         "build_source_path": build_source_path.to_string_lossy().to_string(),
         "runtime_path": runtime_path,
@@ -2648,90 +2679,7 @@ fn dx_runtime_asset_value(build_source_path: &Path, runtime_path: &str) -> Value
     })
 }
 
-fn parse_dx_provider_env_field(
-    value: Option<&Value>,
-    field_name: &str,
-) -> Result<Vec<(String, String)>> {
-    let Some(value) = value else {
-        return Ok(Vec::new());
-    };
-    let mut pairs = Vec::new();
-    match value {
-        Value::Object(obj) => {
-            for (provider, env_name_raw) in obj {
-                let provider = provider.trim();
-                let env_name = env_name_raw
-                    .as_str()
-                    .ok_or_else(|| anyhow!("{}['{}'] must be a string", field_name, provider))?
-                    .trim();
-                if provider.is_empty() || env_name.is_empty() {
-                    return Err(anyhow!(
-                        "{} entries must use non-empty provider and env values",
-                        field_name
-                    ));
-                }
-                pairs.push((provider.to_string(), env_name.to_string()));
-            }
-        }
-        Value::Array(items) => {
-            for (idx, item) in items.iter().enumerate() {
-                if let Some(token) = item.as_str() {
-                    let trimmed = token.trim();
-                    let (provider, env_name) = trimmed.split_once('=').ok_or_else(|| {
-                        anyhow!(
-                            "{}[{}] must use provider=ENV format (got '{}')",
-                            field_name,
-                            idx,
-                            token
-                        )
-                    })?;
-                    if provider.trim().is_empty() || env_name.trim().is_empty() {
-                        return Err(anyhow!(
-                            "{}[{}] must use non-empty provider and env values",
-                            field_name,
-                            idx
-                        ));
-                    }
-                    pairs.push((provider.trim().to_string(), env_name.trim().to_string()));
-                    continue;
-                }
-                let obj = item
-                    .as_object()
-                    .ok_or_else(|| anyhow!("{}[{}] must be a string or object", field_name, idx))?;
-                let provider = obj
-                    .get("provider")
-                    .and_then(Value::as_str)
-                    .map(str::trim)
-                    .filter(|value| !value.is_empty())
-                    .ok_or_else(|| anyhow!("{}[{}].provider is required", field_name, idx))?;
-                let env_name = obj
-                    .get("env")
-                    .and_then(Value::as_str)
-                    .map(str::trim)
-                    .filter(|value| !value.is_empty())
-                    .ok_or_else(|| anyhow!("{}[{}].env is required", field_name, idx))?;
-                pairs.push((provider.to_string(), env_name.to_string()));
-            }
-        }
-        _ => {
-            return Err(anyhow!(
-                "{} must be an object, string[], or object[]",
-                field_name
-            ))
-        }
-    }
-    Ok(pairs)
-}
-
-fn dx_provider_env_value(provider_env: &[(String, String)]) -> Value {
-    let mut mapping = serde_json::Map::new();
-    for (provider, env_name) in provider_env {
-        mapping.insert(provider.clone(), Value::String(env_name.clone()));
-    }
-    Value::Object(mapping)
-}
-
-fn parse_dx_agent_build(
+pub(crate) fn parse_dx_agent_build(
     root: &Value,
     root_name: &str,
     exp_dir: &Path,
@@ -2780,7 +2728,7 @@ fn parse_dx_agent_build(
     })
 }
 
-fn runtime_override_for_variant_build(
+pub(crate) fn runtime_override_for_variant_build(
     build: &DxResolvedAgentBuild,
     variant_env: &BTreeMap<String, String>,
 ) -> Value {
@@ -2800,7 +2748,7 @@ fn runtime_override_for_variant_build(
     })
 }
 
-fn builtin_benchmark_assets_root() -> Result<PathBuf> {
+pub(crate) fn builtin_benchmark_assets_root() -> Result<PathBuf> {
     let candidate = normalize_path(&PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../.."));
     if candidate.join("bench").exists() && candidate.join("adapters").exists() {
         return Ok(candidate);
@@ -2811,7 +2759,7 @@ fn builtin_benchmark_assets_root() -> Result<PathBuf> {
     ))
 }
 
-fn rewrite_new_variant_agent_model(
+pub(crate) fn rewrite_new_variant_agent_model(
     json_value: &Value,
     exp_dir: &Path,
     project_root: &Path,
@@ -2999,7 +2947,7 @@ fn rewrite_new_variant_agent_model(
     Ok(rewritten)
 }
 
-fn resolve_builtin_benchmark_dataset_path(
+pub(crate) fn resolve_builtin_benchmark_dataset_path(
     json_value: &Value,
     builtin_benchmark: &str,
     project_root: &Path,
@@ -3028,7 +2976,7 @@ fn resolve_builtin_benchmark_dataset_path(
         .to_string())
 }
 
-fn normalize_experiment_authoring(
+pub(crate) fn normalize_experiment_authoring(
     json_value: Value,
     exp_dir: &Path,
     project_root: &Path,
@@ -3183,14 +3131,14 @@ fn normalize_experiment_authoring(
             }),
             json!([
                 "python3",
-                "/agentlab/deps/bench/integration/agentlab/bench_benchmark_adapter.py"
-            ]),
-            json!([
-                dx_runtime_asset_value(
-                    &builtin_assets_root.join("bench"),
-                    "/agentlab/deps/bench"
+                task_workdir_support_destination_path(
+                    "bench/integration/agentlab/bench_benchmark_adapter.py"
                 )
             ]),
+            json!([dx_runtime_asset_value(
+                &builtin_assets_root.join("bench"),
+                &task_workdir_support_destination_path("bench")
+            )]),
         ),
         "swebench_lite_curated" => (
             "swebench_lite_curated",
@@ -3208,14 +3156,12 @@ fn normalize_experiment_authoring(
             }),
             json!([
                 "python3",
-                "/agentlab/deps/swebench/swebench_task_container_grader.py"
+                task_workdir_support_destination_path("swebench/swebench_task_container_grader.py")
             ]),
-            json!([
-                dx_runtime_asset_value(
-                    &builtin_assets_root.join("adapters").join("swebench"),
-                    "/agentlab/deps/swebench"
-                )
-            ]),
+            json!([dx_runtime_asset_value(
+                &builtin_assets_root.join("adapters").join("swebench"),
+                &task_workdir_support_destination_path("swebench")
+            )]),
         ),
         _ => unreachable!(),
     };
@@ -3238,11 +3184,6 @@ fn normalize_experiment_authoring(
             network_mode
         ));
     }
-    let root_read_only = json_value
-        .pointer("/overrides/root_read_only")
-        .and_then(Value::as_bool)
-        .unwrap_or(true);
-
     let limit = json_value.pointer("/limit").and_then(Value::as_u64);
     let replications = json_value
         .pointer("/replications")
@@ -3307,8 +3248,7 @@ fn normalize_experiment_authoring(
                 "artifact_resolved_path": agent_build.artifact_path.to_string_lossy().to_string(),
                 "image": agent_build.image.clone(),
                 "env": agent_build.env.clone(),
-                "network": network_mode,
-                "root_read_only": root_read_only
+                "network": network_mode
             }
         },
         "policy": {
@@ -3334,14 +3274,14 @@ fn normalize_experiment_authoring(
     }
     Ok(resolved)
 }
-fn configured_network_mode(json_value: &Value) -> Result<String> {
+pub(crate) fn configured_network_mode(json_value: &Value) -> Result<String> {
     json_value
         .pointer("/policy/task_sandbox/network")
         .and_then(|v| v.as_str())
         .map(|v| v.to_string())
         .ok_or_else(|| anyhow!("missing /policy/task_sandbox/network"))
 }
-fn stage_benchmark_trial_preflight(
+pub(crate) fn stage_benchmark_trial_preflight(
     benchmark_config: &BenchmarkConfig,
     trial_dir: &Path,
     run_id: &str,
@@ -3366,10 +3306,12 @@ fn stage_benchmark_trial_preflight(
         .map(str::trim)
         .filter(|v| !v.is_empty())
         .map(ToString::to_string);
-    let grading_enabled = task_payload
-        .pointer("/grading/enabled")
-        .and_then(|v| v.as_bool())
-        .unwrap_or(true);
+    let grading_enabled = task_grading_enabled(task_payload);
+    if !grading_enabled {
+        return Err(anyhow!(
+            "benchmark preflight: grading.enabled=false was removed in Milestone 4; every benchmark task must emit mapped_grader_output.json"
+        ));
+    }
 
     let frozen_dir = trial_dir
         .join("artifacts")

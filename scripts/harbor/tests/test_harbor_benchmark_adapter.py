@@ -41,21 +41,17 @@ class HarborBenchmarkAdapterTests(unittest.TestCase):
             "AGENTLAB_VARIANT_ID",
             "AGENTLAB_TASK_ID",
             "AGENTLAB_REPL_IDX",
-            "AGENTLAB_SCHEDULE_IDX",
-            "AGENTLAB_SLOT_COMMIT_ID",
-            "AGENTLAB_ATTEMPT",
-            "AGENTLAB_ROW_SEQ",
-            "AGENTLAB_AGENT_EXIT_STATUS",
             "HARBOR_EVALUATOR_CMD_JSON",
             "HARBOR_EVALUATOR_CMD",
+            "AGENTLAB_GRADING_STRATEGY",
+            "AGENTLAB_GRADER_STRATEGY",
         ]
 
     def _assert_schema_valid(self, payload: dict[str, object], schema_file: str) -> None:
         errors = validate_with_schema_file(payload, SCHEMAS_DIR / schema_file)
         self.assertEqual(errors, [], f"schema validation errors: {errors}")
 
-    def test_inv01_fallback_records_match_schema_shape(self) -> None:
-        os.environ["AGENTLAB_AGENT_EXIT_STATUS"] = "0"
+    def test_inv01_fallback_conclusion_matches_schema_shape(self) -> None:
         task = {
             "id": "tb2_task_1",
             "benchmark": {
@@ -64,33 +60,31 @@ class HarborBenchmarkAdapterTests(unittest.TestCase):
                 "split": "test",
             },
         }
-        result = {"outcome": True, "output": {"patch": "diff --git a b"}}
+        grader_input = {
+            "ids": {
+                "run_id": "run_1",
+                "trial_id": "trial_1",
+                "variant_id": "baseline",
+                "task_id": "tb2_task_1",
+                "repl_idx": 0,
+            },
+            "agent_phase": {
+                "exit_code": 0,
+            },
+            "candidate_artifact": {
+                "state": "valid",
+            },
+        }
+        candidate_payload = {"outcome": True, "output": {"patch": "diff --git a b"}}
 
-        prediction = adapter.build_prediction_record(task, result, None)
-        score = adapter.build_score_record(task, result, None)
+        conclusion = adapter.build_trial_conclusion(task, grader_input, candidate_payload, None)
 
-        self.assertEqual(prediction["ids"]["trial_id"], "trial_1")
-        self.assertEqual(prediction["benchmark"]["adapter_id"], "harbor_tb2")
-        self.assertEqual(prediction["prediction"]["kind"], "patch")
-        self.assertGreaterEqual(prediction["schedule_idx"], 0)
-        self.assertTrue(prediction["slot_commit_id"])
-        self.assertGreaterEqual(prediction["attempt"], 1)
-        self.assertGreaterEqual(prediction["row_seq"], 0)
-        self._assert_schema_valid(
-            prediction,
-            "benchmark_prediction_record_v1.jsonschema",
-        )
-
-        self.assertEqual(score["verdict"], "pass")
-        self.assertEqual(score["primary_metric_name"], "resolved")
-        self.assertEqual(score["primary_metric_value"], 1.0)
-        self.assertEqual(score["metrics"]["resolved"], 1.0)
-        self.assertIn("evaluator", score)
-        self.assertGreaterEqual(score["schedule_idx"], 0)
-        self.assertTrue(score["slot_commit_id"])
-        self.assertGreaterEqual(score["attempt"], 1)
-        self.assertGreaterEqual(score["row_seq"], 0)
-        self._assert_schema_valid(score, "benchmark_score_record_v1.jsonschema")
+        self.assertEqual(conclusion["payload"]["benchmark"]["adapter_id"], "harbor_tb2")
+        self.assertEqual(conclusion["payload"]["prediction"]["kind"], "patch")
+        self.assertEqual(conclusion["reported_outcome"], "success")
+        self.assertEqual(conclusion["primary_metric"]["name"], "resolved")
+        self.assertEqual(conclusion["primary_metric"]["value"], 1.0)
+        self._assert_schema_valid(conclusion, "trial_conclusion_v1.jsonschema")
 
     def test_external_evaluator_output_is_used(self) -> None:
         payload = {
@@ -98,26 +92,23 @@ class HarborBenchmarkAdapterTests(unittest.TestCase):
             "primary_metric_name": "resolved",
             "primary_metric_value": 0.0,
             "metrics": {"resolved": 0.0},
-            "prediction": {"kind": "text", "value": "no patch"},
             "evaluator": {"name": "harbor_official", "mode": "official"},
         }
         cmd = [sys.executable, "-c", f"import json;print(json.dumps({payload!r}))"]
         os.environ["HARBOR_EVALUATOR_CMD_JSON"] = json.dumps(cmd)
 
         task = {"id": "tb2_task_1"}
-        result = {"outcome": True}
+        candidate_payload = {"outcome": True}
 
-        evaluation = adapter.run_external_evaluator(task, result)
+        evaluation = adapter.run_external_evaluator(task, candidate_payload)
         self.assertIsInstance(evaluation, dict)
 
-        prediction = adapter.build_prediction_record(task, result, evaluation)
-        score = adapter.build_score_record(task, result, evaluation)
+        conclusion = adapter.build_trial_conclusion(task, {"ids": {}}, candidate_payload, evaluation)
 
-        self.assertEqual(prediction["prediction"]["kind"], "text")
-        self.assertEqual(score["verdict"], "fail")
-        self.assertEqual(score["primary_metric_value"], 0.0)
-        self.assertEqual(score["evaluator"]["name"], "harbor_official")
-        self.assertEqual(score["evaluator"]["mode"], "official")
+        self.assertEqual(conclusion["payload"]["verdict"], "fail")
+        self.assertEqual(conclusion["primary_metric"]["value"], 0.0)
+        self.assertEqual(conclusion["payload"]["evaluator"]["name"], "harbor_official")
+        self.assertEqual(conclusion["payload"]["evaluator"]["mode"], "official")
 
     def test_invalid_evaluator_cmd_json_raises_structured_error(self) -> None:
         os.environ["HARBOR_EVALUATOR_CMD_JSON"] = "{invalid"

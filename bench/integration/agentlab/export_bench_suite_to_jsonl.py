@@ -1,12 +1,5 @@
 #!/usr/bin/env python3
-"""Export bench task bundles as the current AgentLab task JSONL.
-
-Single-head contract:
-- tasks are unversioned
-- task rows emit `environment.image`
-- workspace state emits `workspace.{mode,base,overlays,aux_mounts}`
-- sandbox topology remains runner-owned
-"""
+"""Export bench task bundles as AgentLab task_row_v1 JSONL."""
 
 from __future__ import annotations
 
@@ -398,22 +391,18 @@ def _build_task_row(
     if isinstance(hidden_command, str) and hidden_command.strip():
         task_payload["hidden_command"] = hidden_command.strip()
 
+    task_payload["workspace_base_pack_ref"] = f"sha256:{workspace_base_digest}"
+    task_payload["workspace_overlays"] = _workspace_overlay_files(task_dir)
+
     row: dict[str, Any] = {
+        "schema_version": "task_row_v1",
+        "id": task_id,
+        "image": task_image,
+        "workdir": "/workspace",
         "task": task_payload,
-        "environment": {
-            "image": task_image,
+        "materialization": {
+            "kind": "task_image",
         },
-        "workspace": {
-            "mode": "patch",
-            "base": {
-                "kind": "dataset_pack",
-                "dataset_pack_ref": f"sha256:{workspace_base_digest}",
-            },
-            "overlays": _workspace_overlay_files(task_dir),
-            "aux_mounts": [],
-        },
-        "dependencies": {},
-        "limits": {},
     }
     return row
 

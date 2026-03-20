@@ -83,21 +83,17 @@ Stable contract paths:
 
 - `/agentlab/in`
 - `/agentlab/out`
-- `/agentlab/state`
-- `/agentlab/workspace`
-- `/agentlab/deps`
 - `/agentlab/in/trial_input.json`
-- `/agentlab/in/task.json`
-- `/agentlab/in/bindings.json`
-- `/agentlab/in/policy.json`
+- `/agentlab/in/grader_input.json`
 - `/agentlab/out/result.json`
+- `/agentlab/out/raw_grader_output.json`
+- `/agentlab/out/mapped_grader_output.json`
 - `/agentlab/out/trajectory.jsonl`
 
 Stable grading outputs:
 
-- `result.json`
-- `benchmark_prediction_record_v1`
-- `benchmark_score_record_v1`
+- `artifact_envelope_v1`
+- `trial_conclusion_v1`
 
 Behavioral E2E assertions should target those stable surfaces, plus stable operator outputs such as `run.sqlite`, `attestation.json`, `trial_state.json`, `state_inventory.json`, `query`, and `views`.
 

@@ -1,0 +1,308 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://agent-lab.local/schemas/trial_runtime_state_v1.json",
+  "title": "Trial Runtime State v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "updated_at", "state"],
+  "properties": {
+    "schema_version": { "const": "trial_runtime_state_v1" },
+    "updated_at": { "type": "string", "minLength": 1 },
+    "state": { "$ref": "#/$defs/trial_attempt_state" }
+  },
+  "$defs": {
+    "artifact_type": {
+      "type": "string",
+      "enum": ["patch_submission", "text_response", "structured_json", "file_ref"]
+    },
+    "candidate_artifact_source": {
+      "type": "string",
+      "enum": ["result.inline", "result.file_ref", "none"]
+    },
+    "candidate_artifact_state": {
+      "type": "string",
+      "enum": ["missing", "invalid", "valid"]
+    },
+    "collect_mode": {
+      "type": "string",
+      "enum": ["tail", "after_phase"]
+    },
+    "contract_file_state": {
+      "type": "string",
+      "enum": ["missing", "present_invalid", "valid"]
+    },
+    "grading_strategy": {
+      "type": "string",
+      "enum": ["in_task_image", "injected", "separate"]
+    },
+    "task_materialization_kind": {
+      "type": "string",
+      "enum": ["task_image", "base_image_bundle"]
+    },
+    "telemetry_phase": {
+      "type": "string",
+      "enum": ["agent", "grader"]
+    },
+    "trial_phase": {
+      "type": "string",
+      "enum": [
+        "pending",
+        "agent_materializing",
+        "agent_running",
+        "agent_finished",
+        "grader_materializing",
+        "grader_running",
+        "grader_mapping",
+        "paused",
+        "commit_pending",
+        "committed",
+        "killed",
+        "abandoned"
+      ]
+    },
+    "workspace_observation_kind": {
+      "type": "string",
+      "enum": ["container_tree"]
+    },
+    "attempt_key": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schedule_idx", "attempt"],
+      "properties": {
+        "schedule_idx": { "type": "integer", "minimum": 0 },
+        "attempt": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "slot_ref": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schedule_idx", "variant_id", "task_id", "repl_idx"],
+      "properties": {
+        "schedule_idx": { "type": "integer", "minimum": 0 },
+        "variant_id": { "type": "string", "minLength": 1 },
+        "task_id": { "type": "string", "minLength": 1 },
+        "repl_idx": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "declared_telemetry_mount": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "phase", "host_dir", "container_dir", "rel_path", "schema", "collect_mode"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "phase": { "$ref": "#/$defs/telemetry_phase" },
+        "host_dir": { "type": "string", "minLength": 1 },
+        "container_dir": { "type": "string", "minLength": 1 },
+        "rel_path": { "type": "string", "minLength": 1 },
+        "schema": { "type": ["string", "null"] },
+        "collect_mode": { "$ref": "#/$defs/collect_mode" }
+      }
+    },
+    "attempt_fs_layout": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["attempt_dir", "in_dir", "out_dir", "telemetry_mounts", "logs_dir"],
+      "properties": {
+        "attempt_dir": { "type": "string", "minLength": 1 },
+        "in_dir": { "type": "string", "minLength": 1 },
+        "out_dir": { "type": "string", "minLength": 1 },
+        "telemetry_mounts": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/declared_telemetry_mount" }
+        },
+        "logs_dir": { "type": "string", "minLength": 1 }
+      }
+    },
+    "task_materialization_spec": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kind", "task_bundle_ref"],
+      "properties": {
+        "kind": { "$ref": "#/$defs/task_materialization_kind" },
+        "task_bundle_ref": { "type": ["string", "null"] }
+      }
+    },
+    "task_sandbox_state": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["container_id", "image", "workdir", "materialization"],
+      "properties": {
+        "container_id": { "type": "string", "minLength": 1 },
+        "image": { "type": "string", "minLength": 1 },
+        "workdir": { "type": "string", "minLength": 1 },
+        "materialization": { "$ref": "#/$defs/task_materialization_spec" }
+      }
+    },
+    "grading_sandbox_state": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["container_id", "strategy", "workdir"],
+      "properties": {
+        "container_id": { "type": "string", "minLength": 1 },
+        "strategy": { "$ref": "#/$defs/grading_strategy" },
+        "workdir": { "type": "string", "minLength": 1 }
+      }
+    },
+    "agent_phase_record": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "started_at",
+        "ended_at",
+        "exit_code",
+        "signal",
+        "timed_out",
+        "result_state",
+        "stdout_path",
+        "stderr_path"
+      ],
+      "properties": {
+        "started_at": { "type": "string", "minLength": 1 },
+        "ended_at": { "type": "string", "minLength": 1 },
+        "exit_code": { "type": ["integer", "null"] },
+        "signal": { "type": ["string", "null"] },
+        "timed_out": { "type": "boolean" },
+        "result_state": { "$ref": "#/$defs/contract_file_state" },
+        "stdout_path": { "type": "string", "minLength": 1 },
+        "stderr_path": { "type": "string", "minLength": 1 }
+      }
+    },
+    "grading_phase_record": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "started_at",
+        "ended_at",
+        "exit_code",
+        "signal",
+        "timed_out",
+        "raw_output_state",
+        "stdout_path",
+        "stderr_path"
+      ],
+      "properties": {
+        "started_at": { "type": "string", "minLength": 1 },
+        "ended_at": { "type": "string", "minLength": 1 },
+        "exit_code": { "type": ["integer", "null"] },
+        "signal": { "type": ["string", "null"] },
+        "timed_out": { "type": "boolean" },
+        "raw_output_state": { "$ref": "#/$defs/contract_file_state" },
+        "stdout_path": { "type": "string", "minLength": 1 },
+        "stderr_path": { "type": "string", "minLength": 1 }
+      }
+    },
+    "grader_mapping_phase_record": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["started_at", "ended_at", "mapped_output_state", "stdout_path", "stderr_path"],
+      "properties": {
+        "started_at": { "type": "string", "minLength": 1 },
+        "ended_at": { "type": "string", "minLength": 1 },
+        "mapped_output_state": { "$ref": "#/$defs/contract_file_state" },
+        "stdout_path": { "type": "string", "minLength": 1 },
+        "stderr_path": { "type": "string", "minLength": 1 }
+      }
+    },
+    "candidate_artifact_record": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["state", "artifact_type", "source", "payload"],
+      "properties": {
+        "state": { "$ref": "#/$defs/candidate_artifact_state" },
+        "artifact_type": { "$ref": "#/$defs/artifact_type" },
+        "source": { "$ref": "#/$defs/candidate_artifact_source" },
+        "payload": {}
+      }
+    },
+    "workspace_delta_record": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "observation_kind",
+        "pre_observation_path",
+        "post_observation_path",
+        "diff_path",
+        "patch_path"
+      ],
+      "properties": {
+        "observation_kind": { "$ref": "#/$defs/workspace_observation_kind" },
+        "pre_observation_path": { "type": "string", "minLength": 1 },
+        "post_observation_path": { "type": "string", "minLength": 1 },
+        "diff_path": { "type": "string", "minLength": 1 },
+        "patch_path": { "type": ["string", "null"] }
+      }
+    },
+    "trial_attempt_state": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "key",
+        "slot",
+        "phase",
+        "paused_from_phase",
+        "fs",
+        "task_sandbox",
+        "grading_sandbox",
+        "agent_phase",
+        "grading_phase",
+        "mapping_phase",
+        "candidate_artifact",
+        "workspace_delta"
+      ],
+      "properties": {
+        "key": { "$ref": "#/$defs/attempt_key" },
+        "slot": { "$ref": "#/$defs/slot_ref" },
+        "phase": { "$ref": "#/$defs/trial_phase" },
+        "paused_from_phase": {
+          "oneOf": [
+            { "type": "null" },
+            { "$ref": "#/$defs/trial_phase" }
+          ]
+        },
+        "fs": { "$ref": "#/$defs/attempt_fs_layout" },
+        "task_sandbox": {
+          "oneOf": [
+            { "type": "null" },
+            { "$ref": "#/$defs/task_sandbox_state" }
+          ]
+        },
+        "grading_sandbox": {
+          "oneOf": [
+            { "type": "null" },
+            { "$ref": "#/$defs/grading_sandbox_state" }
+          ]
+        },
+        "agent_phase": {
+          "oneOf": [
+            { "type": "null" },
+            { "$ref": "#/$defs/agent_phase_record" }
+          ]
+        },
+        "grading_phase": {
+          "oneOf": [
+            { "type": "null" },
+            { "$ref": "#/$defs/grading_phase_record" }
+          ]
+        },
+        "mapping_phase": {
+          "oneOf": [
+            { "type": "null" },
+            { "$ref": "#/$defs/grader_mapping_phase_record" }
+          ]
+        },
+        "candidate_artifact": {
+          "oneOf": [
+            { "type": "null" },
+            { "$ref": "#/$defs/candidate_artifact_record" }
+          ]
+        },
+        "workspace_delta": {
+          "oneOf": [
+            { "type": "null" },
+            { "$ref": "#/$defs/workspace_delta_record" }
+          ]
+        }
+      }
+    }
+  }
+}

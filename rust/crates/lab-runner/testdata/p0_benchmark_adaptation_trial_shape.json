@@ -42,38 +42,17 @@
     }
   },
   "dataset_task_row": {
+    "schema_version": "task_row_v1",
+    "id": "swebench__django__12345",
+    "image": "ghcr.io/acme/swebench-task:20260222",
+    "workdir": "/testbed",
+    "time_limit_ms": 1800000,
     "task": {
       "id": "swebench__django__12345",
       "prompt": "Fix failing tests without changing expected behavior."
     },
-    "environment": {
-      "image": "ghcr.io/acme/swebench-task:20260222"
-    },
-    "workspace": {
-      "mode": "patch",
-      "base": {
-        "kind": "dataset_pack",
-        "dataset_pack_ref": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
-      },
-      "overlays": [
-        {
-          "path": "README.md",
-          "content": "Task-scoped fixture for P0 baseline freeze."
-        }
-      ],
-      "aux_mounts": [
-        {
-          "dataset_pack_ref": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-          "mount_path": "/agentlab/workspace/deps"
-        }
-      ]
-    },
-    "limits": {
-      "max_steps": 12,
-      "max_total_tokens": 16000,
-      "max_tool_calls": 32,
-      "trial_seconds": 1800
-    },
-    "dependencies": {}
+    "materialization": {
+      "kind": "task_image"
+    }
   }
 }

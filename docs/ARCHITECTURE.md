@@ -1,463 +1,113 @@
 # System Architecture
 
-> Obsolete note
->
-> Older references here to `experiment_v1_0` and `experiment_overrides_v1` are stale. The live authoring contract is versionless; use [README.md](/Users/jevinnishioka/Desktop/Experiments/README.md) as the current contract summary.
+Current runner architecture as of 2026-03-18.
 
-Reference architecture for the AgentLab experiment runner.
-All diagrams reflect the current codebase as of 2026-02-23.
+The authoring contract summary lives in [README.md](/Users/jevinnishioka/Desktop/Experiments/README.md). This document is the implementation-side map for contributors and operators.
 
----
+## Ownership Map
 
-## 1. Top-Level Orchestration
+`lab-cli` is the operator surface. It parses commands, loads packages or experiments, and calls into `lab-runner`.
 
-```
-  experiment.yaml
-        │
-        ▼
-  ┌───────────────────────────────────────────────────────────┐
-  │                     Runner (lab-cli)                       │
-  │                                                           │
-  │  1. Parse YAML → resolved JSON                            │
-  │  2. Load dataset (JSONL tasks)                            │
-  │  3. Resolve variant plan + runtime profiles               │
-  │  4. Preflight checks                                      │
-  │  5. Build trial schedule (TrialSlot[])                    │
-  │  6. Execute schedule engine                               │
-  └───────────┬───────────────────────────────────────────────┘
-              │
-              ▼
-  ┌───────────────────────────────────────────────────────────┐
-  │                Schedule Engine (Parallel)                   │
-  │                                                           │
-  │  Dispatch loop:                                           │
-  │    schedule[next_idx] → TrialDispatch → WorkerBackend     │
-  │                                                           │
-  │  ┌─────────────────┐     ┌──────────────────────┐        │
-  │  │ LocalThread      │     │ Remote (HTTP)         │        │
-  │  │ WorkerBackend    │     │ WorkerBackend         │        │
-  │  │                 │     │                      │        │
-  │  │ Thread pool     │     │ Submit → Poll        │        │
-  │  │ max_in_flight   │     │ retry + backoff      │        │
-  │  └────────┬────────┘     └──────────┬───────────┘        │
-  │           │                         │                     │
-  │           ▼                         ▼                     │
-  │      TrialCompletion          TrialCompletion             │
-  │           │                         │                     │
-  │           └────────────┬────────────┘                     │
-  │                        ▼                                  │
-  │              DeterministicCommitter                        │
-  │              (ordered fact commit)                         │
-  └───────────┬───────────────────────────────────────────────┘
-              │
-              ▼
-  ┌───────────────────────────────────────────────────────────┐
-  │                   RunSink (JsonlRunSink)                    │
-  │                                                           │
-  │   facts/                                                  │
-  │   ├── run_manifest.json      (RunManifestRecord)          │
-  │   ├── trials.jsonl           (TrialRecord per trial)      │
-  │   ├── metrics_long.jsonl     (MetricRow per metric)       │
-  │   ├── events.jsonl           (EventRow per event)         │
-  │   └── variant_snapshots.jsonl (VariantSnapshotRow)        │
-  └───────────┬───────────────────────────────────────────────┘
-              │
-              ▼
-  ┌───────────────────────────────────────────────────────────┐
-  │                 Analysis (lab-analysis)                     │
-  │                                                           │
-  │   DuckDB views over facts/ JSONL:                         │
-  │     trials, metrics_long, events, variant_snapshots       │
-  │     variant_summary, task_variant_matrix, run_progress    │
-  │                                                           │
-  │   ViewSet selected by experiment design:                  │
-  │     AbTest │ MultiVariant │ ParameterSweep │ Regression   │
-  │                                                           │
-  │   Project-level cross-run views:                          │
-  │     all_trials, all_runs, pass_rate_trend                 │
-  └───────────────────────────────────────────────────────────┘
-```
+`lab-runner` is split by runtime ownership:
 
----
+| Area | Current owner | Responsibility |
+|---|---|---|
+| Config and authoring normalization | `rust/crates/lab-runner/src/config.rs` | Parse experiment state, resolve runtime profiles, validate authoring-time constraints |
+| Run entrypoints and control operations | `rust/crates/lab-runner/src/runner.rs` | `run`, `continue`, `recover`, `pause`, `resume`, `kill`, and durable control reconciliation |
+| Schedule engine and slot commit | `rust/crates/lab-runner/src/core.rs`, `rust/crates/lab-runner/src/lifecycle.rs` | Expand schedules, coordinate execution, and publish slot facts exactly once |
+| Trial orchestration | `rust/crates/lab-runner/src/trial/schedule.rs` | Prepare one scheduled trial, call the runtime, and map runtime outputs into committed trial records |
+| Trial runtime | `rust/crates/lab-runner/src/trial/execution.rs` | Materialize task/grader sandboxes, run agent and grader commands, persist runtime state transitions |
+| Durable per-trial runtime state | `rust/crates/lab-runner/src/trial/state.rs` | `trial_runtime_state.json`, phase reconciliation, persisted container identity |
+| Docker transport | `rust/crates/lab-runner/src/backend/docker.rs` | Image ensure, container create/start/exec/wait/inspect/pause/unpause/remove |
+| Durable rows and stores | `rust/crates/lab-runner/src/persistence/` | Row contracts, JSON-row routing, SQLite ingestion, and run-sink implementations |
 
-## 2. System Boundaries
+The important boundary is that production trial execution now flows through `trial::schedule` and `trial::execution`, while Docker transport stays inside `backend/docker` and durable row ownership stays inside `persistence/`.
 
-Five boundaries define the contract surfaces between components.
+## Primary Local Path
 
-### Boundary 1: Experiment Definition → Runner
+The shipped local path is:
 
-```
-                  User
-                   │
-                   │  experiment.yaml (current authoring contract)
-                   │  + optional overrides
-                   ▼
-              ┌──────────┐
-              │  Runner   │
-              └──────────┘
+1. `lab run <package-or-experiment>` resolves the package and creates a run directory.
+2. The runner persists `run_control_v2`, `run_session_state_v1`, and `schedule_progress_v2` before scheduling work.
+3. The schedule engine dispatches one slot at a time through `trial::schedule::execute_scheduled_trial`.
+4. `trial::execution::execute_trial_runtime` creates the task container, copies task contents into the container-owned workdir, runs the agent contract, then runs grading if the benchmark requires it.
+5. The runtime persists `trial_runtime_state.json` as the trial advances through materialization, agent, grading, mapping, `commit_pending`, and terminal reconciliation.
+6. The committer publishes slot results exactly once into SQLite-backed run facts and advances durable schedule progress.
 
-  Direction: User → Runner (one-shot)
+The primary path does not shell out to `docker`. Production container control is owned by the Docker runtime abstraction in `backend/docker`.
 
-  Contract (current authoring):
-    ├── experiment: { id, name }
-    ├── dataset:    { path, limit? }
-    ├── design:     { comparison, replications, seed? }
-    ├── baseline:   { variant_id, args?, env?, image? }
-    ├── variant_plan?: [{ variant_id, args?, image?, env? }]
-    └── runtime:    { image, command, agent?, policy?, ... }
+## Lifecycle Vocabulary
 
-  Guarantees:
-    - Schema-validated before any trial executes
-    - Preflight checks abort before execution on fatal misconfig
-    - Overrides merged before validation (experiment_overrides_v1)
-```
+Run-level status is persisted in `run_control_v2` and uses:
 
-### Boundary 2: Runner → Agent (Task Contract)
+- `running`
+- `paused`
+- `interrupted`
+- `completed`
+- `failed`
+- `killed`
 
-```
-  ┌──────────┐                    ┌──────────────────────────┐
-  │  Runner   │───────────────────▶│  Agent (inside sandbox)  │
-  └──────────┘                    └──────────────────────────┘
+Trial-level runtime phase is persisted in `trial_runtime_state.json` and uses:
 
-  Direction: Runner → Agent (write), Agent → Runner (write result)
+- `agent_materializing`
+- `agent_running`
+- `agent_finished`
+- `grader_materializing`
+- `grader_running`
+- `grader_mapping`
+- `commit_pending`
+- `paused`
+- `committed`
+- `killed`
+- `abandoned`
 
-  Contract IN (agent_task_v1):
-    ├── ids:          { run_id, trial_id, variant_id, task_id, repl_idx }
-    ├── task:         { ... }    (benchmark-specific payload)
-    ├── bindings:     { ... }    (variant knobs for the agent)
-    ├── dependencies: { services? }
-    └── policy:       { timeout_ms, network: { mode, allowed_hosts },
-                        sandbox: { mode, image?, resources? } }
+The runtime phase is the durable source of truth for in-flight control and recovery decisions. `attempt_no` is retry metadata, not a second lifecycle model.
 
-  Contract OUT (agent_result_v1):
-    ├── ids:          (echo back)
-    ├── outcome:      "success" | "failure" | "missing" | "error"
-    ├── answer?:      raw agent answer
-    ├── metrics?:     { metric_name: value }
-    ├── objective?:   { name, value, direction? }
-    ├── artifacts?:   [{ path, logical_name?, mime_type? }]
-    ├── checkpoints?: [{ path, step?, epoch? }]
-    └── error?:       { error_type?, message?, stack? }
+## Recovery And Control Plane
 
-  Delivery mechanism:
-    Container mode:  Files at well-known paths inside /agentlab/contract/
-    Local mode:      Files on host filesystem
+`recover` is the crash-reconciliation operation. It reads persisted run control, schedule progress, committed slot facts, and `trial_runtime_state.json`, then releases or reconciles active trials into a safe continuable state. Recovery writes a report under `runtime/recovery_report.json` and moves the run to `interrupted` unless it was already terminal.
 
-  Guarantees:
-    - Task payload is schema-validated (agent_task_v1)
-    - Result is schema-validated (agent_result_v1)
-    - Timeout enforced externally by runner
-```
+`continue` resumes only from `failed`, `paused`, or `interrupted`. It reloads persisted run behavior and execution options, verifies the schedule matches the stored run state, and resumes from the next durable schedule slot. A still-`running` run must be reconciled with `recover` first.
 
-### Boundary 3: Trial Execution → Evidence Chain
+`pause`, `resume`, and `kill` operate on the same control plane:
 
-```
-  ┌──────────────────┐              ┌────────────────────┐
-  │ Trial Execution   │─────────────▶│  Evidence Store     │
-  └──────────────────┘              └────────────────────┘
+- If persisted runtime container ids exist, control uses Docker runtime operations first.
+- `pause` pauses the recorded container set and persists trial/run state as paused.
+- `resume` unpauses persisted runtime containers when the paused trial still has live runtime state; otherwise it falls back to checkpoint-fork resume semantics.
+- `kill` is the terminal cancel operation for a run. It removes persisted runtime containers, marks the affected trials killed, and persists a truthful interrupted-or-killed run state if the operation only partially succeeds.
 
-  Direction: Executor → Evidence (append-only after trial)
+There is no separate production worker control plane for the primary local Docker path. Legacy adapter-control handling remains only as a compatibility shim when durable runtime state does not exist.
 
-  Contract (evidence_record_v1):
-    ├── ids:       { run_id, trial_id, variant_id, task_id, repl_idx }
-    ├── runtime:   { executor, exit_status, duration_ms? }
-    ├── evidence:
-    │   ├── trial_input_ref:      artifact://sha256/<hash>
-    │   ├── trial_output_ref:     artifact://sha256/<hash>
-    │   ├── workspace_pre_ref:    artifact://sha256/<hash>
-    │   ├── workspace_post_ref:   artifact://sha256/<hash>
-    │   ├── diff_incremental_ref: artifact://sha256/<hash>
-    │   ├── diff_cumulative_ref:  artifact://sha256/<hash>
-    │   ├── patch_incremental_ref: artifact://sha256/<hash>
-    │   ├── patch_cumulative_ref: artifact://sha256/<hash>
-    │   ├── stdout_ref?:          artifact://sha256/<hash>
-    │   ├── stderr_ref?:          artifact://sha256/<hash>
-    │   └── hook_events_ref?:     artifact://sha256/<hash>
-    └── paths:     { trial_dir, trial_input, trial_output, ... }
+## Grading Boundary
 
-  Guarantees:
-    - Every ref is a content-addressed SHA-256 artifact
-    - Evidence records are append-only (evidence_records.jsonl)
-    - Executor type is recorded: local_docker | local_process | remote
-```
+The agent contract produces a candidate artifact. That is not the benchmark verdict.
 
-### Boundary 4: Runner → Facts (RunSink)
+Benchmark verdicts come only from a validated `trial_conclusion_v1` in `mapped_grader_output.json`:
 
-```
-  ┌──────────┐              ┌──────────────────┐
-  │  Runner   │─────────────▶│  Facts (JSONL)    │
-  └──────────┘              └──────────────────┘
+- Direct grading writes `mapped_grader_output.json` directly.
+- Mapper grading writes raw grader output first, then a mapper writes `mapped_grader_output.json`.
+- If the mapped output is missing or invalid, the committed trial outcome becomes `grading_failed`.
 
-  Direction: Runner → Disk (append-only per trial completion)
+Hidden grader assets stay outside the agent-visible tree during the agent step. In-task-image grading reveals hidden paths only for grading execution.
 
-  Fact types (RunSink trait):
-    write_run_manifest()    → facts/run_manifest.json
-    append_trial_record()   → facts/trials.jsonl
-    append_metric_rows()    → facts/metrics_long.jsonl
-    append_event_rows()     → facts/events.jsonl
-    append_variant_snapshot()→ facts/variant_snapshots.jsonl
+## Persistence And Exactly-Once Commit
 
-  Guarantees:
-    - DeterministicCommitter ensures facts commit in schedule order
-    - Completion may arrive out-of-order from parallel workers;
-      committer holds completions until all prior slots resolve
-    - JSONL format: one JSON object per line, append-only
-```
+Run facts are written through `persistence::RunSink` implementations into SQLite-backed JSON rows. The main persisted tables are trial rows, metric rows, event rows, variant snapshot rows, benchmark conclusion rows, and runtime key-value records.
 
-### Boundary 5: Facts → Analysis (DuckDB)
+Exactly-once applies to slot publication, not trial attempts:
 
-```
-  ┌──────────────────┐              ┌────────────────────┐
-  │  Facts (JSONL)    │─────────────▶│  DuckDB Analysis    │
-  └──────────────────┘              └────────────────────┘
+- a trial may retry with a higher `attempt`
+- a schedule slot publishes one committed result set
+- pending completions survive restart and drain in schedule order
 
-  Direction: Facts → DuckDB (materialized on query)
+If a crash happens after grading but before slot publication, the retry/recovery logic uses durable runtime state plus committed artifacts to avoid fabricating duplicate slot commits.
 
-  Materialization:
-    1. Create views over JSONL files (read_json_auto)
-    2. Select ViewSet based on experiment design:
-       ┌─────────────────────┬──────────────────────────┐
-       │ Design               │ ViewSet                   │
-       ├─────────────────────┼──────────────────────────┤
-       │ paired, ≤2 variants │ AbTest (win_loss_tie)     │
-       │ paired, ≥3 variants │ MultiVariant (ranking)    │
-       │ unpaired             │ ParameterSweep (best_cfg) │
-       │ comparison=none      │ Regression (trend)        │
-       └─────────────────────┴──────────────────────────┘
-    3. Load opinionated SQL view bundle for the ViewSet
-    4. Fallback: in-memory DuckDB on lock contention
+## Contributor Guidance
 
-  Guarantees:
-    - Read-only queries only (validated: no INSERT/UPDATE/DROP)
-    - Views are re-materialized from source JSONL on each access
-    - Project-level views union across all runs in .lab/runs/
-```
+When changing the runner:
 
----
-
-## 3. Trial Lifecycle
-
-```
-  ┌─────────────────────────────────────────────────────────────────────────┐
-  │                          Schedule Engine                                │
-  │                                                                        │
-  │  schedule[idx] ──▶ TrialSlot { variant_idx, task_idx, repl_idx }       │
-  │                                                                        │
-  │       │                                                                │
-  │       ▼                                                                │
-  │  ┌──────────────────────────────────────────┐                          │
-  │  │           Build TrialDispatch             │                          │
-  │  │                                          │                          │
-  │  │  Resolve: variant, task, bindings,       │                          │
-  │  │  policy, runtime profile, task boundary  │                          │
-  │  │  (task_image, workspace from dataset)    │                          │
-  │  └─────────────────┬────────────────────────┘                          │
-  │                    │                                                   │
-  │                    ▼                                                   │
-  │  ┌──────────────────────────────────────────┐                          │
-  │  │        WorkerBackend.submit()             │                          │
-  │  │                                          │                          │
-  │  │  Returns WorkerTicket                    │                          │
-  │  │  { worker_id, ticket_id, trial_id }      │                          │
-  │  └─────────────────┬────────────────────────┘                          │
-  │                    │                                                   │
-  │                    ▼                                                   │
-  │  ┌──────────────────────────────────────────┐                          │
-  │  │        Trial Execution (in worker)        │                          │
-  │  │                                          │                          │
-  │  │  1. Stage trial input (trial_input_v1)   │                          │
-  │  │  2. Prepare sandbox (container/local)    │                          │
-  │  │  3. Mount contract dirs, inject task     │                          │
-  │  │  4. Run agent via adapter (command)      │                          │
-  │  │  5. Collect result (agent_result_v1)     │                          │
-  │  │  6. Snapshot workspace (pre/post)        │                          │
-  │  │  7. Compute diffs + patches              │                          │
-  │  │  8. Run benchmark grader (if configured) │                          │
-  │  │  9. Build evidence record                │                          │
-  │  └─────────────────┬────────────────────────┘                          │
-  │                    │                                                   │
-  │                    ▼                                                   │
-  │  ┌──────────────────────────────────────────┐                          │
-  │  │         TrialCompletion                   │                          │
-  │  │                                          │                          │
-  │  │  { ticket, schedule_idx,                 │                          │
-  │  │    terminal_status, classification,      │                          │
-  │  │    artifacts, metrics, runtime_summary } │                          │
-  │  └─────────────────┬────────────────────────┘                          │
-  │                    │                                                   │
-  │                    ▼                                                   │
-  │  ┌──────────────────────────────────────────┐                          │
-  │  │      DeterministicCommitter               │                          │
-  │  │                                          │                          │
-  │  │  Hold out-of-order completions.          │                          │
-  │  │  Commit facts only when all prior        │                          │
-  │  │  schedule slots are resolved.            │                          │
-  │  │                                          │                          │
-  │  │  Commit:                                 │                          │
-  │  │    → TrialRecord + MetricRows            │                          │
-  │  │    → EventRows + VariantSnapshots        │                          │
-  │  │    → EvidenceRecord                      │                          │
-  │  │    → schedule_progress update            │                          │
-  │  │    → run_control update                  │                          │
-  │  └─────────────────────────────────────────┘                          │
-  └────────────────────────────────────────────────────────────────────────┘
-```
-
----
-
-## 4. Run State Machine
-
-Two files work in tandem to track run state:
-
-```
-  runtime/
-  ├── run_control.json       (run_control_v2)
-  └── schedule_progress.json (schedule_progress_v1)
-```
-
-### run_control_v2 — Observable run status
-
-```
-  States:
-    running ──▶ paused ──▶ running     (pause/resume cycle)
-    running ──▶ interrupted             (ctrl-C / signal)
-    running ──▶ killed                  (explicit kill)
-    running ──▶ completed               (all slots done)
-    running ──▶ failed                  (fatal error)
-
-  State diagram:
-
-                  ┌────────────┐
-                  │  running    │◀──────────────────────┐
-                  └──────┬─────┘                        │
-                         │                              │
-           ┌─────────────┼─────────────┐                │
-           │             │             │                │
-           ▼             ▼             ▼                │
-    ┌───────────┐ ┌────────────┐ ┌──────────┐   ┌──────┴─────┐
-    │ completed  │ │ interrupted │ │  killed   │   │   paused   │
-    └───────────┘ └────────────┘ └──────────┘   └────────────┘
-                                                (resume → running)
-
-  Fields:
-    status:         current state
-    active_trials:  map<trial_id → { worker_id, schedule_idx,
-                                      variant_id, started_at,
-                                      control? }>
-    pause:          { label, requested_at, requested_by? } | null
-    updated_at:     ISO 8601 timestamp
-```
-
-### schedule_progress_v1 — Durable schedule cursor
-
-```
-  Fields:
-    total_slots:          len(schedule)
-    next_schedule_index:  cursor into schedule[] (next to dispatch)
-    next_trial_index:     monotonic trial ID counter
-    schedule:             [{ variant_idx, task_idx, repl_idx }]
-    completed_slots:      [{ schedule_index, trial_id, status }]
-                           status: "completed" | "failed" | "skipped_pruned"
-    pruned_variants:      [variant_idx, ...]
-    consecutive_failures: { variant_idx: count }
-    use_container:        bool
-
-  Interaction with run_control_v2:
-    1. Dispatch reads next_schedule_index → builds TrialDispatch
-    2. run_control writes active_trials for in-flight visibility
-    3. On commit: completed_slots appended, next_schedule_index advanced
-    4. On continue: schedule_progress is the source of truth for
-       resuming from the exact slot where execution stopped
-    5. On kill/interrupt: active_trials drained, schedule_progress
-       records partial completion
-
-  Progress lifecycle:
-
-    ┌──────────────────────────────────────────────────────────┐
-    │  next_schedule_index                                      │
-    │       │                                                   │
-    │       ▼                                                   │
-    │  schedule: [ slot_0, slot_1, slot_2, ... slot_N ]         │
-    │             ──────── ──────── ────────                     │
-    │             committed in-flight  pending                   │
-    │             ────────                                       │
-    │             completed_slots[]                              │
-    └──────────────────────────────────────────────────────────┘
-```
-
----
-
-## 5. Image Resolution Cascade
-
-The container image used for a trial is resolved through a priority cascade:
-
-```
-  experiment.yaml
-  ├── runtime.sandbox.image_source = "global" (default)
-  │   │
-  │   └──▶ Use runtime.sandbox.image
-  │        │
-  │        └──▶ Final image for this variant
-  │
-  └── runtime.sandbox.image_source = "per_task"
-      │
-      └──▶ Each task in the dataset provides its own image:
-           environment.image (from task_boundary_v3 row)
-           │
-           │  Requirements:
-           │  ├── runtime.agent.bundle is REQUIRED
-           │  ├── Container mode only (local mode rejected)
-           │  └── Preflight scans all tasks for valid images
-
-  Resolution at execution time (resolve_container_image):
-
-    ┌──────────────────────────────────────────────┐
-    │  image_source == per_task?                   │
-    │     YES → use environment.image              │
-    │     NO  → use runtime.sandbox.image          │
-    └──────────────────────────────────────────────┘
-
-  Workspace resolution (resolve_container_workspace):
-
-    ┌──────────────────────────────────────────────────────┐
-    │  writable task root is always /agentlab/workspace    │
-    │  optional aliases such as /testbed are runner-owned  │
-    │  task rows never author sandbox cwd or mount paths   │
-    └──────────────────────────────────────────────────────┘
-```
-
----
-
-## 6. Directory Layout (Per Run)
-
-```
-  .lab/runs/<run_id>/
-  ├── manifest.json                  (manifest_v1)
-  ├── resolved_experiment.json       (resolved experiment)
-  ├── resolved_experiment.digest     (canonical JSON digest)
-  ├── runtime/
-  │   ├── run_control.json           (run_control_v2)
-  │   └── schedule_progress.json     (schedule_progress_v1)
-  ├── trials/
-  │   └── <trial_id>/               (per-trial directory)
-  │       ├── trial_input.json       (trial_input_v1)
-  │       ├── result.json            (agent_result_v1)
-  │       ├── stdout.log
-  │       ├── stderr.log
-  │       └── workspace/             (snapshot)
-  ├── evidence/
-  │   ├── evidence_records.jsonl     (evidence_record_v1[])
-  │   └── task_chain_states.jsonl
-  ├── facts/
-  │   ├── run_manifest.json          (RunManifestRecord)
-  │   ├── trials.jsonl               (TrialRecord[])
-  │   ├── metrics_long.jsonl         (MetricRow[])
-  │   ├── events.jsonl               (EventRow[])
-  │   └── variant_snapshots.jsonl    (VariantSnapshotRow[])
-  ├── analysis/
-  │   ├── agentlab.duckdb            (materialized views)
-  │   └── load_duckdb.sql            (reproducible SQL)
-  └── benchmark/                     (if benchmark grading enabled)
-      ├── predictions.jsonl
-      └── scores.jsonl
-```
+1. Put new Docker operations in `backend/docker`, not in orchestration code.
+2. Put new durable row shapes or ingest rules in `persistence/`, not in `io.rs` or schedule code.
+3. Put trial-step behavior in `trial/`, and keep `runner.rs` focused on run-level orchestration and operator commands.
+4. Treat `mapped_grader_output.json` and committed slot facts as the correctness boundary for benchmark outcomes.
+5. Keep recovery and control decisions derivable from persisted records alone.
