@@ -8,14 +8,14 @@ use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 
 use crate::config::*;
+use crate::experiment::preflight::resolve_dataset_path;
 use crate::experiment::runner::*;
 use crate::model::*;
 use crate::package::authoring::*;
 use crate::package::staging::*;
 use crate::package::validate::*;
-use crate::experiment::preflight::resolve_dataset_path;
-use crate::util::{copy_dir_preserve_all, sanitize_for_fs};
 use crate::trial::spec::{parse_task_row, TaskMaterializationKind, TaskRow};
+use crate::util::{copy_dir_preserve_all, sanitize_for_fs};
 
 pub(crate) fn sanitize_name_for_path(raw: &str) -> String {
     let mut out = String::new();

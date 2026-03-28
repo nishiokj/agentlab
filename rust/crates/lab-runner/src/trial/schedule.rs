@@ -10,29 +10,26 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use crate::config::*;
-use crate::trial::execution::AdapterRunRequest;
-use crate::trial::state::{write_trial_state, TrialStateGuard};
-use crate::trial::artifacts::trial_output_payload_view;
-use crate::model::*;
-use crate::persistence::journal::RunSink;
-use crate::persistence::rows::TrialRecord;
-use crate::persistence::store::SqliteRunStore as BackingSqliteStore;
-use crate::experiment::runtime::{resolve_exec_digest, VariantRuntimeProfile};
 use crate::experiment::runner::{
     materialize_trial_runtime_layout, resolve_agent_runtime_manifest_path, write_state_inventory,
 };
+use crate::experiment::runtime::{resolve_exec_digest, VariantRuntimeProfile};
+use crate::model::*;
 use crate::persistence::journal::append_jsonl;
+use crate::persistence::journal::RunSink;
+use crate::persistence::rows::TrialRecord;
+use crate::persistence::store::SqliteRunStore as BackingSqliteStore;
+use crate::trial::artifacts::trial_output_payload_view;
 use crate::trial::events::{build_metric_rows, build_variant_snapshot_rows, load_event_rows};
+use crate::trial::execution::AdapterRunRequest;
 use crate::trial::grade::{mapped_grader_output_state, task_grading_enabled};
+use crate::trial::preflight::stage_benchmark_trial_preflight;
 use crate::trial::prepare::{
     prepare_task_environment, prepare_task_environment_with_paths, PreparedTaskEnvironment,
     TrialPaths,
 };
-use crate::trial::preflight::stage_benchmark_trial_preflight;
-use crate::trial::spec::{
-    parse_task_boundary_from_packaged_task,
-    TaskBoundaryMaterialization,
-};
+use crate::trial::spec::{parse_task_boundary_from_packaged_task, TaskBoundaryMaterialization};
+use crate::trial::state::{write_trial_state, TrialStateGuard};
 
 pub(crate) struct ScheduledTrialRequest<'a> {
     pub(crate) run_dir: &'a Path,
@@ -195,7 +192,7 @@ pub(crate) fn prepare_scheduled_trial(
         .get(&chain_key)
         .map(|state| state.step_index + 1)
         .unwrap_or(0);
-    let has_chain_snapshot = request.chain_states.contains_key(&chain_key);
+    let _has_chain_snapshot = request.chain_states.contains_key(&chain_key);
 
     *request.trial_index += 1;
     let trial_id = format!("trial_{}", *request.trial_index);

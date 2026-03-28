@@ -5,7 +5,6 @@ This workspace contains the Rust implementation for the AgentLab runner, CLI, an
 ## Docs
 
 - [CLI Reference](./docs/cli.md)
-- [Runner SQLite Hard Cutover Patch Spec](./RUNNER_SQLITE_HARD_CUTOVER_PATCH_SPEC.md)
 
 ## Quick Start
 

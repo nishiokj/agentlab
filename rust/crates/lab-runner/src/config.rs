@@ -1,16 +1,15 @@
 use anyhow::{anyhow, Context, Result};
 use chrono::Utc;
-use lab_core::{canonical_json_digest, ensure_dir, sha256_file};
-use lab_schemas::compile_schema;
+use lab_core::{canonical_json_digest, ensure_dir};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Component, Path, PathBuf};
 
+use crate::model::*;
 use crate::persistence::store::SqliteRunStore as BackingSqliteStore;
 use crate::trial::spec::parse_task_row;
-use crate::model::*;
 
 // ---------------------------------------------------------------------------
 // Atomic write helpers

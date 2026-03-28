@@ -1,9 +1,7 @@
-use crate::persistence::rows::JsonRowTable;
 use crate::experiment::state::PendingTrialCompletionRecord;
-use crate::model::{
-    RUNTIME_KEY_RUN_CONTROL, TrialExecutionResult,
-};
+use crate::model::{TrialExecutionResult, RUNTIME_KEY_RUN_CONTROL};
 use crate::package::validate::validate_schema_contract_value;
+use crate::persistence::rows::JsonRowTable;
 use anyhow::{anyhow, Context, Result};
 use chrono::Utc;
 use lab_core::sha256_bytes;

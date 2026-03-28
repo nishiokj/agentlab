@@ -20,14 +20,14 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::config::*;
-use crate::trial::execution::AdapterRunRequest;
-use crate::trial::state::{write_trial_state, TrialStateGuard};
 use crate::experiment::commit::*;
 use crate::experiment::control::*;
 use crate::experiment::lease::{
     acquire_run_operation_lease, adopt_engine_lease_for_recovery, start_engine_lease_heartbeat,
     RunOperationType,
 };
+use crate::experiment::preflight::*;
+use crate::experiment::runtime::*;
 use crate::experiment::state::*;
 use crate::model::*;
 use crate::package::compile::copy_path_into_package;
@@ -40,10 +40,8 @@ use crate::persistence::store::{
     load_pending_trial_completion_records, persist_pending_trial_completions,
     SqliteRunStore as BackingSqliteStore,
 };
-use crate::experiment::preflight::*;
-use crate::experiment::runtime::*;
 use crate::trial::execution::resolve_container_image_digest;
-use crate::util::*;
+use crate::trial::execution::AdapterRunRequest;
 use crate::trial::grade::benchmark_retry_inputs;
 use crate::trial::prepare::{
     build_runtime_contract_env, load_prepared_task_environment_manifest, prepare_io_paths,
@@ -53,6 +51,8 @@ use crate::trial::schedule::*;
 use crate::trial::spec::{
     materialize_packaged_task_boundary, validate_task_boundary_workspace_materialization,
 };
+use crate::trial::state::{write_trial_state, TrialStateGuard};
+use crate::util::*;
 use crate::INTERRUPTED;
 
 pub fn continue_run_with_options(
@@ -1930,7 +1930,7 @@ pub(crate) fn fork_trial_inner(
     )?;
     let mut trial_guard = TrialStateGuard::new(&fork_trial_dir, &fork_trial_id);
 
-    let checkpoint_workspace_ref = if let Some(ref checkpoint_token) = source_checkpoint {
+    let _checkpoint_workspace_ref = if let Some(ref checkpoint_token) = source_checkpoint {
         resolve_workspace_ref_from_checkpoint_token(&run_dir, checkpoint_token)?
     } else {
         None

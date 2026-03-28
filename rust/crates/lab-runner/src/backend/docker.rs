@@ -715,9 +715,25 @@ impl DockerRuntime {
 
 fn docker_socket_path() -> Result<PathBuf> {
     let host = std::env::var("DOCKER_HOST").unwrap_or_default();
-    if host.is_empty() {
-        return Ok(PathBuf::from(DEFAULT_DOCKER_SOCKET_PATH));
+    if !host.is_empty() {
+        return parse_unix_docker_host(&host);
     }
+
+    let context = std::env::var("DOCKER_CONTEXT").unwrap_or_default();
+    if !context.is_empty() {
+        if let Some(path) = docker_socket_path_for_context(&context)? {
+            return Ok(path);
+        }
+    }
+
+    if let Some(path) = docker_socket_path_from_current_context()? {
+        return Ok(path);
+    }
+
+    Ok(PathBuf::from(DEFAULT_DOCKER_SOCKET_PATH))
+}
+
+fn parse_unix_docker_host(host: &str) -> Result<PathBuf> {
     if let Some(path) = host.strip_prefix("unix://") {
         return Ok(PathBuf::from(path));
     }
@@ -725,6 +741,82 @@ fn docker_socket_path() -> Result<PathBuf> {
         "unsupported DOCKER_HOST '{}'; only unix:// sockets are supported",
         host
     ))
+}
+
+fn docker_socket_path_from_current_context() -> Result<Option<PathBuf>> {
+    let config_path = match docker_config_path() {
+        Some(path) => path,
+        None => return Ok(None),
+    };
+    if !config_path.exists() {
+        return Ok(None);
+    }
+
+    let raw = fs::read_to_string(&config_path)
+        .with_context(|| format!("failed to read docker config {}", config_path.display()))?;
+    let config: DockerConfig = serde_json::from_str(&raw)
+        .with_context(|| format!("failed to parse docker config {}", config_path.display()))?;
+    let Some(context_name) = config
+        .current_context
+        .filter(|value| !value.trim().is_empty())
+    else {
+        return Ok(None);
+    };
+    docker_socket_path_for_context(&context_name)
+}
+
+fn docker_socket_path_for_context(context_name: &str) -> Result<Option<PathBuf>> {
+    let meta_root = match docker_contexts_meta_root() {
+        Some(path) => path,
+        None => return Ok(None),
+    };
+    if !meta_root.exists() {
+        return Ok(None);
+    }
+
+    for entry in fs::read_dir(&meta_root)
+        .with_context(|| format!("failed to read docker contexts dir {}", meta_root.display()))?
+    {
+        let entry = entry?;
+        let meta_path = entry.path().join("meta.json");
+        if !meta_path.exists() {
+            continue;
+        }
+        let raw = fs::read_to_string(&meta_path).with_context(|| {
+            format!(
+                "failed to read docker context metadata {}",
+                meta_path.display()
+            )
+        })?;
+        let meta: DockerContextMetadata = serde_json::from_str(&raw).with_context(|| {
+            format!(
+                "failed to parse docker context metadata {}",
+                meta_path.display()
+            )
+        })?;
+        if meta.name != context_name {
+            continue;
+        }
+        let Some(host) = meta.endpoints.docker.and_then(|endpoint| endpoint.host) else {
+            return Ok(None);
+        };
+        return Ok(Some(parse_unix_docker_host(&host)?));
+    }
+
+    Ok(None)
+}
+
+fn docker_config_path() -> Option<PathBuf> {
+    std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".docker").join("config.json"))
+}
+
+fn docker_contexts_meta_root() -> Option<PathBuf> {
+    std::env::var_os("HOME").map(|home| {
+        PathBuf::from(home)
+            .join(".docker")
+            .join("contexts")
+            .join("meta")
+    })
 }
 
 fn docker_uri(path: &str) -> String {
@@ -737,6 +829,137 @@ fn docker_uri(path: &str) -> String {
 
 fn encode_component(raw: &str) -> String {
     utf8_percent_encode(raw, NON_ALPHANUMERIC).to_string()
+}
+
+#[derive(Deserialize)]
+struct DockerConfig {
+    #[serde(rename = "currentContext")]
+    current_context: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct DockerContextMetadata {
+    #[serde(rename = "Name")]
+    name: String,
+    #[serde(rename = "Endpoints")]
+    endpoints: DockerContextEndpoints,
+}
+
+#[derive(Deserialize)]
+struct DockerContextEndpoints {
+    docker: Option<DockerContextEndpoint>,
+}
+
+#[derive(Deserialize)]
+struct DockerContextEndpoint {
+    #[serde(rename = "Host")]
+    host: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Mutex, OnceLock};
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    fn unique_temp_dir(prefix: &str) -> PathBuf {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("{}_{}_{}", prefix, std::process::id(), stamp));
+        fs::create_dir_all(&dir).expect("create temp dir");
+        dir
+    }
+
+    fn write_file(path: &Path, body: &str) {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).expect("create parents");
+        }
+        fs::write(path, body).expect("write file");
+    }
+
+    #[test]
+    fn docker_socket_path_uses_docker_host_when_present() {
+        let _guard = env_lock().lock().expect("env lock");
+        let old_home = std::env::var_os("HOME");
+        let old_host = std::env::var_os("DOCKER_HOST");
+        let old_context = std::env::var_os("DOCKER_CONTEXT");
+        let home = unique_temp_dir("docker_socket_host");
+
+        std::env::set_var("HOME", &home);
+        std::env::set_var("DOCKER_HOST", "unix:///tmp/test-docker.sock");
+        std::env::remove_var("DOCKER_CONTEXT");
+
+        let resolved = docker_socket_path().expect("socket path");
+        assert_eq!(resolved, PathBuf::from("/tmp/test-docker.sock"));
+
+        match old_home {
+            Some(value) => std::env::set_var("HOME", value),
+            None => std::env::remove_var("HOME"),
+        }
+        match old_host {
+            Some(value) => std::env::set_var("DOCKER_HOST", value),
+            None => std::env::remove_var("DOCKER_HOST"),
+        }
+        match old_context {
+            Some(value) => std::env::set_var("DOCKER_CONTEXT", value),
+            None => std::env::remove_var("DOCKER_CONTEXT"),
+        }
+        let _ = fs::remove_dir_all(home);
+    }
+
+    #[test]
+    fn docker_socket_path_uses_current_context_from_docker_config() {
+        let _guard = env_lock().lock().expect("env lock");
+        let old_home = std::env::var_os("HOME");
+        let old_host = std::env::var_os("DOCKER_HOST");
+        let old_context = std::env::var_os("DOCKER_CONTEXT");
+        let home = unique_temp_dir("docker_socket_context");
+
+        write_file(
+            &home.join(".docker").join("config.json"),
+            r#"{"currentContext":"orbstack"}"#,
+        );
+        write_file(
+            &home
+                .join(".docker")
+                .join("contexts")
+                .join("meta")
+                .join("abc123")
+                .join("meta.json"),
+            r#"{"Name":"orbstack","Endpoints":{"docker":{"Host":"unix:///Users/test/.orbstack/run/docker.sock"}}}"#,
+        );
+
+        std::env::set_var("HOME", &home);
+        std::env::remove_var("DOCKER_HOST");
+        std::env::remove_var("DOCKER_CONTEXT");
+
+        let resolved = docker_socket_path().expect("socket path");
+        assert_eq!(
+            resolved,
+            PathBuf::from("/Users/test/.orbstack/run/docker.sock")
+        );
+
+        match old_home {
+            Some(value) => std::env::set_var("HOME", value),
+            None => std::env::remove_var("HOME"),
+        }
+        match old_host {
+            Some(value) => std::env::set_var("DOCKER_HOST", value),
+            None => std::env::remove_var("DOCKER_HOST"),
+        }
+        match old_context {
+            Some(value) => std::env::set_var("DOCKER_CONTEXT", value),
+            None => std::env::remove_var("DOCKER_CONTEXT"),
+        }
+        let _ = fs::remove_dir_all(home);
+    }
 }
 
 fn encode_query_value(raw: &str) -> String {

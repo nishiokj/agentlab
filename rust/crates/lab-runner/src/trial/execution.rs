@@ -1,4 +1,4 @@
-use anyhow::{anyhow, Context, Result};
+use anyhow::{anyhow, Result};
 use chrono::Utc;
 use lab_core::{ensure_dir, sha256_file, AGENTLAB_CONTRACT_IN_DIR, AGENTLAB_CONTRACT_OUT_DIR};
 use serde_json::Value;
@@ -14,38 +14,36 @@ use std::time::Duration;
 use crate::backend::docker::{
     ContainerHandle, ContainerMount, ContainerSpec, DockerRuntime, ExecSpec,
 };
+use crate::experiment::runner::{
+    map_contract_path_to_host, ContractPathHostRoots, ContractPathMode,
+};
+use crate::experiment::runtime::AgentRuntimeConfig;
+use crate::model::{
+    BenchmarkGraderConfig, GradingStrategy, PreparedTrialIo, ResolvedMountReference,
+    AGENTLAB_ENV_AGENT_EXIT_STATUS, MAPPED_GRADER_OUTPUT_FILENAME, RAW_GRADER_OUTPUT_FILENAME,
+};
 use crate::trial::artifacts::{
     artifact_type_from_trial_input_path, extract_candidate_artifact_record,
     load_trial_output_resilient,
 };
 use crate::trial::env::{
-    benchmark_grader_expected_output_filename, benchmark_grader_uses_mapper,
-    build_exec_env, replace_task_workdir_placeholder,
+    benchmark_grader_expected_output_filename, benchmark_grader_uses_mapper, build_exec_env,
     resolve_benchmark_conclusion_mapper_command, resolve_benchmark_grader_command,
     resolve_grading_phase, resolve_runtime_agent_command, ResolvedGradingPhase,
 };
 use crate::trial::grade::{
-    build_grading_sandbox_plan, build_hidden_asset_bindings,
-    materialize_injected_grader_bundle, reveal_hidden_assets, stash_hidden_assets,
-    validate_benchmark_grading_contract, write_grader_input_file,
+    build_grading_sandbox_plan, build_hidden_asset_bindings, materialize_injected_grader_bundle,
+    reveal_hidden_assets, stash_hidden_assets, validate_benchmark_grading_contract,
+    write_grader_input_file,
 };
+use crate::trial::prepare::TrialPaths;
+use crate::trial::spec::TaskMaterializationKind;
 use crate::trial::state::{
     new_trial_attempt_state, reconcile_trial_attempt_as_abandoned, set_trial_attempt_phase,
     write_trial_attempt_state, AgentPhaseRecord, ContractFileState, GraderMappingPhaseRecord,
-    GraderOutputMode, GradingPhaseRecord, GradingSandboxDetails, GradingSandboxPlan,
-    GradingSandboxState, IoMountPlan, TaskSandboxPlan, TaskSandboxState, TrialAttemptState,
+    GradingPhaseRecord, GradingSandboxState, TaskSandboxPlan, TaskSandboxState, TrialAttemptState,
     TrialPhase,
 };
-use crate::config::atomic_write_json_pretty;
-use crate::experiment::runtime::AgentRuntimeConfig;
-use crate::model::{
-    ArtifactType, BenchmarkGraderConfig, GradingStrategy, PreparedTrialIo, ResolvedMountReference,
-    AGENTLAB_ENV_AGENT_EXIT_STATUS, AGENT_ARTIFACT_PATH_ENV_VALUE,
-    MAPPED_GRADER_OUTPUT_FILENAME, RAW_GRADER_OUTPUT_FILENAME,
-};
-use crate::trial::spec::TaskMaterializationKind;
-use crate::experiment::runner::{ContractPathHostRoots, ContractPathMode, map_contract_path_to_host};
-use crate::trial::prepare::TrialPaths;
 use crate::util::output_error_detail;
 use lab_schemas::compile_schema;
 
@@ -358,10 +356,7 @@ pub(crate) fn execute_trial_runtime(
                     env: build_exec_env(
                         request,
                         &grading_phase_resolved.workdir,
-                        Some((
-                            AGENTLAB_ENV_AGENT_EXIT_STATUS,
-                            agent_exit_status.as_str(),
-                        )),
+                        Some((AGENTLAB_ENV_AGENT_EXIT_STATUS, agent_exit_status.as_str())),
                         false,
                     ),
                     workdir: Some(grading_phase_resolved.workdir.clone()),

@@ -1,6 +1,5 @@
 use anyhow::{anyhow, Context, Result};
 use lab_core::{sha256_bytes, sha256_file, AGENTLAB_TASK_WORKDIR_PLACEHOLDER};
-use serde::Deserialize;
 use serde_json::Value;
 use std::collections::{BTreeMap, HashSet};
 use std::fs;

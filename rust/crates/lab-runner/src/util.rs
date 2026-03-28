@@ -1,10 +1,10 @@
 use anyhow::{anyhow, Result};
 use lab_core::ensure_dir;
 use std::fs;
-use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
 #[cfg(unix)]
 use std::os::unix::fs::{symlink, PermissionsExt};
+use std::path::Path;
+use std::process::{Command, Output};
 
 pub(crate) fn shell_join(parts: &[String]) -> String {
     parts
@@ -199,11 +199,7 @@ pub(crate) fn copy_dir_preserve_contents(src: &Path, dst: &Path) -> Result<()> {
     Ok(())
 }
 
-pub(crate) fn copy_dir_with_policy(
-    src: &Path,
-    dst: &Path,
-    exclude: &[&str],
-) -> Result<()> {
+pub(crate) fn copy_dir_with_policy(src: &Path, dst: &Path, exclude: &[&str]) -> Result<()> {
     let walker = walkdir::WalkDir::new(src).into_iter().filter_entry(|e| {
         let rel = e.path().strip_prefix(src).unwrap_or(e.path());
         if rel.as_os_str().is_empty() {

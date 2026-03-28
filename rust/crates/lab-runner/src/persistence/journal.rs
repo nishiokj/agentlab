@@ -1,15 +1,15 @@
+use crate::experiment::state::SlotCommitRecord;
+use crate::model::RUNTIME_KEY_RUN_CONTROL;
+use crate::package::validate::validate_schema_contract_value;
 use crate::persistence::rows::{
     infer_run_dir_from_path, json_row_table_from_path, path_uses_sqlite_json_row_ingest,
     row_has_sqlite_identity_fields, EventRow, MetricRow, RunManifestRecord, TrialRecord,
     VariantSnapshotRow,
 };
-use crate::experiment::state::SlotCommitRecord;
 use crate::persistence::store::{
     EventRowInsert, MetricRowInsert, SqliteRunStore as BackingSqliteStore, TrialRowInsert,
     VariantSnapshotRowInsert,
 };
-use crate::model::RUNTIME_KEY_RUN_CONTROL;
-use crate::package::validate::validate_schema_contract_value;
 use anyhow::{anyhow, Result};
 use lab_core::ensure_dir;
 use serde_json::{json, Value};
