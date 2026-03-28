@@ -4,8 +4,8 @@ use serde_json::Value;
 use std::path::{Path, PathBuf};
 
 use crate::config::*;
-use crate::model::*;
 use crate::model::STAGING_MANIFEST_FILE;
+use crate::model::*;
 
 pub(crate) fn resolve_package_path_under_root(
     package_dir: &Path,

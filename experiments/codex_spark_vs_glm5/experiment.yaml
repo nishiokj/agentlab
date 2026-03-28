@@ -1,0 +1,56 @@
+experiment:
+  id: codex_spark_vs_glm5_swebench
+  name: Codex Spark (medium reasoning) vs GLM-5 (reasoning on)
+  workload_type: agent_runtime
+
+baseline:
+  variant_id: codex_spark
+  bindings:
+    model_provider: codex
+    model: codex-spark
+    reasoning: medium
+
+variant_plan:
+  - variant_id: glm_5
+    bindings:
+      model_provider: z.ai-coder
+      model: glm-5
+      reasoning: "on"
+
+dataset:
+  suite_id: swebench_lite_curated
+  provider: local_jsonl
+  path: ../../.lab/experiments/data/swebench_lite_curated.task_spec.jsonl
+  split_id: test
+  limit: 3
+
+design:
+  replications: 1
+  max_concurrency: 2
+
+runtime:
+  agent_runtime:
+    artifact: /Users/jevinnishioka/Desktop/jesus/.lab/agents/rex-current.linux-x64.tar.gz
+    image: task_image
+    command: [/opt/agent/bin/bun, /opt/agent/bin/rex.js, run, --provider, $model_provider, --model, $model, --reasoning, $reasoning]
+    network: full
+
+benchmark:
+  grader:
+    strategy: in_task_image
+    command: [python3, grader.py]
+    conclusion:
+      mode: direct
+
+metrics:
+  - id: resolved
+    source: output
+    json_pointer: /metrics/resolved
+    direction: maximize
+    primary: true
+    weight: 1
+
+policy:
+  timeout_ms: 600000
+  task_sandbox:
+    network: full

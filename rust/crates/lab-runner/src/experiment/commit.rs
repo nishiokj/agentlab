@@ -11,9 +11,9 @@ use std::path::Path;
 use crate::experiment::runner::emit_slot_commit_progress;
 use crate::experiment::state::*;
 use crate::model::*;
+use crate::persistence::journal::append_jsonl;
 use crate::persistence::journal::*;
 use crate::persistence::rows::*;
-use crate::persistence::journal::append_jsonl;
 
 pub(crate) fn make_slot_commit_id(
     run_id: &str,

@@ -1,18 +1,18 @@
 use anyhow::{anyhow, Result};
 use lab_core::{
-    canonical_json_digest, ensure_dir, runner_runtime_host_paths, ArtifactStore,
-    RunnerRuntimeHostPaths, AGENTLAB_CONTRACT_IN_DIR, AGENTLAB_CONTRACT_OUT_DIR,
-    AGENTLAB_ENV_GRADER_INPUT_PATH, AGENTLAB_ENV_MAPPED_GRADER_OUTPUT_PATH,
-    AGENTLAB_ENV_RAW_GRADER_OUTPUT_PATH, AGENTLAB_ENV_REPL_IDX, AGENTLAB_ENV_RESULT_PATH,
-    AGENTLAB_ENV_RUN_ID, AGENTLAB_ENV_TASK_ID, AGENTLAB_ENV_TIMEOUT_MS,
-    AGENTLAB_ENV_TRAJECTORY_PATH, AGENTLAB_ENV_TRIAL_ID, AGENTLAB_ENV_TRIAL_INPUT_PATH,
-    AGENTLAB_ENV_VARIANT_ID,
+    canonical_json_digest, ensure_dir, runner_runtime_host_paths, RunnerRuntimeHostPaths,
+    AGENTLAB_CONTRACT_IN_DIR, AGENTLAB_CONTRACT_OUT_DIR, AGENTLAB_ENV_GRADER_INPUT_PATH,
+    AGENTLAB_ENV_MAPPED_GRADER_OUTPUT_PATH, AGENTLAB_ENV_RAW_GRADER_OUTPUT_PATH,
+    AGENTLAB_ENV_REPL_IDX, AGENTLAB_ENV_RESULT_PATH, AGENTLAB_ENV_RUN_ID, AGENTLAB_ENV_TASK_ID,
+    AGENTLAB_ENV_TIMEOUT_MS, AGENTLAB_ENV_TRAJECTORY_PATH, AGENTLAB_ENV_TRIAL_ID,
+    AGENTLAB_ENV_TRIAL_INPUT_PATH, AGENTLAB_ENV_VARIANT_ID,
 };
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::config::{atomic_write_json_pretty, load_json_file};
+use crate::experiment::runtime::AgentRuntimeConfig;
 use crate::model::{
     PreparedContractFilePaths, PreparedMountReference, PreparedTaskEnvironmentManifest,
     PreparedTrialIo, ResolvedMountReference, Variant, AGENTLAB_ENV_TASK_IMAGE,
@@ -21,10 +21,9 @@ use crate::model::{
     DEFAULT_CONTAINER_TRAJECTORY_PATH, DEFAULT_CONTAINER_TRIAL_INPUT_PATH,
 };
 use crate::persistence::rows::infer_run_dir_from_path;
-use crate::experiment::runtime::AgentRuntimeConfig;
-use crate::util::sanitize_for_fs;
 use crate::trial::spec::TaskBoundaryMaterialization;
 use crate::trial::state::{ArtifactMountPlan, IoMountPlan, TaskSandboxPlan};
+use crate::util::sanitize_for_fs;
 
 #[derive(Debug, Clone)]
 pub(crate) struct TrialPaths {
@@ -453,7 +452,7 @@ fn build_task_sandbox_plan(
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn prepare_task_environment_with_paths(
     trial_paths: TrialPaths,
-    project_root: &Path,
+    _project_root: &Path,
     trial_dir: &Path,
     run_id: &str,
     trial_id: &str,

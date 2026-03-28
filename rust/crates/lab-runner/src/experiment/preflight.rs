@@ -17,13 +17,13 @@ use std::thread;
 use std::time::Instant;
 
 use crate::config::*;
-use crate::trial::execution::AdapterRunRequest;
 use crate::experiment::commit::load_optional_json_record_with_schema;
 use crate::experiment::runtime::*;
 use crate::experiment::state::{RunBehavior, RunExecutionOptions};
 use crate::model::*;
 use crate::package::sealed::*;
 use crate::package::validate::*;
+use crate::trial::execution::AdapterRunRequest;
 use crate::trial::grade::task_grading_enabled;
 use crate::trial::prepare::{
     build_runtime_contract_env, load_prepared_task_environment_manifest, prepare_io_paths,
@@ -762,7 +762,7 @@ pub(crate) fn check_disk_headroom(probe_path: &Path) -> PreflightCheck {
 // ---------------------------------------------------------------------------
 
 pub(crate) fn collect_preflight_checks(
-    json_value: &Value,
+    _json_value: &Value,
     _exp_dir: &Path,
     disk_probe_path: &Path,
     project_root: &Path,
@@ -1346,28 +1346,6 @@ pub(crate) fn check_container_ready(
         return checks;
     }
 
-    if let Err(err) = docker.ensure_image(runtime_profile.agent_runtime.image.as_str()) {
-        checks.push(PreflightCheck {
-            name,
-            passed: false,
-            severity: PreflightSeverity::Error,
-            message: format!(
-                "agent runtime image '{}' is not available: {}",
-                runtime_profile.agent_runtime.image, err
-            ),
-        });
-        return checks;
-    }
-    checks.push(PreflightCheck {
-        name,
-        passed: true,
-        severity: PreflightSeverity::Error,
-        message: format!(
-            "agent runtime image '{}' is available",
-            runtime_profile.agent_runtime.image
-        ),
-    });
-
     let images = match resolve_preflight_images(
         name,
         runtime_profile,
@@ -1381,6 +1359,23 @@ pub(crate) fn check_container_ready(
             return checks;
         }
     };
+
+    checks.push(PreflightCheck {
+        name,
+        passed: true,
+        severity: PreflightSeverity::Error,
+        message: if images.len() == 1 {
+            format!(
+                "container execution resolved required image '{}'",
+                images[0]
+            )
+        } else {
+            format!(
+                "container execution resolved {} required image(s)",
+                images.len()
+            )
+        },
+    });
 
     emit_preflight_log(format!(
         "container_ready: probing {} image(s) for availability",

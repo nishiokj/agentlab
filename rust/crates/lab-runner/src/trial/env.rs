@@ -3,14 +3,14 @@ use lab_core::{AGENTLAB_CONTRACT_RUNTIME_AUX_DIR, AGENTLAB_TASK_WORKDIR_PLACEHOL
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use crate::trial::execution::AdapterRunRequest;
+use crate::experiment::preflight::is_runner_staged_script_path;
+use crate::experiment::runtime::TASK_WORKDIR_TEMPLATE_PLACEHOLDER;
 use crate::model::{
     BenchmarkGraderConfig, GraderConclusionMode, GradingStrategy, ResolvedMountReference,
     AGENT_ARTIFACT_PATH_ENV_VALUE, MAPPED_GRADER_OUTPUT_FILENAME, RAW_GRADER_OUTPUT_FILENAME,
 };
 use crate::package::staging::matches_contract_runtime_root;
-use crate::experiment::preflight::is_runner_staged_script_path;
-use crate::experiment::runtime::TASK_WORKDIR_TEMPLATE_PLACEHOLDER;
+use crate::trial::execution::AdapterRunRequest;
 use crate::trial::execution::{
     map_container_path_to_host, resolve_container_workspace, resolve_task_sandbox_image,
 };

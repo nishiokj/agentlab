@@ -1,14 +1,12 @@
 use crate::backend::docker::{ContainerHandle, DockerRuntime};
 use crate::config::load_json_file;
-use crate::trial::state::write_trial_state;
 use crate::experiment::lease::{acquire_run_operation_lease, RunOperationType};
 use crate::experiment::runner::{fork_trial_inner, resolve_resume_selector};
-use crate::model::{
-    ForkResult, RUNTIME_KEY_RUN_CONTROL, RUN_CONTROL_UNKNOWN_WORKER_ID,
-};
 #[cfg(test)]
 use crate::model::ActiveAdapterControl;
+use crate::model::{ForkResult, RUNTIME_KEY_RUN_CONTROL, RUN_CONTROL_UNKNOWN_WORKER_ID};
 use crate::persistence::store::SqliteRunStore;
+use crate::trial::state::write_trial_state;
 use crate::trial::state::{
     load_trial_attempt_container_ids, load_trial_attempt_state, reconcile_trial_attempt_as_killed,
     reconcile_trial_attempt_as_paused, reconcile_trial_attempt_as_resumed,
@@ -411,10 +409,11 @@ pub fn pause_run(
     };
 
     let pause_label = label.unwrap_or("pause").to_string();
-    let active_by_id: HashMap<String, RunControlActiveTrial> = run_control_active_trials(&run_control)
-        .into_iter()
-        .map(|entry| (entry.trial_id.clone(), entry))
-        .collect();
+    let active_by_id: HashMap<String, RunControlActiveTrial> =
+        run_control_active_trials(&run_control)
+            .into_iter()
+            .map(|entry| (entry.trial_id.clone(), entry))
+            .collect();
 
     let mut paused_active_trials: Vec<RunControlActiveTrial> = Vec::new();
     let mut failures: Vec<String> = Vec::new();
@@ -535,10 +534,11 @@ pub fn kill_run(run_dir: &Path) -> Result<KillResult> {
     let run_id = run_control_run_id(&run_control).unwrap_or_else(|| "run".to_string());
 
     let active_trial_ids = run_control_active_trial_ids(&run_control);
-    let active_by_id: HashMap<String, RunControlActiveTrial> = run_control_active_trials(&run_control)
-        .into_iter()
-        .map(|entry| (entry.trial_id.clone(), entry))
-        .collect();
+    let active_by_id: HashMap<String, RunControlActiveTrial> =
+        run_control_active_trials(&run_control)
+            .into_iter()
+            .map(|entry| (entry.trial_id.clone(), entry))
+            .collect();
     let mut survivor_active_trials: Vec<RunControlActiveTrial> = Vec::new();
     let mut killed_trials: Vec<String> = Vec::new();
     let mut failures: Vec<String> = Vec::new();
@@ -695,7 +695,8 @@ pub fn resume_trial(
         ));
     }
     let pause_label = trial_state.pointer("/pause_label").and_then(|v| v.as_str());
-    let selector = resolve_resume_selector(&run_dir, &run_id, &target_trial, label.or(pause_label))?;
+    let selector =
+        resolve_resume_selector(&run_dir, &run_id, &target_trial, label.or(pause_label))?;
 
     let fork = fork_trial_inner(&run_dir, &target_trial, &selector, set_bindings, strict)?;
     Ok(ResumeResult {

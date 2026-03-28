@@ -1,10 +1,10 @@
-use crate::persistence::store::SqliteRunStore;
-use crate::model::{
-    MaterializationMode, RUNTIME_KEY_RUN_SESSION_STATE, RUNTIME_KEY_SCHEDULE_PROGRESS,
-    TrialExecutionResult, TrialSlot,
-};
 #[cfg(test)]
 use crate::model::ExecutorKind;
+use crate::model::{
+    MaterializationMode, TrialExecutionResult, TrialSlot, RUNTIME_KEY_RUN_SESSION_STATE,
+    RUNTIME_KEY_SCHEDULE_PROGRESS,
+};
+use crate::persistence::store::SqliteRunStore;
 
 use anyhow::{anyhow, Result};
 use chrono::Utc;

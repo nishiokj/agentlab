@@ -5441,7 +5441,8 @@ mod tests {
 
     #[test]
     fn preflight_resolve_images_reports_missing_global_image() {
-        let profile = preflight_test_runtime_profile(ImageSource::Global, None);
+        let mut profile = preflight_test_runtime_profile(ImageSource::Global, None);
+        profile.agent_runtime.image.clear();
         let check = resolve_preflight_images(
             "container_ready",
             &profile,
@@ -5453,6 +5454,17 @@ mod tests {
         assert_eq!(check.name, "container_ready");
         assert!(!check.passed);
         assert!(check.message.contains("global image missing"));
+    }
+
+    #[test]
+    fn preflight_resolve_images_falls_back_to_global_image_when_tasks_absent() {
+        let profile = preflight_test_runtime_profile(ImageSource::Global, Some("python:3.11-slim"));
+
+        let images =
+            resolve_preflight_images("container_ready", &profile, &[], None, "unused")
+                .expect("global image should resolve");
+
+        assert_eq!(images, vec!["python:3.11-slim".to_string()]);
     }
 
     #[test]
@@ -5470,6 +5482,32 @@ mod tests {
         assert!(check
             .message
             .contains("failed to parse packaged task_row_v1 rows"));
+    }
+
+    #[test]
+    fn preflight_resolve_images_prefers_per_task_images_over_task_image_sentinel() {
+        let mut profile = preflight_test_runtime_profile(ImageSource::PerTask, Some("task_image"));
+        profile.agent_runtime.image = "task_image".to_string();
+        let scan = PerTaskImageScanResult {
+            unique_images: vec![
+                "swebench/task-a:latest".to_string(),
+                "swebench/task-b:latest".to_string(),
+            ],
+            missing_task_ids: Vec::new(),
+            parse_errors: Vec::new(),
+        };
+
+        let images =
+            resolve_preflight_images("container_ready", &profile, &[], Some(&scan), "unused")
+                .expect("per-task images should resolve");
+
+        assert_eq!(
+            images,
+            vec![
+                "swebench/task-a:latest".to_string(),
+                "swebench/task-b:latest".to_string(),
+            ]
+        );
     }
 
     #[test]

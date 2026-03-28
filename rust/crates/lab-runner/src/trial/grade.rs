@@ -10,11 +10,8 @@ use std::time::Duration;
 
 use crate::backend::docker::{ContainerHandle, DockerRuntime, ExecSpec};
 use crate::config::{atomic_write_json_pretty, trial_conclusion_outcome_to_trial_outcome};
-use crate::trial::execution::AdapterRunRequest;
 use crate::experiment::runner::agent_artifact_archive_flag;
 use crate::model::*;
-use crate::trial::execution::validate_container_workspace_path;
-use crate::util::{copy_file_if_exists, sanitize_for_fs, shell_quote};
 use crate::trial::artifacts::{
     artifact_type_from_trial_input, extract_candidate_artifact_record, trial_output_payload_view,
 };
@@ -22,10 +19,13 @@ use crate::trial::env::{
     benchmark_grader_uses_mapper, resolve_benchmark_conclusion_mapper_command,
     resolve_benchmark_grader_command, ResolvedGradingPhase,
 };
+use crate::trial::execution::validate_container_workspace_path;
+use crate::trial::execution::AdapterRunRequest;
 use crate::trial::prepare::TrialPaths;
 use crate::trial::state::{
     GraderOutputMode, GradingSandboxDetails, GradingSandboxPlan, IoMountPlan,
 };
+use crate::util::{copy_file_if_exists, sanitize_for_fs, shell_quote};
 
 pub(crate) struct HiddenAssetBinding {
     pub(crate) hidden_path: String,
@@ -143,9 +143,7 @@ fn resolve_in_task_image_hidden_asset_pairs(
     Ok(bindings)
 }
 
-fn validate_in_task_image_hidden_asset_isolation(
-    grader: &BenchmarkGraderConfig,
-) -> Result<()> {
+fn validate_in_task_image_hidden_asset_isolation(grader: &BenchmarkGraderConfig) -> Result<()> {
     let _ = resolve_in_task_image_hidden_asset_pairs(grader)?;
     Ok(())
 }
