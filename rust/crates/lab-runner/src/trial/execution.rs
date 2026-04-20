@@ -179,6 +179,7 @@ pub(crate) fn execute_trial_runtime(
                 task_sandbox_plan.time_limit_ms,
             )?;
         }
+        //Lots of clones here. Why? ###Codex 
         let task_sandbox = TaskSandboxState {
             container_id: task_handle.container_id.clone(),
             image: task_sandbox_plan.image.clone(),
@@ -192,6 +193,7 @@ pub(crate) fn execute_trial_runtime(
         set_trial_attempt_phase(trial_dir, &mut attempt_state, TrialPhase::AgentRunning)?;
 
         let agent_started_at = Utc::now().to_rfc3339();
+        //Is there overlap here with ExecSpec? seems like workingDir is used twice, is agent path also a component of command? ###Codex
         let agent_exec = docker.exec(
             &task_handle,
             &ExecSpec {

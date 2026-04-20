@@ -163,6 +163,7 @@ impl DockerRuntime {
     }
 
     pub(crate) fn exec(&self, handle: &ContainerHandle, spec: &ExecSpec) -> Result<ExecHandle> {
+        //What is this block_on? Is this a mutex? Is this really desirable? ###Codex 
         self.runtime.block_on(self.exec_async(handle, spec))
     }
 
@@ -238,8 +239,30 @@ impl DockerRuntime {
             }
         }
 
-        self.pull_image_async(image_ref).await?;
-        self.inspect_image_async(image_ref).await
+        let primary_pull_error = match self.pull_image_async(image_ref).await {
+            Ok(()) => return self.inspect_image_async(image_ref).await,
+            Err(err) => err,
+        };
+
+        let mut attempted_remote_aliases = Vec::new();
+        for remote_alias in resolve_remote_image_aliases(image_ref) {
+            attempted_remote_aliases.push(remote_alias.clone());
+            if self.pull_image_async(&remote_alias).await.is_ok() {
+                self.tag_image_async(&remote_alias, image_ref).await?;
+                return self.inspect_image_async(image_ref).await;
+            }
+        }
+
+        if attempted_remote_aliases.is_empty() {
+            return Err(primary_pull_error);
+        }
+
+        Err(primary_pull_error).with_context(|| {
+            format!(
+                "also tried alternate image refs: {}",
+                attempted_remote_aliases.join(", ")
+            )
+        })
     }
 
     async fn inspect_image_async(&self, image_ref: &str) -> Result<ImageMetadata> {
@@ -960,6 +983,24 @@ mod tests {
         }
         let _ = fs::remove_dir_all(home);
     }
+
+    #[test]
+    fn resolve_remote_image_aliases_maps_swebench_eval_images() {
+        assert_eq!(
+            resolve_remote_image_aliases("swebench/sweb.eval.x86_64.astropy__astropy-14365:latest"),
+            vec![
+                "ghcr.io/epoch-research/swe-bench.eval.x86_64.astropy__astropy-14365:latest"
+                    .to_string(),
+                "slimshetty/swebench-lite:sweb.eval.x86_64.astropy__astropy-14365".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn resolve_remote_image_aliases_ignores_non_swebench_images() {
+        assert!(resolve_remote_image_aliases("python:3.11-slim").is_empty());
+        assert!(resolve_remote_image_aliases("ghcr.io/acme/task-image:latest").is_empty());
+    }
 }
 
 fn encode_query_value(raw: &str) -> String {
@@ -1005,6 +1046,28 @@ fn resolve_local_image_alias(image: &str) -> Option<String> {
         .strip_prefix("swebench/")
         .filter(|candidate| candidate.starts_with("sweb.eval."))
         .map(ToString::to_string)
+}
+
+fn resolve_remote_image_aliases(image: &str) -> Vec<String> {
+    let candidate = match image
+        .strip_prefix("swebench/")
+        .filter(|candidate| candidate.starts_with("sweb.eval."))
+    {
+        Some(value) => value,
+        None => return Vec::new(),
+    };
+
+    let mut aliases = vec![format!(
+        "ghcr.io/epoch-research/{}",
+        candidate.replacen("sweb.eval.", "swe-bench.eval.", 1)
+    )];
+
+    let (repo, tag) = split_image_reference(candidate);
+    if matches!(tag, Some("latest")) {
+        aliases.push(format!("slimshetty/swebench-lite:{}", repo));
+    }
+
+    aliases
 }
 
 fn is_not_found_error(err: &anyhow::Error) -> bool {

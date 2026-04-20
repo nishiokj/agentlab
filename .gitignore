@@ -55,3 +55,5 @@ bench/taskkit/validate_task.py
 .pytest_cache/
 .coverage
 htmlcov/
+
+docs

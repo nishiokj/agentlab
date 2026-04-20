@@ -4,10 +4,10 @@ experiment:
   workload_type: agent_runtime
 
 baseline:
-  variant_id: codex_spark
+  variant_id: codex_spark1
   bindings:
     model_provider: codex
-    model: codex-spark
+    model: gpt-5.3-codex-spark
     reasoning: medium
 
 variant_plan:
@@ -30,9 +30,25 @@ design:
 
 runtime:
   agent_runtime:
-    artifact: /Users/jevinnishioka/Desktop/jesus/.lab/agents/rex-current.linux-x64.tar.gz
+    artifact: /Users/jevinnishioka/Desktop/Experiments/.lab/agents/rex-current-rebuilt.linux-x64.tar.gz
     image: task_image
-    command: [/opt/agent/bin/bun, /opt/agent/bin/rex.js, run, --provider, $model_provider, --model, $model, --reasoning, $reasoning]
+    command:
+      [
+        /opt/agent/bin/rex,
+        run,
+        --config,
+        /opt/agent/config/defaults.json,
+        --input-file,
+        /agentlab/in/trial_input.json,
+        --output,
+        /agentlab/out/result.json,
+        --provider,
+        $model_provider,
+        --model,
+        $model,
+        --reasoning,
+        $reasoning,
+      ]
     network: full
 
 benchmark:

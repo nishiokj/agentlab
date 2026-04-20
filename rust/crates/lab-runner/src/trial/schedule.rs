@@ -10,9 +10,6 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use crate::config::*;
-use crate::experiment::runner::{
-    materialize_trial_runtime_layout, resolve_agent_runtime_manifest_path, write_state_inventory,
-};
 use crate::experiment::runtime::{resolve_exec_digest, VariantRuntimeProfile};
 use crate::model::*;
 use crate::persistence::journal::append_jsonl;
@@ -23,6 +20,9 @@ use crate::trial::artifacts::trial_output_payload_view;
 use crate::trial::events::{build_metric_rows, build_variant_snapshot_rows, load_event_rows};
 use crate::trial::execution::AdapterRunRequest;
 use crate::trial::grade::{mapped_grader_output_state, task_grading_enabled};
+use crate::trial::layout::{
+    materialize_trial_runtime_layout, resolve_agent_runtime_manifest_path, write_state_inventory,
+};
 use crate::trial::preflight::stage_benchmark_trial_preflight;
 use crate::trial::prepare::{
     prepare_task_environment, prepare_task_environment_with_paths, PreparedTaskEnvironment,

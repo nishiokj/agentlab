@@ -65,6 +65,7 @@ mod tests {
         validate_container_workspace_path,
     };
     use crate::trial::grade::benchmark_retry_inputs;
+    use crate::trial::layout::*;
     use crate::trial::execution::AdapterRunRequest;
     use crate::trial::preflight::stage_benchmark_trial_preflight;
     use crate::trial::prepare::{
@@ -5440,6 +5441,65 @@ mod tests {
     }
 
     #[test]
+    fn prepare_task_environment_carries_dependency_file_staging_into_dynamic_mounts() {
+        let root = TempDirGuard::new("agentlab_prepare_dependency_mounts");
+        let trial_dir = root.path.join("trial_1");
+        ensure_dir(&trial_dir).expect("trial dir");
+
+        let staged_grader = root.path.join("grader.py");
+        fs::write(&staged_grader, "#!/usr/bin/env python3\nprint('ok')\n").expect("grader");
+
+        let mut runtime = legacy_contract_runtime_fixture();
+        runtime.dependency_file_staging = vec![DependencyFileStagingSpec {
+            source_from_host: staged_grader.clone(),
+            destination_path: task_workdir_support_destination_path("grader.py"),
+            required: true,
+            read_only: true,
+        }];
+
+        let variant = preflight_test_variant();
+        let task_boundary = runtime_task_boundary(
+            json!({
+                "id": "task_1",
+                "task": {
+                    "input": {
+                        "prompt": "solve it"
+                    }
+                }
+            }),
+            "python:3.11-slim",
+            "/testbed",
+            None,
+        );
+
+        let prepared = prepare_task_environment(
+            &root.path,
+            &trial_dir,
+            "run_1",
+            "trial_1",
+            &json!({ "policy": { "timeout_ms": 30000 } }),
+            &variant,
+            0,
+            0,
+            &task_boundary,
+            &runtime,
+        )
+        .expect("prepare task environment");
+
+        assert_eq!(prepared.dynamic_mounts.len(), 1);
+        assert_eq!(prepared.dynamic_mounts[0].host_path, staged_grader);
+        assert_eq!(
+            prepared.dynamic_mounts[0].mount_path,
+            "/testbed/.agentlab/support/grader.py"
+        );
+        assert_eq!(prepared.manifest.aux_mounts.len(), 1);
+        assert_eq!(
+            prepared.manifest.aux_mounts[0].mount_path,
+            "/testbed/.agentlab/support/grader.py"
+        );
+    }
+
+    #[test]
     fn preflight_resolve_images_reports_missing_global_image() {
         let mut profile = preflight_test_runtime_profile(ImageSource::Global, None);
         profile.agent_runtime.image.clear();
@@ -7956,6 +8016,115 @@ mod tests {
         assert_eq!(
             resolved,
             vec!["agent".to_string(), "/workspace/task".to_string()]
+        );
+    }
+
+    #[test]
+    fn resolve_runtime_agent_command_appends_rex_file_io_flags() {
+        let (_root, paths) = create_trial_paths_fixture("agentlab_rex_file_io_flags");
+        let mut runtime = legacy_contract_runtime_fixture();
+        runtime.command_raw = vec![
+            "/opt/agent/bin/bun".to_string(),
+            "/opt/agent/bin/rex.js".to_string(),
+            "run".to_string(),
+            "--provider".to_string(),
+            "codex".to_string(),
+            "--model".to_string(),
+            "codex-spark".to_string(),
+        ];
+        runtime.io = AgentRuntimeIoConfig {
+            input_arg: String::new(),
+            output_arg: String::new(),
+        };
+        let io_paths = prepared_trial_io_fixture(
+            paths.out.join("result.json"),
+            paths.state.join("events.jsonl"),
+        );
+        let empty_json = json!({});
+        let request = AdapterRunRequest {
+            runtime_experiment: &empty_json,
+            runtime: &runtime,
+            variant_args: &[],
+            runtime_env: &BTreeMap::new(),
+            runtime_overrides_env: &BTreeMap::new(),
+            trial_paths: &paths,
+            dynamic_mounts: &[],
+            io_paths: &io_paths,
+            network_mode: "none",
+            benchmark_grader: None,
+            benchmark_grading_enabled: false,
+            run_id: "run_1",
+            task_image: "python:3.11-slim",
+            task_workdir: "/workspace/task",
+            task_materialization_kind: TaskMaterializationKind::TaskImage,
+            agent_artifact: None,
+        };
+
+        let resolved = resolve_runtime_agent_command(&request).expect("resolve runtime command");
+        assert!(
+            command_contains_flag_value(&resolved, "--input-file", &request.io_paths.trial_input_path),
+            "rex command should receive --input-file: {:?}",
+            resolved
+        );
+        assert!(
+            command_contains_flag_value(&resolved, "--output", &request.io_paths.result_path),
+            "rex command should receive --output: {:?}",
+            resolved
+        );
+    }
+
+    #[test]
+    fn resolve_runtime_agent_command_does_not_duplicate_existing_rex_input_flags() {
+        let (_root, paths) = create_trial_paths_fixture("agentlab_rex_existing_io_flags");
+        let mut runtime = legacy_contract_runtime_fixture();
+        runtime.command_raw = vec![
+            "rex".to_string(),
+            "run".to_string(),
+            "--input-file".to_string(),
+            "/tmp/task.json".to_string(),
+            "--output".to_string(),
+            "/tmp/result.json".to_string(),
+        ];
+        runtime.io = AgentRuntimeIoConfig {
+            input_arg: String::new(),
+            output_arg: String::new(),
+        };
+        let io_paths = prepared_trial_io_fixture(
+            paths.out.join("result.json"),
+            paths.state.join("events.jsonl"),
+        );
+        let empty_json = json!({});
+        let request = AdapterRunRequest {
+            runtime_experiment: &empty_json,
+            runtime: &runtime,
+            variant_args: &[],
+            runtime_env: &BTreeMap::new(),
+            runtime_overrides_env: &BTreeMap::new(),
+            trial_paths: &paths,
+            dynamic_mounts: &[],
+            io_paths: &io_paths,
+            network_mode: "none",
+            benchmark_grader: None,
+            benchmark_grading_enabled: false,
+            run_id: "run_1",
+            task_image: "python:3.11-slim",
+            task_workdir: "/workspace/task",
+            task_materialization_kind: TaskMaterializationKind::TaskImage,
+            agent_artifact: None,
+        };
+
+        let resolved = resolve_runtime_agent_command(&request).expect("resolve runtime command");
+        assert_eq!(
+            resolved.iter().filter(|arg| arg.as_str() == "--input-file").count(),
+            1,
+            "rex command should not duplicate --input-file: {:?}",
+            resolved
+        );
+        assert_eq!(
+            resolved.iter().filter(|arg| arg.as_str() == "--output").count(),
+            1,
+            "rex command should not duplicate --output: {:?}",
+            resolved
         );
     }
 

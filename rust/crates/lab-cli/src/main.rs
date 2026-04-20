@@ -732,12 +732,21 @@ fn stale_binary_guard_error(
         .duration_since(UNIX_EPOCH)
         .unwrap_or(Duration::ZERO)
         .as_secs();
+    let rebuild_cmd = if exe_path
+        .components()
+        .any(|component| component.as_os_str() == "debug")
+    {
+        "cargo build --manifest-path rust/Cargo.toml -p lab-cli"
+    } else {
+        "cargo build --manifest-path rust/Cargo.toml -p lab-cli --release"
+    };
     anyhow!(
-        "stale lab-cli binary detected: executable '{}' (mtime={}s) is older than source '{}' (mtime={}s). Rebuild with `cargo build -p lab-cli --release` and rerun.",
+        "stale lab-cli binary detected: executable '{}' (mtime={}s) is older than source '{}' (mtime={}s). Rebuild with `{}` and rerun.",
         exe_path.display(),
         exe_secs,
         source_path.display(),
-        source_secs
+        source_secs,
+        rebuild_cmd
     )
 }
 
