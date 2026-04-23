@@ -579,7 +579,7 @@ def artifact_bundle(tmp_path_factory: pytest.TempPathFactory) -> Path:
         'exec python3 "$SCRIPT_DIR/e2e_agent.py" "$@"\n',
         encoding="utf-8",
     )
-    os.chmod(wrapper_path, 0o755)
+    wrapper_path.chmod(0o755)
 
     shutil.copy2(FIXTURES_DIR / "e2e_agent.py", bin_dir / "e2e_agent.py")
 

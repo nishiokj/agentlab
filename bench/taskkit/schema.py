@@ -65,7 +65,6 @@ def validate_all_schemas(schemas_dir: Path) -> list[str]:
             errors.append(f"Invalid JSON in {name}: {e}")
             continue
         # Check that the schema itself is a valid JSON Schema
-        meta_schema_uri = schema.get("$schema", "")
         try:
             jsonschema.Draft202012Validator.check_schema(schema)
         except jsonschema.SchemaError as e:

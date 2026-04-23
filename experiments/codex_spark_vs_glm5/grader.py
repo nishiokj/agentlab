@@ -13,7 +13,6 @@ import sys
 from pathlib import Path
 from typing import Any
 
-
 # ---------------------------------------------------------------------------
 # SWE-bench metadata extraction (inlined from _swebench_meta.py)
 # ---------------------------------------------------------------------------
@@ -249,4 +248,4 @@ if __name__ == "__main__":
         raise SystemExit(main())
     except Exception as exc:
         print(f"grader.py error: {exc}", file=sys.stderr)
-        raise SystemExit(1)
+        raise SystemExit(1) from exc

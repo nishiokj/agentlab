@@ -9,9 +9,8 @@ import pathlib
 import re
 import subprocess
 import sys
+from collections.abc import Iterable
 from dataclasses import dataclass
-from typing import Iterable
-
 
 TEST_PATH_RE = re.compile(
     r"(^|/)(__tests__|tests)(/|$)|\.(test|spec)\.[A-Za-z0-9]+$"
@@ -65,7 +64,7 @@ LINE_PATTERNS = [
         "impl-rationalization",
         "Comment rationalizes current implementation",
         -3,
-        re.compile(r"current implementation|by design|tried first|matches first|priority ordering", re.I),
+        re.compile(r"current implementation|by design|tried first|matches first|priority ordering", re.IGNORECASE),
     ),
     SmellPattern(
         "conditional-assertion",
@@ -145,9 +144,10 @@ def smell_hits(path: pathlib.Path) -> dict:
     for idx, line in enumerate(lines, start=1):
         for pattern in LINE_PATTERNS:
             if pattern.regex.search(line):
-                if pattern.code == "conditional-assertion":
-                    if not window_match(lines, idx - 1, re.compile(r"\bexpect\("), window=4):
-                        continue
+                if pattern.code == "conditional-assertion" and not window_match(
+                    lines, idx - 1, re.compile(r"\bexpect\("), window=4
+                ):
+                    continue
                 hits.append(
                     {
                         "code": pattern.code,

@@ -8,7 +8,6 @@ import json
 from pathlib import Path
 from typing import Any
 
-
 DEFAULT_INPUT = (
     ".lab/runs/run_20260223_025729/trials/trial_1/dataset/swebench_lite_curated.jsonl"
 )

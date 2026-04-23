@@ -10,11 +10,11 @@ import json
 import subprocess
 import sys
 import time
-from dataclasses import dataclass, field, asdict
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
-from bench.taskkit.determinism import enforce_determinism_env, stable_json
+from bench.taskkit.determinism import enforce_determinism_env
 
 
 def _as_non_negative_float(value: Any) -> float:
@@ -66,7 +66,7 @@ class HiddenSuiteResult:
 def run_hidden_suite(
     workspace: Path,
     hidden_dir: Path,
-    task_data: dict[str, Any],
+    _task_data: dict[str, Any],
     timeout: int = 60,
     per_case_timeout: int = 5,
     determinism_env: dict[str, str] | None = None,
@@ -111,7 +111,7 @@ def run_hidden_suite(
             cwd=str(workspace),
         )
         duration_ms = (time.monotonic() - start) * 1000
-    except subprocess.TimeoutExpired as e:
+    except subprocess.TimeoutExpired:
         duration_ms = (time.monotonic() - start) * 1000
         return HiddenSuiteResult(
             timed_out=True,

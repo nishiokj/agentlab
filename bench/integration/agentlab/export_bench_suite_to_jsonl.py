@@ -121,7 +121,7 @@ def _resolve_task_image(
     task_yaml: dict[str, Any],
     default_task_image: str | None,
     task_id: str,
-    require_task_image: bool,
+    _require_task_image: bool,
 ) -> str:
     explicit = _candidate_string(task_yaml.get("image"))
     if explicit:
@@ -191,8 +191,7 @@ def _run_checked(command: list[str], cwd: Path | None = None, env: dict[str, str
         command,
         cwd=str(cwd) if cwd is not None else None,
         text=True,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
+        capture_output=True,
         env=env,
     )
     if proc.returncode == 0:
@@ -316,7 +315,7 @@ def _materialize_workspace_base_pack(
                 shutil.rmtree(tmp_dir, ignore_errors=True)
                 return digest
             shutil.rmtree(pack_dir, ignore_errors=True)
-        os.replace(tmp_dir, pack_dir)
+        Path(tmp_dir).replace(pack_dir)
     except Exception:
         shutil.rmtree(tmp_dir, ignore_errors=True)
         raise
@@ -340,7 +339,7 @@ def _build_task_row(
         task_yaml=task_yaml,
         default_task_image=default_task_image,
         task_id=task_id,
-        require_task_image=require_task_image,
+        _require_task_image=require_task_image,
     )
     workspace_base_digest = _materialize_workspace_base_pack(
         root=root,

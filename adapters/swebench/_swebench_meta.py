@@ -9,7 +9,6 @@ from __future__ import annotations
 
 from typing import Any
 
-
 _SENTINEL = object()
 
 
@@ -17,7 +16,7 @@ def _coerce_non_empty_string(value: Any) -> str | None:
     if not isinstance(value, str):
         return None
     trimmed = value.strip()
-    return trimmed if trimmed else None
+    return trimmed or None
 
 
 def _read_path(payload: Any, path: tuple[str, ...]) -> Any:

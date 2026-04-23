@@ -368,10 +368,10 @@ if __name__ == "__main__":
             f"harbor_benchmark_adapter.py error_code={exc.code} message={exc}",
             file=sys.stderr,
         )
-        raise SystemExit(exc.exit_code)
+        raise SystemExit(exc.exit_code) from exc
     except Exception as exc:  # pragma: no cover
         print(
             f"harbor_benchmark_adapter.py error_code=internal.unhandled message={exc}",
             file=sys.stderr,
         )
-        raise SystemExit(99)
+        raise SystemExit(99) from exc

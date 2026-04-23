@@ -1,9 +1,9 @@
 from __future__ import annotations
 
+import subprocess
 import tarfile
 import tempfile
 import unittest
-import subprocess
 from pathlib import Path
 
 import yaml

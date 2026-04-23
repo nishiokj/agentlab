@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import fnmatch
-from pathlib import Path
 from typing import Any
 
 from bench.paths import HARNESS_DENY_PATTERNS, REPO_CONFIG_DENY_PATTERNS

@@ -7,7 +7,6 @@ import sys
 from pathlib import Path
 from typing import Any
 
-
 DEFAULT_MAPPED_OUTPUT_PATH = "/agentlab/out/mapped_grader_output.json"
 DEFAULT_RAW_OUTPUT_PATH = "/agentlab/out/raw_grader_output.json"
 VALID_GRADING_STRATEGIES = {"in_task_image", "injected", "separate"}
@@ -289,4 +288,4 @@ if __name__ == "__main__":
         raise SystemExit(main())
     except Exception as exc:  # pragma: no cover
         print(f"custom_benchmark_grader.py error: {exc}", file=sys.stderr)
-        raise SystemExit(1)
+        raise SystemExit(1) from exc

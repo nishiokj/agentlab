@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import hashlib
 import subprocess
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -65,7 +65,7 @@ def get_injection_manifest(
         "files_changed": files,
         "patch_hash": hashlib.sha256(patch_text.encode()).hexdigest(),
         "source_snapshot_id": source_snapshot_id,
-        "created_at": created_at or datetime.now(timezone.utc).isoformat(),
+        "created_at": created_at or datetime.now(UTC).isoformat(),
         "tree_hash_before": tree_hash_before,
         "tree_hash_after": tree_hash_after,
     }

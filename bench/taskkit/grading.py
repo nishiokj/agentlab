@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from bench.config import BenchConfig
-from bench.taskkit.hidden_runner import run_hidden_suite, HiddenSuiteResult
+from bench.taskkit.hidden_runner import HiddenSuiteResult, run_hidden_suite
 from bench.taskkit.patch_utils import check_patch_escapes_workspace, parse_patch_files
 from bench.taskkit.policy import PatchPolicy
 
@@ -175,7 +175,7 @@ def grade_patch_for_task_data(
         hidden_result = run_hidden_suite(
             workspace=workspace,
             hidden_dir=hidden_dir,
-            task_data=task_data,
+            _task_data=task_data,
             timeout=int(task_data.get("time_limits", {}).get("hidden_timeout", 60)),
         )
         if hidden_result.timed_out:

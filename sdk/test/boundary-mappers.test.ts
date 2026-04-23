@@ -2,26 +2,26 @@ import assert from 'node:assert/strict';
 import test, { describe } from 'node:test';
 
 import {
-  assertTaskBoundaryV3,
-  compileTaskBoundaries,
+  assertTaskSpecV1,
+  compileTaskSpecs,
   createOutcomeBoundary,
   createRunnerBoundaryManifest,
   INVOCATION_ENV_CONTRACT_V1,
   mapOutcome,
-  taskBoundariesToJsonl,
+  taskSpecsToJsonl,
   WORKSPACE_CONTRACT_V1,
 } from '../src/boundary-mappers.js';
 import type {
   InputMapper,
   OutcomeMapper,
-  TaskBoundaryV3,
+  TaskSpecV1,
 } from '../src/boundary-mappers.js';
 import type { HookEvent } from '../src/hook-events.js';
 import type { TrialOutput } from '../src/trial-output.js';
 
-function makeTaskBoundary(taskId: string): TaskBoundaryV3 {
+function makeTaskBoundary(taskId: string): TaskSpecV1 {
   return {
-    schema_version: 'task_boundary_v3',
+    schema_version: 'task_spec_v1',
     task: {
       id: taskId,
       prompt: `solve ${taskId}`,
@@ -94,26 +94,26 @@ describe('Runner boundary contracts', () => {
 });
 
 describe('InputMapper and task boundary', () => {
-  test('compileTaskBoundaries maps source inputs to runner-consumable boundaries', () => {
+  test('compileTaskSpecs maps source inputs to runner-consumable specs', () => {
     const mapper: InputMapper<{ id: string }> = {
       map(input) {
         return makeTaskBoundary(input.id);
       },
     };
 
-    const boundaries = compileTaskBoundaries([{ id: 't1' }, { id: 't2' }], mapper);
+    const boundaries = compileTaskSpecs([{ id: 't1' }, { id: 't2' }], mapper);
     assert.equal(boundaries.length, 2);
     assert.equal(boundaries[0].task.id, 't1');
     assert.equal(boundaries[1].task.id, 't2');
   });
 
-  test('assertTaskBoundaryV3 enforces abstraction boundary keys', () => {
+  test('assertTaskSpecV1 enforces abstraction boundary keys', () => {
     const invalid = {
       ...makeTaskBoundary('t1'),
       benchmark_kind: 'new_magic_type',
     };
     assert.throws(
-      () => assertTaskBoundaryV3(invalid),
+      () => assertTaskSpecV1(invalid),
       /must compile into exactly: task \+ environment \+ workspace \+ limits/,
     );
   });
@@ -122,7 +122,7 @@ describe('InputMapper and task boundary', () => {
     const invalidRef = makeTaskBoundary('t1');
     invalidRef.workspace.aux_mounts[0].dataset_pack_ref = 'dataset-v1';
     assert.throws(
-      () => assertTaskBoundaryV3(invalidRef),
+      () => assertTaskSpecV1(invalidRef),
       /dataset_pack_ref must match sha256:<hex64>/,
     );
   });
@@ -131,7 +131,7 @@ describe('InputMapper and task boundary', () => {
     const invalidPath = makeTaskBoundary('t1');
     invalidPath.workspace.overlays[0].path = '/etc/passwd';
     assert.throws(
-      () => assertTaskBoundaryV3(invalidPath),
+      () => assertTaskSpecV1(invalidPath),
       /must be relative to \/agentlab\/workspace/,
     );
   });
@@ -140,17 +140,17 @@ describe('InputMapper and task boundary', () => {
     const invalidBase = makeTaskBoundary('t1');
     invalidBase.workspace.base = { kind: 'empty' };
     assert.throws(
-      () => assertTaskBoundaryV3(invalidBase),
+      () => assertTaskSpecV1(invalidBase),
       /patch tasks require a real workspace\.base/,
     );
   });
 
-  test('taskBoundariesToJsonl serializes validated boundaries', () => {
-    const jsonl = taskBoundariesToJsonl([makeTaskBoundary('t1'), makeTaskBoundary('t2')]);
+  test('taskSpecsToJsonl serializes validated specs', () => {
+    const jsonl = taskSpecsToJsonl([makeTaskBoundary('t1'), makeTaskBoundary('t2')]);
     const lines = jsonl.trim().split('\n');
     assert.equal(lines.length, 2);
-    const parsed = JSON.parse(lines[0]) as TaskBoundaryV3;
-    assert.equal(parsed.schema_version, 'task_boundary_v3');
+    const parsed = JSON.parse(lines[0]) as TaskSpecV1;
+    assert.equal(parsed.schema_version, 'task_spec_v1');
     assert.equal(parsed.task.id, 't1');
     assert.equal(parsed.environment.image, 'python:3.11-slim');
   });

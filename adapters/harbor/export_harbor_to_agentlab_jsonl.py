@@ -7,9 +7,10 @@ import argparse
 import json
 import re
 import sys
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Iterable
+from typing import Any
 
 try:  # Python 3.11+
     import tomllib  # type: ignore[attr-defined]
@@ -109,7 +110,7 @@ def _first_string(doc: dict[str, Any], paths: Iterable[tuple[str, ...]]) -> str 
 
 
 def _sanitize_task_id(raw: str, fallback: str) -> str:
-    chosen = raw.strip() if raw.strip() else fallback
+    chosen = raw.strip() or fallback
     cleaned = re.sub(r"[^A-Za-z0-9._-]+", "_", chosen).strip("._-")
     return cleaned or fallback
 

@@ -16,7 +16,6 @@ import time
 from pathlib import Path
 from typing import Any
 
-
 VALID_ARTIFACT_TYPES = {
     "patch_submission",
     "text_response",
@@ -160,7 +159,7 @@ def _artifact_payload(
     artifact_type: str,
     *,
     patch: str | None,
-    workspace: Path,
+    _workspace: Path,
     result_dir: Path,
     outcome: str,
     exit_code: int,
@@ -331,7 +330,7 @@ def main() -> int:
         "artifact": _artifact_payload(
             artifact_type,
             patch=patch,
-            workspace=workspace,
+            _workspace=workspace,
             result_dir=Path(result_path).parent,
             outcome=outcome,
             exit_code=exit_code,
@@ -391,4 +390,4 @@ if __name__ == "__main__":
         raise SystemExit(main())
     except Exception as exc:  # pragma: no cover
         print(f"bench_runtime_adapter.py error: {exc}", file=sys.stderr)
-        raise SystemExit(1)
+        raise SystemExit(1) from exc

@@ -4,11 +4,9 @@ from __future__ import annotations
 import argparse
 import json
 import os
-import sys
 import time
 from pathlib import Path
 from typing import Any
-
 
 VALID_ARTIFACT_TYPES = {
     "patch_submission",
@@ -221,6 +219,7 @@ def _artifact_payload(
     result_dir: Path,
     checkpoint_abs: Path,
     task_payload: dict[str, Any],
+    bindings: dict[str, Any],
 ) -> Any:
     if artifact_type == "patch_submission":
         return {
@@ -431,6 +430,7 @@ def main() -> int:
             result_dir=result_path.parent,
             checkpoint_abs=checkpoint_abs,
             task_payload=task_payload,
+            bindings=controls,
         ),
         "metadata": {
             "task_id": task_id,

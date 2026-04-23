@@ -19,9 +19,8 @@ if str(REPO_ROOT) not in sys.path:
 
 from bench.taskkit.schema import validate_with_schema_file
 
-
 ERROR_CODE_RE = re.compile(r"error_code=([A-Za-z0-9._-]+)")
-DEFAULT_ADAPTER_SCRIPT = str((Path(__file__).resolve().parent / "harbor_benchmark_adapter.py"))
+DEFAULT_ADAPTER_SCRIPT = str(Path(__file__).resolve().parent / "harbor_benchmark_adapter.py")
 SCHEMAS_DIR = REPO_ROOT / "schemas"
 
 
@@ -50,7 +49,7 @@ def _parse_args(argv: list[str]) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
-def _actionable_error(error_code: str | None, stderr: str) -> str:
+def _actionable_error(error_code: str | None, _stderr: str) -> str:
     if error_code is None:
         return (
             "Adapter exited non-zero without a typed error code.\n"

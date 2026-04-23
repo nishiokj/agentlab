@@ -9,7 +9,6 @@ from __future__ import annotations
 import json
 import shutil
 import subprocess
-import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -18,7 +17,7 @@ from bench.config import BenchConfig
 
 def load_task(task_dir: Path, config: BenchConfig) -> dict[str, Any]:
     """Load and validate a task from its directory."""
-    from bench.taskkit.schema import load_task_yaml, load_schema, validate_json
+    from bench.taskkit.schema import load_schema, load_task_yaml, validate_json
 
     task_data = load_task_yaml(task_dir)
     schema = load_schema(config.schemas_dir / "task.schema.json")
@@ -62,8 +61,8 @@ def unpack_repo_snapshot(
                 timeout=120,
             )
             zstd.wait()
-        except FileNotFoundError:
-            raise RuntimeError(f"Cannot decompress {archive}: install zstd or tar with zstd support")
+        except FileNotFoundError as exc:
+            raise RuntimeError(f"Cannot decompress {archive}: install zstd or tar with zstd support") from exc
 
 
 def apply_injection_patch(
