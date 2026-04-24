@@ -10,8 +10,11 @@ use std::fs;
 use std::path::{Component, Path, PathBuf};
 
 use crate::config::*;
-use crate::experiment::runner::*;
 use crate::model::*;
+use crate::package::authoring::{
+    contains_removed_runtime_template, resolve_existing_public_path_reference,
+    validate_dx_support_file_relpath,
+};
 use crate::package::compile::*;
 use crate::package::sealed::*;
 

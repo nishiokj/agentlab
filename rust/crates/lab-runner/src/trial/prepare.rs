@@ -21,6 +21,7 @@ use crate::model::{
     DEFAULT_CONTAINER_TRAJECTORY_PATH, DEFAULT_CONTAINER_TRIAL_INPUT_PATH,
 };
 use crate::persistence::rows::infer_run_dir_from_path;
+use crate::trial::env::replace_task_workdir_placeholder;
 use crate::trial::spec::TaskBoundaryMaterialization;
 use crate::trial::state::{ArtifactMountPlan, IoMountPlan, TaskSandboxPlan};
 use crate::util::sanitize_for_fs;
@@ -464,7 +465,17 @@ pub(crate) fn prepare_task_environment_with_paths(
     agent_runtime: &AgentRuntimeConfig,
 ) -> Result<PreparedTaskEnvironment> {
     trial_paths.prepare(false)?;
-    let dynamic_mounts: Vec<ResolvedMountReference> = Vec::new();
+    let dynamic_mounts: Vec<ResolvedMountReference> = agent_runtime
+        .dependency_file_staging
+        .iter()
+        .map(|spec| ResolvedMountReference {
+            host_path: spec.source_from_host.clone(),
+            mount_path: replace_task_workdir_placeholder(
+                &spec.destination_path,
+                &task_boundary.task_workdir,
+            ),
+        })
+        .collect();
 
     let input = build_trial_input(
         trial_experiment,

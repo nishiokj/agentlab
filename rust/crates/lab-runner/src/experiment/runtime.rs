@@ -6,9 +6,13 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use crate::config::*;
-use crate::experiment::runner::*;
+use crate::experiment::runner::configured_network_mode;
 use crate::experiment::state::{RunBehavior, RunExecutionOptions};
 use crate::model::*;
+use crate::package::authoring::{
+    compute_artifact_content_digest, contains_removed_runtime_template,
+    resolve_dx_artifact_path, resolve_existing_public_path_reference,
+};
 use crate::package::sealed::*;
 use crate::package::staging::*;
 use crate::package::validate::*;

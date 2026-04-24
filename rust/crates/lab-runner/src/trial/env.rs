@@ -186,18 +186,73 @@ pub(crate) fn resolve_runtime_agent_command(
             .iter()
             .map(|token| replace_task_workdir_placeholder(token, request.task_workdir)),
     );
+    if should_append_rex_contract_io(&command) {
+        command.push("--input-file".to_string());
+        command.push(request.io_paths.trial_input_path.clone());
+        command.push("--output".to_string());
+        command.push(request.io_paths.result_path.clone());
+    }
     #[cfg(test)]
     {
-        if !request.runtime.io.input_arg.trim().is_empty() {
+        if !request.runtime.io.input_arg.trim().is_empty()
+            && !command
+                .iter()
+                .any(|arg| arg == &request.runtime.io.input_arg)
+        {
             command.push(request.runtime.io.input_arg.clone());
             command.push(request.io_paths.trial_input_path.clone());
         }
-        if !request.runtime.io.output_arg.trim().is_empty() {
+        if !request.runtime.io.output_arg.trim().is_empty()
+            && !command
+                .iter()
+                .any(|arg| arg == &request.runtime.io.output_arg)
+        {
             command.push(request.runtime.io.output_arg.clone());
             command.push(request.io_paths.result_path.clone());
         }
     }
     Ok(command)
+}
+
+fn should_append_rex_contract_io(command: &[String]) -> bool {
+    if !is_rex_headless_command(command) {
+        return false;
+    }
+    if command.iter().any(|arg| {
+        matches!(
+            arg.as_str(),
+            "--input" | "--input-file" | "--output"
+        ) || arg.starts_with("--input=")
+            || arg.starts_with("--input-file=")
+            || arg.starts_with("--output=")
+    }) {
+        return false;
+    }
+    true
+}
+
+fn is_rex_headless_command(command: &[String]) -> bool {
+    if command.is_empty() {
+        return false;
+    }
+    let first = file_name_str(&command[0]);
+    if matches!(first, Some("rex") | Some("rex.js")) {
+        return command.get(1).is_some_and(|value| value == "run");
+    }
+    if matches!(first, Some("bun") | Some("bunx")) {
+        let Some(script) = command.get(1).and_then(|value| file_name_str(value)) else {
+            return false;
+        };
+        if !matches!(script, "rex" | "rex.js") {
+            return false;
+        }
+        return command.get(2).is_some_and(|value| value == "run");
+    }
+    false
+}
+
+fn file_name_str(raw: &str) -> Option<&str> {
+    Path::new(raw).file_name().and_then(|value| value.to_str())
 }
 
 pub(crate) fn replace_task_workdir_placeholder(raw: &str, task_workdir: &str) -> String {
