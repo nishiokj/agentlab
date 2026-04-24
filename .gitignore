@@ -57,3 +57,4 @@ bench/taskkit/validate_task.py
 htmlcov/
 
 docs
+/docs
