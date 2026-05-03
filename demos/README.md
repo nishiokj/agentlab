@@ -21,8 +21,15 @@ It exercises all three metric sources with a tiny runtime footprint:
 From repo root:
 
 ```bash
-./lab describe demos/experiment.yaml --json
-./lab run demos/experiment.yaml --json
+scripts/lab-cli-fresh.sh build demos/experiment.yaml --out .lab/builds/demo --json
+scripts/lab-cli-fresh.sh describe .lab/builds/demo --json
+scripts/lab-cli-fresh.sh run .lab/builds/demo --materialize full --json
 ```
 
-If your `lab` binary is not in repo root, pass `--runner-bin` via SDK or set `AGENTLAB_RUNNER_BIN`.
+Or build and run in one step:
+
+```bash
+scripts/lab-cli-fresh.sh build-run demos/experiment.yaml --out .lab/builds/demo --materialize full --json
+```
+
+The current runner uses Docker for the task sandbox, so Docker or OrbStack must be running and able to provide the `node:20-alpine` image.

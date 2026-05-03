@@ -11,7 +11,7 @@ use crate::experiment::state::{RunBehavior, RunExecutionOptions};
 use crate::model::*;
 use crate::package::authoring::{
     compute_artifact_content_digest, contains_removed_runtime_template,
-    resolve_dx_artifact_path, resolve_existing_public_path_reference,
+    resolve_agent_artifact_path, resolve_existing_public_path_reference,
 };
 use crate::package::sealed::*;
 use crate::package::staging::*;
@@ -83,6 +83,20 @@ pub(crate) struct DependencyFileStagingSpec {
     pub(crate) read_only: bool,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct AgentRuntimeSecretFileSpec {
+    pub(crate) id: String,
+    pub(crate) target_path: String,
+    pub(crate) required_for_variants: Vec<String>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ResolvedSecretFileMount {
+    pub(crate) id: String,
+    pub(crate) source_from_host: PathBuf,
+    pub(crate) target_path: String,
+}
+
 pub(crate) enum PathResolutionContext<'a> {
     Build {
         exp_dir: &'a Path,
@@ -92,6 +106,16 @@ pub(crate) enum PathResolutionContext<'a> {
         package_dir: &'a Path,
         variant_id: &'a str,
     },
+}
+
+#[derive(Clone)]
+pub(crate) struct AgentRuntimeEventSink {
+    pub(crate) id: String,
+    pub(crate) format: String,
+    pub(crate) path: String,
+    pub(crate) mode: String,
+    pub(crate) persist: bool,
+    pub(crate) ingest: bool,
 }
 
 #[derive(Clone)]
@@ -106,6 +130,8 @@ pub(crate) struct AgentRuntimeConfig {
     pub(crate) integration_level: String,
     pub(crate) env: BTreeMap<String, String>,
     pub(crate) env_from_host: Vec<String>,
+    pub(crate) secret_files: Vec<AgentRuntimeSecretFileSpec>,
+    pub(crate) event_sinks: Vec<AgentRuntimeEventSink>,
     pub(crate) trajectory_path: Option<String>,
     pub(crate) causal_extraction: Option<String>,
     #[cfg(test)]
@@ -137,6 +163,7 @@ pub(crate) struct VariantRuntimeProfile {
     pub(crate) variant_args: Vec<String>,
     pub(crate) agent_runtime: AgentRuntimeConfig,
     pub(crate) agent_runtime_env: BTreeMap<String, String>,
+    pub(crate) secret_file_mounts: Vec<ResolvedSecretFileMount>,
     pub(crate) invocation_source: String,
     pub(crate) configured_network_mode: String,
     pub(crate) effective_network_mode: String,
@@ -319,6 +346,94 @@ pub(crate) fn parse_command_field(
     }
 }
 
+fn parse_agent_runtime_event_sinks(
+    value: Option<&Value>,
+    field: &str,
+) -> Result<Vec<AgentRuntimeEventSink>> {
+    let Some(value) = value else {
+        return Ok(Vec::new());
+    };
+    let items = value
+        .as_array()
+        .ok_or_else(|| anyhow!("{} must be an array", field))?;
+    if items.len() > 1 {
+        return Err(anyhow!(
+            "{} currently supports one file-backed JSONL event sink",
+            field
+        ));
+    }
+    let mut sinks = Vec::with_capacity(items.len());
+    let mut ids = HashSet::new();
+    for (idx, item) in items.iter().enumerate() {
+        let item_field = format!("{}[{}]", field, idx);
+        let obj = item
+            .as_object()
+            .ok_or_else(|| anyhow!("{} must be an object", item_field))?;
+        let id = obj
+            .get("id")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| anyhow!("{}.id is required", item_field))?;
+        if !id
+            .chars()
+            .all(|ch| ch == '_' || ch == '-' || ch.is_ascii_alphanumeric())
+        {
+            return Err(anyhow!(
+                "{}.id must contain only ASCII letters, digits, '_' or '-'",
+                item_field
+            ));
+        }
+        if !ids.insert(id.to_string()) {
+            return Err(anyhow!("{} contains duplicate id '{}'", field, id));
+        }
+        let format = obj
+            .get("format")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("hook_events_v1");
+        if format != "hook_events_v1" {
+            return Err(anyhow!(
+                "{}.format must be 'hook_events_v1' for this runtime",
+                item_field
+            ));
+        }
+        let path = obj
+            .get("path")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or(DEFAULT_CONTAINER_TRAJECTORY_PATH);
+        if !path.starts_with("/agentlab/out/") {
+            return Err(anyhow!(
+                "{}.path must be under /agentlab/out so the runner can persist it",
+                item_field
+            ));
+        }
+        let mode = obj
+            .get("mode")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .unwrap_or("jsonl");
+        if mode != "jsonl" {
+            return Err(anyhow!("{}.mode must be 'jsonl'", item_field));
+        }
+        let persist = obj.get("persist").and_then(Value::as_bool).unwrap_or(true);
+        let ingest = obj.get("ingest").and_then(Value::as_bool).unwrap_or(true);
+        sinks.push(AgentRuntimeEventSink {
+            id: id.to_string(),
+            format: format.to_string(),
+            path: path.to_string(),
+            mode: mode.to_string(),
+            persist,
+            ingest,
+        });
+    }
+    Ok(sinks)
+}
+
 // ---------------------------------------------------------------------------
 // Agent runtime resolution
 // ---------------------------------------------------------------------------
@@ -365,7 +480,7 @@ pub(crate) fn resolve_agent_artifact_path_for_context(
             if trimmed.starts_with("./") || trimmed.starts_with("../") || trimmed.contains('/') {
                 Ok(normalize_path(&exp_dir.join(trimmed)))
             } else {
-                Ok(resolve_dx_artifact_path(trimmed, exp_dir, project_root))
+                Ok(resolve_agent_artifact_path(trimmed, exp_dir, project_root))
             }
         }
         PathResolutionContext::Run { package_dir, .. } => {
@@ -399,6 +514,111 @@ pub(crate) fn resolve_runtime_source_path_for_context(
             }
         }
     }
+}
+
+pub(crate) fn validate_agent_runtime_network_mode(mode: &str) -> Result<()> {
+    if matches!(mode, "none" | "full" | "allowlist_enforced" | "llm_egress") {
+        return Ok(());
+    }
+    Err(anyhow!(
+        "runtime.agent_runtime.network must be one of: none, full, allowlist_enforced, llm_egress (got '{}')",
+        mode
+    ))
+}
+
+pub(crate) fn validate_secret_target_path(target: &str, field_name: &str) -> Result<()> {
+    let path = Path::new(target);
+    if !path.is_absolute() {
+        return Err(anyhow!("{} must be an absolute container path", field_name));
+    }
+    if path
+        .components()
+        .any(|component| matches!(component, std::path::Component::ParentDir))
+    {
+        return Err(anyhow!("{} must not contain '..'", field_name));
+    }
+    for forbidden in ["/agentlab/in", "/agentlab/out", "/opt/agent"] {
+        if target == forbidden || target.starts_with(&format!("{}/", forbidden)) {
+            return Err(anyhow!(
+                "{} targets reserved runner path '{}'",
+                field_name,
+                forbidden
+            ));
+        }
+    }
+    Ok(())
+}
+
+pub(crate) fn parse_agent_runtime_secret_files(
+    value: Option<&Value>,
+    field_name: &str,
+) -> Result<Vec<AgentRuntimeSecretFileSpec>> {
+    let Some(raw) = value else {
+        return Ok(Vec::new());
+    };
+    let items = raw
+        .as_array()
+        .ok_or_else(|| anyhow!("{} must be an array", field_name))?;
+    let mut specs = Vec::with_capacity(items.len());
+    let mut ids = HashSet::new();
+    for (idx, item) in items.iter().enumerate() {
+        let obj = item
+            .as_object()
+            .ok_or_else(|| anyhow!("{}[{}] must be an object", field_name, idx))?;
+        let id = obj
+            .get("id")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| anyhow!("{}[{}].id is required", field_name, idx))?
+            .to_string();
+        if !ids.insert(id.clone()) {
+            return Err(anyhow!("{} contains duplicate id '{}'", field_name, id));
+        }
+        let target_path = obj
+            .get("target")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| anyhow!("{}[{}].target is required", field_name, idx))?
+            .to_string();
+        validate_secret_target_path(&target_path, &format!("{}[{}].target", field_name, idx))?;
+        let required_for_variants = match obj.get("required_for_variants") {
+            Some(Value::Array(values)) => values
+                .iter()
+                .enumerate()
+                .map(|(variant_idx, value)| {
+                    value
+                        .as_str()
+                        .map(str::trim)
+                        .filter(|value| !value.is_empty())
+                        .map(ToString::to_string)
+                        .ok_or_else(|| {
+                            anyhow!(
+                                "{}[{}].required_for_variants[{}] must be a non-empty string",
+                                field_name,
+                                idx,
+                                variant_idx
+                            )
+                        })
+                })
+                .collect::<Result<Vec<_>>>()?,
+            Some(_) => {
+                return Err(anyhow!(
+                    "{}[{}].required_for_variants must be an array",
+                    field_name,
+                    idx
+                ));
+            }
+            None => Vec::new(),
+        };
+        specs.push(AgentRuntimeSecretFileSpec {
+            id,
+            target_path,
+            required_for_variants,
+        });
+    }
+    Ok(specs)
 }
 
 pub(crate) fn resolve_agent_runtime_with_context(
@@ -472,6 +692,7 @@ pub(crate) fn resolve_agent_runtime_with_context(
         .filter(|v| !v.is_empty())
         .unwrap_or("none")
         .to_string();
+    validate_agent_runtime_network_mode(&execution_network)?;
     #[cfg(test)]
     let execution_network_for_test = execution_network.clone();
     let artifact_raw = parse_optional_nonempty_string(
@@ -510,6 +731,12 @@ pub(crate) fn resolve_agent_runtime_with_context(
         .to_string();
     let adapter_ref = AgentAdapterRef::default();
     let env = parse_string_map_field(agent.pointer("/env"), "runtime.agent_runtime.env")?;
+    let secret_files = parse_agent_runtime_secret_files(
+        agent.pointer("/secret_files"),
+        "runtime.agent_runtime.secret_files",
+    )?;
+    let event_sinks =
+        parse_agent_runtime_event_sinks(agent.pointer("/events"), "runtime.agent_runtime.events")?;
     let allow_internal_contract_paths = matches!(context, PathResolutionContext::Run { .. });
     for (key, value) in &env {
         if contains_removed_runtime_template(value) {
@@ -573,6 +800,8 @@ pub(crate) fn resolve_agent_runtime_with_context(
         integration_level,
         env,
         env_from_host,
+        secret_files,
+        event_sinks,
         trajectory_path,
         causal_extraction,
         #[cfg(test)]
@@ -673,6 +902,68 @@ pub(crate) fn resolve_runtime_env_inputs(
         resolved.insert(key.clone(), value.clone());
     }
     Ok(resolved)
+}
+
+pub(crate) fn secret_file_active_for_variant(
+    spec: &AgentRuntimeSecretFileSpec,
+    variant_id: &str,
+) -> bool {
+    spec.required_for_variants.is_empty()
+        || spec
+            .required_for_variants
+            .iter()
+            .any(|candidate| candidate == variant_id)
+}
+
+pub(crate) fn resolve_runtime_secret_file_mounts(
+    secret_files: &[AgentRuntimeSecretFileSpec],
+    variant_id: &str,
+    execution: &RunExecutionOptions,
+) -> Result<Vec<ResolvedSecretFileMount>> {
+    let cwd =
+        std::env::current_dir().map_err(|err| anyhow!("failed to resolve current dir: {}", err))?;
+    let mut mounts = Vec::new();
+    for spec in secret_files
+        .iter()
+        .filter(|spec| secret_file_active_for_variant(spec, variant_id))
+    {
+        let Some(raw_source) = execution.secret_files.get(&spec.id) else {
+            return Err(anyhow!(
+                "missing required secret file '{}' for variant '{}' (target: {}; provide via --secret-file {}=HOST_PATH)",
+                spec.id,
+                variant_id,
+                spec.target_path,
+                spec.id
+            ));
+        };
+        let source_from_host = if raw_source.is_absolute() {
+            normalize_path(raw_source)
+        } else {
+            normalize_path(&cwd.join(raw_source))
+        };
+        let metadata = fs::metadata(&source_from_host).map_err(|_| {
+            anyhow!(
+                "failed to read secret file '{}' for variant '{}' (target: {})",
+                spec.id,
+                variant_id,
+                spec.target_path
+            )
+        })?;
+        if !metadata.is_file() {
+            return Err(anyhow!(
+                "secret file '{}' for variant '{}' is not a file (target: {})",
+                spec.id,
+                variant_id,
+                spec.target_path
+            ));
+        }
+        mounts.push(ResolvedSecretFileMount {
+            id: spec.id.clone(),
+            source_from_host,
+            target_path: spec.target_path.clone(),
+        });
+    }
+    Ok(mounts)
 }
 
 pub(crate) fn resolve_agent_runtime_env(
@@ -908,6 +1199,8 @@ pub(crate) fn resolve_variant_runtime_profile_with_context(
     }
 
     let runtime_env_inputs = resolve_runtime_env_inputs(execution)?;
+    let secret_file_mounts =
+        resolve_runtime_secret_file_mounts(&agent_runtime.secret_files, &variant.id, execution)?;
     agent_runtime.command_raw = resolve_agent_runtime_command(
         &agent_runtime.command_raw,
         &variant.bindings,
@@ -933,6 +1226,7 @@ pub(crate) fn resolve_variant_runtime_profile_with_context(
         variant_args,
         agent_runtime,
         agent_runtime_env,
+        secret_file_mounts,
         invocation_source: "runtime_agent".to_string(),
         configured_network_mode,
         effective_network_mode,

@@ -8,7 +8,9 @@ use crate::config::atomic_write_json_pretty;
 use crate::experiment::runner::{
     map_contract_path_to_host, ContractPathHostRoots, ContractPathMode,
 };
-use crate::experiment::runtime::{AgentRuntimeConfig, DEFAULT_TASK_WORKDIR_FALLBACK};
+use crate::experiment::runtime::{
+    AgentRuntimeConfig, ResolvedSecretFileMount, DEFAULT_TASK_WORKDIR_FALLBACK,
+};
 use crate::model::MaterializationMode;
 use crate::trial::execution::resolve_container_image_digest;
 use crate::trial::prepare::TrialPaths;
@@ -101,6 +103,7 @@ pub(crate) fn write_state_inventory(
     trial_dir: &Path,
     json_value: &Value,
     agent_runtime: &AgentRuntimeConfig,
+    secret_file_mounts: &[ResolvedSecretFileMount],
     _paths: &TrialPaths,
     exec_digest: &str,
     effective_network_mode: &str,
@@ -142,6 +145,14 @@ pub(crate) fn write_state_inventory(
         "path": "/opt/agent",
         "writable": false
     }));
+    for secret in secret_file_mounts {
+        agent_runtime_mounts.push(json!({
+            "name": format!("secret:{}", secret.id),
+            "path": secret.target_path,
+            "writable": false,
+            "secret": true
+        }));
+    }
     let mut task_sandbox_mounts = vec![
         json!({"name": "in", "path": AGENTLAB_CONTRACT_IN_DIR, "writable": false}),
         json!({"name": "workdir", "path": workspace_path, "writable": true}),
@@ -162,6 +173,20 @@ pub(crate) fn write_state_inventory(
     let agent_runtime_image = Some(agent_runtime.image.as_str());
     let agent_runtime_image_digest = agent_runtime_image.and_then(resolve_container_image_digest);
     let task_sandbox_image_digest = task_sandbox_image.and_then(resolve_container_image_digest);
+    let event_sinks = agent_runtime
+        .event_sinks
+        .iter()
+        .map(|sink| {
+            json!({
+                "id": sink.id,
+                "format": sink.format,
+                "path": sink.path,
+                "mode": sink.mode,
+                "persist": sink.persist,
+                "ingest": sink.ingest
+            })
+        })
+        .collect::<Vec<_>>();
 
     let state = json!({
         "schema_version": "state_inventory_v1",
@@ -193,7 +218,8 @@ pub(crate) fn write_state_inventory(
                 "image_digest": agent_runtime_image_digest,
                 "workdir": workspace_path,
                 "mounts": agent_runtime_mounts,
-                "network_mode": agent_runtime.network
+                "network_mode": agent_runtime.network,
+                "event_sinks": event_sinks
             },
             "task_sandbox": {
                 "executor": "docker",

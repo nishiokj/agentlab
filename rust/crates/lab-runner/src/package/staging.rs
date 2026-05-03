@@ -13,7 +13,7 @@ use crate::config::*;
 use crate::model::*;
 use crate::package::authoring::{
     contains_removed_runtime_template, resolve_existing_public_path_reference,
-    validate_dx_support_file_relpath,
+    validate_public_authoring_relpath,
 };
 use crate::package::compile::*;
 use crate::package::sealed::*;
@@ -567,7 +567,7 @@ pub(crate) fn collect_packaged_runtime_asset_entries(
             .ok_or_else(|| anyhow!("{}[{}].runtime_path is required", field_name, idx))?;
         entries.push(RuntimePathStagingManifestEntry {
             original_relative_path: packaged_path.to_string(),
-            packaged_path: validate_dx_support_file_relpath(
+            packaged_path: validate_public_authoring_relpath(
                 packaged_path,
                 &format!("{}[{}].packaged_path", field_name, idx),
             )?,

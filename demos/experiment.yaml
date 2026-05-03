@@ -2,7 +2,7 @@ version: '0.3'
 experiment:
   id: swebench_mini_harness_eval
   name: SWE-bench Mini Harness Eval
-  workload_type: agent_harness
+  workload_type: agent_runtime
   description: Small real issue set for testing harness metrics and artifacts.
   owner: demos
 
@@ -95,25 +95,31 @@ variant_plan:
       difficulty_threshold: 2
       difficulty_bias: 0
 
-runtime:
-  harness:
-    mode: cli
+benchmark:
+  grader:
+    strategy: in_task_image
     command:
       - node
-      - ./agentlab_demo_harness.js
-    integration_level: cli_events
-    input_path: /out/trial_input.json
-    output_path: /out/trial_output.json
-    events:
-      path: /out/harness_events.jsonl
-    control_plane:
-      mode: file
-      path: /state/lab_control.json
-  sandbox:
-    mode: local
-  network:
-    mode: none
+      - ./agentlab_demo_grader.js
+    conclusion:
+      mode: direct
+
+policy:
+  timeout_ms: 600000
+  task_sandbox:
+    profile: hermetic_functional
+    network: none
     allowed_hosts: []
+
+runtime:
+  agent_runtime:
+    artifact: .
+    image: node:20-alpine
+    command:
+      - node
+      - /opt/agent/agentlab_demo_harness.js
+    integration_level: cli_events
+    network: none
 
 validity:
   fail_on_state_leak: true

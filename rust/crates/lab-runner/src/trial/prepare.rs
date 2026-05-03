@@ -192,7 +192,13 @@ pub(crate) fn build_trial_input(
     task_boundary: &TaskBoundaryMaterialization,
 ) -> Value {
     let normalized_task_payload = normalize_task_prompt_aliases(&task_boundary.task_payload);
-    let time_limit_ms = task_boundary.time_limit_ms.unwrap_or(600_000);
+    let policy_timeout_ms = json_value
+        .pointer("/policy/timeout_ms")
+        .and_then(Value::as_u64);
+    let time_limit_ms = task_boundary
+        .time_limit_ms
+        .or(policy_timeout_ms)
+        .unwrap_or(600_000);
     let requested_network_mode = json_value
         .pointer("/policy/task_sandbox/network")
         .and_then(Value::as_str)
@@ -211,6 +217,7 @@ pub(crate) fn build_trial_input(
         .unwrap_or("cli_basic");
     let artifact_type = json_value
         .pointer("/agent/artifact_type")
+        .or_else(|| json_value.pointer("/runtime/agent_runtime/artifact_type"))
         .and_then(Value::as_str)
         .unwrap_or("structured_json");
 
@@ -286,7 +293,10 @@ pub(crate) fn load_prepared_task_environment_manifest(
 }
 
 pub(crate) fn resolve_trial_timeout_ms(input: &Value) -> Option<u64> {
-    input.pointer("/policy/timeout_ms").and_then(|v| v.as_u64())
+    input
+        .pointer("/policy/timeout_ms")
+        .or_else(|| input.pointer("/runtime/time_limit_ms"))
+        .and_then(|v| v.as_u64())
 }
 
 pub(crate) fn build_runtime_contract_env(
@@ -353,13 +363,33 @@ pub(crate) fn resolve_trial_io_host_path(path: &str, paths: &TrialPaths) -> Resu
     crate::trial::execution::map_container_path_to_host(path, paths)
 }
 
+fn resolve_runtime_event_path(agent_runtime: Option<&AgentRuntimeConfig>) -> String {
+    agent_runtime
+        .and_then(|runtime| runtime.event_sinks.first())
+        .map(|sink| sink.path.clone())
+        .or_else(|| {
+            agent_runtime
+                .and_then(|runtime| runtime.trajectory_path.as_ref())
+                .cloned()
+        })
+        .unwrap_or_else(|| DEFAULT_CONTAINER_TRAJECTORY_PATH.to_string())
+}
+
 pub(crate) fn prepare_io_paths(paths: &TrialPaths, input_bytes: &[u8]) -> Result<PreparedTrialIo> {
+    prepare_io_paths_for_runtime(paths, input_bytes, None)
+}
+
+pub(crate) fn prepare_io_paths_for_runtime(
+    paths: &TrialPaths,
+    input_bytes: &[u8],
+    agent_runtime: Option<&AgentRuntimeConfig>,
+) -> Result<PreparedTrialIo> {
     let trial_input_path = DEFAULT_CONTAINER_TRIAL_INPUT_PATH.to_string();
     let grader_input_path = DEFAULT_CONTAINER_GRADER_INPUT_PATH.to_string();
     let result_path = DEFAULT_CONTAINER_RESULT_PATH.to_string();
     let raw_grader_output_path = DEFAULT_CONTAINER_RAW_GRADER_OUTPUT_PATH.to_string();
     let mapped_grader_output_path = DEFAULT_CONTAINER_MAPPED_GRADER_OUTPUT_PATH.to_string();
-    let trajectory_path = DEFAULT_CONTAINER_TRAJECTORY_PATH.to_string();
+    let trajectory_path = resolve_runtime_event_path(agent_runtime);
     let trial_input_host = resolve_trial_io_host_path(DEFAULT_CONTAINER_TRIAL_INPUT_PATH, paths)?;
     let grader_input_host = resolve_trial_io_host_path(DEFAULT_CONTAINER_GRADER_INPUT_PATH, paths)?;
     let result_host = resolve_trial_io_host_path(DEFAULT_CONTAINER_RESULT_PATH, paths)?;
@@ -367,8 +397,8 @@ pub(crate) fn prepare_io_paths(paths: &TrialPaths, input_bytes: &[u8]) -> Result
         resolve_trial_io_host_path(DEFAULT_CONTAINER_RAW_GRADER_OUTPUT_PATH, paths)?;
     let mapped_grader_output_host =
         resolve_trial_io_host_path(DEFAULT_CONTAINER_MAPPED_GRADER_OUTPUT_PATH, paths)?;
-    let trajectory_host = resolve_trial_io_host_path(DEFAULT_CONTAINER_TRAJECTORY_PATH, paths)?;
-    let events_host = resolve_trial_io_host_path(DEFAULT_CONTAINER_TRAJECTORY_PATH, paths)?;
+    let trajectory_host = resolve_trial_io_host_path(&trajectory_path, paths)?;
+    let events_host = resolve_trial_io_host_path(&trajectory_path, paths)?;
 
     for host_path in [
         &trial_input_host,
@@ -487,7 +517,7 @@ pub(crate) fn prepare_task_environment_with_paths(
         task_boundary,
     );
     let input_bytes = serde_json::to_vec_pretty(&input)?;
-    let io_paths = prepare_io_paths(&trial_paths, &input_bytes)?;
+    let io_paths = prepare_io_paths_for_runtime(&trial_paths, &input_bytes, Some(agent_runtime))?;
     let resolved_time_limit_ms = resolve_trial_timeout_ms(&input).unwrap_or(600000);
     let runtime_env = build_runtime_contract_env(
         run_id,

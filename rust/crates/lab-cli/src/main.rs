@@ -75,6 +75,8 @@ enum Commands {
         runtime_env: Vec<String>,
         #[arg(long = "env-file", value_name = "PATH", action = ArgAction::Append)]
         runtime_env_file: Vec<PathBuf>,
+        #[arg(long = "secret-file", value_name = "ID=PATH", action = ArgAction::Append)]
+        secret_file: Vec<String>,
         #[arg(long)]
         json: bool,
     },
@@ -86,6 +88,8 @@ enum Commands {
         runtime_env: Vec<String>,
         #[arg(long = "env-file", value_name = "PATH", action = ArgAction::Append)]
         runtime_env_file: Vec<PathBuf>,
+        #[arg(long = "secret-file", value_name = "ID=PATH", action = ArgAction::Append)]
+        secret_file: Vec<String>,
         #[arg(long)]
         json: bool,
     },
@@ -95,6 +99,8 @@ enum Commands {
         runtime_env: Vec<String>,
         #[arg(long = "env-file", value_name = "PATH", action = ArgAction::Append)]
         runtime_env_file: Vec<PathBuf>,
+        #[arg(long = "secret-file", value_name = "ID=PATH", action = ArgAction::Append)]
+        secret_file: Vec<String>,
         #[arg(long)]
         json: bool,
     },
@@ -157,6 +163,8 @@ enum Commands {
         runtime_env: Vec<String>,
         #[arg(long = "env-file", value_name = "PATH", action = ArgAction::Append)]
         runtime_env_file: Vec<PathBuf>,
+        #[arg(long = "secret-file", value_name = "ID=PATH", action = ArgAction::Append)]
+        secret_file: Vec<String>,
         #[arg(long)]
         json: bool,
     },
@@ -308,6 +316,8 @@ enum Commands {
         runtime_env: Vec<String>,
         #[arg(long = "env-file", value_name = "PATH", action = ArgAction::Append)]
         runtime_env_file: Vec<PathBuf>,
+        #[arg(long = "secret-file", value_name = "ID=PATH", action = ArgAction::Append)]
+        secret_file: Vec<String>,
         #[arg(long)]
         json: bool,
     },
@@ -857,6 +867,7 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
             materialize,
             runtime_env,
             runtime_env_file,
+            secret_file,
             json,
         } => {
             if !json {
@@ -867,8 +878,12 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
                 overrides.as_deref(),
                 out.as_deref(),
             )?;
-            let execution =
-                build_run_execution_options(materialize, &runtime_env, &runtime_env_file)?;
+            let execution = build_run_execution_options(
+                materialize,
+                &runtime_env,
+                &runtime_env_file,
+                &secret_file,
+            )?;
             let summary =
                 lab_runner::describe_experiment_with_options(&build.package_dir, &execution)?;
             if !json {
@@ -904,13 +919,18 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
             materialize,
             runtime_env,
             runtime_env_file,
+            secret_file,
             json,
         } => {
             if !json {
                 eprintln!("loading package: {}", package.display());
             }
-            let execution =
-                build_run_execution_options(materialize, &runtime_env, &runtime_env_file)?;
+            let execution = build_run_execution_options(
+                materialize,
+                &runtime_env,
+                &runtime_env_file,
+                &secret_file,
+            )?;
             let summary = lab_runner::describe_experiment_with_options(&package, &execution)?;
             if !json {
                 print_summary(&summary);
@@ -937,12 +957,14 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
             package,
             runtime_env,
             runtime_env_file,
+            secret_file,
             json,
         } => {
             if !json {
                 eprintln!("loading package: {}", package.display());
             }
-            let execution = build_run_execution_options(None, &runtime_env, &runtime_env_file)?;
+            let execution =
+                build_run_execution_options(None, &runtime_env, &runtime_env_file, &secret_file)?;
             let summary = lab_runner::describe_experiment_with_options(&package, &execution)?;
             if !json {
                 print_summary(&summary);
@@ -1085,9 +1107,11 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
             run_dir,
             runtime_env,
             runtime_env_file,
+            secret_file,
             json,
         } => {
-            let execution = build_run_execution_options(None, &runtime_env, &runtime_env_file)?;
+            let execution =
+                build_run_execution_options(None, &runtime_env, &runtime_env_file, &secret_file)?;
             let result = lab_runner::continue_run_with_options(&run_dir, execution)?;
             if json {
                 return Ok(Some(json!({
@@ -1764,12 +1788,14 @@ fn run_command(command: Commands) -> Result<Option<Value>> {
             package,
             runtime_env,
             runtime_env_file,
+            secret_file,
             json,
         } => {
             if !json {
                 eprintln!("running preflight: {}", package.display());
             }
-            let execution = build_run_execution_options(None, &runtime_env, &runtime_env_file)?;
+            let execution =
+                build_run_execution_options(None, &runtime_env, &runtime_env_file, &secret_file)?;
             let report = lab_runner::preflight_experiment_with_options(&package, &execution)?;
             if json {
                 return Ok(Some(json!({
@@ -2135,15 +2161,42 @@ fn parse_runtime_env_bindings(values: &[String]) -> Result<BTreeMap<String, Stri
     Ok(out)
 }
 
+fn parse_secret_file_bindings(values: &[String]) -> Result<BTreeMap<String, PathBuf>> {
+    let mut out = BTreeMap::new();
+    for raw in values {
+        let (key_raw, value_raw) = raw
+            .split_once('=')
+            .ok_or_else(|| anyhow!("invalid --secret-file '{}': expected ID=PATH", raw))?;
+        let key = key_raw.trim();
+        if key.is_empty() {
+            return Err(anyhow!(
+                "invalid --secret-file '{}': id cannot be empty",
+                raw
+            ));
+        }
+        let value = value_raw.trim();
+        if value.is_empty() {
+            return Err(anyhow!(
+                "invalid --secret-file '{}': path cannot be empty",
+                raw
+            ));
+        }
+        out.insert(key.to_string(), PathBuf::from(value));
+    }
+    Ok(out)
+}
+
 fn build_run_execution_options(
     materialize: Option<MaterializeArg>,
     runtime_env: &[String],
     runtime_env_files: &[PathBuf],
+    secret_files: &[String],
 ) -> Result<lab_runner::RunExecutionOptions> {
     Ok(lab_runner::RunExecutionOptions {
         materialize: materialize.map(Into::into),
         runtime_env: parse_runtime_env_bindings(runtime_env)?,
         runtime_env_files: runtime_env_files.to_vec(),
+        secret_files: parse_secret_file_bindings(secret_files)?,
     })
 }
 

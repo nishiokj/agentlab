@@ -1,8 +1,8 @@
 use anyhow::{anyhow, Context, Result};
 use chrono::Utc;
 use lab_core::{
-    canonical_json_digest, ensure_dir, ArtifactStore,
-    AGENTLAB_CONTRACT_IN_DIR, AGENTLAB_CONTRACT_OUT_DIR, AGENTLAB_TASK_WORKDIR_PLACEHOLDER,
+    canonical_json_digest, ensure_dir, ArtifactStore, AGENTLAB_CONTRACT_IN_DIR,
+    AGENTLAB_CONTRACT_OUT_DIR, AGENTLAB_TASK_WORKDIR_PLACEHOLDER,
 };
 use lab_provenance::{default_attestation, write_attestation};
 use serde_json::{json, Value};
@@ -97,6 +97,7 @@ pub fn continue_run_with_options(
         materialize: persisted_execution.materialize,
         runtime_env: options.runtime_env,
         runtime_env_files: options.runtime_env_files,
+        secret_files: options.secret_files,
     });
 
     // 2. Load schedule progress
@@ -1109,7 +1110,7 @@ pub(crate) fn run_experiment_with_behavior(
             &benchmark_config,
             &variants,
             &variant_runtime_profiles,
-         );
+        );
 
         let preflight = PreflightReport {
             passed: checks
@@ -1725,6 +1726,7 @@ pub fn replay_trial(run_dir: &Path, trial_id: &str, strict: bool) -> Result<Repl
         runtime_overrides_env: &agent_runtime_env,
         trial_paths: &trial_paths,
         dynamic_mounts: &dynamic_mounts,
+        secret_file_mounts: &runtime_profile.secret_file_mounts,
         io_paths: &io_paths,
         network_mode: effective_network_mode.as_str(),
         benchmark_grader: None,
@@ -1991,6 +1993,7 @@ pub(crate) fn fork_trial_inner(
         runtime_overrides_env: &agent_runtime_env,
         trial_paths: &trial_paths,
         dynamic_mounts: &dynamic_mounts,
+        secret_file_mounts: &runtime_profile.secret_file_mounts,
         io_paths: &io_paths,
         network_mode: effective_network_mode.as_str(),
         benchmark_grader: None,
@@ -2828,8 +2831,6 @@ pub(crate) fn resolve_command_artifact_targets(
             targets.push(target);
         }
     }
-
-    
 
     if targets.is_empty() {
         if let Some((token, candidate)) = first_bin_candidate {

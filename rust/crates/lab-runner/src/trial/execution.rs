@@ -17,7 +17,7 @@ use crate::backend::docker::{
 use crate::experiment::runner::{
     map_contract_path_to_host, ContractPathHostRoots, ContractPathMode,
 };
-use crate::experiment::runtime::AgentRuntimeConfig;
+use crate::experiment::runtime::{AgentRuntimeConfig, ResolvedSecretFileMount};
 use crate::model::{
     BenchmarkGraderConfig, GradingStrategy, PreparedTrialIo, ResolvedMountReference,
     AGENTLAB_ENV_AGENT_EXIT_STATUS, MAPPED_GRADER_OUTPUT_FILENAME, RAW_GRADER_OUTPUT_FILENAME,
@@ -56,6 +56,7 @@ pub(crate) struct AdapterRunRequest<'a> {
     pub(crate) runtime_overrides_env: &'a BTreeMap<String, String>,
     pub(crate) trial_paths: &'a TrialPaths,
     pub(crate) dynamic_mounts: &'a [ResolvedMountReference],
+    pub(crate) secret_file_mounts: &'a [ResolvedSecretFileMount],
     pub(crate) io_paths: &'a PreparedTrialIo,
     pub(crate) network_mode: &'a str,
     pub(crate) benchmark_grader: Option<&'a BenchmarkGraderConfig>,
@@ -179,7 +180,7 @@ pub(crate) fn execute_trial_runtime(
                 task_sandbox_plan.time_limit_ms,
             )?;
         }
-        //Lots of clones here. Why? ###Codex 
+        //Lots of clones here. Why? ###Codex
         let task_sandbox = TaskSandboxState {
             container_id: task_handle.container_id.clone(),
             image: task_sandbox_plan.image.clone(),
@@ -269,6 +270,18 @@ pub(crate) fn execute_trial_runtime(
             trial_output: trial_output.clone(),
             result_parse_error: result_parse_error.clone(),
         };
+        if agent_stream.timed_out {
+            return finalize_trial_runtime(
+                trial_dir,
+                &mut attempt_state,
+                agent_outcome,
+                GradingStageOutcome {
+                    trial_conclusion_row,
+                    deferred_trial_conclusion_records,
+                    grade_error_reason: Some("agent_timeout: benchmark grader skipped".to_string()),
+                },
+            );
+        }
 
         if request.benchmark_grading_enabled {
             write_grader_input_file(
@@ -601,6 +614,16 @@ pub(crate) fn build_container_spec(
         container_path: mount.mount_path.clone(),
         read_only: true,
     }));
+    mounts.extend(
+        request
+            .secret_file_mounts
+            .iter()
+            .map(|mount| ContainerMount {
+                host_path: mount.source_from_host.clone(),
+                container_path: mount.target_path.clone(),
+                read_only: true,
+            }),
+    );
     if include_agent_artifact {
         if let Some(bundle) = request.agent_artifact {
             if let Ok(bundle_root) = resolve_agent_artifact_mount_dir(bundle) {
@@ -631,11 +654,7 @@ pub(crate) fn build_container_spec(
     spec.workdir = Some(workdir.to_string());
     spec.mounts = mounts;
     spec.tmpfs = tmpfs;
-    spec.network_mode = if network_mode == "none" {
-        Some("none".to_string())
-    } else {
-        None
-    };
+    spec.network_mode = docker_network_mode(network_mode);
     spec.security_opt = if request
         .runtime_experiment
         .pointer("/policy/task_sandbox/hardening/no_new_privileges")
@@ -659,6 +678,14 @@ pub(crate) fn build_container_spec(
     spec.cpu_count = cpu_count;
     spec.memory_mb = memory_mb;
     spec
+}
+
+pub(crate) fn docker_network_mode(network_mode: &str) -> Option<String> {
+    match network_mode {
+        "none" => Some("none".to_string()),
+        "full" | "allowlist_enforced" | "llm_egress" => None,
+        _ => None,
+    }
 }
 
 fn classify_contract_file_state(path: &Path, validation_error: Option<&str>) -> ContractFileState {
