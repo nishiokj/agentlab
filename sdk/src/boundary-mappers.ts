@@ -404,7 +404,7 @@ export function assertTaskSpecV1(boundary: unknown): asserts boundary is TaskSpe
 export function compileTaskSpecs<TInput>(
   inputs: readonly TInput[],
   mapper: InputMapper<TInput>,
-: TaskSpecV1[] {
+): TaskSpecV1[] {
   return inputs.map((input, index) => {
     const boundary = mapper.map(input, { index });
     assertTaskSpecV1(boundary);

@@ -73,7 +73,6 @@ export type {
 
 export type {
   ArtifactMeasure,
-  BenchmarkAdapterConfig,
   BenchmarkConfig,
   BenchmarkScoringLifecycle,
   BenchmarkTaskModel,
@@ -83,7 +82,6 @@ export type {
   DatasetJsonlOptions,
   DesignPolicies,
   ExperimentSpec,
-  AgentIoConfig,
   GuardrailDef,
   MetricAggregate,
   MetricDef,

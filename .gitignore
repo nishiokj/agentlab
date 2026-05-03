@@ -58,3 +58,8 @@ htmlcov/
 
 docs
 /docs
+
+# Dev notes and scratch
+notes/
+agentlab-oracle-patch.*.json
+adapters/swebench/official_metadata/

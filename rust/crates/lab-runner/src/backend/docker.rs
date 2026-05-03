@@ -163,7 +163,7 @@ impl DockerRuntime {
     }
 
     pub(crate) fn exec(&self, handle: &ContainerHandle, spec: &ExecSpec) -> Result<ExecHandle> {
-        //What is this block_on? Is this a mutex? Is this really desirable? ###Codex 
+        //What is this block_on? Is this a mutex? Is this really desirable? ###Codex
         self.runtime.block_on(self.exec_async(handle, spec))
     }
 

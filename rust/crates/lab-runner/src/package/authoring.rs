@@ -54,7 +54,7 @@ pub(crate) fn load_authoring_input_for_build(
     })
 }
 
-pub(crate) fn is_dx_contract_authoring(json_value: &Value) -> bool {
+pub(crate) fn is_simplified_authoring_spec(json_value: &Value) -> bool {
     json_value.pointer("/agent").is_some()
         || json_value.pointer("/overrides").is_some()
         || json_value.pointer("/baseline/id").is_some()
@@ -136,7 +136,7 @@ fn tokenize_command_string(raw: &str) -> Result<Vec<String>> {
     Ok(tokens)
 }
 
-fn parse_dx_command_field_named(value: Option<&Value>, field: &str) -> Result<Vec<String>> {
+fn parse_authoring_command_field(value: Option<&Value>, field: &str) -> Result<Vec<String>> {
     match value {
         Some(Value::String(raw)) => tokenize_command_string(raw),
         Some(Value::Array(_)) => {
@@ -151,7 +151,11 @@ fn parse_dx_command_field_named(value: Option<&Value>, field: &str) -> Result<Ve
     }
 }
 
-pub(crate) fn resolve_dx_artifact_path(raw: &str, exp_dir: &Path, project_root: &Path) -> PathBuf {
+pub(crate) fn resolve_agent_artifact_path(
+    raw: &str,
+    exp_dir: &Path,
+    project_root: &Path,
+) -> PathBuf {
     let trimmed = raw.trim();
     let candidate = Path::new(trimmed);
     if candidate.is_absolute() {
@@ -217,7 +221,7 @@ pub(crate) fn compute_artifact_content_digest(path: &Path) -> Result<String> {
 }
 
 #[derive(Debug, Clone)]
-struct DxResolvedAgentBuild {
+struct ResolvedAuthoringAgentBuild {
     artifact_raw: String,
     artifact_path: PathBuf,
     artifact_digest: String,
@@ -229,7 +233,7 @@ struct DxResolvedAgentBuild {
 }
 
 #[derive(Debug, Clone)]
-struct DxVariantSpec {
+struct AuthoringVariantSpec {
     id: String,
     baseline: bool,
     agent_ref: String,
@@ -237,7 +241,7 @@ struct DxVariantSpec {
     env: BTreeMap<String, String>,
 }
 
-pub(crate) fn uses_new_variant_agent_model(json_value: &Value) -> bool {
+pub(crate) fn uses_agent_build_variant_model(json_value: &Value) -> bool {
     if matches!(json_value.pointer("/agent_builds"), Some(Value::Array(_))) {
         return true;
     }
@@ -251,7 +255,7 @@ pub(crate) fn uses_new_variant_agent_model(json_value: &Value) -> bool {
     })
 }
 
-fn reject_removed_dx_agent_fields(root: &Value, root_name: &str) -> Result<()> {
+fn reject_removed_agent_authoring_fields(root: &Value, root_name: &str) -> Result<()> {
     let removed = [
         ("arg_map", "put public argv directly in agent.command using $binding placeholders"),
         (
@@ -305,7 +309,7 @@ pub(crate) fn resolve_existing_public_path_reference(
     {
         return Ok(None);
     }
-    let rel = validate_dx_support_file_relpath(trimmed, field_name)?;
+    let rel = validate_public_authoring_relpath(trimmed, field_name)?;
     let resolved = normalize_path(&exp_dir.join(&rel));
     match fs::metadata(&resolved) {
         Ok(_) => Ok(Some(PathBuf::from(rel))),
@@ -331,7 +335,7 @@ pub(crate) fn resolve_existing_public_path_reference(
     }
 }
 
-fn validate_dx_command_and_env_surface(
+fn validate_agent_authoring_surface(
     command: &[String],
     env: &BTreeMap<String, String>,
     root_name: &str,
@@ -374,7 +378,7 @@ fn validate_dx_command_and_env_surface(
     Ok(())
 }
 
-pub(crate) fn validate_dx_support_file_relpath(raw: &str, field_name: &str) -> Result<String> {
+pub(crate) fn validate_public_authoring_relpath(raw: &str, field_name: &str) -> Result<String> {
     let trimmed = raw.trim();
     if trimmed.is_empty() {
         return Err(anyhow!("{} must not be empty", field_name));
@@ -402,7 +406,7 @@ pub(crate) fn validate_dx_support_file_relpath(raw: &str, field_name: &str) -> R
     Ok(normalized.to_string_lossy().replace('\\', "/"))
 }
 
-fn dx_runtime_asset_value(build_source_path: &Path, runtime_path: &str) -> Value {
+fn runtime_asset_mount_spec(build_source_path: &Path, runtime_path: &str) -> Value {
     json!({
         "build_source_path": build_source_path.to_string_lossy().to_string(),
         "runtime_path": runtime_path,
@@ -411,13 +415,13 @@ fn dx_runtime_asset_value(build_source_path: &Path, runtime_path: &str) -> Value
     })
 }
 
-fn parse_dx_agent_build(
+fn parse_authoring_agent_build(
     root: &Value,
     root_name: &str,
     exp_dir: &Path,
     project_root: &Path,
-) -> Result<DxResolvedAgentBuild> {
-    reject_removed_dx_agent_fields(root, root_name)?;
+) -> Result<ResolvedAuthoringAgentBuild> {
+    reject_removed_agent_authoring_fields(root, root_name)?;
     let artifact_raw = root
         .get("artifact")
         .and_then(Value::as_str)
@@ -425,7 +429,7 @@ fn parse_dx_agent_build(
         .filter(|v| !v.is_empty())
         .ok_or_else(|| anyhow!("{}.artifact is required", root_name))?
         .to_string();
-    let artifact_path = resolve_dx_artifact_path(&artifact_raw, exp_dir, project_root);
+    let artifact_path = resolve_agent_artifact_path(&artifact_raw, exp_dir, project_root);
     fs::metadata(&artifact_path).with_context(|| {
         format!(
             "failed to read {}.artifact source path '{}' (artifact value '{}')",
@@ -436,7 +440,7 @@ fn parse_dx_agent_build(
     })?;
     let artifact_digest = compute_artifact_content_digest(&artifact_path)?;
     let command_base =
-        parse_dx_command_field_named(root.get("command"), &format!("{}.command", root_name))?;
+        parse_authoring_command_field(root.get("command"), &format!("{}.command", root_name))?;
     let command = command_base.clone();
     let image = root
         .get("image")
@@ -447,8 +451,8 @@ fn parse_dx_agent_build(
         .to_string();
     let env_base = parse_string_map_field(root.get("env"), &format!("{}.env", root_name))?;
     let env = env_base.clone();
-    validate_dx_command_and_env_surface(&command_base, &env_base, root_name, exp_dir)?;
-    Ok(DxResolvedAgentBuild {
+    validate_agent_authoring_surface(&command_base, &env_base, root_name, exp_dir)?;
+    Ok(ResolvedAuthoringAgentBuild {
         artifact_raw,
         artifact_path,
         artifact_digest,
@@ -461,7 +465,7 @@ fn parse_dx_agent_build(
 }
 
 fn runtime_override_for_variant_build(
-    build: &DxResolvedAgentBuild,
+    build: &ResolvedAuthoringAgentBuild,
     variant_env: &BTreeMap<String, String>,
 ) -> Value {
     let mut merged_env = build.env.clone();
@@ -491,13 +495,13 @@ pub(crate) fn builtin_benchmark_assets_root() -> Result<PathBuf> {
     ))
 }
 
-pub(crate) fn rewrite_new_variant_agent_model(
+pub(crate) fn rewrite_agent_build_variants_to_variant_plan(
     json_value: &Value,
     exp_dir: &Path,
     project_root: &Path,
 ) -> Result<Value> {
     let mut rewritten = json_value.clone();
-    let mut builds_by_id: BTreeMap<String, DxResolvedAgentBuild> = BTreeMap::new();
+    let mut builds_by_id: BTreeMap<String, ResolvedAuthoringAgentBuild> = BTreeMap::new();
 
     if let Some(agent_builds) = json_value.pointer("/agent_builds") {
         let items = agent_builds
@@ -520,7 +524,7 @@ pub(crate) fn rewrite_new_variant_agent_model(
             if builds_by_id.contains_key(&id) {
                 return Err(anyhow!("agent_builds contains duplicate id '{}'", id));
             }
-            let parsed = parse_dx_agent_build(
+            let parsed = parse_authoring_agent_build(
                 item,
                 &format!("agent_builds[{}]", idx),
                 exp_dir,
@@ -532,7 +536,7 @@ pub(crate) fn rewrite_new_variant_agent_model(
         let legacy_agent = json_value
             .pointer("/agent")
             .ok_or_else(|| anyhow!("agent_builds is required when agent section is missing"))?;
-        let parsed = parse_dx_agent_build(legacy_agent, "agent", exp_dir, project_root)?;
+        let parsed = parse_authoring_agent_build(legacy_agent, "agent", exp_dir, project_root)?;
         builds_by_id.insert("default".to_string(), parsed);
     }
 
@@ -592,7 +596,7 @@ pub(crate) fn rewrite_new_variant_agent_model(
                 agent_ref
             ));
         }
-        parsed_variants.push(DxVariantSpec {
+        parsed_variants.push(AuthoringVariantSpec {
             id,
             baseline,
             agent_ref,
@@ -713,12 +717,13 @@ pub(crate) fn normalize_experiment_authoring(
     exp_dir: &Path,
     project_root: &Path,
 ) -> Result<Value> {
-    if !is_dx_contract_authoring(&json_value) {
+    if !is_simplified_authoring_spec(&json_value) {
         return Ok(json_value);
     }
     let mut json_value = json_value;
-    if uses_new_variant_agent_model(&json_value) {
-        json_value = rewrite_new_variant_agent_model(&json_value, exp_dir, project_root)?;
+    if uses_agent_build_variant_model(&json_value) {
+        json_value =
+            rewrite_agent_build_variants_to_variant_plan(&json_value, exp_dir, project_root)?;
     }
 
     let experiment_id = json_value
@@ -836,7 +841,14 @@ pub(crate) fn normalize_experiment_authoring(
     let agent_root = json_value
         .pointer("/agent")
         .ok_or_else(|| anyhow!("agent section is required"))?;
-    let agent_build = parse_dx_agent_build(agent_root, "agent", exp_dir, project_root)?;
+    let agent_build = parse_authoring_agent_build(agent_root, "agent", exp_dir, project_root)?;
+    let agent_artifact_type = agent_root
+        .get("artifact_type")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .unwrap_or("structured_json")
+        .to_string();
     let (
         dataset_suite_id,
         dataset_split_id,
@@ -867,7 +879,7 @@ pub(crate) fn normalize_experiment_authoring(
                     "bench/integration/agentlab/bench_benchmark_adapter.py"
                 )
             ]),
-            json!([dx_runtime_asset_value(
+            json!([runtime_asset_mount_spec(
                 &builtin_assets_root.join("bench"),
                 &task_workdir_support_destination_path("bench")
             )]),
@@ -888,9 +900,11 @@ pub(crate) fn normalize_experiment_authoring(
             }),
             json!([
                 "python3",
-                task_workdir_support_destination_path("swebench/swebench_task_container_grader.py")
+                task_workdir_support_destination_path(
+                    "swebench/swebench_official_single_grader.py"
+                )
             ]),
-            json!([dx_runtime_asset_value(
+            json!([runtime_asset_mount_spec(
                 &builtin_assets_root.join("adapters").join("swebench"),
                 &task_workdir_support_destination_path("swebench")
             )]),
@@ -961,6 +975,9 @@ pub(crate) fn normalize_experiment_authoring(
             }
         },
         "metrics": metrics,
+        "agent": {
+            "artifact_type": agent_artifact_type
+        },
         "baseline": {
             "variant_id": baseline_id,
             "bindings": baseline_bindings

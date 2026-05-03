@@ -37,13 +37,13 @@ const builder = ExperimentBuilder.create('rex_ab', 'Rex Prompt A/B')
     limit: 10,
   })
 
-  // Agent runtime bundle plus task-sandbox image.
-  .agentBundle('./agents/rex-bundle.tar.gz')
-  .customAgentImage(
+  // Agent runtime artifact plus agent-runtime image.
+  .agentArtifact('./agents/rex-bundle.tar.gz')
+  .agentRuntime(
     'ghcr.io/acme/task-sandbox@sha256:0123456789abcdef...',
     ['python', '-m', 'rex.run_trial'],
   )
-  .agentEnvFromHost(['OPENAI_API_KEY'])
+  .runtimeEnvFromHost(['OPENAI_API_KEY'])
 
   .baseline('control', { model: 'gpt-4o-mini', prompt: 'v1' })
   .addVariant('treatment', { model: 'gpt-4o-mini', prompt: 'treatment_prompt' })
@@ -56,7 +56,7 @@ const builder = ExperimentBuilder.create('rex_ab', 'Rex Prompt A/B')
   }))
 
   .timeoutMs(600_000)
-  .networkMode('none');
+  .networkPolicy('none');
 
 mkdirSync('.lab', { recursive: true });
 writeFileSync('.lab/experiment.yaml', builder.toYaml());
@@ -85,8 +85,8 @@ You do not provide a control-plane protocol, runner socket wiring, or runner sta
 
 ```ts
 builder
-  .agentBundle('./agents/rex-bundle.tar.gz')
-  .customAgentImage(
+  .agentArtifact('./agents/rex-bundle.tar.gz')
+  .agentRuntime(
     'ghcr.io/acme/task-sandbox@sha256:...',
     ['python', '-m', 'rex.run_trial'],
   );
@@ -94,13 +94,12 @@ builder
 
 You can set runtime command/env through:
 
-1. `.agentBundle(path)` (sets `runtime.agent_runtime.artifact`)
-2. `.agentLoop(command)` (sets `runtime.agent_runtime.command`)
-3. `.customAgentImage(image, command)` (sets `runtime.agent_runtime.image` and `runtime.agent_runtime.command`)
-4. `.agentArgs(args)`
+1. `.agentArtifact(path)` (sets `runtime.agent_runtime.artifact`)
+2. `.agentCommand(command)` (sets `runtime.agent_runtime.command`)
+3. `.agentRuntime(image, command)` (sets `runtime.agent_runtime.image` and `runtime.agent_runtime.command`)
+4. `.appendAgentCommandArgs(args)`
 5. `.agentEnv(env)`
-6. `.agentEnvFromHost(keys)`
-7. `.agentIo(inputArg, outputArg)` (optional IO flag mapping)
+6. `.runtimeEnvFromHost(keys)`
 
 ## Command Semantics
 
@@ -171,8 +170,8 @@ Resolution rules:
 Required before `build()`:
 
 1. `.datasetJsonl(path, opts)`
-2. `.agentBundle(path)`
-3. `.agentLoop(...)` or `.customAgentImage(...)`
+2. `.agentArtifact(path)`
+3. `.agentCommand(...)` or `.agentRuntime(...)`
 
 Common optional setters:
 
@@ -181,7 +180,7 @@ Common optional setters:
 3. `.metric(def)`
 4. `.guardrail(def)`
 5. `.artifacts({ collect, diff, baseDir? })`
-6. `.networkMode('none' | 'full' | 'allowlist_enforced', hosts?)`
+6. `.networkPolicy('none' | 'full' | 'allowlist_enforced', hosts?)`
 7. `.timeoutMs(ms)`
 
 ## LabClient API (Primary)
@@ -217,6 +216,6 @@ Canonical per-trial result is:
 
 ## Current Runtime Notes
 
-1. `networkMode('allowlist_enforced', ...)` is not yet implemented by the Rust container executor.
+1. `networkPolicy('allowlist_enforced', ...)` is not yet implemented by the Rust container executor.
 2. Container reproducibility is strongest when image references are pinned by digest (`image@sha256:...`).
 3. `runtime.agent_runtime` is the runtime source of truth.

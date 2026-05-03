@@ -178,13 +178,24 @@ pub(crate) fn resolve_runtime_agent_command(
         .runtime
         .command_raw
         .iter()
-        .map(|token| replace_task_workdir_placeholder(token, request.task_workdir))
-        .collect::<Vec<_>>();
+        .map(|token| {
+            replace_event_path_placeholders(
+                &replace_task_workdir_placeholder(token, request.task_workdir),
+                request,
+            )
+        })
+        .collect::<Result<Vec<_>>>()?;
     command.extend(
         request
             .variant_args
             .iter()
-            .map(|token| replace_task_workdir_placeholder(token, request.task_workdir)),
+            .map(|token| {
+                replace_event_path_placeholders(
+                    &replace_task_workdir_placeholder(token, request.task_workdir),
+                    request,
+                )
+            })
+            .collect::<Result<Vec<_>>>()?,
     );
     if should_append_rex_contract_io(&command) {
         command.push("--input-file".to_string());
@@ -214,15 +225,30 @@ pub(crate) fn resolve_runtime_agent_command(
     Ok(command)
 }
 
+fn replace_event_path_placeholders(raw: &str, request: &AdapterRunRequest<'_>) -> Result<String> {
+    let mut rendered = raw.replace(
+        "__AGENTLAB_TRAJECTORY_PATH__",
+        request.io_paths.trajectory_path.as_str(),
+    );
+    for sink in &request.runtime.event_sinks {
+        let placeholder = format!("__AGENTLAB_EVENT_PATH_{}__", sink.id);
+        rendered = rendered.replace(&placeholder, sink.path.as_str());
+    }
+    if rendered.contains("__AGENTLAB_EVENT_PATH_") {
+        return Err(anyhow!(
+            "runtime.agent_runtime.command references an unknown __AGENTLAB_EVENT_PATH_<id>__ placeholder"
+        ));
+    }
+    Ok(rendered)
+}
+
 fn should_append_rex_contract_io(command: &[String]) -> bool {
     if !is_rex_headless_command(command) {
         return false;
     }
     if command.iter().any(|arg| {
-        matches!(
-            arg.as_str(),
-            "--input" | "--input-file" | "--output"
-        ) || arg.starts_with("--input=")
+        matches!(arg.as_str(), "--input" | "--input-file" | "--output")
+            || arg.starts_with("--input=")
             || arg.starts_with("--input-file=")
             || arg.starts_with("--output=")
     }) {

@@ -318,6 +318,7 @@ pub(crate) fn execute_scheduled_trial_attempt(
         runtime_overrides_env: &prepared.variant_runtime.agent_runtime_env,
         trial_paths: &prepared.trial_paths,
         dynamic_mounts: &prepared.dynamic_mounts,
+        secret_file_mounts: &prepared.variant_runtime.secret_file_mounts,
         io_paths: &prepared.io_paths,
         network_mode: prepared.effective_network_mode.as_str(),
         benchmark_grader: request.benchmark_config.grader.as_ref(),
@@ -404,7 +405,10 @@ pub(crate) fn finalize_scheduled_trial(
         None
     };
 
-    let hook_events_path = if prepared.io_paths.events_host.exists() {
+    let event_sink = prepared.variant_runtime.agent_runtime.event_sinks.first();
+    let persist_hook_events = event_sink.map(|sink| sink.persist).unwrap_or(true);
+    let ingest_hook_events = event_sink.map(|sink| sink.ingest).unwrap_or(true);
+    let hook_events_path = if persist_hook_events && prepared.io_paths.events_host.exists() {
         Some(prepared.io_paths.events_host.clone())
     } else {
         None
@@ -506,6 +510,7 @@ pub(crate) fn finalize_scheduled_trial(
         &prepared.trial_dir,
         &prepared.variant_runtime.experiment,
         &prepared.variant_runtime.agent_runtime,
+        &prepared.variant_runtime.secret_file_mounts,
         &prepared.trial_paths,
         &resolve_exec_digest(
             &prepared.variant_runtime.agent_runtime.command_raw,
@@ -518,7 +523,7 @@ pub(crate) fn finalize_scheduled_trial(
     )?;
 
     let manifest_path = resolve_agent_runtime_manifest_path(&prepared.trial_paths)?;
-    if manifest_path.exists() && prepared.io_paths.events_host.exists() {
+    if ingest_hook_events && manifest_path.exists() && prepared.io_paths.events_host.exists() {
         let manifest = load_manifest(&manifest_path)?;
         let schema = compile_schema("hook_events_v1.jsonschema")?;
         let _ = validate_hooks(&manifest, &prepared.io_paths.events_host, &schema);
@@ -625,7 +630,7 @@ pub(crate) fn finalize_scheduled_trial(
         ("success".to_string(), json!(fallback))
     };
     let bindings = variant_bindings_for_summary(&prepared.variant);
-    let event_rows = if prepared.io_paths.events_host.exists() {
+    let event_rows = if ingest_hook_events && prepared.io_paths.events_host.exists() {
         load_event_rows(
             &prepared.io_paths.events_host,
             request.run_id,

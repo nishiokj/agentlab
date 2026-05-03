@@ -2,26 +2,26 @@ import assert from 'node:assert/strict';
 import test, { describe } from 'node:test';
 
 import {
-  assertTaskBoundaryV3,
-  compileTaskBoundaries,
+  assertTaskSpecV1,
+  compileTaskSpecs,
   createOutcomeBoundary,
   createRunnerBoundaryManifest,
   INVOCATION_ENV_CONTRACT_V1,
   mapOutcome,
-  taskBoundariesToJsonl,
+  taskSpecsToJsonl,
   WORKSPACE_CONTRACT_V1,
 } from '../src/boundary-mappers.js';
 import type {
   InputMapper,
   OutcomeMapper,
-  TaskBoundaryV3,
+  TaskSpecV1,
 } from '../src/boundary-mappers.js';
 import type { HookEvent } from '../src/hook-events.js';
 import type { TrialOutput } from '../src/trial-output.js';
 
-function makeTaskBoundary(taskId: string): TaskBoundaryV3 {
+function makeTaskSpec(taskId: string): TaskSpecV1 {
   return {
-    schema_version: 'task_boundary_v3',
+    schema_version: 'task_spec_v1',
     task: {
       id: taskId,
       prompt: `solve ${taskId}`,
@@ -58,7 +58,7 @@ function makeTaskBoundary(taskId: string): TaskBoundaryV3 {
   };
 }
 
-describe('Runner boundary contracts', () => {
+describe('Runner spec contracts', () => {
   test('workspace and event contracts are fixed', () => {
     assert.equal(WORKSPACE_CONTRACT_V1.root, '/agentlab/workspace');
     assert.equal(
@@ -93,64 +93,64 @@ describe('Runner boundary contracts', () => {
   });
 });
 
-describe('InputMapper and task boundary', () => {
-  test('compileTaskBoundaries maps source inputs to runner-consumable boundaries', () => {
+describe('InputMapper and task spec', () => {
+  test('compileTaskSpecs maps source inputs to runner-consumable specs', () => {
     const mapper: InputMapper<{ id: string }> = {
       map(input) {
-        return makeTaskBoundary(input.id);
+        return makeTaskSpec(input.id);
       },
     };
 
-    const boundaries = compileTaskBoundaries([{ id: 't1' }, { id: 't2' }], mapper);
-    assert.equal(boundaries.length, 2);
-    assert.equal(boundaries[0].task.id, 't1');
-    assert.equal(boundaries[1].task.id, 't2');
+    const specs = compileTaskSpecs([{ id: 't1' }, { id: 't2' }], mapper);
+    assert.equal(specs.length, 2);
+    assert.equal(specs[0].task.id, 't1');
+    assert.equal(specs[1].task.id, 't2');
   });
 
-  test('assertTaskBoundaryV3 enforces abstraction boundary keys', () => {
+  test('assertTaskSpecV1 enforces abstraction spec keys', () => {
     const invalid = {
-      ...makeTaskBoundary('t1'),
+      ...makeTaskSpec('t1'),
       benchmark_kind: 'new_magic_type',
     };
     assert.throws(
-      () => assertTaskBoundaryV3(invalid),
+      () => assertTaskSpecV1(invalid),
       /must compile into exactly: task \+ environment \+ workspace \+ limits/,
     );
   });
 
   test('aux mounts must be dataset packs by hash under the logical workspace root', () => {
-    const invalidRef = makeTaskBoundary('t1');
+    const invalidRef = makeTaskSpec('t1');
     invalidRef.workspace.aux_mounts[0].dataset_pack_ref = 'dataset-v1';
     assert.throws(
-      () => assertTaskBoundaryV3(invalidRef),
+      () => assertTaskSpecV1(invalidRef),
       /dataset_pack_ref must match sha256:<hex64>/,
     );
   });
 
   test('workspace overlays must be relative to /agentlab/workspace', () => {
-    const invalidPath = makeTaskBoundary('t1');
+    const invalidPath = makeTaskSpec('t1');
     invalidPath.workspace.overlays[0].path = '/etc/passwd';
     assert.throws(
-      () => assertTaskBoundaryV3(invalidPath),
+      () => assertTaskSpecV1(invalidPath),
       /must be relative to \/agentlab\/workspace/,
     );
   });
 
   test('patch tasks require a real base', () => {
-    const invalidBase = makeTaskBoundary('t1');
+    const invalidBase = makeTaskSpec('t1');
     invalidBase.workspace.base = { kind: 'empty' };
     assert.throws(
-      () => assertTaskBoundaryV3(invalidBase),
+      () => assertTaskSpecV1(invalidBase),
       /patch tasks require a real workspace\.base/,
     );
   });
 
-  test('taskBoundariesToJsonl serializes validated boundaries', () => {
-    const jsonl = taskBoundariesToJsonl([makeTaskBoundary('t1'), makeTaskBoundary('t2')]);
+  test('taskSpecsToJsonl serializes validated specs', () => {
+    const jsonl = taskSpecsToJsonl([makeTaskSpec('t1'), makeTaskSpec('t2')]);
     const lines = jsonl.trim().split('\n');
     assert.equal(lines.length, 2);
-    const parsed = JSON.parse(lines[0]) as TaskBoundaryV3;
-    assert.equal(parsed.schema_version, 'task_boundary_v3');
+    const parsed = JSON.parse(lines[0]) as TaskSpecV1;
+    assert.equal(parsed.schema_version, 'task_spec_v1');
     assert.equal(parsed.task.id, 't1');
     assert.equal(parsed.environment.image, 'python:3.11-slim');
   });
@@ -185,19 +185,19 @@ describe('OutcomeMapper', () => {
   ];
 
   test('createOutcomeBoundary creates runner-emitted shape for user mapping', () => {
-    const boundary = createOutcomeBoundary(trialOutput, runEvents);
-    assert.equal(boundary.schema_version, 'outcome_boundary_v1');
-    assert.equal(boundary.result_summary.outcome, 'success');
-    assert.equal(boundary.run_events.length, 1);
-    assert.equal(boundary.run_events[0].event_type, 'agent_step_start');
+    const spec = createOutcomeBoundary(trialOutput, runEvents);
+    assert.equal(spec.schema_version, 'outcome_boundary_v1');
+    assert.equal(spec.result_summary.outcome, 'success');
+    assert.equal(spec.run_events.length, 1);
+    assert.equal(spec.run_events[0].event_type, 'agent_step_start');
   });
 
   test('mapOutcome supports sync user mappers', async () => {
     const mapper: OutcomeMapper<{ passed: boolean; calls: number }> = {
-      map(boundary) {
+      map(spec) {
         return {
-          passed: boundary.result_summary.outcome === 'success',
-          calls: boundary.run_events.length,
+          passed: spec.result_summary.outcome === 'success',
+          calls: spec.run_events.length,
         };
       },
     };
@@ -207,8 +207,8 @@ describe('OutcomeMapper', () => {
 
   test('mapOutcome supports async user mappers', async () => {
     const mapper: OutcomeMapper<string> = {
-      async map(boundary) {
-        return `${boundary.result_summary.ids.trial_id}:${boundary.result_summary.outcome}`;
+      async map(spec) {
+        return `${spec.result_summary.ids.trial_id}:${spec.result_summary.outcome}`;
       },
     };
     const mapped = await mapOutcome(createOutcomeBoundary(trialOutput, runEvents), mapper);

@@ -11,9 +11,8 @@ import type { DesignPolicies, MetricDef } from '../src/experiment-builder.js';
 function validBuilder(): ExperimentBuilder {
   return ExperimentBuilder.create('exp-1', 'My Experiment')
     .datasetJsonl('tasks.jsonl', { suiteId: 'suite', splitId: 'dev', limit: 50 })
-    .agentLoop(['node', './agent_loop.js', 'run'])
-    .agentBundle('./agents/agent-runtime.tar.gz')
-    .sandboxImage('ghcr.io/acme/task-sandbox:latest');
+    .agentArtifact('./agents/agent-runtime.tar.gz')
+    .agentRuntime('ghcr.io/acme/agent-runtime:latest', ['node', './agent_loop.js', 'run']);
 }
 
 function validFromBuilder(policies: DesignPolicies): ExperimentBuilder {
@@ -21,9 +20,8 @@ function validFromBuilder(policies: DesignPolicies): ExperimentBuilder {
     .id('exp-from')
     .name('From Preset')
     .datasetJsonl('tasks.jsonl', { suiteId: 'suite', splitId: 'dev', limit: 50 })
-    .agentLoop(['node', './agent_loop.js', 'run'])
-    .agentBundle('./agents/agent-runtime.tar.gz')
-    .sandboxImage('ghcr.io/acme/task-sandbox:latest');
+    .agentArtifact('./agents/agent-runtime.tar.gz')
+    .agentRuntime('ghcr.io/acme/agent-runtime:latest', ['node', './agent_loop.js', 'run']);
 }
 
 describe('ExperimentBuilder defaults', () => {
@@ -40,19 +38,18 @@ describe('ExperimentBuilder defaults', () => {
     assert.equal(spec.design.comparison, 'paired');
     assert.equal(spec.design.shuffle_tasks, true);
     assert.equal(spec.design.max_concurrency, 1);
-    assert.equal(spec.dataset.schema_version, 'task_boundary_v3');
+    assert.equal(spec.dataset.schema_version, 'task_spec_v1');
   });
 
   test('runtime defaults are set', () => {
-    assert.deepEqual(spec.runtime.agent.command, ['node', './agent_loop.js', 'run']);
-    assert.equal(spec.runtime.agent.bundle, './agents/agent-runtime.tar.gz');
-    assert.equal(spec.runtime.policy.timeout_ms, 600_000);
-    assert.equal(spec.runtime.sandbox.executor, 'docker');
-    assert.equal(spec.runtime.sandbox.image_source, 'global');
-    assert.equal(spec.runtime.sandbox.image, 'ghcr.io/acme/task-sandbox:latest');
-    assert.equal(spec.runtime.sandbox.profile, 'default');
-    assert.equal(spec.runtime.sandbox.network, 'none');
-    assert.deepEqual(spec.runtime.policy.network.allowed_hosts, []);
+    assert.deepEqual(spec.runtime.agent_runtime.command, ['node', './agent_loop.js', 'run']);
+    assert.equal(spec.runtime.agent_runtime.artifact, './agents/agent-runtime.tar.gz');
+    assert.equal(spec.runtime.agent_runtime.image, 'ghcr.io/acme/agent-runtime:latest');
+    assert.equal(spec.runtime.agent_runtime.network, 'none');
+    assert.equal(spec.policy.timeout_ms, 600_000);
+    assert.equal(spec.policy.task_sandbox.profile, 'default');
+    assert.equal(spec.policy.task_sandbox.network, 'none');
+    assert.deepEqual(spec.policy.task_sandbox.allowed_hosts, []);
   });
 
   test('baseline and variants defaults', () => {
@@ -69,8 +66,8 @@ describe('ExperimentBuilder validation', () => {
       (err: Error) => {
         assert.ok(err.message.includes('required fields not set'));
         assert.ok(err.message.includes('dataset path'));
-        assert.ok(err.message.includes('runtime.agent.command'));
-        assert.ok(err.message.includes('runtime.agent.bundle'));
+        assert.ok(err.message.includes('runtime.agent_runtime.command'));
+        assert.ok(err.message.includes('runtime.agent_runtime.artifact'));
         return true;
       },
     );
@@ -80,7 +77,7 @@ describe('ExperimentBuilder validation', () => {
     assert.throws(
       () => ExperimentBuilder.from(ExperimentType.AB_TEST)
         .datasetJsonl('tasks.jsonl', { suiteId: 'suite', splitId: 'dev', limit: 1 })
-        .agentLoop(['node', './agent_loop.js'])
+        .agentCommand(['node', './agent_loop.js'])
         .build(),
       (err: Error) => {
         assert.ok(err.message.includes('experiment id'));
@@ -113,26 +110,35 @@ describe('ExperimentBuilder validation', () => {
 });
 
 describe('ExperimentBuilder runtime APIs', () => {
-  test('agentLoop sets entrypoint', () => {
-    const spec = validBuilder().agentLoop(['python', 'agent_loop.py']).build();
-    assert.deepEqual(spec.runtime.agent.command, ['python', 'agent_loop.py']);
+  test('agentCommand sets entrypoint', () => {
+    const spec = validBuilder().agentCommand(['python', 'agent_loop.py']).build();
+    assert.deepEqual(spec.runtime.agent_runtime.command, ['python', 'agent_loop.py']);
   });
 
-  test('customAgentImage sets container mode + image', () => {
-    const spec = validBuilder().customAgentImage('ghcr.io/acme/agent:latest', ['python', 'run.py']).build();
-    assert.deepEqual(spec.runtime.agent.command, ['python', 'run.py']);
-    assert.equal(spec.runtime.sandbox.image, 'ghcr.io/acme/agent:latest');
-    assert.equal(spec.runtime.sandbox.executor, 'docker');
+  test('agentRuntime sets runtime image and command', () => {
+    const spec = validBuilder().agentRuntime('ghcr.io/acme/agent:latest', ['python', 'run.py']).build();
+    assert.deepEqual(spec.runtime.agent_runtime.command, ['python', 'run.py']);
+    assert.equal(spec.runtime.agent_runtime.image, 'ghcr.io/acme/agent:latest');
   });
 
-  test('networkMode and timeoutMs are applied', () => {
+  test('networkPolicy and timeoutMs are applied', () => {
     const spec = validBuilder()
-      .networkMode('allowlist_enforced', ['api.openai.com'])
+      .networkPolicy('allowlist_enforced', ['api.openai.com'])
       .timeoutMs(42_000)
       .build();
-    assert.equal(spec.runtime.sandbox.network, 'allowlist_enforced');
-    assert.deepEqual(spec.runtime.policy.network.allowed_hosts, ['api.openai.com']);
-    assert.equal(spec.runtime.policy.timeout_ms, 42_000);
+    assert.equal(spec.runtime.agent_runtime.network, 'allowlist_enforced');
+    assert.equal(spec.policy.task_sandbox.network, 'allowlist_enforced');
+    assert.deepEqual(spec.policy.task_sandbox.allowed_hosts, ['api.openai.com']);
+    assert.equal(spec.policy.timeout_ms, 42_000);
+  });
+
+  test('networkPolicy llm_egress keeps task sandbox network isolated', () => {
+    const spec = validBuilder()
+      .networkPolicy('llm_egress', ['api.openai.com'])
+      .build();
+    assert.equal(spec.runtime.agent_runtime.network, 'llm_egress');
+    assert.equal(spec.policy.task_sandbox.network, 'none');
+    assert.deepEqual(spec.policy.task_sandbox.allowed_hosts, ['api.openai.com']);
   });
 
   test('localSandbox is rejected after hard cutover', () => {
@@ -295,7 +301,7 @@ describe('YAML serialization', () => {
 
     assert.ok(!yaml.includes('version: "0.5"'));
     assert.ok(yaml.includes('runtime:'));
-    assert.ok(yaml.includes('agent:'));
+    assert.ok(yaml.includes('agent_runtime:'));
     assert.ok(yaml.includes('baseline:'));
     assert.ok(yaml.includes('variant_plan:'));
     assert.ok(yaml.includes('metrics:'));

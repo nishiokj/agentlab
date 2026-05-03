@@ -61,8 +61,8 @@ mod tests {
     use crate::trial::artifacts::load_trial_output_resilient;
     use crate::trial::env::{build_exec_env, resolve_runtime_agent_command};
     use crate::trial::execution::{
-        map_container_path_to_host, resolve_agent_artifact_mount_dir, resolve_container_platform,
-        validate_container_workspace_path,
+        docker_network_mode, map_container_path_to_host, resolve_agent_artifact_mount_dir,
+        resolve_container_platform, validate_container_workspace_path,
     };
     use crate::trial::grade::benchmark_retry_inputs;
     use crate::trial::layout::*;
@@ -201,6 +201,8 @@ mod tests {
             launch_mode: AgentLaunchMode::File,
             env: BTreeMap::new(),
             env_from_host: vec![],
+            secret_files: Vec::new(),
+            event_sinks: Vec::new(),
             workspace_patches: Vec::new(),
             trajectory_path: None,
             causal_extraction: None,
@@ -1037,6 +1039,7 @@ mod tests {
             &paths.trial_dir,
             &experiment,
             &runtime,
+            &[],
             &paths,
             "sha256:test",
             "none",
@@ -1103,6 +1106,7 @@ mod tests {
             &paths.trial_dir,
             &experiment,
             &runtime,
+            &[],
             &paths,
             "sha256:test",
             "full",
@@ -1152,6 +1156,7 @@ mod tests {
             &paths.trial_dir,
             &experiment,
             &runtime,
+            &[],
             &paths,
             "sha256:test",
             "none",
@@ -1187,6 +1192,7 @@ mod tests {
             materialize: None,
             runtime_env: BTreeMap::new(),
             runtime_env_files: Vec::new(),
+            secret_files: BTreeMap::new(),
         };
         write_run_session_state(&run_dir, "run_1", &behavior, &execution).expect("write state");
         let state = load_run_session_state(&run_dir).expect("load state");
@@ -1475,6 +1481,41 @@ mod tests {
         let agent_runtime =
             resolve_agent_runtime(&spec, &exp_dir, &root.path).expect("resolve runtime");
         assert_eq!(agent_runtime.command_raw, vec!["rex"]);
+    }
+
+    #[test]
+    fn resolve_agent_runtime_parses_file_backed_event_sink() {
+        let root = TempDirGuard::new("agentlab_event_sink_parse");
+        let exp_dir = root.path.join("exp");
+        ensure_dir(&exp_dir).expect("exp dir");
+        let spec = json!({
+            "runtime": {
+                "agent_runtime": {
+                    "command": ["rex", "run", "--events", "__AGENTLAB_EVENT_PATH_rex_hooks__"],
+                    "artifact": ".lab/agents/rex-current.tar.gz",
+                    "image": "debian:bookworm-slim",
+                    "events": [
+                        {
+                            "id": "rex_hooks",
+                            "format": "hook_events_v1",
+                            "path": "/agentlab/out/rex-events.jsonl",
+                            "mode": "jsonl",
+                            "persist": true,
+                            "ingest": true
+                        }
+                    ]
+                }
+            }
+        });
+
+        let agent_runtime =
+            resolve_agent_runtime(&spec, &exp_dir, &root.path).expect("resolve runtime");
+        assert_eq!(agent_runtime.event_sinks.len(), 1);
+        assert_eq!(agent_runtime.event_sinks[0].id, "rex_hooks");
+        assert_eq!(
+            agent_runtime.event_sinks[0].path,
+            "/agentlab/out/rex-events.jsonl"
+        );
     }
 
     #[test]
@@ -5322,6 +5363,7 @@ mod tests {
             variant_args: Vec::new(),
             agent_runtime,
             agent_runtime_env: BTreeMap::new(),
+            secret_file_mounts: Vec::new(),
             invocation_source: "test".to_string(),
             configured_network_mode: "none".to_string(),
             effective_network_mode: "none".to_string(),
@@ -5653,6 +5695,7 @@ mod tests {
         json!({
             "experiment": { "id": "e", "name": "n", "workload_type": "agent_runtime" },
             "dataset": { "path": "tasks.jsonl", "provider": "local_jsonl", "suite_id": "s", "split_id": "dev", "limit": 1 },
+            "benchmark": { "grader": { "command": ["python", "-m", "grader"] } },
             "design": { "sanitization_profile": "hermetic_functional", "comparison": "paired", "replications": 1, "random_seed": 1, "shuffle_tasks": false, "max_concurrency": 1 },
             "baseline": { "variant_id": "base", "bindings": { "model_provider": "openai", "model": "gpt-5" } },
             "variant_plan": [
@@ -5703,6 +5746,140 @@ mod tests {
             );
         }
         (variants, profiles)
+    }
+
+    fn inv07_spec_with_runtime_secret_files() -> Value {
+        let mut spec = inv07_spec_with_runtime_bindings();
+        let agent_runtime = spec
+            .pointer_mut("/runtime/agent_runtime")
+            .and_then(Value::as_object_mut)
+            .expect("agent runtime object");
+        agent_runtime.insert(
+            "secret_files".to_string(),
+            json!([
+                {
+                    "id": "codex_oauth",
+                    "target": "/root/.codex/auth.json",
+                    "required_for_variants": ["base"]
+                }
+            ]),
+        );
+        spec
+    }
+
+    #[test]
+    fn runtime_secret_files_resolve_to_active_variant_mounts() {
+        let root = TempDirGuard::new("agentlab_runtime_secret_file_mounts");
+        let exp_dir = root.path.join("exp");
+        ensure_dir(&exp_dir).expect("exp dir");
+        fs::write(exp_dir.join("tasks.jsonl"), "{\"id\":\"task_1\"}\n").expect("dataset");
+        let secret_path = root.path.join("auth.json");
+        fs::write(&secret_path, "{}\n").expect("secret");
+        let spec = inv07_spec_with_runtime_secret_files();
+        let (variants, _) = resolve_variant_plan(&spec).expect("variant plan");
+        let mut execution = RunExecutionOptions::default();
+        execution
+            .runtime_env
+            .insert("OPENAI_API_KEY".to_string(), "test-token".to_string());
+        execution
+            .secret_files
+            .insert("codex_oauth".to_string(), secret_path.clone());
+
+        let base_profile = resolve_variant_runtime_profile(
+            &spec,
+            &variants[0],
+            &exp_dir,
+            &RunBehavior::default(),
+            &execution,
+        )
+        .expect("base profile");
+        assert_eq!(base_profile.secret_file_mounts.len(), 1);
+        assert_eq!(base_profile.secret_file_mounts[0].id, "codex_oauth");
+        assert_eq!(
+            base_profile.secret_file_mounts[0].source_from_host,
+            normalize_path(&secret_path)
+        );
+        assert_eq!(
+            base_profile.secret_file_mounts[0].target_path,
+            "/root/.codex/auth.json"
+        );
+
+        let alt_profile = resolve_variant_runtime_profile(
+            &spec,
+            &variants[1],
+            &exp_dir,
+            &RunBehavior::default(),
+            &execution,
+        )
+        .expect("alt profile");
+        assert!(alt_profile.secret_file_mounts.is_empty());
+    }
+
+    #[test]
+    fn runtime_secret_files_require_launch_time_source_binding() {
+        let root = TempDirGuard::new("agentlab_runtime_secret_file_missing");
+        let exp_dir = root.path.join("exp");
+        ensure_dir(&exp_dir).expect("exp dir");
+        fs::write(exp_dir.join("tasks.jsonl"), "{\"id\":\"task_1\"}\n").expect("dataset");
+        let spec = inv07_spec_with_runtime_secret_files();
+        let (variants, _) = resolve_variant_plan(&spec).expect("variant plan");
+        let mut execution = RunExecutionOptions::default();
+        execution
+            .runtime_env
+            .insert("OPENAI_API_KEY".to_string(), "test-token".to_string());
+
+        let err = match resolve_variant_runtime_profile(
+            &spec,
+            &variants[0],
+            &exp_dir,
+            &RunBehavior::default(),
+            &execution,
+        ) {
+            Ok(_) => panic!("missing secret binding should fail"),
+            Err(err) => err,
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("missing required secret file 'codex_oauth'"));
+        assert!(msg.contains("--secret-file codex_oauth=HOST_PATH"));
+    }
+
+    #[test]
+    fn strict_run_allows_agent_llm_egress_when_task_sandbox_policy_is_none() {
+        let root = TempDirGuard::new("agentlab_runtime_llm_egress");
+        let exp_dir = root.path.join("exp");
+        ensure_dir(&exp_dir).expect("exp dir");
+        fs::write(exp_dir.join("tasks.jsonl"), "{\"id\":\"task_1\"}\n").expect("dataset");
+        let mut spec = inv07_spec_with_runtime_bindings();
+        spec.pointer_mut("/runtime/agent_runtime")
+            .and_then(Value::as_object_mut)
+            .expect("agent runtime object")
+            .insert("network".to_string(), json!("llm_egress"));
+        *spec.pointer_mut("/policy/task_sandbox/network")
+            .expect("task sandbox network") = json!("none");
+        let (variants, _) = resolve_variant_plan(&spec).expect("variant plan");
+        let mut execution = RunExecutionOptions::default();
+        execution
+            .runtime_env
+            .insert("OPENAI_API_KEY".to_string(), "test-token".to_string());
+        let behavior = RunBehavior {
+            network_mode_override: None,
+            require_network_none: true,
+        };
+
+        let profile = resolve_variant_runtime_profile(
+            &spec,
+            &variants[0],
+            &exp_dir,
+            &behavior,
+            &execution,
+        )
+        .expect("strict profile");
+
+        assert_eq!(profile.agent_runtime.network, "llm_egress");
+        assert_eq!(profile.configured_network_mode, "none");
+        assert_eq!(profile.effective_network_mode, "none");
+        assert_eq!(docker_network_mode("llm_egress"), None);
+        assert_eq!(docker_network_mode("none"), Some("none".to_string()));
     }
 
     #[test]
@@ -7831,6 +8008,7 @@ mod tests {
             runtime_overrides_env: &overrides,
             trial_paths: &paths,
             dynamic_mounts: &dynamic_mounts,
+            secret_file_mounts: &[],
             io_paths: &io_paths,
             network_mode: "none",
             benchmark_grader: None,
@@ -7899,6 +8077,7 @@ mod tests {
             runtime_overrides_env: &overrides,
             trial_paths: &paths,
             dynamic_mounts: &[],
+            secret_file_mounts: &[],
             io_paths: &io_paths,
             network_mode: "none",
             benchmark_grader: None,
@@ -7952,6 +8131,7 @@ mod tests {
             runtime_overrides_env: &overrides,
             trial_paths: &paths,
             dynamic_mounts: &[],
+            secret_file_mounts: &[],
             io_paths: &io_paths,
             network_mode: "none",
             benchmark_grader: None,
@@ -8002,6 +8182,7 @@ mod tests {
             runtime_overrides_env: &BTreeMap::new(),
             trial_paths: &paths,
             dynamic_mounts: &[],
+            secret_file_mounts: &[],
             io_paths: &io_paths,
             network_mode: "none",
             benchmark_grader: None,
@@ -8049,6 +8230,7 @@ mod tests {
             runtime_overrides_env: &BTreeMap::new(),
             trial_paths: &paths,
             dynamic_mounts: &[],
+            secret_file_mounts: &[],
             io_paths: &io_paths,
             network_mode: "none",
             benchmark_grader: None,
@@ -8069,6 +8251,57 @@ mod tests {
         assert!(
             command_contains_flag_value(&resolved, "--output", &request.io_paths.result_path),
             "rex command should receive --output: {:?}",
+            resolved
+        );
+    }
+
+    #[test]
+    fn resolve_runtime_agent_command_projects_declared_event_path() {
+        let (_root, paths) = create_trial_paths_fixture("agentlab_rex_event_path");
+        let mut runtime = legacy_contract_runtime_fixture();
+        runtime.command_raw = vec![
+            "rex".to_string(),
+            "run".to_string(),
+            "--events".to_string(),
+            "__AGENTLAB_EVENT_PATH_rex_hooks__".to_string(),
+        ];
+        runtime.event_sinks.push(AgentRuntimeEventSink {
+            id: "rex_hooks".to_string(),
+            format: "hook_events_v1".to_string(),
+            path: "/agentlab/out/rex-events.jsonl".to_string(),
+            mode: "jsonl".to_string(),
+            persist: true,
+            ingest: true,
+        });
+        let io_paths = prepared_trial_io_fixture(
+            paths.out.join("result.json"),
+            paths.out.join("rex-events.jsonl"),
+        );
+        let empty_json = json!({});
+        let request = AdapterRunRequest {
+            runtime_experiment: &empty_json,
+            runtime: &runtime,
+            variant_args: &[],
+            runtime_env: &BTreeMap::new(),
+            runtime_overrides_env: &BTreeMap::new(),
+            trial_paths: &paths,
+            dynamic_mounts: &[],
+            secret_file_mounts: &[],
+            io_paths: &io_paths,
+            network_mode: "none",
+            benchmark_grader: None,
+            benchmark_grading_enabled: false,
+            run_id: "run_1",
+            task_image: "python:3.11-slim",
+            task_workdir: "/workspace/task",
+            task_materialization_kind: TaskMaterializationKind::TaskImage,
+            agent_artifact: None,
+        };
+
+        let resolved = resolve_runtime_agent_command(&request).expect("resolve runtime command");
+        assert!(
+            command_contains_flag_value(&resolved, "--events", "/agentlab/out/rex-events.jsonl"),
+            "rex command should receive declared event path: {:?}",
             resolved
         );
     }
@@ -8102,6 +8335,7 @@ mod tests {
             runtime_overrides_env: &BTreeMap::new(),
             trial_paths: &paths,
             dynamic_mounts: &[],
+            secret_file_mounts: &[],
             io_paths: &io_paths,
             network_mode: "none",
             benchmark_grader: None,
@@ -8150,6 +8384,7 @@ mod tests {
             runtime_overrides_env: &BTreeMap::new(),
             trial_paths: &paths,
             dynamic_mounts: &[],
+            secret_file_mounts: &[],
             io_paths: &io_paths,
             network_mode: "none",
             benchmark_grader: None,
@@ -8212,6 +8447,7 @@ mod tests {
             runtime_overrides_env: &overrides,
             trial_paths: &paths,
             dynamic_mounts: &[],
+            secret_file_mounts: &[],
             io_paths: &io_paths,
             network_mode: "none",
             benchmark_grader: Some(&grader),
@@ -8266,6 +8502,7 @@ mod tests {
             runtime_overrides_env: &overrides,
             trial_paths: &paths,
             dynamic_mounts: &[],
+            secret_file_mounts: &[],
             io_paths: &io_paths,
             network_mode: "none",
             benchmark_grader: Some(&grader),
@@ -8317,6 +8554,7 @@ mod tests {
             runtime_overrides_env: &overrides,
             trial_paths: &paths,
             dynamic_mounts: &[],
+            secret_file_mounts: &[],
             io_paths: &io_paths,
             network_mode: "none",
             benchmark_grader: Some(&grader),
@@ -8419,6 +8657,7 @@ mod tests {
             runtime_overrides_env: &overrides,
             trial_paths: &prepared.trial_paths,
             dynamic_mounts: &prepared.dynamic_mounts,
+            secret_file_mounts: &[],
             io_paths: &prepared.io_paths,
             network_mode: "none",
             benchmark_grader: None,
@@ -8563,6 +8802,7 @@ mod tests {
             runtime_overrides_env: &overrides,
             trial_paths: &prepared.trial_paths,
             dynamic_mounts: &prepared.dynamic_mounts,
+            secret_file_mounts: &[],
             io_paths: &prepared.io_paths,
             network_mode: "none",
             benchmark_grader: Some(&grader),
@@ -8636,6 +8876,7 @@ mod tests {
             runtime_overrides_env: &overrides,
             trial_paths: &paths,
             dynamic_mounts: &[],
+            secret_file_mounts: &[],
             io_paths: &io_paths,
             network_mode: "none",
             benchmark_grader: Some(&grader),
@@ -8689,6 +8930,7 @@ mod tests {
             runtime_overrides_env: &overrides,
             trial_paths: &paths,
             dynamic_mounts: &[],
+            secret_file_mounts: &[],
             io_paths: &io_paths,
             network_mode: "none",
             benchmark_grader: Some(&grader),
@@ -8737,6 +8979,7 @@ mod tests {
             runtime_overrides_env: &overrides,
             trial_paths: &paths,
             dynamic_mounts: &[],
+            secret_file_mounts: &[],
             io_paths: &io_paths,
             network_mode: "none",
             benchmark_grader: None,
@@ -9102,40 +9345,40 @@ mod tests {
     }
 
     #[test]
-    fn is_dx_contract_authoring_agent_section() {
-        assert!(is_dx_contract_authoring(
+    fn is_simplified_authoring_spec_agent_section() {
+        assert!(is_simplified_authoring_spec(
             &json!({"agent": {"command": ["echo"]}})
         ));
     }
 
     #[test]
-    fn is_dx_contract_authoring_overrides_section() {
-        assert!(is_dx_contract_authoring(&json!({"overrides": "path"})));
+    fn is_simplified_authoring_spec_overrides_section() {
+        assert!(is_simplified_authoring_spec(&json!({"overrides": "path"})));
     }
 
     #[test]
-    fn is_dx_contract_authoring_baseline_id() {
-        assert!(is_dx_contract_authoring(&json!({"baseline": {"id": "b1"}})));
+    fn is_simplified_authoring_spec_baseline_id() {
+        assert!(is_simplified_authoring_spec(&json!({"baseline": {"id": "b1"}})));
     }
 
     #[test]
-    fn is_dx_contract_authoring_benchmark_string() {
-        assert!(is_dx_contract_authoring(&json!({"benchmark": "bench_v0"})));
+    fn is_simplified_authoring_spec_benchmark_string() {
+        assert!(is_simplified_authoring_spec(&json!({"benchmark": "bench_v0"})));
     }
 
     #[test]
-    fn is_dx_contract_authoring_variants_section() {
-        assert!(is_dx_contract_authoring(&json!({"variants": []})));
+    fn is_simplified_authoring_spec_variants_section() {
+        assert!(is_simplified_authoring_spec(&json!({"variants": []})));
     }
 
     #[test]
-    fn is_dx_contract_authoring_false_for_empty() {
-        assert!(!is_dx_contract_authoring(&json!({})));
+    fn is_simplified_authoring_spec_false_for_empty() {
+        assert!(!is_simplified_authoring_spec(&json!({})));
     }
 
     #[test]
-    fn is_dx_contract_authoring_false_for_legacy() {
-        assert!(!is_dx_contract_authoring(&json!({
+    fn is_simplified_authoring_spec_false_for_legacy() {
+        assert!(!is_simplified_authoring_spec(&json!({
             "experiment": {"workload_type": "agent_runtime"},
             "runtime": {"agent": {"command": ["echo"]}}
         })));
@@ -11334,6 +11577,7 @@ mod tests {
             materialize: Some(MaterializationMode::Full),
             runtime_env: BTreeMap::new(),
             runtime_env_files: Vec::new(),
+            secret_files: BTreeMap::new(),
         };
         write_run_session_state(&run_dir, "run_001", &behavior, &execution).unwrap();
         let loaded = load_run_session_state(&run_dir).unwrap();
@@ -11359,6 +11603,7 @@ mod tests {
                 materialize: None,
                 runtime_env: BTreeMap::new(),
                 runtime_env_files: Vec::new(),
+                secret_files: BTreeMap::new(),
             },
         )
         .unwrap();
@@ -11384,6 +11629,7 @@ mod tests {
             materialize: Some(MaterializationMode::MetadataOnly),
             runtime_env: BTreeMap::new(),
             runtime_env_files: Vec::new(),
+            secret_files: BTreeMap::new(),
         };
         write_run_session_state(&run_dir, "run_003", &behavior, &execution).unwrap();
         assert_eq!(
@@ -11911,6 +12157,12 @@ mod tests {
     fn resolve_trial_timeout_ms_reads_policy_field() {
         let input = json!({ "policy": { "timeout_ms": 60000 } });
         assert_eq!(resolve_trial_timeout_ms(&input), Some(60000));
+    }
+
+    #[test]
+    fn resolve_trial_timeout_ms_reads_runtime_time_limit_field() {
+        let input = json!({ "runtime": { "time_limit_ms": 1200000 } });
+        assert_eq!(resolve_trial_timeout_ms(&input), Some(1200000));
     }
 
     #[test]

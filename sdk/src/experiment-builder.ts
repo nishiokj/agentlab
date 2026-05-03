@@ -347,7 +347,7 @@ export interface ExperimentSpec {
       env?: Record<string, string>;
       env_from_host?: string[];
       binding_args?: Array<{ key: string; flag: string }>;
-      network?: 'none' | 'full' | 'allowlist_enforced';
+      network?: 'none' | 'full' | 'allowlist_enforced' | 'llm_egress';
     };
     telemetry?: {
       trajectory_path?: string;
@@ -476,23 +476,28 @@ export class ExperimentBuilder {
     return this;
   }
 
-  agentBundle(bundle: string): this {
-    this.spec.runtime.agent_runtime.artifact = bundle;
+  agentArtifact(artifact: string): this {
+    this.spec.runtime.agent_runtime.artifact = artifact;
     return this;
   }
 
-  customAgentImage(image: string, command: string[]): this {
+  agentRuntime(image: string, command: string[]): this {
     this.spec.runtime.agent_runtime.command = [...command];
     this.spec.runtime.agent_runtime.image = image;
     return this;
   }
 
-  agentLoop(command: string[]): this {
+  agentImage(image: string): this {
+    this.spec.runtime.agent_runtime.image = image;
+    return this;
+  }
+
+  agentCommand(command: string[]): this {
     this.spec.runtime.agent_runtime.command = [...command];
     return this;
   }
 
-  agentArgs(args: string[]): this {
+  appendAgentCommandArgs(args: string[]): this {
     this.spec.runtime.agent_runtime.command.push(...args);
     return this;
   }
@@ -502,17 +507,44 @@ export class ExperimentBuilder {
     return this;
   }
 
-  agentLoopEnv(env: Record<string, string>): this {
-    return this.agentEnv(env);
-  }
-
-  agentEnvFromHost(keys: string[]): this {
+  runtimeEnvFromHost(keys: string[]): this {
     this.spec.runtime.agent_runtime.env_from_host = [...keys];
     return this;
   }
 
+  /** @deprecated Use agentArtifact(). */
+  agentBundle(bundle: string): this {
+    return this.agentArtifact(bundle);
+  }
+
+  /** @deprecated Use agentRuntime() or agentImage() + agentCommand(). */
+  customAgentImage(image: string, command: string[]): this {
+    return this.agentRuntime(image, command);
+  }
+
+  /** @deprecated Use agentCommand(). */
+  agentLoop(command: string[]): this {
+    return this.agentCommand(command);
+  }
+
+  /** @deprecated Use appendAgentCommandArgs(). */
+  agentArgs(args: string[]): this {
+    return this.appendAgentCommandArgs(args);
+  }
+
+  /** @deprecated Use agentEnv(). */
+  agentLoopEnv(env: Record<string, string>): this {
+    return this.agentEnv(env);
+  }
+
+  /** @deprecated Use runtimeEnvFromHost(). */
+  agentEnvFromHost(keys: string[]): this {
+    return this.runtimeEnvFromHost(keys);
+  }
+
+  /** @deprecated Use runtimeEnvFromHost(). */
   agentLoopEnvFromHost(keys: string[]): this {
-    return this.agentEnvFromHost(keys);
+    return this.runtimeEnvFromHost(keys);
   }
 
   agentIo(inputArg: string, outputArg: string): this {
@@ -613,11 +645,16 @@ export class ExperimentBuilder {
     return this;
   }
 
-  networkMode(mode: 'none' | 'full' | 'allowlist_enforced', allowedHosts: string[] = []): this {
+  networkPolicy(mode: 'none' | 'full' | 'allowlist_enforced' | 'llm_egress', allowedHosts: string[] = []): this {
     this.spec.runtime.agent_runtime.network = mode;
-    this.spec.policy.task_sandbox.network = mode;
+    this.spec.policy.task_sandbox.network = mode === 'llm_egress' ? 'none' : mode;
     this.spec.policy.task_sandbox.allowed_hosts = [...allowedHosts];
     return this;
+  }
+
+  /** @deprecated Use networkPolicy(). */
+  networkMode(mode: 'none' | 'full' | 'allowlist_enforced' | 'llm_egress', allowedHosts: string[] = []): this {
+    return this.networkPolicy(mode, allowedHosts);
   }
 
   sandboxImage(image: string): this {
@@ -647,15 +684,15 @@ export class ExperimentBuilder {
     if (this.spec.dataset.limit <= 0) missing.push('dataset limit (call .datasetJsonl() with limit > 0)');
     const command = this.spec.runtime.agent_runtime.command ?? [];
     if (command.length === 0 || command.some((part) => part.trim().length === 0)) {
-      missing.push('runtime.agent_runtime.command (call .agentLoop() or .customAgentImage())');
+      missing.push('runtime.agent_runtime.command (call .agentCommand() or .agentRuntime())');
     }
     const bundle = this.spec.runtime.agent_runtime.artifact;
     if (!bundle || bundle.trim().length === 0) {
-      missing.push('runtime.agent_runtime.artifact (call .agentBundle())');
+      missing.push('runtime.agent_runtime.artifact (call .agentArtifact())');
     }
     const agentImage = this.spec.runtime.agent_runtime.image;
     if (!agentImage || agentImage.trim().length === 0) {
-      missing.push('runtime.agent_runtime.image (call .customAgentImage())');
+      missing.push('runtime.agent_runtime.image (call .agentImage() or .agentRuntime())');
     }
     if (this.spec.policy.timeout_ms <= 0) {
       missing.push('policy.timeout_ms (call .timeoutMs() with > 0)');

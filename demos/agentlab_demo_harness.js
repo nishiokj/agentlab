@@ -95,7 +95,7 @@ function resolveMountedPath(rawPath) {
   return path.isAbsolute(rawPath) ? rawPath : path.join(process.cwd(), rawPath);
 }
 
-function writeHarnessManifest(manifestDir, integration, controlPath, controlMode) {
+function writeHarnessManifest(manifestDir, integration, controlPath, controlMode, eventsPath) {
   if (integration === 'cli_basic') {
     return;
   }
@@ -116,7 +116,7 @@ function writeHarnessManifest(manifestDir, integration, controlPath, controlMode
   if (integration === 'cli_events') {
     manifest.hooks = {
       schema_version: 'hook_events_v1',
-      events_path: path.join(manifestDir, 'harness_events.jsonl'),
+      events_path: eventsPath,
       header_event_emitted: false,
     };
   }
@@ -211,31 +211,22 @@ function emitEvents(params) {
 }
 
 function main() {
-  const inputPath = resolveMountedPath('/out/trial_input.json');
+  const inputPath = resolveMountedPath(process.env.AGENTLAB_TRIAL_INPUT_PATH);
   if (!inputPath) {
-    throw new Error('trial_input missing /out/trial_input.json');
+    throw new Error('AGENTLAB_TRIAL_INPUT_PATH is required');
   }
   const ti = readJson(inputPath);
-  const runtimeOutPath = resolveMountedPath(ti.runtime?.paths?.out);
-  const runtimeWorkspacePath = resolveMountedPath(
-    ti.runtime?.paths?.workspace,
-  );
-  if (!runtimeOutPath) {
-    throw new Error('trial_input missing runtime.paths.out');
+  const resultPath = resolveMountedPath(process.env.AGENTLAB_RESULT_PATH);
+  if (!resultPath) {
+    throw new Error('AGENTLAB_RESULT_PATH is required');
   }
-  if (!runtimeWorkspacePath) {
-    throw new Error('trial_input missing runtime.paths.workspace');
-  }
+  const trajectoryPath = resolveMountedPath(process.env.AGENTLAB_TRAJECTORY_PATH);
+  const runtimeOutPath = path.dirname(resultPath);
+  const runtimeWorkspacePath = process.cwd();
   const outputDir = runtimeOutPath;
-  const outputPath = path.join(outputDir, 'trial_output.json');
-  const controlMode = ti.runtime?.control_plane?.mode;
-  const controlPath = ti.runtime?.control_plane?.path;
-  if (!controlMode) {
-    throw new Error('trial_input missing runtime.control_plane.mode');
-  }
-  if (!controlPath) {
-    throw new Error('trial_input missing runtime.control_plane.path');
-  }
+  const outputPath = resultPath;
+  const controlMode = ti.runtime?.control_plane?.mode || 'file';
+  const controlPath = ti.runtime?.control_plane?.path || '/agentlab/in/runtime/lab_control.json';
   const ids = ti.ids;
   const integration = (ti.design && ti.design.integration_level) || 'cli_basic';
 
@@ -243,7 +234,8 @@ function main() {
   ensureDir(outDir);
   ensureDir(runtimeWorkspacePath);
 
-  writeHarnessManifest(outputDir, integration, controlPath, controlMode);
+  const eventsPath = trajectoryPath || path.join(outputDir, 'trajectory.jsonl');
+  writeHarnessManifest(outputDir, integration, controlPath, controlMode, eventsPath);
 
   const prompt =
     ti.task?.input?.prompt ||
@@ -306,7 +298,6 @@ function main() {
     `task_id=${ids.task_id}\npredicted=${difficulty.predictedDifficulty}\noutcome=${outcome}\n`,
   );
 
-  const eventsPath = path.join(outputDir, 'harness_events.jsonl');
   emitEvents({
     integration,
     eventsPath,

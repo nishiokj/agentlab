@@ -1702,6 +1702,7 @@ pub(crate) fn build_preflight_probe_request<'a>(
         runtime_overrides_env: &runtime_profile.agent_runtime_env,
         trial_paths: &context.trial_paths,
         dynamic_mounts: &context.dynamic_mounts,
+        secret_file_mounts: &runtime_profile.secret_file_mounts,
         io_paths: &context.io_paths,
         network_mode: runtime_profile.effective_network_mode.as_str(),
         benchmark_grader,
